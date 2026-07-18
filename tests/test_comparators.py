@@ -282,6 +282,32 @@ class TestComparatorGridFeatures:
         expected_f_max = min(1.0 / (2.0 * max(dy, dx)) for dy, dx in spacings)
         assert cmp.freq_edges[-1] == pytest.approx(expected_f_max * (1.0 + 1e-9))
 
+    def test_missing_bins_are_centered_then_zero_filled(self, monkeypatch):
+        gene_names = ["constant", "sparse"]
+        raster = np.zeros((2, 4, 4), dtype=float)
+        raster[0] = 5.0
+        raster[1, 0, 1] = 2.0
+        raster[:, 3, 3] = np.nan
+        samples = _install_grid_rasters(monkeypatch, [raster, raster.copy()], gene_names)
+
+        cmp = ComparatorGrid(
+            samples,
+            bins="bins",
+            table_name="table",
+            col_key="col_idx",
+            row_key="row_idx",
+            gene_names=gene_names,
+            feature_mode="radial",
+            n_radial_bins=2,
+            presence_threshold=0.065,
+            fft_chunk_size=1,
+        ).compute_spectra(n_jobs=1, progress=False)
+
+        np.testing.assert_allclose(cmp.dc_[:, 0], 5.0)
+        np.testing.assert_allclose(cmp.spectra_[:, 0], 0.0, atol=1e-12)
+        assert cmp.presence_[:, 1].all()  # 1/15 observed bins, not 1/16 bounding-box bins
+        assert np.isfinite(cmp.spectra_).all()
+
     def test_2d_auto_chunk_with_per_sample_spacing(self, monkeypatch):
         rng = np.random.default_rng(11)
         gene_names = ["g0", "g1", "g2"]
@@ -289,6 +315,8 @@ class TestComparatorGridFeatures:
             rng.standard_normal((3, 9, 11)),
             rng.standard_normal((3, 11, 9)),
         ]
+        rasters[0][:, 2, 3] = np.nan
+        rasters[1][:, 4, 2] = np.nan
         samples = _install_grid_rasters(monkeypatch, rasters, gene_names)
         spacings = [(0.4, 0.5), (0.8, 0.6)]
 

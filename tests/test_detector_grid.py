@@ -442,6 +442,38 @@ class TestDetectorGridStatistic(unittest.TestCase):
         Q_from_detector = df.loc[list(self.features), "Q"].to_numpy()
         np.testing.assert_allclose(Q_from_detector, Q_raw, rtol=1e-10, atol=1e-12)
 
+    def test_missing_bins_match_observed_mean_imputation_for_q_and_r(self):
+        """Structural NaNs become zero residuals; observed zeros remain data."""
+        from quadsv.statistics import spatial_q_test
+
+        raster = self.raster_data.copy()
+        raster[0, 0, 0] = 0.0  # observed biological zero, not missing
+        raster[:, 2, 3] = np.nan
+        missing_da = MockDataArray(raster, self.features)
+
+        means = np.nanmean(raster, axis=(1, 2), keepdims=True)
+        mean_filled = np.where(np.isnan(raster), means, raster)
+        filled_da = MockDataArray(mean_filled, self.features)
+
+        with patch("quadsv._rasterize.rasterize_table", return_value=missing_da):
+            detector = DetectorGrid(kernel_method="gaussian", bandwidth=1.5)
+            self._setup(detector)
+            df = detector.compute_qstat(n_jobs=1, return_pval=False, show_progress=False)
+
+        expected_q = np.asarray(
+            spatial_q_test(
+                np.moveaxis(mean_filled, 0, -1),
+                detector.kernel_,
+                return_pval=False,
+            )
+        )
+        observed_q = df.loc[list(self.features), "Q"].to_numpy()
+        np.testing.assert_allclose(observed_q, expected_q, rtol=1e-10, atol=1e-12)
+
+        missing_embeddings = detector._compute_batch_spectral_embeddings(missing_da, self.features)
+        filled_embeddings = detector._compute_batch_spectral_embeddings(filled_da, self.features)
+        np.testing.assert_allclose(missing_embeddings, filled_embeddings, rtol=1e-10, atol=1e-12)
+
 
 if __name__ == "__main__":
     unittest.main()

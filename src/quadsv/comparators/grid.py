@@ -19,6 +19,7 @@ warnings.filterwarnings("ignore", category=UserWarning, message=".*pkg_resources
 
 import spatialdata as sd
 
+from quadsv._rasterize import _mean_fill_missing
 from quadsv.comparators.base import (
     _ComparatorBase,
     _run_per_sample,
@@ -36,6 +37,35 @@ from quadsv.comparators.features import (
 __all__ = ["ComparatorGrid"]
 
 logger = logging.getLogger(__name__)
+
+
+def _grid_spectrum(
+    block: np.ndarray,
+    *,
+    fft_solver: str,
+    workers: int | None,
+    return_dc: bool = False,
+):
+    """Compute a grid spectrum after mean-filling structural ``NaN`` holes."""
+    return compute_sample_spectrum(
+        _mean_fill_missing(block, axis=(1, 2)),
+        fft_solver=fft_solver,
+        workers=workers,
+        return_dc=return_dc,
+    )
+
+
+def _observed_nonzero_fraction(block: np.ndarray) -> np.ndarray:
+    """Fraction of nonzero values among observed, rather than bounding-box, bins."""
+    observed = ~np.isnan(block)
+    denominator = observed.sum(axis=(1, 2))
+    numerator = (observed & (block != 0)).sum(axis=(1, 2))
+    return np.divide(
+        numerator,
+        denominator,
+        out=np.zeros(block.shape[0], dtype=float),
+        where=denominator > 0,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -255,7 +285,7 @@ class ComparatorGrid(_ComparatorBase):
 
         def _spec_chunk(start: int, stop: int) -> np.ndarray:
             block = self._batch_raster(img, self.gene_names[start:stop])
-            return compute_sample_spectrum(
+            return _grid_spectrum(
                 block,
                 fft_solver=self._spectrum_fft_solver,
                 workers=self._workers,
@@ -324,15 +354,14 @@ class ComparatorGrid(_ComparatorBase):
 
             def _spec_chunk(start: int, stop: int) -> np.ndarray:
                 block = self._batch_raster(img, self.gene_names[start:stop])
-                frac_nonzero = (block != 0).reshape(block.shape[0], -1).mean(axis=1)
-                presence[start:stop] = frac_nonzero >= self._presence_threshold
-                dc[start:stop] = block.mean(axis=(1, 2))
-                return compute_sample_spectrum(
+                presence[start:stop] = _observed_nonzero_fraction(block) >= self._presence_threshold
+                spectrum, dc[start:stop] = _grid_spectrum(
                     block,
                     fft_solver=self._spectrum_fft_solver,
                     workers=self._workers,
-                    return_dc=False,
+                    return_dc=True,
                 )
+                return spectrum
 
             feat = stream_radial_features(
                 _spec_chunk,
@@ -398,12 +427,14 @@ class ComparatorGrid(_ComparatorBase):
 
             def _spec_chunk(start: int, stop: int, _img=img, _dc=dc, _pr=presence):
                 block = self._batch_raster(_img, self.gene_names[start:stop])
-                frac_nonzero = (block != 0).reshape(block.shape[0], -1).mean(axis=1)
-                _pr[start:stop] = frac_nonzero >= self._presence_threshold
-                _dc[start:stop] = block.mean(axis=(1, 2))
-                return compute_sample_spectrum(
-                    block, fft_solver=self._spectrum_fft_solver, workers=self._workers
+                _pr[start:stop] = _observed_nonzero_fraction(block) >= self._presence_threshold
+                spectrum, _dc[start:stop] = _grid_spectrum(
+                    block,
+                    fft_solver=self._spectrum_fft_solver,
+                    workers=self._workers,
+                    return_dc=True,
                 )
+                return spectrum
 
             if lm_idx is None:
                 # Default: stream the cross-gene geomean landmark; this single
@@ -420,7 +451,7 @@ class ComparatorGrid(_ComparatorBase):
                 if cache_landmarks:
                     # Within budget: cache the landmark genes' per-gene spectra.
                     lm_names = [self.gene_names[j] for j in lm_idx]
-                    lm = compute_sample_spectrum(
+                    lm = _grid_spectrum(
                         self._batch_raster(img, lm_names),
                         fft_solver=self._spectrum_fft_solver,
                         workers=self._workers,
@@ -528,7 +559,11 @@ class ComparatorGrid(_ComparatorBase):
                     f"sample {i} covariate raster has shape {arr.shape}; "
                     "expected (n_keys, ny, nx) from rasterize_bins."
                 )
-            out.append(self._covariate_features_from_array(arr, sample_index=i))
+            out.append(
+                self._covariate_features_from_array(
+                    _mean_fill_missing(arr, axis=(1, 2)), sample_index=i
+                )
+            )
         return out
 
 

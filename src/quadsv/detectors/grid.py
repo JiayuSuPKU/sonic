@@ -17,6 +17,7 @@ from joblib import Parallel, delayed
 from scipy.stats import norm
 from tqdm import tqdm
 
+from quadsv._rasterize import _mean_fill_missing
 from quadsv.detectors.base import Detector
 from quadsv.kernels.fft import FFTKernel
 from quadsv.statistics import apply_bh_correction, spatial_q_test
@@ -52,6 +53,9 @@ def _qstat_worker_fft(
 
     # Load data to memory for batch: shape (M, ny, nx)
     data_chunk = raster_layer.sel(c=feature_batch).values
+    # Structural holes are NaN after rasterization. Mean-fill them so the
+    # Q-test's subsequent centering maps missing bins to zero residuals.
+    data_chunk = _mean_fill_missing(data_chunk, axis=(1, 2))
     # Transpose to (ny, nx, M) for kernel
     data_chunk_transposed = np.moveaxis(data_chunk, 0, -1)
 
@@ -167,8 +171,7 @@ class DetectorGrid(Detector):
         for key, value in user_params.items():
             if key not in defaults:
                 raise ValueError(
-                    f"Unknown parameter {key!r} for method {method!r}. "
-                    f"Allowed: {sorted(defaults)}."
+                    f"Unknown parameter {key!r} for method {method!r}. Allowed: {sorted(defaults)}."
                 )
             defaults[key] = value
         return defaults
@@ -469,7 +472,9 @@ class DetectorGrid(Detector):
         n_feats, ny, nx = data.shape
 
         # 2. Standardize (In-place to save memory)
-        # Mean/Std per feature
+        # Mean-fill structural holes first; after centering they become zero
+        # residuals and the full FFT grid supplies the standardization scale.
+        data = _mean_fill_missing(data, axis=(1, 2))
         means = np.mean(data, axis=(1, 2), keepdims=True)
         stds = np.std(data, axis=(1, 2), keepdims=True, ddof=1)
 

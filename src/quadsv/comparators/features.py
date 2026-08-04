@@ -7,6 +7,8 @@ them to cross-sample features. This module owns those array-level operations:
   and optionally returns the separated DC expression means.
 - :func:`radial_bin_spectrum` and :func:`stream_radial_features` collapse 2-D
   spectra to rotation-invariant radial profiles.
+- :func:`adapt_frequency_edges` merges radial intervals until every sample's
+  FFT grid supports every retained interval.
 - :func:`estimate_rotations_from_landmarks` plus the polar streaming helpers
   keep directional information for ``feature_mode="2d"`` while aligning sample
   orientation.
@@ -33,6 +35,7 @@ from tqdm.auto import tqdm
 from quadsv.kernels.fft import power_spectrum_2d
 
 __all__ = [
+    "adapt_frequency_edges",
     "compute_sample_spectrum",
     "effective_rank",
     "gene_pattern_diversity",
@@ -604,6 +607,68 @@ def radial_bin_counts(
         spacing=spacing,
         edges=edges,
     )[2]
+
+
+def adapt_frequency_edges(
+    grid_shapes: Sequence[tuple[int, int]],
+    spacings: Sequence[tuple[float, float]],
+    edges: np.ndarray,
+    *,
+    fft_solver: str = "rfft2",
+) -> np.ndarray:
+    """Merge radial bins until every interval has support in every FFT grid.
+
+    Parameters
+    ----------
+    grid_shapes
+        Spatial lattice shape for each sample.
+    spacings
+        Physical ``(dy, dx)`` spacing for each sample.
+    edges
+        Strictly increasing candidate frequency-bin edges.
+    fft_solver
+        FFT layout used to count frequency cells.
+    """
+    shapes = list(grid_shapes)
+    sample_spacings = list(spacings)
+    if not shapes or len(shapes) != len(sample_spacings):
+        raise ValueError("grid_shapes and spacings must have the same nonzero length.")
+    requested_edges = np.asarray(edges, dtype=float)
+    if (
+        requested_edges.ndim != 1
+        or requested_edges.size < 2
+        or not np.isfinite(requested_edges).all()
+        or np.any(np.diff(requested_edges) <= 0)
+    ):
+        raise ValueError("edges must be a finite, strictly increasing 1D array.")
+
+    # For each sample and each bin, count number of supporting cells
+    counts = np.vstack(
+        [
+            radial_bin_counts(
+                shape,
+                n_bins=requested_edges.size - 1,
+                fft_solver=fft_solver,
+                spacing=spacing,
+                edges=requested_edges,
+            )
+            for shape, spacing in zip(shapes, sample_spacings, strict=True)
+        ]
+    )
+    # If any sample has zero support for the current bin, merge the bin to its right
+    merged = [float(requested_edges[0])]
+    running = np.zeros(counts.shape[0], dtype=float)
+    for bin_idx in range(requested_edges.size - 1):
+        running += counts[:, bin_idx]
+        if np.all(running > 0):
+            merged.append(float(requested_edges[bin_idx + 1]))
+            running.fill(0.0)
+
+    if len(merged) == 1:
+        merged.append(float(requested_edges[-1]))
+    elif merged[-1] != float(requested_edges[-1]):
+        merged[-1] = float(requested_edges[-1])
+    return np.asarray(merged)
 
 
 def stream_radial_features(

@@ -46,6 +46,7 @@ warnings.filterwarnings("ignore", category=FutureWarning, message=".*legacy Dask
 warnings.filterwarnings("ignore", category=UserWarning, message=".*pkg_resources is deprecated.*")
 
 from quadsv.comparators.features import (
+    adapt_frequency_edges,
     compute_sample_spectrum,
     radial_bin_counts,
     radial_bin_spectrum,
@@ -466,34 +467,14 @@ class _ComparatorBase:
         if not self._grid_shapes or not self._spacings:
             return
 
-        # Compute number of FFT-cells in each radial bin from the current edges.
         edges = np.asarray(self.freq_edges, dtype=float)
         requested = edges.size - 1
-        feature_grid_counts = self._fft_cell_counts_for_edges(edges)
-        if feature_grid_counts is None:
-            return
-
-        # Accumulate adjacent original bins until all samples have at least one
-        # FFT cell in the merged interval. This is equivalent to repeatedly
-        # merging unsupported bins, but avoids recomputing per-sample histograms
-        # after every edge deletion.
-        merged_edges = [float(edges[0])]
-        running = np.zeros(feature_grid_counts.shape[0], dtype=float)
-        for bin_idx in range(requested):
-            running += feature_grid_counts[:, bin_idx]
-            if np.all(running > 0):
-                merged_edges.append(float(edges[bin_idx + 1]))
-                running.fill(0.0)
-
-        if len(merged_edges) == 1:
-            merged_edges.append(float(edges[-1]))
-        elif merged_edges[-1] != float(edges[-1]):
-            # Trailing unsupported bins have no right neighbour, so merge them
-            # into the final retained interval by extending its right edge.
-            merged_edges[-1] = float(edges[-1])
-
-        # Update the frequency edges and the number of radial bins.
-        self.freq_edges = np.asarray(merged_edges, dtype=float)
+        self.freq_edges = adapt_frequency_edges(
+            self._grid_shapes,
+            self._spacings,
+            edges,
+            fft_solver=self._spectrum_fft_solver,
+        )
         self._n_radial_bins = int(self.freq_edges.size - 1)
         collapsed = requested - self._n_radial_bins
         if collapsed:

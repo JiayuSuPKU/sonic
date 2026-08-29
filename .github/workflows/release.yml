@@ -21,6 +21,23 @@ jobs:
       - run: python -m build
       - run: python -m build compat/quadsv --outdir compat-dist
       - run: python -m twine check dist/* compat-dist/*
+      - name: Verify release version and wheel ownership
+        env:
+          RELEASE_TAG: ${{ github.event.release.tag_name }}
+        run: |
+          case "$RELEASE_TAG" in
+            v*) version="${RELEASE_TAG#v}" ;;
+            *) echo "Release tag must start with v"; exit 1 ;;
+          esac
+          sonic_wheel="dist/sonic_spatial-${version}-py3-none-any.whl"
+          quadsv_wheel="compat-dist/quadsv-${version}-py3-none-any.whl"
+          test -f "$sonic_wheel"
+          test -f "$quadsv_wheel"
+          unzip -Z1 "$sonic_wheel" | grep -qx 'sonic/__init__.py'
+          ! unzip -Z1 "$sonic_wheel" | grep -q '^quadsv/'
+          unzip -Z1 "$quadsv_wheel" | grep -qx 'quadsv/__init__.py'
+          unzip -p "$quadsv_wheel" 'quadsv-*.dist-info/METADATA' |
+            grep -Eq '^Requires-Dist: sonic-spatial(<2,>=1\.0\.0rc1|>=1\.0\.0rc1,<2)$'
       - uses: actions/upload-artifact@v4
         with:
           name: sonic-dist

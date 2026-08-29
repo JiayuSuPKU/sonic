@@ -1,29 +1,38 @@
 Installation
 ============
 
-From PyPI
----------
+Release candidate
+-----------------
 
 .. code-block:: bash
 
-   pip install sonic
+   pip install sonic-spatial==1.0.0rc1
 
-Two optional extras are available for development and documentation:
-
-.. code-block:: bash
-
-   pip install 'sonic[dev]'    # tests, linting, jupyter, matplotlib
-   pip install 'sonic[docs]'   # Sphinx + theme + autoapi
+The Python import remains ``sonic``.
 
 
-From source
------------
+Development install
+-------------------
 
 .. code-block:: bash
 
    git clone https://github.com/JiayuSuPKU/sonic.git
    cd sonic
    pip install -e '.[dev,docs]'
+
+The ``dev`` and ``docs`` extras include the test and documentation toolchains,
+respectively.
+
+
+Legacy ``quadsv`` compatibility
+-------------------------------
+
+The compatibility distribution installs SONIC while preserving deprecated
+``quadsv`` imports:
+
+.. code-block:: bash
+
+   pip install quadsv==1.0.0rc1
 
 
 Requirements

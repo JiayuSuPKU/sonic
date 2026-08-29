@@ -1,11 +1,13 @@
 """Compatibility checks for the former ``quadsv`` namespace."""
 
 import importlib
+from pathlib import Path
 
 import pytest
 
 
-def test_quadsv_namespace_forwards_to_sonic():
+def test_quadsv_namespace_forwards_to_sonic(monkeypatch):
+    monkeypatch.syspath_prepend(str(Path(__file__).parents[1] / "compat" / "quadsv" / "src"))
     sonic = importlib.import_module("sonic")
 
     with pytest.warns(DeprecationWarning, match="renamed to sonic"):

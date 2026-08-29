@@ -34,7 +34,7 @@ except ImportError:  # _version.py absent — source checkout without a build st
     try:
         from importlib.metadata import PackageNotFoundError, version
 
-        __version__ = version("sonic")
+        __version__ = version("sonic-spatial")
     except (ImportError, PackageNotFoundError):
         __version__ = "0.0.0+unknown"
 

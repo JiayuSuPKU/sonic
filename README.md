@@ -11,17 +11,30 @@ Detect spatial patterns in omics data via kernel-based hypothesis tests for spat
 
 ## Installation
 
+Install the release candidate from PyPI:
+
 ```bash
-pip install sonic  # From PyPI
-# OR (latest dev version)
-pip install git+https://github.com/JiayuSuPKU/sonic.git#egg=sonic
-# OR (for development)
+pip install sonic-spatial==1.0.0rc1
+```
+
+The distribution name is `sonic-spatial`; the Python import remains `sonic`.
+
+For the latest source:
+
+```bash
+pip install "sonic-spatial @ git+https://github.com/JiayuSuPKU/sonic.git"
+```
+
+For development:
+
+```bash
 git clone https://github.com/JiayuSuPKU/sonic.git && cd sonic && pip install -e .
 ```
 
-Code written for the former `quadsv` package remains supported during the
-transition. `pip install quadsv` installs SONIC, and legacy `quadsv` imports
-emit a deprecation warning while forwarding to the same implementation.
+Code written for the former `quadsv` package remains supported by a separate
+compatibility distribution. `pip install quadsv==1.0.0rc1` installs SONIC,
+and legacy `quadsv` imports emit a deprecation warning while forwarding to the
+same implementation.
 
 ## Usage
 

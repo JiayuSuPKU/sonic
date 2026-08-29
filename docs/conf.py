@@ -15,14 +15,14 @@ except ModuleNotFoundError:  # pragma: no cover - Python 3.10 fallback
 def _load_project_info() -> tuple[str, str, str]:
     """Load (name, author, version) from installed metadata or pyproject.toml."""
     try:
-        info = metadata("sonic")
+        info = metadata("sonic-spatial")
         return info["Name"], info["Author"], info["Version"]
     except PackageNotFoundError:
         pyproject_path = Path(__file__).resolve().parents[1] / "pyproject.toml"
         with pyproject_path.open("rb") as f:
             pyproject = tomllib.load(f)
         project_cfg = pyproject.get("project", {})
-        name = project_cfg.get("name", "sonic")
+        name = project_cfg.get("name", "sonic-spatial")
         version = project_cfg.get("version", "0.0.0")
         authors = project_cfg.get("authors", [])
         author = authors[0].get("name", "") if authors and isinstance(authors[0], dict) else ""

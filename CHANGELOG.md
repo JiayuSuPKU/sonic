@@ -7,11 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.0.0rc1] - 2026-08-29
+
 ### Changed
 - **QuadSV is now SONIC** (Spatial Organization through Nonrandom-pattern
-  Inference and Comparison). The canonical distribution and import package are
-  `sonic`; the `quadsv` distribution and import namespace remain as a
-  compatibility bridge for existing users.
+  Inference and Comparison). The canonical distribution is `sonic-spatial`
+  and the import package is `sonic`; the `quadsv` distribution and import
+  namespace remain as a compatibility bridge for existing users.
 
 ### Added
 - **GLM design API for cross-sample pattern comparison.** New public
@@ -234,32 +236,38 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## Release Process
 
-The next planned release is `1.0.0`. Until it is ready, keep its changes under
-`Unreleased`.
+The immediate release is the real prerelease `1.0.0rc1`. The thorough
+documentation rewrite remains deferred to the final `1.0.0`; until the RC is
+tagged, keep its changes under `Unreleased`.
 
-- [ ] Complete and review the package documentation.
-- [ ] Run the full test suite: `pytest tests/ --cov=sonic`.
-- [ ] Run lint checks: `ruff check src tests`.
-- [ ] Build the documentation without warnings:
+- [x] Review the current installation, migration, and release notes for
+  accuracy; the full documentation rewrite is not an RC blocker.
+- [x] Run the full test suite: `pytest tests/ --cov=sonic`.
+- [x] Run lint checks: `ruff check src tests compat/quadsv/src`.
+- [x] Build the documentation without warnings:
   `sphinx-build -W -b html docs/ docs/_build/`.
-- [ ] Confirm the `sonic` and `quadsv` trusted publishers target the renamed
-  GitHub repository and the `release.yml` workflow.
-- [ ] Update the compatibility package requirement to `sonic>=1,<2` in
-  `compat/quadsv/pyproject.toml`.
-- [ ] Confirm the new Read the Docs project builds successfully and legacy
+- [x] Add the pending `sonic-spatial` publisher with owner `JiayuSuPKU`,
+  repository `sonic`, workflow `release.yml`, and environment `pypi`.
+- [x] Add the additional `quadsv` publisher with the same identity. Keep the
+  existing QuadSV credential until this release succeeds.
+- [x] Update the compatibility requirement to
+  `sonic-spatial>=1.0.0rc1,<2` and make
+  the compatibility wheel, rather than the SONIC wheel, own the deprecated
+  `quadsv` import namespace.
+- [x] Confirm the new Read the Docs project builds successfully and legacy
   documentation links remain available or redirect.
-- [ ] Add a dated `1.0.0` section below `Unreleased`, leaving a new empty
+- [x] Add a dated `1.0.0rc1` section below `Unreleased`, leaving a new empty
   `Unreleased` section for future changes.
 - [ ] Commit the release preparation and create an annotated tag:
-  `git tag -a v1.0.0 -m "SONIC 1.0.0"`.
-- [ ] Build both distributions: `python -m build` and
+  `git tag -a v1.0.0rc1 -m "SONIC 1.0.0rc1"`.
+- [x] Build both distributions: `python -m build` and
   `python -m build compat/quadsv --outdir compat-dist`.
-- [ ] Verify their metadata:
+- [x] Verify their metadata:
   `python -m twine check dist/* compat-dist/*`.
-- [ ] Push `v1.0.0`, then publish its GitHub Release to trigger trusted
+- [ ] Push `v1.0.0rc1`, then publish its GitHub prerelease to trigger trusted
   publishing of SONIC followed by the QuadSV compatibility package.
-- [ ] Verify clean installations of `sonic==1.0.0` and `quadsv==1.0.0` from
-  PyPI.
+- [ ] Verify clean installations of `sonic-spatial==1.0.0rc1` and
+  `quadsv==1.0.0rc1` from PyPI, then remove obsolete QuadSV credentials.
 
 ## [0.1.0] - 2026-02-02
 

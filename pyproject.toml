@@ -3,7 +3,7 @@ requires = ["setuptools>=64", "setuptools-scm>=8", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "sonic"
+name = "sonic-spatial"
 dynamic = ["version"]
 description = "Consistent and scalable spatial pattern detection and comparison."
 readme = "README.md"
@@ -27,7 +27,7 @@ keywords = [
     "single-cell",
 ]
 classifiers = [
-    "Development Status :: 3 - Alpha",
+    "Development Status :: 4 - Beta",
     "Environment :: Console",
     "Intended Audience :: Science/Research",
     "Natural Language :: English",
@@ -176,7 +176,7 @@ where = ["src"]
 # the resolved version is written to ``src/sonic/_version.py`` so the
 # runtime ``__version__`` lookup works without git (sdist, wheel, shallow
 # clones). ``fallback_version`` is used only when both git AND the
-# generated file are missing — keep it in sync with the last release.
+# generated file are missing — keep it in sync with the release being prepared.
 [tool.setuptools_scm]
 version_file = "src/sonic/_version.py"
-fallback_version = "0.2.0"
+fallback_version = "1.0.0rc1"

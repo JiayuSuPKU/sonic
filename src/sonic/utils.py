@@ -278,7 +278,7 @@ def load_visium_sample(  # noqa: C901
     except ImportError as e:  # pragma: no cover
         raise ImportError(
             "load_visium_sample requires scanpy + anndata. "
-            "Install with `pip install 'sonic[spatial]'` or `pip install scanpy`."
+            "Install with `pip install sonic-spatial` or `pip install scanpy`."
         ) from e
 
     path = Path(path)

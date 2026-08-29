@@ -2,7 +2,7 @@
 Shared mixin and input-validation helpers for the comparator layer.
 
 This module hosts the private :class:`_ComparatorBase` mixin that
-:class:`~quadsv.ComparatorIrregular` and :class:`~quadsv.ComparatorGrid`
+:class:`~sonic.ComparatorIrregular` and :class:`~sonic.ComparatorGrid`
 inherit from. The mixin owns:
 
 - the ``compute_spectra`` driver that turns per-sample 2-D images
@@ -10,7 +10,7 @@ inherit from. The mixin owns:
 - the chainable preprocessing methods ``normalize_background()`` and
   ``normalize_covariates(covariates)`` — thin wrappers around the
   same-named standalone functions in
-  :mod:`quadsv.comparators.normalization` that mutate ``spectra_`` in
+  :mod:`sonic.comparators.normalization` that mutate ``spectra_`` in
   place;
 - the test methods ``test_diff_freq(design, ...)`` and
   ``test_diff_expr(design, ...)`` — design-at-call-time so a single
@@ -24,8 +24,8 @@ The shape-only / sum-1 feature representation is reached via the
 keeps the per-test choice non-destructive.
 
 Concrete classes live in sibling modules:
-:mod:`quadsv.comparators.irregular` and
-:mod:`quadsv.comparators.grid`.
+:mod:`sonic.comparators.irregular` and
+:mod:`sonic.comparators.grid`.
 """
 
 from __future__ import annotations
@@ -45,16 +45,17 @@ from tqdm.auto import tqdm
 warnings.filterwarnings("ignore", category=FutureWarning, message=".*legacy Dask DataFrame.*")
 warnings.filterwarnings("ignore", category=UserWarning, message=".*pkg_resources is deprecated.*")
 
-from quadsv.comparators.features import (
+from sonic.comparators.features import (
+    adapt_frequency_edges,
     compute_sample_spectrum,
     radial_bin_counts,
     radial_bin_spectrum,
     stream_polar_features,
 )
-from quadsv.comparators.features import (
+from sonic.comparators.features import (
     gene_pattern_diversity as _gene_pattern_diversity,
 )
-from quadsv.comparators.multisample import (
+from sonic.comparators.multisample import (
     _estimate_glm_masked_null_covariance,
     _estimate_glm_null_covariance,
     _estimate_two_group_masked_null_covariance,
@@ -69,15 +70,15 @@ from quadsv.comparators.multisample import (
 
 # Aliased to leading-underscore names to avoid shadowing the like-named
 # instance methods on the comparator class below.
-from quadsv.comparators.normalization import (
+from sonic.comparators.normalization import (
     normalize_background as _normalize_background,
 )
-from quadsv.comparators.normalization import (
+from sonic.comparators.normalization import (
     normalize_covariates as _normalize_covariates,
 )
 
 if TYPE_CHECKING:
-    from quadsv.comparators.multisample import _AnalyticNullState
+    from sonic.comparators.multisample import _AnalyticNullState
 
 __all__: list[str] = []
 
@@ -263,7 +264,7 @@ class _ComparatorBase:
           (A) learn per-sample rotation angles against a reference using
           landmark genes (default: use the per-sample *geometric-mean* spectrum as
           a single landmark, like
-          :func:`quadsv.comparators.normalization.normalize_background`; optionally, align
+          :func:`sonic.comparators.normalization.normalize_background`; optionally, align
           the spectra of an explicit ``landmark_genes`` set).
           (B) for every gene-chunk, first rotate by the estimated angle, then
           resample onto a polar ``(radius, theta)`` grid whose **radius axis is
@@ -288,7 +289,7 @@ class _ComparatorBase:
         raise NotImplementedError
 
     # Backend cache sweet-spot cap for ``chunk_size='auto'`` — the empirically
-    # tuned caps from :func:`quadsv.statistics.auto_chunk_size` (FFT → 32,
+    # tuned caps from :func:`sonic.statistics.auto_chunk_size` (FFT → 32,
     # NUFFT → 64). Subclasses override. The live-memory budget (across all
     # workers) is :attr:`_auto_chunk_budget_bytes`.
     _auto_chunk_cap: int = 32
@@ -346,7 +347,7 @@ class _ComparatorBase:
     ) -> int:
         """Resolve a chunk-size spec (an int, or ``'auto'``) to an int.
 
-        ``'auto'`` reuses :func:`quadsv.statistics.resolve_chunk_size` — the
+        ``'auto'`` reuses :func:`sonic.statistics.resolve_chunk_size` — the
         same cache sweet-spot cap (:attr:`_auto_chunk_cap`) and live-memory
         budget (:attr:`_auto_chunk_budget_bytes`) as the Q/R-test chunker — with
         ``per_feat = max(ny·nx) · 8`` bytes (one dense lattice block per gene).
@@ -356,7 +357,7 @@ class _ComparatorBase:
             return max(1, int(spec))
         if spec != "auto":
             raise ValueError(f"chunk_size must be a positive int or 'auto', got {spec!r}.")
-        from quadsv.statistics import resolve_chunk_size
+        from sonic.statistics import resolve_chunk_size
 
         max_lat = max((ny * nx for (ny, nx) in grid_shapes), default=1)
         return resolve_chunk_size(
@@ -466,34 +467,14 @@ class _ComparatorBase:
         if not self._grid_shapes or not self._spacings:
             return
 
-        # Compute number of FFT-cells in each radial bin from the current edges.
         edges = np.asarray(self.freq_edges, dtype=float)
         requested = edges.size - 1
-        feature_grid_counts = self._fft_cell_counts_for_edges(edges)
-        if feature_grid_counts is None:
-            return
-
-        # Accumulate adjacent original bins until all samples have at least one
-        # FFT cell in the merged interval. This is equivalent to repeatedly
-        # merging unsupported bins, but avoids recomputing per-sample histograms
-        # after every edge deletion.
-        merged_edges = [float(edges[0])]
-        running = np.zeros(feature_grid_counts.shape[0], dtype=float)
-        for bin_idx in range(requested):
-            running += feature_grid_counts[:, bin_idx]
-            if np.all(running > 0):
-                merged_edges.append(float(edges[bin_idx + 1]))
-                running.fill(0.0)
-
-        if len(merged_edges) == 1:
-            merged_edges.append(float(edges[-1]))
-        elif merged_edges[-1] != float(edges[-1]):
-            # Trailing unsupported bins have no right neighbour, so merge them
-            # into the final retained interval by extending its right edge.
-            merged_edges[-1] = float(edges[-1])
-
-        # Update the frequency edges and the number of radial bins.
-        self.freq_edges = np.asarray(merged_edges, dtype=float)
+        self.freq_edges = adapt_frequency_edges(
+            self._grid_shapes,
+            self._spacings,
+            edges,
+            fft_solver=self._spectrum_fft_solver,
+        )
         self._n_radial_bins = int(self.freq_edges.size - 1)
         collapsed = requested - self._n_radial_bins
         if collapsed:
@@ -700,11 +681,11 @@ class _ComparatorBase:
           Each string key is considered as one covariate applied to every
           sample. Implementation depends on the subclass:
 
-            * :class:`~quadsv.ComparatorIrregular` looks each key up in
+            * :class:`~sonic.ComparatorIrregular` looks each key up in
               ``adata.obs.columns`` first, then ``adata.var_names``
               (preferring obs on collision); the resolved per-spot
               vector is NUFFTed directly onto the sample's k-grid.
-            * :class:`~quadsv.ComparatorGrid` rasterizes via
+            * :class:`~sonic.ComparatorGrid` rasterizes via
               :func:`spatialdata.rasterize_bins` with the keys forwarded
               as ``value_key`` (any combination of ``.obs`` columns and
               ``var_names``).
@@ -719,7 +700,7 @@ class _ComparatorBase:
         Both modes produce the same downstream behaviour: per-sample
         covariate features are reduced to ``(n_covariates, n_feature_bins)``
         (same trailing axis as :attr:`spectra_`) and passed through
-        :func:`~quadsv.comparators.normalization.normalize_covariates` to
+        :func:`~sonic.comparators.normalization.normalize_covariates` to
         log-space-residualise each gene's spectrum against them.
 
         Parameters
@@ -899,7 +880,7 @@ class _ComparatorBase:
 
         - **Binary, analytic null** (1-D ``design``, ``null="analytic"`` (default),
           ``contrast=None``): Liu mixture-χ² test on the binary indicator
-          via :func:`~quadsv.comparators.multisample.compare_two_groups`
+          via :func:`~sonic.comparators.multisample.compare_two_groups`
           (or its masked variant when any ``presence_`` entry is
           ``False``).
         - **Binary, permutation null** (1-D ``design``,
@@ -907,8 +888,8 @@ class _ComparatorBase:
           label-permutation test on the same dispatch target.
         - **GLM analytic** (multi-column / continuous ``design`` **or**
           explicit ``contrast=``): generalized Liu mixture-χ² test via
-          :func:`~quadsv.comparators.multisample.compare_glm` (or
-          :func:`~quadsv.comparators.multisample.compare_glm_masked`
+          :func:`~sonic.comparators.multisample.compare_glm` (or
+          :func:`~sonic.comparators.multisample.compare_glm_masked`
           when any ``presence_`` entry is ``False``).
 
         Supplying ``contrast=`` alongside a 1-D ``design`` switches to
@@ -929,7 +910,7 @@ class _ComparatorBase:
             *is* the contrast).
         statistic : str, default 'log_l2'
             Per-gene statistic. See
-            :func:`~quadsv.comparators.multisample.compare_two_groups`
+            :func:`~sonic.comparators.multisample.compare_two_groups`
             for the catalog.
         null : {'analytic', 'permutation'}, default 'analytic'
             Null-distribution method. ``'analytic'`` is the analytic
@@ -952,7 +933,7 @@ class _ComparatorBase:
         min_samples_per_group : int, default 2
             Minimum per-group sample count required to keep a gene under
             the masked path (forwarded to
-            :func:`~quadsv.comparators.multisample.compare_two_groups_masked`).
+            :func:`~sonic.comparators.multisample.compare_two_groups_masked`).
             Ignored on the unmasked / GLM paths.
         min_resid_df : int, default 1
             Minimum per-gene residual degrees of freedom required under
@@ -967,7 +948,7 @@ class _ComparatorBase:
         chainable :meth:`normalize_background` and
         :meth:`normalize_covariates` methods (no chainable equivalent
         for sum-1 normalisation — call this kwarg or the standalone
-        :func:`~quadsv.comparators.normalization.normalize_shape`).
+        :func:`~sonic.comparators.normalization.normalize_shape`).
         """
         if self.spectra_ is None:
             raise RuntimeError("Call .compute_spectra() before .test_diff_freq().")
@@ -1158,9 +1139,9 @@ class _ComparatorBase:
 
         Per-gene two-sided test on the per-sample DC scalars (the grid
         mean of each sample's per-gene expression), routed through
-        :func:`~quadsv.comparators.multisample.compare_two_groups_scalar`
+        :func:`~sonic.comparators.multisample.compare_two_groups_scalar`
         for 1-D binary designs, or through
-        :func:`~quadsv.comparators.multisample.compare_glm_scalar` when
+        :func:`~sonic.comparators.multisample.compare_glm_scalar` when
         ``contrast=`` is supplied or ``design`` is a DataFrame / 2-D matrix.
         The binary path uses Welch t statistics with Welch-Satterthwaite
         t-distribution p-values; the GLM path uses OLS contrast t statistics

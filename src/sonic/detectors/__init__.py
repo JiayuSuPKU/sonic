@@ -1,5 +1,5 @@
 """
-``quadsv.detectors`` — single-sample spatial-pattern detection.
+``sonic.detectors`` — single-sample spatial-pattern detection.
 
 Subpackage grouping the layer-3 public classes:
 
@@ -11,8 +11,8 @@ Subpackage grouping the layer-3 public classes:
   rasterized grid; FFT backend).
 """
 
-from quadsv.detectors.base import Detector
-from quadsv.detectors.grid import DetectorGrid
-from quadsv.detectors.irregular import DetectorIrregular
+from sonic.detectors.base import Detector
+from sonic.detectors.grid import DetectorGrid
+from sonic.detectors.irregular import DetectorIrregular
 
 __all__ = ["Detector", "DetectorIrregular", "DetectorGrid"]

@@ -1,4 +1,4 @@
-"""Unit tests for :mod:`quadsv._rasterize`.
+"""Unit tests for :mod:`sonic._rasterize`.
 
 The two helpers in ``_rasterize.py`` do thin, testable work:
 
@@ -18,21 +18,47 @@ from __future__ import annotations
 import types
 from unittest.mock import patch
 
+import dask.array as da
 import numpy as np
 import pytest
 import scipy.sparse as sp
+import xarray as xr
 
-from quadsv._rasterize import ensure_csc_table, rasterize_table
+from sonic._rasterize import _mean_fill_missing, ensure_csc_table, rasterize_table
 
 
 class _FakeTable:
-    def __init__(self, X):
+    def __init__(self, X, obs=None):
         self.X = X
+        self.obs = {} if obs is None else obs
 
 
 class _FakeSData:
     def __init__(self, tables):
         self.tables = tables
+
+
+class TestMeanFillMissing:
+    def test_fills_in_place_with_each_feature_mean(self):
+        values = np.array(
+            [
+                [[0.0, np.nan], [2.0, 4.0]],
+                [[np.nan, 1.0], [3.0, 5.0]],
+            ]
+        )
+
+        out = _mean_fill_missing(values, axis=(1, 2))
+
+        assert out is values
+        np.testing.assert_allclose(
+            values,
+            np.array(
+                [
+                    [[0.0, 2.0], [2.0, 4.0]],
+                    [[3.0, 1.0], [3.0, 5.0]],
+                ]
+            ),
+        )
 
 
 class TestEnsureCscTable:
@@ -75,12 +101,18 @@ class TestEnsureCscTable:
 
 class TestRasterizeTable:
     def test_forwards_kwargs_and_coerces_first(self):
-        X = sp.random(6, 4, density=0.25, format="csr", random_state=1)
-        table = _FakeTable(X)
+        X = sp.random(9, 4, density=0.25, format="csr", random_state=1)
+        table = _FakeTable(
+            X,
+            obs={
+                "row": np.repeat(np.arange(3), 3),
+                "col": np.tile(np.arange(3), 3),
+            },
+        )
         sdata = _FakeSData({"tbl": table})
-        sentinel = types.SimpleNamespace(data=np.zeros((4, 3, 3)))
+        sentinel = xr.DataArray(np.zeros((4, 3, 3)), dims=("c", "y", "x"))
 
-        with patch("quadsv._rasterize.sd.rasterize_bins", return_value=sentinel) as mock_rb:
+        with patch("sonic._rasterize.sd.rasterize_bins", return_value=sentinel) as mock_rb:
             out = rasterize_table(
                 sdata,
                 bins="bins",
@@ -103,6 +135,59 @@ class TestRasterizeTable:
             value_key=None,
             return_region_as_labels=False,
         )
+        assert out is sentinel
+
+    def test_structural_holes_are_nan_but_observed_zeros_remain_zero(self):
+        table = _FakeTable(
+            np.zeros((3, 2)),
+            obs={"row": np.array([0, 0, 1]), "col": np.array([0, 1, 1])},
+        )
+        sdata = _FakeSData({"tbl": table})
+        raw = da.from_array(
+            np.array(
+                [
+                    [[0.0, 2.0], [0.0, 4.0]],
+                    [[5.0, 6.0], [0.0, 8.0]],
+                ]
+            ),
+            chunks=(1, 2, 2),
+        )
+        sentinel = xr.DataArray(
+            raw,
+            dims=("c", "y", "x"),
+            attrs={"transformations": {"global": "sentinel"}},
+        )
+
+        with patch("sonic._rasterize.sd.rasterize_bins", return_value=sentinel):
+            out = rasterize_table(
+                sdata,
+                bins="bins",
+                table_name="tbl",
+                col_key="col",
+                row_key="row",
+            )
+
+        assert isinstance(out.data, da.Array)
+        assert out.attrs == sentinel.attrs
+        assert out.sel(c=0, y=0, x=0).compute().item() == 0.0
+        assert np.isnan(out.sel(c=0, y=1, x=0).compute().item())
+        assert np.isnan(out.sel(c=1, y=1, x=0).compute().item())
+
+    def test_label_raster_is_returned_unchanged(self):
+        table = _FakeTable(np.zeros((1, 1)))
+        sdata = _FakeSData({"tbl": table})
+        sentinel = types.SimpleNamespace(data=np.zeros((2, 2), dtype=int))
+
+        with patch("sonic._rasterize.sd.rasterize_bins", return_value=sentinel):
+            out = rasterize_table(
+                sdata,
+                bins="bins",
+                table_name="tbl",
+                col_key="col",
+                row_key="row",
+                return_region_as_labels=True,
+            )
+
         assert out is sentinel
 
     def test_raises_on_missing_table(self):

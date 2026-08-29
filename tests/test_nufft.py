@@ -1,12 +1,12 @@
-"""Tests for quadsv.kernels.nufft + ComparatorIrregular."""
+"""Tests for sonic.kernels.nufft + ComparatorIrregular."""
 
 from __future__ import annotations
 
 import numpy as np
 import pytest
 
-from quadsv.kernels.fft import power_spectrum_2d
-from quadsv.kernels.nufft import power_spectrum_2d_nufft
+from sonic.kernels.fft import power_spectrum_2d
+from sonic.kernels.nufft import power_spectrum_2d_nufft
 
 # ---------------------------------------------------------------------------
 # Primitive: power_spectrum_2d_nufft
@@ -106,9 +106,9 @@ class TestBatchedValues:
 # ---------------------------------------------------------------------------
 
 
-from quadsv.kernels.nufft import NUFFTKernel
-from quadsv.statistics import spatial_q_test, spatial_r_test
-from quadsv.utils import get_rect_coords
+from sonic.kernels.nufft import NUFFTKernel
+from sonic.statistics import spatial_q_test, spatial_r_test
+from sonic.utils import get_rect_coords
 
 
 class TestNUFFTKernelConstruction:
@@ -193,7 +193,7 @@ class TestNUFFTKernelConstruction:
 class TestNUFFTKernelxtKx:
     def test_matches_spatial_kernel_dense_on_irregular(self):
         """xtKx_nufft matches the dense Euclidean quadratic form to ~2% (torus-BC band)."""
-        from quadsv.kernels import MatrixKernel
+        from sonic.kernels import MatrixKernel
 
         rng = np.random.default_rng(0)
         N = 400
@@ -359,8 +359,8 @@ class TestNUFFTTwoPathsAgree:
     def test_trace_takes_no_kwargs(self):
         """``NUFFTKernel.trace`` / ``square_trace`` are closed-form on the
         FFT spectrum — no probes, no options. The signatures match
-        :class:`quadsv.kernels.fft.FFTKernel` (also argument-free). Only
-        :class:`quadsv.kernels.MatrixKernelBase` exposes an ``n_probes``
+        :class:`sonic.kernels.fft.FFTKernel` (also argument-free). Only
+        :class:`sonic.kernels.MatrixKernelBase` exposes an ``n_probes``
         kwarg, and only because its precision-stored path runs a
         Rademacher-through-LU Hutchinson estimator.
         """
@@ -427,7 +427,7 @@ class TestSpatialQTestNUFFT:
 
     def test_matches_fft_on_regular_grid(self):
         """On a uniform N=ny*nx grid the NUFFT Q-test equals spatial_q_test (FFT kernel)."""
-        from quadsv.kernels.fft import FFTKernel
+        from sonic.kernels.fft import FFTKernel
 
         ny, nx = 16, 20
         yy, xx = np.meshgrid(np.arange(ny), np.arange(nx), indexing="ij")
@@ -501,7 +501,7 @@ class TestDetectorNUFFTBackend:
         return adata
 
     def test_build_and_qstat(self):
-        from quadsv import DetectorIrregular
+        from sonic import DetectorIrregular
 
         adata = self._mk_adata(n_spots=400, n_genes=8, with_signal=True)
         det = DetectorIrregular(kernel_method="matern", backend="nufft", bandwidth=2.0, nu=1.5)
@@ -516,7 +516,7 @@ class TestDetectorNUFFTBackend:
         assert df.set_index("Feature").loc["g0", "P_value"] < 0.05
 
     def test_rstat_on_correlated_pair(self):
-        from quadsv import DetectorIrregular
+        from sonic import DetectorIrregular
 
         adata = self._mk_adata(n_spots=400, n_genes=4, with_signal=True)
         adata.X[:, 1] = adata.X[:, 0] + 0.3 * np.random.default_rng(1).standard_normal(adata.n_obs)
@@ -530,7 +530,7 @@ class TestDetectorNUFFTBackend:
     def test_invalid_spatial_key(self):
         import anndata as ad
 
-        from quadsv import DetectorIrregular
+        from sonic import DetectorIrregular
 
         adata = ad.AnnData(X=np.zeros((5, 3)))
         det = DetectorIrregular(kernel_method="matern", backend="nufft")
@@ -538,7 +538,7 @@ class TestDetectorNUFFTBackend:
             det.setup_data(adata)
 
     def test_requires_build_kernel(self):
-        from quadsv import DetectorIrregular
+        from sonic import DetectorIrregular
 
         det = DetectorIrregular(kernel_method="matern", backend="nufft")
         with pytest.raises((ValueError, RuntimeError), match="setup_data|Kernel not initialized"):
@@ -550,8 +550,8 @@ class TestNUFFTKernelNullParamsRoundTrip:
     without changing results."""
 
     def test_qtest_nufft_null_params_round_trip(self):
-        from quadsv.kernels.nufft import NUFFTKernel
-        from quadsv.statistics import compute_null_params, spatial_q_test
+        from sonic.kernels.nufft import NUFFTKernel
+        from sonic.statistics import compute_null_params, spatial_q_test
 
         rng = np.random.default_rng(0)
         ny, nx = 16, 16
@@ -571,8 +571,8 @@ class TestNUFFTKernelNullParamsRoundTrip:
         (e.g. the legacy ``'eigenvalues'``) must raise a clear error —
         callers should use ``compute_null_params`` or supply
         ``liu_coef`` / ``cumulants`` directly."""
-        from quadsv.kernels.nufft import NUFFTKernel
-        from quadsv.statistics import spatial_q_test
+        from sonic.kernels.nufft import NUFFTKernel
+        from sonic.statistics import spatial_q_test
 
         rng = np.random.default_rng(0)
         ny, nx = 16, 16
@@ -587,8 +587,8 @@ class TestNUFFTKernelNullParamsRoundTrip:
             )
 
     def test_rtest_nufft_null_params_round_trip(self):
-        from quadsv.kernels.nufft import NUFFTKernel
-        from quadsv.statistics import spatial_r_test
+        from sonic.kernels.nufft import NUFFTKernel
+        from sonic.statistics import spatial_r_test
 
         rng = np.random.default_rng(0)
         ny, nx = 16, 16
@@ -701,7 +701,7 @@ class TestNUFFTKNeighborsAPI:
         rng = np.random.default_rng(0)
         coords = rng.uniform(0, 20, size=(200, 2))
         # MatrixKernel Moran: normalized adjacency of the mutual 4-NN graph.
-        from quadsv.kernels import MatrixKernel
+        from sonic.kernels import MatrixKernel
 
         km = MatrixKernel.from_coordinates(coords, method="moran", k_neighbors=4)
         K_m = km._K.toarray() if hasattr(km._K, "toarray") else np.asarray(km._K)
@@ -750,7 +750,7 @@ class TestNUFFTEmpiricalNullMoments:
         assert k_cen.trace() < k_raw.trace()
 
     def test_welch_fpr_calibrated_on_nufft_car(self):
-        from quadsv.statistics import compute_null_params
+        from sonic.statistics import compute_null_params
 
         coords, _ = self._mk_irregular()
         k = NUFFTKernel(coords, method="car", k_neighbors=4, rho=0.9, workers=1)
@@ -762,7 +762,7 @@ class TestNUFFTEmpiricalNullMoments:
         assert abs(fpr - 0.05) < 0.03, f"NUFFT-CAR welch FPR {fpr} off target"
 
     def test_clt_fpr_calibrated_on_nufft_moran(self):
-        from quadsv.statistics import compute_null_params
+        from sonic.statistics import compute_null_params
 
         coords, _ = self._mk_irregular()
         k = NUFFTKernel(coords, method="moran", k_neighbors=4, workers=1)

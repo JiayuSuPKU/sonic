@@ -28,7 +28,7 @@ from typing import Any
 
 import pandas as pd
 
-from quadsv.kernels import Kernel
+from sonic.kernels import Kernel
 
 __all__ = ["Detector"]
 
@@ -44,7 +44,7 @@ class Detector(ABC):
     kernel_params\_ : dict
         Resolved kernel parameters after backend-specific defaults are merged
         with user overrides. Set at construction.
-    kernel\_ : :class:`~quadsv.kernels.Kernel` or None
+    kernel\_ : :class:`~sonic.kernels.Kernel` or None
         Kernel object built in :meth:`setup_data`. ``None`` before data setup.
     n : int or None
         Effective number of observations after preprocessing. ``None`` before

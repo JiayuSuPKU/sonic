@@ -13,13 +13,13 @@ import anndata as _ad
 import numpy as np
 import scipy.sparse as sp
 
-from quadsv.comparators.base import (
+from sonic.comparators.base import (
     _ComparatorBase,
     _run_per_sample,
     _unpack_sample_triples,
     _validate_common,
 )
-from quadsv.comparators.features import (
+from sonic.comparators.features import (
     estimate_rotations_from_landmarks,
     radial_bin_spectrum,
     stream_geomean_landmark,
@@ -80,7 +80,7 @@ class ComparatorIrregular(_ComparatorBase):
         Manual grid control is used only when **both** ``grid_shape`` and
         ``spacing`` are supplied. If either is omitted, both values are
         auto-inferred independently for each sample from its unit-scaled
-        coordinates with :func:`quadsv.kernels.nufft._infer_grid_from_coords`.
+        coordinates with :func:`sonic.kernels.nufft._infer_grid_from_coords`.
 
         These values define each sample's raw NUFFT lattice; they do not by
         themselves choose the comparison bins. Unless ``freq_edges`` is given,
@@ -118,7 +118,7 @@ class ComparatorIrregular(_ComparatorBase):
         Number of genes per batched NUFFT call. 32–128 balances finufft's
         per-call overhead against the `(n_spots, chunk)` transient RAM.
         ``'auto'`` sizes the chunk from the per-sample k-grid shapes via
-        :func:`quadsv.statistics.resolve_chunk_size` — the NUFFT cache
+        :func:`sonic.statistics.resolve_chunk_size` — the NUFFT cache
         sweet-spot cap (64) capped further by the live-memory budget.
     workers : int, optional
         Forwarded to per-sample FFTs used by :meth:`normalize_covariates`.
@@ -190,7 +190,7 @@ class ComparatorIrregular(_ComparatorBase):
         self._nufft_eps = float(eps)
 
         # Per-sample coords / grids.
-        from quadsv.kernels.nufft import _infer_grid_from_coords
+        from sonic.kernels.nufft import _infer_grid_from_coords
 
         if unit_scales is None:
             unit_scales = [1.0] * len(samples_list)
@@ -256,7 +256,7 @@ class ComparatorIrregular(_ComparatorBase):
         shared ``dc`` / ``presence`` arrays on the way. The dense
         ``(n_genes, ny, nx)`` spectrum is never assembled by the caller.
         """
-        from quadsv.kernels.nufft import power_spectrum_2d_nufft
+        from sonic.kernels.nufft import power_spectrum_2d_nufft
 
         adata = self.samples[i]
         pts = self._coords[i]
@@ -477,7 +477,7 @@ class ComparatorIrregular(_ComparatorBase):
             If an obs column cannot be cast to float (e.g., string
             categoricals — encode them first).
         """
-        from quadsv.kernels.nufft import power_spectrum_2d_nufft
+        from sonic.kernels.nufft import power_spectrum_2d_nufft
 
         keys = list(keys)
         # Classify each key once against the first sample; require all

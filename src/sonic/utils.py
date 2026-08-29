@@ -278,7 +278,7 @@ def load_visium_sample(  # noqa: C901
     except ImportError as e:  # pragma: no cover
         raise ImportError(
             "load_visium_sample requires scanpy + anndata. "
-            "Install with `pip install 'quadsv[spatial]'` or `pip install scanpy`."
+            "Install with `pip install 'sonic[spatial]'` or `pip install scanpy`."
         ) from e
 
     path = Path(path)
@@ -416,7 +416,7 @@ def visium_to_grid(  # noqa: C901
     -------
     grid_arr : np.ndarray
         ``(n_genes, ny, nx)`` float64, ready for
-        :func:`quadsv.power_spectrum_2d`.
+        :func:`sonic.power_spectrum_2d`.
     spacing_um : tuple of float
         ``(dy, dx)`` in μm.
 
@@ -430,7 +430,7 @@ def visium_to_grid(  # noqa: C901
     if "array_row" not in adata.obs or "array_col" not in adata.obs:
         raise KeyError(
             "adata.obs must contain 'array_row' and 'array_col'. "
-            "Load the sample with quadsv.utils.load_visium_sample first."
+            "Load the sample with sonic.utils.load_visium_sample first."
         )
     if grid not in ("dense", "collapsed"):
         raise ValueError(f"grid must be 'dense' or 'collapsed', got '{grid}'.")

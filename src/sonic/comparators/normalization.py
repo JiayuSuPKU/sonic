@@ -342,9 +342,9 @@ def normalize_shape(
     total-variation are well-defined between fibres.
 
     Used internally by the spectrum comparison functions
-    (:func:`quadsv.comparators.multisample.compare_two_groups`,
-    :func:`quadsv.comparators.multisample.compare_two_groups_masked`,
-    :func:`quadsv.comparators.multisample.compare_glm`) when their
+    (:func:`sonic.comparators.multisample.compare_two_groups`,
+    :func:`sonic.comparators.multisample.compare_two_groups_masked`,
+    :func:`sonic.comparators.multisample.compare_glm`) when their
     ``normalize_shape=True`` keyword argument is set - the
     differential-frequency test then fires only on shape redistribution
     across radial bins, not on overall amplitude changes.

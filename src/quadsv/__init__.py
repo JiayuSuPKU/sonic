@@ -1,73 +1,50 @@
-"""
-quadsv: kernel-based spatial pattern detection and comparison for spatial omics.
+"""Compatibility namespace for the former :mod:`quadsv` package."""
 
-The public top-level API is organised in four layers:
+from importlib import import_module
+from sys import modules
+from warnings import warn
 
-1. **Kernels** — :class:`MatrixKernel` (dense / sparse), :class:`FFTKernel`
-   (regular grid), :class:`NUFFTKernel` (irregular 2D coordinates). The
-   :class:`~quadsv.kernels.Kernel` and
-   :class:`~quadsv.kernels.MatrixKernelBase` ABCs live in
-   :mod:`quadsv.kernels` and are intended for backend authors.
-2. **Statistical tests** — :func:`spatial_q_test` and :func:`spatial_r_test`.
-   A single entry point per test dispatches on the kernel type (matrix, FFT,
-   or NUFFT). Signature: ``(x, kernel, null_params=None, return_pval=True,
-   is_standardized=False)``.
-3. **Detectors** — :class:`DetectorIrregular` consumes :class:`anndata.AnnData`
-   (irregular grids, matrix/NUFFT backends); :class:`DetectorGrid` consumes
-   :class:`spatialdata.SpatialData` (regular grids, FFT backend).
-4. **Comparators** — cross-sample pattern comparison:
-   :class:`ComparatorIrregular` on a list of AnnData (NUFFT backend);
-   :class:`ComparatorGrid` on a list of SpatialData (FFT backend).
-"""
+_sonic = import_module("sonic")
 
-import logging
+warn(
+    "quadsv has been renamed to sonic; update imports to use 'sonic'",
+    DeprecationWarning,
+    stacklevel=2,
+)
 
-logging.getLogger(__name__).addHandler(logging.NullHandler())
+__all__ = list(_sonic.__all__)
+__version__ = _sonic.__version__
 
-# Version resolution order: prefer the file written by ``setuptools-scm`` at
-# build time (``src/quadsv/_version.py`` — see ``[tool.setuptools_scm]`` in
-# ``pyproject.toml``), fall back to installed-package metadata, then to a
-# last-known release string for unbuilt / shallow-clone checkouts.
-try:
-    from quadsv._version import version as __version__  # type: ignore[assignment]
-except ImportError:  # _version.py absent — source checkout without a build step
-    try:
-        from importlib.metadata import PackageNotFoundError, version
+for _name in __all__:
+    globals()[_name] = getattr(_sonic, _name)
 
-        __version__ = version("quadsv")
-    except (ImportError, PackageNotFoundError):
-        __version__ = "0.0.0+unknown"
+_SUBMODULES = (
+    "api",
+    "_rasterize",
+    "statistics",
+    "utils",
+    "kernels",
+    "kernels.base",
+    "kernels.fft",
+    "kernels.matrix",
+    "kernels.nufft",
+    "detectors",
+    "detectors.base",
+    "detectors.grid",
+    "detectors.irregular",
+    "comparators",
+    "comparators.base",
+    "comparators.features",
+    "comparators.grid",
+    "comparators.irregular",
+    "comparators.multisample",
+    "comparators.normalization",
+)
 
-from quadsv.api import Comparator, Detector
-from quadsv.comparators import ComparatorGrid, ComparatorIrregular
-from quadsv.detectors.grid import DetectorGrid
-from quadsv.detectors.irregular import DetectorIrregular
-from quadsv.kernels import MatrixKernel
-from quadsv.kernels.fft import FFTKernel
-from quadsv.kernels.nufft import NUFFTKernel
-from quadsv.statistics import spatial_q_test, spatial_r_test
+for _name in _SUBMODULES:
+    _module = import_module(f"sonic.{_name}")
+    modules[f"quadsv.{_name}"] = _module
+    if "." not in _name:
+        globals()[_name] = _module
 
-# The :class:`~quadsv.kernels.Kernel` and
-# :class:`~quadsv.kernels.MatrixKernelBase` ABCs are intentionally not
-# re-exported here. They are extension points for backend authors and
-# live at ``quadsv.kernels`` (the canonical path). Importing them through
-# ``quadsv`` directly is unsupported.
-
-__all__ = [
-    # Kernels
-    "MatrixKernel",
-    "FFTKernel",
-    "NUFFTKernel",
-    # Statistical tests
-    "spatial_q_test",
-    "spatial_r_test",
-    # Detectors
-    "DetectorIrregular",
-    "DetectorGrid",
-    # Cross-sample
-    "ComparatorIrregular",
-    "ComparatorGrid",
-    # Factories — type-dispatched discovery face on the four classes above
-    "Detector",
-    "Comparator",
-]
+del _module, _name, _sonic

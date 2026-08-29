@@ -1,4 +1,4 @@
-# quadsv: Consistent and scalable spatial pattern detection and comparison
+# SONIC: Spatial Organization through Nonrandom-pattern Inference and Comparison
 
 Detect spatial patterns in omics data via kernel-based hypothesis tests for spatial variability (*Q-tests*) and co-expression (*R-tests*), then compare spatial pattern spectra across samples or conditions.
 
@@ -12,12 +12,16 @@ Detect spatial patterns in omics data via kernel-based hypothesis tests for spat
 ## Installation
 
 ```bash
-pip install quadsv  # From PyPI
+pip install sonic  # From PyPI
 # OR (latest dev version)
-pip install git+https://github.com/JiayuSuPKU/quadsv.git#egg=quadsv
+pip install git+https://github.com/JiayuSuPKU/sonic.git#egg=sonic
 # OR (for development)
-git clone https://github.com/JiayuSuPKU/quadsv.git && cd quadsv && pip install -e .
+git clone https://github.com/JiayuSuPKU/sonic.git && cd sonic && pip install -e .
 ```
+
+Code written for the former `quadsv` package remains supported during the
+transition. `pip install quadsv` installs SONIC, and legacy `quadsv` imports
+emit a deprecation warning while forwarding to the same implementation.
 
 ## Usage
 
@@ -25,7 +29,7 @@ git clone https://github.com/JiayuSuPKU/quadsv.git && cd quadsv && pip install -
 
 ```python
 import numpy as np
-from quadsv import MatrixKernel, spatial_q_test
+from sonic import MatrixKernel, spatial_q_test
 
 # simulate coordinates and gene expression
 coords = np.random.randn(500, 2)
@@ -40,7 +44,7 @@ print(f"Q-statistic: {Q:.4f}, p-value: {pval:.4e}")
 ### R-test: Spatial co-expression
 
 ```python
-from quadsv import spatial_r_test
+from sonic import spatial_r_test
 
 # run R-test with the same kernel
 gene1, gene2 = np.random.randn(500), np.random.randn(500)
@@ -52,7 +56,7 @@ print(f"R-statistic: {R:.4f}, p-value: {pval:.4e}")
 
 ```python
 import numpy as np
-from quadsv import FFTKernel, spatial_q_test, spatial_r_test
+from sonic import FFTKernel, spatial_q_test, spatial_r_test
 
 # For grid data (e.g., 1000x1000 Visium HD)
 kernel_fft = FFTKernel(shape=(1000, 1000), method='car', rho=0.9)
@@ -77,7 +81,7 @@ print(f"FFT R-test: R={R_fft:.4f}, p-value={pval_fft:.4e}")
 
 ```python
 import anndata as ad
-from quadsv import Detector
+from sonic import Detector
 
 adata = ad.read_h5ad("spatial_data.h5ad")
 detector = Detector(
@@ -112,7 +116,7 @@ print(f"Found {len(significant_pairs)} spatially co-expressed gene pairs")
 
 ```python
 import spatialdata as sd
-from quadsv import Detector
+from sonic import Detector
 
 sdata = sd.read_zarr("visium_hd.zarr/")
 detector = Detector(sdata, kernel_method='car', rho=0.9, topology='square').setup_data(
@@ -132,7 +136,7 @@ results = detector.compute_qstat(
 ```python
 import anndata as ad
 import numpy as np
-from quadsv import Comparator
+from sonic import Comparator
 
 sample_paths = [
     "control_1.h5ad",
@@ -176,7 +180,7 @@ expression_hits = cmp.test_diff_expr(groups)
 ## Testing & Development
 
 ```bash
-pytest tests/ --cov=quadsv              # Run all tests
+pytest tests/ --cov=sonic              # Run all tests
 pytest tests/test_tutorials.py -v       # Run tutorial examples
 pip install -e ".[dev,docs]"            # Install dev + docs dependencies
 ```
@@ -187,8 +191,8 @@ To confirm whether a failure is environment-specific, validate from a clean
 conda environment:
 
 ```bash
-conda create -n quadsv-test -c conda-forge python=3.12 pip -y
-conda activate quadsv-test
+conda create -n sonic-test -c conda-forge python=3.12 pip -y
+conda activate sonic-test
 python -m pip install -e ".[dev]"
 python -m pytest -q
 ```
@@ -207,7 +211,7 @@ To fix this, either point Numba at a writable cache directory via
 
 ```bash
 mkdir -p /private/tmp/numba-cache
-NUMBA_CACHE_DIR=/private/tmp/numba-cache python -c 'import quadsv'
+NUMBA_CACHE_DIR=/private/tmp/numba-cache python -c 'import sonic'
 ```
 
  or disable JIT to bypass the import-time cache path via
@@ -233,7 +237,7 @@ Longer-term, prefer a consistent conda-forge native stack so FINUFFT, OpenBLAS,
 NumPy/SciPy, and scikit-learn do not bring separate vendored OpenMP runtimes.
 
 ### Documentation
-[ReadTheDocs](https://quadsv.readthedocs.io/)
+[ReadTheDocs](https://sonic-spatial.readthedocs.io/)
 
 ## References
 
@@ -243,5 +247,5 @@ Su, Jiayu, et al. "On the consistent and scalable detection of spatial patterns.
 ## License & Support
 
 - **License:** BSD-3-Clause - see [LICENSE](LICENSE)  
-- **Issues:** [GitHub Issues](https://github.com/JiayuSuPKU/quadsv/issues)
-- **Docs:** [ReadTheDocs](https://quadsv.readthedocs.io/)
+- **Issues:** [GitHub Issues](https://github.com/JiayuSuPKU/sonic/issues)
+- **Docs:** [ReadTheDocs](https://sonic-spatial.readthedocs.io/)

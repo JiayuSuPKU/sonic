@@ -1,5 +1,5 @@
 """
-``quadsv.comparators`` — cross-sample spatial-pattern comparison.
+``sonic.comparators`` — cross-sample spatial-pattern comparison.
 
 Subpackage grouping the layer-4 public classes:
 
@@ -12,7 +12,7 @@ Subpackage grouping the layer-4 public classes:
 Both classes share the same post-``compute_spectra`` surface
 (``normalize_background``, ``normalize_covariates``,
 ``test_diff_freq``, ``test_diff_expr``) through
-the private :class:`~quadsv.comparators.base._ComparatorBase` mixin.
+the private :class:`~sonic.comparators.base._ComparatorBase` mixin.
 Cross-sample contrasts are supplied at test time via the ``design``
 argument on the test methods — the comparator itself is
 design-agnostic, so one fitted comparator can serve any number of
@@ -22,12 +22,12 @@ test is available via a ``normalize_shape: bool = False`` keyword on
 function).
 
 The array-level spectral feature helpers live in
-:mod:`quadsv.comparators.features`; normalization primitives live in
-:mod:`quadsv.comparators.normalization`; statistical comparison
-primitives live in :mod:`quadsv.comparators.multisample`.
+:mod:`sonic.comparators.features`; normalization primitives live in
+:mod:`sonic.comparators.normalization`; statistical comparison
+primitives live in :mod:`sonic.comparators.multisample`.
 """
 
-from quadsv.comparators.grid import ComparatorGrid
-from quadsv.comparators.irregular import ComparatorIrregular
+from sonic.comparators.grid import ComparatorGrid
+from sonic.comparators.irregular import ComparatorIrregular
 
 __all__ = ["ComparatorIrregular", "ComparatorGrid"]

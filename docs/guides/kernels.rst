@@ -29,24 +29,24 @@ space (irregular coordinates, graph, or regular grid).
      - Pick
    * - Coordinate cloud
      - Smooth, large-scale gradient
-     - :class:`~quadsv.NUFFTKernel` with ``method="matern"``
+     - :class:`~sonic.NUFFTKernel` with ``method="matern"``
        (``nu=1.5``).
    * - Coordinate cloud (graph-defined)
      - Smooth, large-scale gradient
-     - :class:`~quadsv.MatrixKernel` with ``method="car"``
+     - :class:`~sonic.MatrixKernel` with ``method="car"``
        (``rho=0.9``, ``k_neighbors=4``).
    * - Coordinate cloud (graph-defined)
      - Sharp variation between neighbours
-     - :class:`~quadsv.MatrixKernel` with
+     - :class:`~sonic.MatrixKernel` with
        ``method="graph_laplacian"``.
    * - Regular rasterised grid (Visium HD, imaging)
      - Smooth, large-scale gradient
-     - :class:`~quadsv.FFTKernel` with ``method="car"`` or
+     - :class:`~sonic.FFTKernel` with ``method="car"`` or
        ``method="matern"``. Both have polynomial spectral decay,
        which keeps power on mid- and high-frequency modes.
    * - Small ``n`` (under ~5 000), sanity check
      - Any
-     - :class:`~quadsv.MatrixKernel`. The dense matrix path is the
+     - :class:`~sonic.MatrixKernel`. The dense matrix path is the
        simplest.
 
 If you don't yet know which pattern type you want, start with CAR or
@@ -57,7 +57,7 @@ Code:
 
 .. code-block:: python
 
-   from quadsv import NUFFTKernel, MatrixKernel, FFTKernel
+   from sonic import NUFFTKernel, MatrixKernel, FFTKernel
 
    # Irregular coords, smooth pattern (default)
    kernel = NUFFTKernel(coords, method="matern", bandwidth=25.0, nu=1.5)
@@ -77,9 +77,9 @@ Code:
        shape=(1000, 1000), method="matern", bandwidth=4.0, nu=1.5
    )
 
-The ``backend`` keyword on :class:`~quadsv.DetectorIrregular` selects
-between :class:`~quadsv.NUFFTKernel` and
-:class:`~quadsv.MatrixKernel`. See :doc:`/guides/quickstart`.
+The ``backend`` keyword on :class:`~sonic.DetectorIrregular` selects
+between :class:`~sonic.NUFFTKernel` and
+:class:`~sonic.MatrixKernel`. See :doc:`/guides/quickstart`.
 
 
 Picking a method
@@ -232,7 +232,7 @@ How decay rates depend on hyper-parameters:
    Bochner-theorem spectral density.
 
    On irregular coordinates the same shapes hold for
-   :class:`~quadsv.NUFFTKernel`, with an oversampled auxiliary
+   :class:`~sonic.NUFFTKernel`, with an oversampled auxiliary
    grid in place of the data points. See :doc:`/guides/scaling`
    for the NUFFT operator definition and its analytic moments.
 
@@ -281,7 +281,7 @@ custom subclass.
 .. code-block:: python
 
    import numpy as np
-   from quadsv.kernels import MatrixKernel
+   from sonic.kernels import MatrixKernel
 
    # Build a CAR precision from a custom adjacency
    W = ...                                        # (n, n) adjacency
@@ -290,37 +290,37 @@ custom subclass.
        precision, method="car", is_precision=True
    )
 
-**2. Subclass an ABC from** ``quadsv.kernels``
+**2. Subclass an ABC from** ``sonic.kernels``
 
 Backend authors get two extension points, both in
-:mod:`quadsv.kernels`:
+:mod:`sonic.kernels`:
 
-- :class:`quadsv.kernels.Kernel` is the universal ABC. Subclass it
+- :class:`sonic.kernels.Kernel` is the universal ABC. Subclass it
   for any custom kernel that you can express through a single
   ``self._K`` buffer.
-- :class:`quadsv.kernels.MatrixKernelBase` is the matrix-family
-  base used by :class:`~quadsv.MatrixKernel`. Subclass it if you
+- :class:`sonic.kernels.MatrixKernelBase` is the matrix-family
+  base used by :class:`~sonic.MatrixKernel`. Subclass it if you
   need the dense / sparse / sparse-precision auto-switching
   machinery for a new matrix backend.
 
-Neither ABC is re-exported from the top-level ``quadsv``
-namespace. Always import them through ``quadsv.kernels``.
+Neither ABC is re-exported from the top-level ``sonic``
+namespace. Always import them through ``sonic.kernels``.
 
-The :class:`~quadsv.kernels.Kernel` ABC ships default
-implementations of :meth:`~quadsv.kernels.Kernel.Kx`,
-:meth:`~quadsv.kernels.Kernel.xtKx`,
-:meth:`~quadsv.kernels.Kernel.xtKy`,
-:meth:`~quadsv.kernels.Kernel.trace`,
-:meth:`~quadsv.kernels.Kernel.square_trace`, and
-:meth:`~quadsv.kernels.Kernel.eigenvalues` that all read off the
+The :class:`~sonic.kernels.Kernel` ABC ships default
+implementations of :meth:`~sonic.kernels.Kernel.Kx`,
+:meth:`~sonic.kernels.Kernel.xtKx`,
+:meth:`~sonic.kernels.Kernel.xtKy`,
+:meth:`~sonic.kernels.Kernel.trace`,
+:meth:`~sonic.kernels.Kernel.square_trace`, and
+:meth:`~sonic.kernels.Kernel.eigenvalues` that all read off the
 single ``self._K`` buffer. Override
-:meth:`~quadsv.kernels.Kernel._build_kernel` to plug in your own
+:meth:`~sonic.kernels.Kernel._build_kernel` to plug in your own
 matrix:
 
 .. code-block:: python
 
    import numpy as np
-   from quadsv.kernels import Kernel
+   from sonic.kernels import Kernel
 
    class MyKernel(Kernel):
        def _build_kernel(self):
@@ -330,21 +330,21 @@ matrix:
    K = np.eye(100)
    kernel = MyKernel(n=100, method="custom", K=K)
 
-Override :meth:`~quadsv.kernels.Kernel.Kx` only if you have a
+Override :meth:`~sonic.kernels.Kernel.Kx` only if you have a
 faster operator than ``K @ x``. That is what the FFT and NUFFT
 backends do.
 
 .. dropdown:: Subclassing FFTKernel for a custom spectrum
 
    For a regular grid, override
-   :meth:`~quadsv.kernels.fft.FFTKernel._compute_eigenvalues` to
+   :meth:`~sonic.kernels.fft.FFTKernel._compute_eigenvalues` to
    define a custom spectral filter:
 
    .. code-block:: python
 
       import numpy as np
       import scipy.fft
-      from quadsv.kernels.fft import FFTKernel
+      from sonic.kernels.fft import FFTKernel
 
       class CustomFFTKernel(FFTKernel):
           def _compute_eigenvalues(self):
@@ -398,4 +398,4 @@ See also
 - :doc:`/guides/theory` for derivations and proofs.
 - :doc:`/guides/scaling` for how kernel choice affects runtime and
   memory.
-- :doc:`/autoapi/quadsv/kernels/index` for the kernel API reference.
+- :doc:`/autoapi/sonic/kernels/index` for the kernel API reference.

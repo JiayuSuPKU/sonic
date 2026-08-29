@@ -19,13 +19,14 @@ warnings.filterwarnings("ignore", category=UserWarning, message=".*pkg_resources
 
 import spatialdata as sd
 
-from quadsv.comparators.base import (
+from sonic._rasterize import _mean_fill_missing
+from sonic.comparators.base import (
     _ComparatorBase,
     _run_per_sample,
     _unpack_sample_quads,
     _validate_common,
 )
-from quadsv.comparators.features import (
+from sonic.comparators.features import (
     compute_sample_spectrum,
     estimate_rotations_from_landmarks,
     stream_geomean_landmark,
@@ -36,6 +37,35 @@ from quadsv.comparators.features import (
 __all__ = ["ComparatorGrid"]
 
 logger = logging.getLogger(__name__)
+
+
+def _grid_spectrum(
+    block: np.ndarray,
+    *,
+    fft_solver: str,
+    workers: int | None,
+    return_dc: bool = False,
+):
+    """Compute a grid spectrum after mean-filling structural ``NaN`` holes."""
+    return compute_sample_spectrum(
+        _mean_fill_missing(block, axis=(1, 2)),
+        fft_solver=fft_solver,
+        workers=workers,
+        return_dc=return_dc,
+    )
+
+
+def _observed_nonzero_fraction(block: np.ndarray) -> np.ndarray:
+    """Fraction of nonzero values among observed, rather than bounding-box, bins."""
+    observed = ~np.isnan(block)
+    denominator = observed.sum(axis=(1, 2))
+    numerator = (observed & (block != 0)).sum(axis=(1, 2))
+    return np.divide(
+        numerator,
+        denominator,
+        out=np.zeros(block.shape[0], dtype=float),
+        where=denominator > 0,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -52,7 +82,7 @@ class ComparatorGrid(_ComparatorBase):
     shape + table into a dense ``(n_genes, ny, nx)`` image, which is then fed
     to the batched 2D FFT. All samples are expected to share the same
     rasterization schema (``bins`` / ``table_name`` / ``col_key`` / ``row_key``
-    / ``value_key``) — this mirrors :class:`~quadsv.DetectorGrid`.
+    / ``value_key``) — this mirrors :class:`~sonic.DetectorGrid`.
 
     Parameters
     ----------
@@ -88,7 +118,7 @@ class ComparatorGrid(_ComparatorBase):
         Peak memory is ``O(chunk · ny · nx · 8 B)`` and the full ``(n_genes, ny,
         nx)`` raster / 2D spectra are *never* held in either mode.
         ``'auto'`` sizes the chunk from the (lazily-known) lattice shapes via
-        :func:`quadsv.statistics.resolve_chunk_size` — the FFT cache sweet-spot
+        :func:`sonic.statistics.resolve_chunk_size` — the FFT cache sweet-spot
         cap (32) capped further by the live-memory budget.
         In 2d mode the rotation is learned from a streamed cross-gene geometric-mean
         landmark by default, or from an explicit ``landmark_genes`` set passed
@@ -213,7 +243,7 @@ class ComparatorGrid(_ComparatorBase):
         ``_qstat_worker_fft``). Returns the lazy ``(n_genes, ny, nx)``
         ``DataArray``.
         """
-        from quadsv._rasterize import rasterize_table
+        from sonic._rasterize import rasterize_table
 
         img = rasterize_table(
             sdata,
@@ -255,7 +285,7 @@ class ComparatorGrid(_ComparatorBase):
 
         def _spec_chunk(start: int, stop: int) -> np.ndarray:
             block = self._batch_raster(img, self.gene_names[start:stop])
-            return compute_sample_spectrum(
+            return _grid_spectrum(
                 block,
                 fft_solver=self._spectrum_fft_solver,
                 workers=self._workers,
@@ -324,15 +354,14 @@ class ComparatorGrid(_ComparatorBase):
 
             def _spec_chunk(start: int, stop: int) -> np.ndarray:
                 block = self._batch_raster(img, self.gene_names[start:stop])
-                frac_nonzero = (block != 0).reshape(block.shape[0], -1).mean(axis=1)
-                presence[start:stop] = frac_nonzero >= self._presence_threshold
-                dc[start:stop] = block.mean(axis=(1, 2))
-                return compute_sample_spectrum(
+                presence[start:stop] = _observed_nonzero_fraction(block) >= self._presence_threshold
+                spectrum, dc[start:stop] = _grid_spectrum(
                     block,
                     fft_solver=self._spectrum_fft_solver,
                     workers=self._workers,
-                    return_dc=False,
+                    return_dc=True,
                 )
+                return spectrum
 
             feat = stream_radial_features(
                 _spec_chunk,
@@ -398,12 +427,14 @@ class ComparatorGrid(_ComparatorBase):
 
             def _spec_chunk(start: int, stop: int, _img=img, _dc=dc, _pr=presence):
                 block = self._batch_raster(_img, self.gene_names[start:stop])
-                frac_nonzero = (block != 0).reshape(block.shape[0], -1).mean(axis=1)
-                _pr[start:stop] = frac_nonzero >= self._presence_threshold
-                _dc[start:stop] = block.mean(axis=(1, 2))
-                return compute_sample_spectrum(
-                    block, fft_solver=self._spectrum_fft_solver, workers=self._workers
+                _pr[start:stop] = _observed_nonzero_fraction(block) >= self._presence_threshold
+                spectrum, _dc[start:stop] = _grid_spectrum(
+                    block,
+                    fft_solver=self._spectrum_fft_solver,
+                    workers=self._workers,
+                    return_dc=True,
                 )
+                return spectrum
 
             if lm_idx is None:
                 # Default: stream the cross-gene geomean landmark; this single
@@ -420,7 +451,7 @@ class ComparatorGrid(_ComparatorBase):
                 if cache_landmarks:
                     # Within budget: cache the landmark genes' per-gene spectra.
                     lm_names = [self.gene_names[j] for j in lm_idx]
-                    lm = compute_sample_spectrum(
+                    lm = _grid_spectrum(
                         self._batch_raster(img, lm_names),
                         fft_solver=self._spectrum_fft_solver,
                         workers=self._workers,
@@ -505,7 +536,7 @@ class ComparatorGrid(_ComparatorBase):
         spectrum + radial-binning pipeline as the gene panel via
         :meth:`_covariate_features_from_array`.
         """
-        from quadsv._rasterize import rasterize_table
+        from sonic._rasterize import rasterize_table
 
         keys = list(keys)
         out: list[np.ndarray] = []
@@ -528,7 +559,11 @@ class ComparatorGrid(_ComparatorBase):
                     f"sample {i} covariate raster has shape {arr.shape}; "
                     "expected (n_keys, ny, nx) from rasterize_bins."
                 )
-            out.append(self._covariate_features_from_array(arr, sample_index=i))
+            out.append(
+                self._covariate_features_from_array(
+                    _mean_fill_missing(arr, axis=(1, 2)), sample_index=i
+                )
+            )
         return out
 
 

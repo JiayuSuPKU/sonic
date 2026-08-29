@@ -9,7 +9,7 @@ import scipy.sparse as sp
 from scipy.stats import chi2, ncx2, norm
 from tqdm import tqdm
 
-from quadsv.kernels import Kernel
+from sonic.kernels import Kernel
 
 __all__ = [
     "apply_bh_correction",
@@ -130,9 +130,9 @@ def auto_chunk_size(
 
           * - Backend
             - chunk cap
-          * - :class:`~quadsv.FFTKernel`
+          * - :class:`~sonic.FFTKernel`
             - 32
-          * - :class:`~quadsv.NUFFTKernel`
+          * - :class:`~sonic.NUFFTKernel`
             - 64
           * - MatrixKernel (any sub-type)
             - 16 (``n < 200k``); 8 (``n ≥ 200k``)
@@ -172,8 +172,8 @@ def auto_chunk_size(
         consumes most of the per-worker budget.
     """
     # Lazy imports to avoid circular dependency with the FFT / NUFFT modules.
-    from quadsv.kernels.fft import FFTKernel
-    from quadsv.kernels.nufft import NUFFTKernel
+    from sonic.kernels.fft import FFTKernel
+    from sonic.kernels.nufft import NUFFTKernel
 
     if isinstance(kernel, FFTKernel):
         n = kernel.n
@@ -207,7 +207,7 @@ def resolve_chunk_size(
     """Resolve a per-feature chunk size: ``min(cache-cap, memory-cap)``.
 
     The kernel-free core of :func:`auto_chunk_size`, shared by the
-    :class:`~quadsv.ComparatorGrid` / :class:`~quadsv.ComparatorIrregular`
+    :class:`~sonic.ComparatorGrid` / :class:`~sonic.ComparatorIrregular`
     streaming spectrum loops so they reuse the same empirically-tuned cache
     sweet-spot caps (FFT → 32, NUFFT → 64) and live-memory budget.
 
@@ -408,7 +408,7 @@ def _hutchinson_cumulants(
         = 2\bigl(\|A\|_F^2 - \|\mathrm{diag}(A)\|^2\bigr), \\
         \mathrm{Var}_{\mathcal{N}}[v^\top A v] &= 2 \|A\|_F^2.
 
-    ``K`` centering is inherited from :meth:`~quadsv.kernels.Kernel.Kx`
+    ``K`` centering is inherited from :meth:`~sonic.kernels.Kernel.Kx`
     (which applies ``H`` on both sides whenever ``centering=True``).
     Analytic substitutions listed below all read from backend-specific
     :meth:`trace` / :meth:`square_trace` methods that already embed the
@@ -419,7 +419,7 @@ def _hutchinson_cumulants(
 
     *FFTKernel* — **full spectrum always, all four cumulants analytic**
         ``c_p = Σ_k λ̃(k)^p`` is computed analytically using the ``n`` Fourier
-        modes (``O(n)``) cached from :meth:`~quadsv.kernels.fft.FFTKernel.eigenvalues`.
+        modes (``O(n)``) cached from :meth:`~sonic.kernels.fft.FFTKernel.eigenvalues`.
 
     *MatrixKernel / NUFFTKernel — ``use_analytic_c12=True``* (default)
         ``c_1`` from :meth:`trace`, ``c_2`` from :meth:`square_trace`
@@ -470,7 +470,7 @@ def _hutchinson_cumulants(
     # ------------------------------------------------------------------
     # FFTKernel fast path — full spectrum is O(n) and exact for all c_p.
     # ------------------------------------------------------------------
-    from quadsv.kernels.fft import FFTKernel  # lazy to avoid circular import
+    from sonic.kernels.fft import FFTKernel  # lazy to avoid circular import
 
     if isinstance(kernel, FFTKernel):
         # ``return_full_layout=True`` unpacks the rfft2 half-spectrum to
@@ -805,8 +805,8 @@ def _q_test_matrix(  # noqa: C901
 ) -> float | np.ndarray | tuple[float | np.ndarray, float | np.ndarray]:
     """Single-batch Q-test on a MatrixKernel (no chunking).
 
-    Parallel to :func:`quadsv.kernels.fft._q_test_fft` /
-    :func:`quadsv.kernels.nufft._q_test_nufft`: takes whatever batch size is
+    Parallel to :func:`sonic.kernels.fft._q_test_fft` /
+    :func:`sonic.kernels.nufft._q_test_nufft`: takes whatever batch size is
     handed in and processes it in one call. The chunking loop lives in
     :func:`spatial_q_test`, which dispatches here per chunk.
     """
@@ -958,8 +958,8 @@ def spatial_q_test(  # noqa: C901
     Top-level chunking wrapper — splits the feature batch along the
     trailing axis into blocks of ``chunk_size`` features, dispatches
     each block to the backend-specific per-chunk helper
-    (:func:`quadsv.kernels.fft._q_test_fft`,
-    :func:`quadsv.kernels.nufft._q_test_nufft`, or :func:`_q_test_matrix`), and
+    (:func:`sonic.kernels.fft._q_test_fft`,
+    :func:`sonic.kernels.nufft._q_test_nufft`, or :func:`_q_test_matrix`), and
     concatenates the results. The per-chunk helpers do **not** handle
     chunking themselves.
 
@@ -971,7 +971,7 @@ def spatial_q_test(  # noqa: C901
         Can be dense numpy array or sparse matrix (CSC/CSR recommended)
         for MatrixKernel; FFT/NUFFT paths require dense input.
     kernel : Kernel
-        Pre-constructed :class:`~quadsv.kernels.Kernel` (``MatrixKernel`` /
+        Pre-constructed :class:`~sonic.kernels.Kernel` (``MatrixKernel`` /
         ``FFTKernel`` / ``NUFFTKernel``) or a raw dense / sparse kernel
         matrix.
     null_params : dict, optional
@@ -1019,8 +1019,8 @@ def spatial_q_test(  # noqa: C901
     >>> Q, pval = spatial_q_test(sparse_data, kernel, show_progress=True)
     """
     # Lazy imports — avoid circular dependency with the FFT / NUFFT modules.
-    from quadsv.kernels.fft import FFTKernel, _q_test_fft
-    from quadsv.kernels.nufft import NUFFTKernel, _q_test_nufft
+    from sonic.kernels.fft import FFTKernel, _q_test_fft
+    from sonic.kernels.nufft import NUFFTKernel, _q_test_nufft
 
     is_fft = isinstance(kernel, FFTKernel)
     is_nufft = isinstance(kernel, NUFFTKernel)
@@ -1040,7 +1040,7 @@ def spatial_q_test(  # noqa: C901
         if not hasattr(kernel, "square_trace"):
             # A raw dense / sparse kernel matrix can't produce null moments
             # on its own — the caller must supply ``null_params`` or wrap
-            # the matrix in a :class:`~quadsv.MatrixKernel`.
+            # the matrix in a :class:`~sonic.MatrixKernel`.
             raise ValueError(
                 "spatial_q_test received a raw kernel matrix without "
                 "null_params; pass a Kernel object or provide "
@@ -1130,8 +1130,8 @@ def _r_test_matrix(  # noqa: C901
 ) -> float | np.ndarray | tuple[float | np.ndarray, float | np.ndarray]:
     """Single-batch R-test on a MatrixKernel (no chunking).
 
-    Parallel to :func:`quadsv.kernels.fft._r_test_fft` /
-    :func:`quadsv.kernels.nufft._r_test_nufft`: takes whatever batch size is
+    Parallel to :func:`sonic.kernels.fft._r_test_fft` /
+    :func:`sonic.kernels.nufft._r_test_nufft`: takes whatever batch size is
     handed in and processes it in one call. The chunking loop lives in
     :func:`spatial_r_test`, which dispatches here per chunk.
     """
@@ -1217,8 +1217,8 @@ def spatial_r_test(  # noqa: C901
     Top-level chunking wrapper — splits the paired feature batch along
     the trailing axis into blocks of ``chunk_size`` features, dispatches
     each block to the backend-specific per-chunk helper
-    (:func:`quadsv.kernels.fft._r_test_fft`,
-    :func:`quadsv.kernels.nufft._r_test_nufft`, or :func:`_r_test_matrix`), and
+    (:func:`sonic.kernels.fft._r_test_fft`,
+    :func:`sonic.kernels.nufft._r_test_nufft`, or :func:`_r_test_matrix`), and
     concatenates the results. The per-chunk helpers do **not** handle
     chunking themselves.
 
@@ -1232,7 +1232,7 @@ def spatial_r_test(  # noqa: C901
         For ``NUFFTKernel`` a bipartite mode with ``M_x != M_y`` is
         passed through without chunking.
     kernel : Kernel
-        Pre-constructed :class:`~quadsv.kernels.Kernel`.
+        Pre-constructed :class:`~sonic.kernels.Kernel`.
     null_params : dict, optional
         Pre-computed null parameters; only ``'var_R'`` is consumed.
         Resolved once at the top level if ``None`` and shared across
@@ -1275,8 +1275,8 @@ def spatial_r_test(  # noqa: C901
     >>> R, pval = spatial_r_test(x_data, y_data, kernel)
     """
     # Lazy imports — avoid circular dependency with the FFT / NUFFT modules.
-    from quadsv.kernels.fft import FFTKernel, _r_test_fft
-    from quadsv.kernels.nufft import NUFFTKernel, _r_test_nufft
+    from sonic.kernels.fft import FFTKernel, _r_test_fft
+    from sonic.kernels.nufft import NUFFTKernel, _r_test_nufft
 
     is_fft = isinstance(kernel, FFTKernel)
     is_nufft = isinstance(kernel, NUFFTKernel)

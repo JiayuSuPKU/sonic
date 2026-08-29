@@ -2,11 +2,11 @@
 Built-in concrete matrix kernel.
 
 :class:`MatrixKernel` is the standard subclass of
-:class:`~quadsv.kernels.base.MatrixKernelBase`. It carries the
+:class:`~sonic.kernels.base.MatrixKernelBase`. It carries the
 construction logic for turning a coordinate cloud or a precomputed
 matrix into the underlying ``_K`` storage; the algorithm itself
 (Kx / xtKx / trace / etc.) is inherited unchanged from
-:class:`~quadsv.kernels.base.MatrixKernelBase`.
+:class:`~sonic.kernels.base.MatrixKernelBase`.
 """
 
 from __future__ import annotations
@@ -21,7 +21,7 @@ from scipy.spatial.distance import pdist, squareform
 from scipy.special import gamma, kv
 from sklearn.neighbors import NearestNeighbors
 
-from quadsv.kernels.base import MatrixKernelBase
+from sonic.kernels.base import MatrixKernelBase
 
 __all__ = ["MatrixKernel"]
 

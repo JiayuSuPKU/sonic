@@ -5,7 +5,8 @@ from __future__ import annotations
 import numpy as np
 import pytest
 
-from quadsv.comparators.features import (
+from sonic.comparators.features import (
+    adapt_frequency_edges,
     align_spectra_by_rotation,
     apply_rotations_to_spectra,
     compute_sample_spectrum,
@@ -13,12 +14,13 @@ from quadsv.comparators.features import (
     estimate_rotations_from_landmarks,
     gene_pattern_diversity,
     power_spectrum_anisotropy,
+    radial_bin_counts,
     radial_bin_spectrum,
     stream_geomean_landmark,
     stream_polar_features,
     stream_radial_features,
 )
-from quadsv.kernels.fft import power_spectrum_2d
+from sonic.kernels.fft import power_spectrum_2d
 
 
 def _axis_angle_error(observed: float, expected: float) -> float:
@@ -215,6 +217,21 @@ class TestRadialBinning:
     def test_shape_validation(self):
         with pytest.raises(ValueError, match="last two dims"):
             radial_bin_spectrum(np.zeros((10, 10)), grid_shape=(8, 8), fft_solver="fft2")
+
+    def test_adapt_frequency_edges_supports_every_grid(self):
+        shapes = [(32, 32), (9, 9)]
+        spacings = [(1.0, 1.0), (1.0, 1.0)]
+        requested = np.linspace(0.0, 0.5 * (1.0 + 1e-9), 9)
+
+        adapted = adapt_frequency_edges(shapes, spacings, requested)
+
+        assert adapted.size < requested.size
+        assert adapted[[0, -1]] == pytest.approx(requested[[0, -1]])
+        counts = [
+            radial_bin_counts(shape, spacing=spacing, edges=adapted)
+            for shape, spacing in zip(shapes, spacings, strict=True)
+        ]
+        assert np.all(np.asarray(counts) > 0)
 
 
 class TestRotationAlignment:

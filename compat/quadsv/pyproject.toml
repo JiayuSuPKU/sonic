@@ -1,0 +1,24 @@
+[build-system]
+requires = ["setuptools>=64", "setuptools-scm>=8", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "quadsv"
+dynamic = ["version"]
+description = "Compatibility package for SONIC, formerly QuadSV."
+readme = "README.md"
+requires-python = ">=3.10"
+license = "BSD-3-Clause"
+authors = [{name = "Jiayu Su"}]
+dependencies = ["sonic>=0.2,<1"]
+
+[project.urls]
+Documentation = "https://sonic-spatial.readthedocs.io/"
+Repository = "https://github.com/JiayuSuPKU/sonic"
+
+[tool.setuptools]
+packages = []
+
+[tool.setuptools_scm]
+root = "../.."
+fallback_version = "0.2.0"

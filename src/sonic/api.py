@@ -22,8 +22,8 @@ forward kwargs verbatim. Asymmetry between the two:
   positional argument, since both comparator constructors take
   ``samples`` there. Cross-sample contrasts (``design``) are
   supplied later, at test time, on
-  :meth:`~quadsv.ComparatorIrregular.test_diff_freq` /
-  :meth:`~quadsv.ComparatorIrregular.test_diff_expr`.
+  :meth:`~sonic.ComparatorIrregular.test_diff_freq` /
+  :meth:`~sonic.ComparatorIrregular.test_diff_expr`.
 
 For advanced use (custom kernel selection, sample-list inputs that
 mix two backends intentionally) prefer the explicit class names —
@@ -36,9 +36,9 @@ from __future__ import annotations
 from collections.abc import Sequence
 from typing import Any
 
-from quadsv.comparators import ComparatorGrid, ComparatorIrregular
-from quadsv.detectors.grid import DetectorGrid
-from quadsv.detectors.irregular import DetectorIrregular
+from sonic.comparators import ComparatorGrid, ComparatorIrregular
+from sonic.detectors.grid import DetectorGrid
+from sonic.detectors.irregular import DetectorIrregular
 
 __all__ = ["Detector", "Comparator"]
 
@@ -47,7 +47,7 @@ def _is_anndata(obj: Any) -> bool:
     """Return True if ``obj`` is an :class:`anndata.AnnData`. Lazy
     import so the factories work even when ``anndata`` isn't
     available — though in practice ``anndata`` is a hard dependency
-    of :mod:`quadsv`.
+    of :mod:`sonic`.
     """
     try:
         from anndata import AnnData
@@ -78,12 +78,12 @@ def _supported_types_msg() -> str:
 
 
 def Detector(data: Any, **kwargs: Any) -> Any:  # noqa: N802 - factory mimics class names
-    """Construct the right :class:`~quadsv.Detector` for ``data``.
+    """Construct the right :class:`~sonic.Detector` for ``data``.
 
     Dispatches on ``type(data)``:
 
-    - :class:`anndata.AnnData` → :class:`~quadsv.DetectorIrregular`.
-    - :class:`spatialdata.SpatialData` → :class:`~quadsv.DetectorGrid`.
+    - :class:`anndata.AnnData` → :class:`~sonic.DetectorIrregular`.
+    - :class:`spatialdata.SpatialData` → :class:`~sonic.DetectorGrid`.
 
     The data itself is **not** passed to the constructor — the caller
     is expected to chain ``.setup_data(data, ...)`` afterwards (the
@@ -108,7 +108,7 @@ def Detector(data: Any, **kwargs: Any) -> Any:  # noqa: N802 - factory mimics cl
 
     Examples
     --------
-    >>> from quadsv import Detector
+    >>> from sonic import Detector
     >>> det = Detector(adata, kernel_method="gaussian", backend="matrix")
     >>> det = det.setup_data(adata)
     >>> df = det.compute_qstat()
@@ -125,12 +125,12 @@ def Detector(data: Any, **kwargs: Any) -> Any:  # noqa: N802 - factory mimics cl
 def Comparator(  # noqa: N802 - factory mimics class names
     data_list: Sequence[Any], **kwargs: Any
 ) -> Any:
-    """Construct the right :class:`~quadsv.Comparator` for ``data_list``.
+    """Construct the right :class:`~sonic.Comparator` for ``data_list``.
 
     Dispatches on the homogeneous element type:
 
-    - all :class:`anndata.AnnData` → :class:`~quadsv.ComparatorIrregular`.
-    - all :class:`spatialdata.SpatialData` → :class:`~quadsv.ComparatorGrid`.
+    - all :class:`anndata.AnnData` → :class:`~sonic.ComparatorIrregular`.
+    - all :class:`spatialdata.SpatialData` → :class:`~sonic.ComparatorGrid`.
     - mixed types → :class:`TypeError`.
 
     Unlike :func:`Detector`, the data list **is** forwarded as the
@@ -161,7 +161,7 @@ def Comparator(  # noqa: N802 - factory mimics class names
 
     Examples
     --------
-    >>> from quadsv import Comparator
+    >>> from sonic import Comparator
     >>> cmp = Comparator([a1, a2, a3]).compute_spectra()
     >>> df = cmp.test_diff_freq(group_labels)
     """

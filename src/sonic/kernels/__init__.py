@@ -1,5 +1,5 @@
 """
-``quadsv.kernels`` — spatial-kernel layer.
+``sonic.kernels`` — spatial-kernel layer.
 
 Subpackage grouping the public kernel classes plus the ABCs that
 backend authors subclass:
@@ -14,17 +14,17 @@ backend authors subclass:
 
 All five are importable from this subpackage:
 
-    from quadsv.kernels import FFTKernel, NUFFTKernel, MatrixKernel
-    from quadsv.kernels import Kernel, MatrixKernelBase  # for backend authors
+    from sonic.kernels import FFTKernel, NUFFTKernel, MatrixKernel
+    from sonic.kernels import Kernel, MatrixKernelBase  # for backend authors
 
 The three concrete classes are also re-exported at the top of the
-:mod:`quadsv` namespace.
+:mod:`sonic` namespace.
 """
 
-from quadsv.kernels.base import Kernel, MatrixKernelBase
-from quadsv.kernels.fft import FFTKernel
-from quadsv.kernels.matrix import MatrixKernel
-from quadsv.kernels.nufft import NUFFTKernel
+from sonic.kernels.base import Kernel, MatrixKernelBase
+from sonic.kernels.fft import FFTKernel
+from sonic.kernels.matrix import MatrixKernel
+from sonic.kernels.nufft import NUFFTKernel
 
 __all__ = [
     "Kernel",

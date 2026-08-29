@@ -10,7 +10,7 @@ import numpy as np
 import pandas as pd
 import scipy.sparse as sp
 
-from quadsv.detectors.irregular import DetectorIrregular
+from sonic.detectors.irregular import DetectorIrregular
 
 
 class TestDetectorIrregular(unittest.TestCase):
@@ -396,8 +396,8 @@ class TestDetectorIrregular(unittest.TestCase):
         detector.setup_data(self.adata, min_cells=5)
 
         # Mock the compute_null_params to avoid actual computation
-        with patch("quadsv.statistics.compute_null_params") as mock_compute_null:
-            with patch("quadsv.statistics.spatial_q_test") as mock_spatial_q_test:
+        with patch("sonic.statistics.compute_null_params") as mock_compute_null:
+            with patch("sonic.statistics.spatial_q_test") as mock_spatial_q_test:
                 mock_compute_null.return_value = {"mean_Q": 1.0, "var_Q": 0.5}
                 mock_spatial_q_test.return_value = (2.5, 0.05)
 

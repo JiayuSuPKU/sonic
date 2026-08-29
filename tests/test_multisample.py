@@ -7,7 +7,7 @@ import pandas as pd
 import pytest
 from scipy.stats import kstest
 
-from quadsv.comparators.multisample import (
+from sonic.comparators.multisample import (
     compare_glm,
     compare_glm_masked,
     compare_glm_scalar,
@@ -15,7 +15,7 @@ from quadsv.comparators.multisample import (
     compare_two_groups_masked,
     compare_two_groups_scalar,
 )
-from quadsv.comparators.normalization import normalize_shape
+from sonic.comparators.normalization import normalize_shape
 
 
 class TestTwoGroupNullCalibration:

@@ -3,9 +3,9 @@ requires = ["setuptools>=64", "setuptools-scm>=8", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "quadsv"
+name = "sonic"
 dynamic = ["version"]
-description = "Consistent and scalable spatial pattern detection and comparison via quadratic forms."
+description = "Consistent and scalable spatial pattern detection and comparison."
 readme = "README.md"
 requires-python = ">=3.10"
 license = "BSD-3-Clause"
@@ -19,6 +19,8 @@ keywords = [
     "spatial statistics",
     "pattern detection",
     "SVG detection",
+    "pattern comparison",
+    "differential frequency",
     "kernel methods",
     "hypothesis testing",
     "spatial transcriptomics",
@@ -86,10 +88,10 @@ docs = [
 ]
 
 [project.urls]
-Documentation = "https://quadsv.readthedocs.io/"
-Repository = "https://github.com/JiayuSuPKU/quadsv"
-"Bug Tracker" = "https://github.com/JiayuSuPKU/quadsv/issues"
-"Source Code" = "https://github.com/JiayuSuPKU/quadsv"
+Documentation = "https://sonic-spatial.readthedocs.io/"
+Repository = "https://github.com/JiayuSuPKU/sonic"
+"Bug Tracker" = "https://github.com/JiayuSuPKU/sonic/issues"
+"Source Code" = "https://github.com/JiayuSuPKU/sonic"
 
 [tool.black]
 line-length = 100
@@ -146,7 +148,7 @@ markers = [
 ]
 
 [tool.coverage.run]
-source = ["src/quadsv"]
+source = ["src/sonic"]
 branch = true
 omit = [
     "*/tests/*",
@@ -171,10 +173,10 @@ where = ["src"]
 # Derive the package version from git tags. On a clean release commit
 # tagged ``vX.Y.Z`` the version is ``X.Y.Z``; between tags it is
 # ``X.Y.(Z+1).devN+g<sha>[.dYYYYMMDD]`` per PEP 440. On install / build
-# the resolved version is written to ``src/quadsv/_version.py`` so the
+# the resolved version is written to ``src/sonic/_version.py`` so the
 # runtime ``__version__`` lookup works without git (sdist, wheel, shallow
 # clones). ``fallback_version`` is used only when both git AND the
 # generated file are missing — keep it in sync with the last release.
 [tool.setuptools_scm]
-version_file = "src/quadsv/_version.py"
-fallback_version = "0.1.1"
+version_file = "src/sonic/_version.py"
+fallback_version = "0.2.0"

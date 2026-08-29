@@ -15,14 +15,14 @@ except ModuleNotFoundError:  # pragma: no cover - Python 3.10 fallback
 def _load_project_info() -> tuple[str, str, str]:
     """Load (name, author, version) from installed metadata or pyproject.toml."""
     try:
-        info = metadata("quadsv")
+        info = metadata("sonic")
         return info["Name"], info["Author"], info["Version"]
     except PackageNotFoundError:
         pyproject_path = Path(__file__).resolve().parents[1] / "pyproject.toml"
         with pyproject_path.open("rb") as f:
             pyproject = tomllib.load(f)
         project_cfg = pyproject.get("project", {})
-        name = project_cfg.get("name", "quadsv")
+        name = project_cfg.get("name", "sonic")
         version = project_cfg.get("version", "0.0.0")
         authors = project_cfg.get("authors", [])
         author = authors[0].get("name", "") if authors and isinstance(authors[0], dict) else ""
@@ -30,7 +30,7 @@ def _load_project_info() -> tuple[str, str, str]:
 
 
 project_name, author, version = _load_project_info()
-project = project_name
+project = "SONIC"
 copyright = f"{datetime.now():%Y}, {author}"
 release = version
 
@@ -56,7 +56,7 @@ myst_enable_extensions = [
 ]
 
 # AutoAPI configuration
-autoapi_dirs = ["../src/quadsv"]
+autoapi_dirs = ["../src/sonic"]
 autoapi_add_toctree_entry = False
 autoapi_python_class_content = "class"
 autoapi_ignore = ["**/.ipynb_checkpoints/*", "**/*-checkpoint.py"]
@@ -133,12 +133,12 @@ mathjax4_config = {
 html_theme = "sphinx_book_theme"
 html_theme_options = {
     "logo": {
-        "text": "quadsv",
+        "text": "SONIC",
     },
     "search_bar_text": "Search...",
     "show_toc_level": 4,
     "navigation_depth": 4,
-    "repository_url": "https://github.com/JiayuSuPKU/quadsv",
+    "repository_url": "https://github.com/JiayuSuPKU/sonic",
     "use_repository_button": True,
 }
 

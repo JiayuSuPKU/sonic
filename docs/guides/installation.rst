@@ -6,14 +6,14 @@ From PyPI
 
 .. code-block:: bash
 
-   pip install quadsv
+   pip install sonic
 
 Two optional extras are available for development and documentation:
 
 .. code-block:: bash
 
-   pip install 'quadsv[dev]'    # tests, linting, jupyter, matplotlib
-   pip install 'quadsv[docs]'   # Sphinx + theme + autoapi
+   pip install 'sonic[dev]'    # tests, linting, jupyter, matplotlib
+   pip install 'sonic[docs]'   # Sphinx + theme + autoapi
 
 
 From source
@@ -21,8 +21,8 @@ From source
 
 .. code-block:: bash
 
-   git clone https://github.com/JiayuSuPKU/quadsv.git
-   cd quadsv
+   git clone https://github.com/JiayuSuPKU/sonic.git
+   cd sonic
    pip install -e '.[dev,docs]'
 
 
@@ -35,11 +35,11 @@ Requirements
   ``scanpy`` you also get ``anndata``, ``numpy``, ``scipy``,
   ``scikit-learn`` and ``pandas``.
 
-``spatialdata`` is needed by :class:`~quadsv.DetectorGrid` and
-:class:`~quadsv.ComparatorGrid`. ``finufft`` is needed by
-:class:`~quadsv.NUFFTKernel`, by :class:`~quadsv.DetectorIrregular`
+``spatialdata`` is needed by :class:`~sonic.DetectorGrid` and
+:class:`~sonic.ComparatorGrid`. ``finufft`` is needed by
+:class:`~sonic.NUFFTKernel`, by :class:`~sonic.DetectorIrregular`
 when you set ``backend="nufft"``, and by
-:class:`~quadsv.ComparatorIrregular`.
+:class:`~sonic.ComparatorIrregular`.
 
 
 Verify the install
@@ -47,14 +47,14 @@ Verify the install
 
 .. code-block:: python
 
-   import quadsv
+   import sonic
 
-   print(quadsv.__version__)
-   print(sorted(quadsv.__all__))
+   print(sonic.__version__)
+   print(sorted(sonic.__all__))
 
 You should see 17 public names organised into four layers (see
 :doc:`/guides/quickstart` for what each layer does). The top-level
 package is the user-facing surface. The canonical submodule paths
-(``quadsv.kernels.*``, ``quadsv.detectors.*``,
-``quadsv.comparators.multisample``, ``quadsv.statistics``) are
-documented under :doc:`/autoapi/quadsv/index`.
+(``sonic.kernels.*``, ``sonic.detectors.*``,
+``sonic.comparators.multisample``, ``sonic.statistics``) are
+documented under :doc:`/autoapi/sonic/index`.

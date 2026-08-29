@@ -5,7 +5,7 @@ from __future__ import annotations
 import numpy as np
 import pytest
 
-from quadsv.comparators.normalization import (
+from sonic.comparators.normalization import (
     normalize_background,
     normalize_covariates,
     normalize_shape,
@@ -89,7 +89,7 @@ class TestNormalizationPrimitives:
         np.testing.assert_array_equal(out_kw, out_pos)
 
     def test_normalizers_are_not_reexported_from_multisample(self):
-        import quadsv.comparators.multisample as multisample
+        import sonic.comparators.multisample as multisample
 
         for name in ("normalize_background", "normalize_covariates", "normalize_shape"):
             assert name not in multisample.__all__

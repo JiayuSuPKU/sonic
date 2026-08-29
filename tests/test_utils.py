@@ -1,5 +1,5 @@
 """
-Unit tests for quadsv.utils functions.
+Unit tests for sonic.utils functions.
 Tests coordinate generation and distance calculations.
 """
 
@@ -7,7 +7,7 @@ import unittest
 
 import numpy as np
 
-from quadsv.utils import (
+from sonic.utils import (
     compute_torus_distance_matrix,
     convert_visium_to_physical,
     get_rect_coords,

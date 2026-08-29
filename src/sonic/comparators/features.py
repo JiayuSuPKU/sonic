@@ -19,7 +19,7 @@ them to cross-sample features. This module owns those array-level operations:
 
 All helpers are pure array transforms. Container handling, covariate lookup,
 and statistical tests live in the comparator backends and
-:mod:`quadsv.comparators.multisample`.
+:mod:`sonic.comparators.multisample`.
 """
 
 from __future__ import annotations
@@ -32,7 +32,7 @@ import pandas as pd
 import scipy.ndimage
 from tqdm.auto import tqdm
 
-from quadsv.kernels.fft import power_spectrum_2d
+from sonic.kernels.fft import power_spectrum_2d
 
 __all__ = [
     "adapt_frequency_edges",
@@ -78,7 +78,7 @@ def compute_sample_spectrum(
     sample : np.ndarray
         Rasterized expression of shape ``(n_genes, ny, nx)``.
     fft_solver : {'fft2', 'rfft2'}, default 'rfft2'
-        FFT routine forwarded to :func:`quadsv.kernels.fft.power_spectrum_2d`.
+        FFT routine forwarded to :func:`sonic.kernels.fft.power_spectrum_2d`.
     workers : int, optional
         Parallel workers forwarded to :mod:`scipy.fft`.
     return_dc : bool, default False
@@ -752,7 +752,7 @@ def stream_geomean_landmark(
     time, then exponentiates — yielding ``(1, ny, n_kx)``. The geomean is the
     amplitude-invariant consensus orientation template (per-gene brightness
     becomes an additive log constant that cannot move the angular argmax),
-    mirroring :func:`quadsv.comparators.normalization.normalize_background`'s
+    mirroring :func:`sonic.comparators.normalization.normalize_background`'s
     cross-gene geometric mean. Peak
     memory is ``O(chunk · ny · nx)`` plus one ``(ny, n_kx)`` accumulator — the
     full ``(n_genes, ny, n_kx)`` stack is never held.

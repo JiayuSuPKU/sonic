@@ -1,6 +1,6 @@
 """
 Shared :func:`spatialdata.rasterize_bins` wrappers used by
-:class:`quadsv.DetectorGrid` and :class:`quadsv.ComparatorGrid`.
+:class:`sonic.DetectorGrid` and :class:`sonic.ComparatorGrid`.
 
 Both consumers need the same boilerplate:
 

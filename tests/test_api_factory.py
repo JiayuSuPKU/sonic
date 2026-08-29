@@ -1,4 +1,4 @@
-"""Tests for the :func:`quadsv.Detector` / :func:`quadsv.Comparator`
+"""Tests for the :func:`sonic.Detector` / :func:`sonic.Comparator`
 factory dispatch.
 
 The factories pick the right class from ``isinstance(data, ...)``;
@@ -17,7 +17,7 @@ import anndata as ad
 import numpy as np
 import pytest
 
-from quadsv import (
+from sonic import (
     Comparator,
     ComparatorIrregular,
     Detector,
@@ -76,7 +76,7 @@ class TestComparatorFactory(unittest.TestCase):
         # ComparatorGrid needs a full table-backed SpatialData object, but
         # factory dispatch only needs to prove the selected class and forwarded
         # sample list. Patch the constructor to keep this test focused.
-        with patch("quadsv.api.ComparatorGrid") as grid_cls:
+        with patch("sonic.api.ComparatorGrid") as grid_cls:
             sentinel = object()
             grid_cls.return_value = sentinel
 

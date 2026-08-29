@@ -18,15 +18,15 @@ import spatialdata as sd
 from geopandas import GeoDataFrame
 from spatialdata.models import ShapesModel, TableModel
 
-from quadsv.comparators import ComparatorGrid, ComparatorIrregular
-from quadsv.comparators.features import radial_bin_spectrum
-from quadsv.comparators.multisample import (
+from sonic.comparators import ComparatorGrid, ComparatorIrregular
+from sonic.comparators.features import radial_bin_spectrum
+from sonic.comparators.multisample import (
     compare_glm_masked,
     compare_glm_scalar,
     compare_two_groups,
     compare_two_groups_scalar,
 )
-from quadsv.statistics import liu_sf
+from sonic.statistics import liu_sf
 
 # Standalone comparison helpers are the oracles for wrapper-level dispatch tests.
 
@@ -348,7 +348,7 @@ class TestComparatorGridFeatures:
         assert np.isfinite(cmp.spectra_).all()
 
     def test_radial_and_2d_use_sample_parallel_dispatch(self, monkeypatch):
-        import quadsv.comparators.base as base_mod
+        import sonic.comparators.base as base_mod
 
         calls = []
 
@@ -611,7 +611,7 @@ class TestComparatorIrregularFeatures:
         assert np.isfinite(cmp.spectra_).all()
 
     def test_2d_uses_sample_parallel_dispatch(self, monkeypatch):
-        import quadsv.comparators.base as base_mod
+        import sonic.comparators.base as base_mod
 
         calls = []
 

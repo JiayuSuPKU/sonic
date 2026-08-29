@@ -1,20 +1,20 @@
 Quick Start
 ===========
 
-A 5-minute tour. ``quadsv`` does three things:
+A 5-minute tour. ``sonic`` does three things:
 
-1. **Score one feature** with :func:`~quadsv.spatial_q_test`. Does
+1. **Score one feature** with :func:`~sonic.spatial_q_test`. Does
    its expression depend on space?
-2. **Score every feature in a tissue** with :func:`~quadsv.Detector`.
+2. **Score every feature in a tissue** with :func:`~sonic.Detector`.
    Which genes are spatially variable?
-3. **Compare slides** with :func:`~quadsv.Comparator`. Do two
+3. **Compare slides** with :func:`~sonic.Comparator`. Do two
    groups of samples differ in spatial pattern?
 
 The kernel you pass to the single-sample tests decides what kind of
 spatial structure earns a high score. CAR and Matérn kernels reward
 smooth gradients; a graph-Laplacian kernel rewards sharp differences
 between neighbouring spots. See :doc:`/guides/kernels`. For
-cross-sample comparisons, ``quadsv`` compares frequency-domain
+cross-sample comparisons, ``sonic`` compares frequency-domain
 pattern spectra so samples do not need to be spatially registered.
 
 
@@ -22,7 +22,7 @@ The four layers
 ---------------
 
 Every name listed below is importable from the top-level package
-with ``from quadsv import ...``.
+with ``from sonic import ...``.
 
 .. list-table::
    :header-rows: 1
@@ -33,30 +33,30 @@ with ``from quadsv import ...``.
      - Public names
    * - **Kernels**
      - Encode the spatial structure to look for.
-     - :class:`~quadsv.MatrixKernel` (any coords or graph),
-       :class:`~quadsv.FFTKernel` (regular grid),
-       :class:`~quadsv.NUFFTKernel` (irregular 2-D coords).
+     - :class:`~sonic.MatrixKernel` (any coords or graph),
+       :class:`~sonic.FFTKernel` (regular grid),
+       :class:`~sonic.NUFFTKernel` (irregular 2-D coords).
        Backend authors can subclass
-       :class:`quadsv.kernels.Kernel` or
-       :class:`quadsv.kernels.MatrixKernelBase` for a custom
+       :class:`sonic.kernels.Kernel` or
+       :class:`sonic.kernels.MatrixKernelBase` for a custom
        backend; see :doc:`/guides/kernels`.
    * - **Tests**
      - Compute the test statistic and a p-value on a feature
        vector or batch.
-     - :func:`~quadsv.spatial_q_test` (univariate),
-       :func:`~quadsv.spatial_r_test` (bivariate),
-       and helpers :func:`~quadsv.compute_null_params`,
-       :func:`~quadsv.auto_chunk_size`, :func:`~quadsv.liu_sf`.
+     - :func:`~sonic.spatial_q_test` (univariate),
+       :func:`~sonic.spatial_r_test` (bivariate),
+       and helpers :func:`~sonic.compute_null_params`,
+       :func:`~sonic.auto_chunk_size`, :func:`~sonic.liu_sf`.
    * - **Detectors**
      - Genome-wide pattern screening on one sample.
-     - :class:`~quadsv.DetectorIrregular`,
-       :class:`~quadsv.DetectorGrid`, and the dispatch factory
-       :func:`~quadsv.Detector`.
+     - :class:`~sonic.DetectorIrregular`,
+       :class:`~sonic.DetectorGrid`, and the dispatch factory
+       :func:`~sonic.Detector`.
    * - **Comparators**
      - Cross-sample pattern comparison between groups of slides.
-     - :class:`~quadsv.ComparatorIrregular`,
-       :class:`~quadsv.ComparatorGrid`, and the dispatch factory
-       :func:`~quadsv.Comparator`.
+     - :class:`~sonic.ComparatorIrregular`,
+       :class:`~sonic.ComparatorGrid`, and the dispatch factory
+       :func:`~sonic.Comparator`.
 
 
 Test one feature
@@ -67,7 +67,7 @@ Score whether a gene's expression depends on space, given a kernel.
 .. code-block:: python
 
    import numpy as np
-   from quadsv import NUFFTKernel, spatial_q_test
+   from sonic import NUFFTKernel, spatial_q_test
 
    rng = np.random.default_rng(0)
    coords = rng.uniform(0, 20, size=(500, 2))
@@ -90,31 +90,31 @@ kernel and a gene that scored low above can score high if its
 expression changes sharply between neighbouring spots. See
 :doc:`/guides/kernels` for picking a kernel.
 
-The same :func:`~quadsv.spatial_q_test` call works with any kernel
-type. Pass a :class:`~quadsv.MatrixKernel` for an arbitrary
-coordinate cloud or graph, an :class:`~quadsv.FFTKernel` for a
-regular 2-D grid, or :class:`~quadsv.NUFFTKernel` for irregular 2-D
-coordinates. The companion :func:`~quadsv.spatial_r_test` tests two
+The same :func:`~sonic.spatial_q_test` call works with any kernel
+type. Pass a :class:`~sonic.MatrixKernel` for an arbitrary
+coordinate cloud or graph, an :class:`~sonic.FFTKernel` for a
+regular 2-D grid, or :class:`~sonic.NUFFTKernel` for irregular 2-D
+coordinates. The companion :func:`~sonic.spatial_r_test` tests two
 features at a time for spatial co-expression.
 
 .. dropdown:: Reuse the null fit across many features
 
    When you test many features against the same kernel, precompute
    the null distribution once with
-   :func:`~quadsv.compute_null_params` and pass the result back into
+   :func:`~sonic.compute_null_params` and pass the result back into
    the test:
 
    .. code-block:: python
 
-      from quadsv import compute_null_params, spatial_q_test
+      from sonic import compute_null_params, spatial_q_test
 
       null = compute_null_params(kernel, method="liu")  # one-time cost
       for gene in gene_matrix.T:
           Q, pval = spatial_q_test(gene, kernel, null_params=null)
 
-   :func:`~quadsv.spatial_q_test` and :func:`~quadsv.spatial_r_test`
+   :func:`~sonic.spatial_q_test` and :func:`~sonic.spatial_r_test`
    also accept a ``chunk_size`` keyword. The default ``"auto"``
-   dispatches to :func:`~quadsv.auto_chunk_size` to size each batch
+   dispatches to :func:`~sonic.auto_chunk_size` to size each batch
    for the kernel's cache sweet spot. See :doc:`/guides/scaling` for
    the cost model.
 
@@ -122,11 +122,11 @@ features at a time for spatial co-expression.
 Test every feature in an AnnData
 --------------------------------
 
-The :func:`~quadsv.Detector` factory picks the right detector class
+The :func:`~sonic.Detector` factory picks the right detector class
 from the input type. An :class:`anndata.AnnData` returns a
-:class:`~quadsv.DetectorIrregular`; a
+:class:`~sonic.DetectorIrregular`; a
 :class:`spatialdata.SpatialData` returns a
-:class:`~quadsv.DetectorGrid`.
+:class:`~sonic.DetectorGrid`.
 
 Expected ``adata`` layout:
 
@@ -148,13 +148,13 @@ You need at least one of ``obsm_key`` or ``obsp_key``. If you pass
 both, ``obsp_key`` wins.
 
 Build the detector, attach the data with
-:meth:`~quadsv.DetectorIrregular.setup_data`, then run
-:meth:`~quadsv.DetectorIrregular.compute_qstat`:
+:meth:`~sonic.DetectorIrregular.setup_data`, then run
+:meth:`~sonic.DetectorIrregular.compute_qstat`:
 
 .. code-block:: python
 
    import anndata as ad
-   from quadsv import Detector
+   from sonic import Detector
 
    adata = ad.read_h5ad("spatial_tissue.h5ad")
    print(f"Data: {adata.n_obs} spots × {adata.n_vars} genes")
@@ -172,7 +172,7 @@ Build the detector, attach the data with
    print(f"Found {len(svgs)} SVGs at FDR < 5%")
 
 The same detector handles spatial co-expression through
-:meth:`~quadsv.DetectorIrregular.compute_rstat`:
+:meth:`~sonic.DetectorIrregular.compute_rstat`:
 
 .. code-block:: python
 
@@ -186,15 +186,15 @@ The same detector handles spatial co-expression through
 
 .. dropdown:: Picking a backend (matrix vs nufft)
 
-   :class:`~quadsv.DetectorIrregular` ships two backends, selected
+   :class:`~sonic.DetectorIrregular` ships two backends, selected
    with the ``backend`` keyword.
 
-   ``backend="nufft"`` builds a :class:`~quadsv.NUFFTKernel`. It
+   ``backend="nufft"`` builds a :class:`~sonic.NUFFTKernel`. It
    runs at ``O(n log n)`` per feature and never materialises an
    ``(n, n)`` matrix, so it scales to large ``n``. Use it with
    smooth kernels (Gaussian, Matérn).
 
-   ``backend="matrix"`` builds a :class:`~quadsv.MatrixKernel`,
+   ``backend="matrix"`` builds a :class:`~sonic.MatrixKernel`,
    which picks dense, sparse, or sparse-precision storage based on
    ``n``. Use it for graph kernels (``car``, ``moran``,
    ``graph_laplacian``) or when you have a precomputed adjacency in
@@ -217,10 +217,10 @@ Large regular grids (Visium HD)
 -------------------------------
 
 For rasterised grids in :class:`spatialdata.SpatialData` containers,
-the same :func:`~quadsv.Detector` factory returns a
-:class:`~quadsv.DetectorGrid`. Kernel hyper-parameters go to the
+the same :func:`~sonic.Detector` factory returns a
+:class:`~sonic.DetectorGrid`. Kernel hyper-parameters go to the
 constructor. The bin / table / coordinate layout goes to
-:meth:`~quadsv.DetectorGrid.setup_data`.
+:meth:`~sonic.DetectorGrid.setup_data`.
 
 Expected ``sdata`` layout:
 
@@ -243,7 +243,7 @@ Code:
 .. code-block:: python
 
    import spatialdata as sd
-   from quadsv import Detector
+   from sonic import Detector
 
    sdata = sd.read_zarr("visium_hd.zarr")
    detector = Detector(
@@ -266,14 +266,14 @@ Code:
 Compare Patterns Across Samples
 -------------------------------
 
-The :func:`~quadsv.Comparator` factory picks
-:class:`~quadsv.ComparatorIrregular` for a list of
-:class:`anndata.AnnData` samples and :class:`~quadsv.ComparatorGrid`
+The :func:`~sonic.Comparator` factory picks
+:class:`~sonic.ComparatorIrregular` for a list of
+:class:`anndata.AnnData` samples and :class:`~sonic.ComparatorGrid`
 for a list of :class:`spatialdata.SpatialData` samples. The
 pattern-comparison path is alignment-free: each sample is converted
 to per-gene spatial power spectra, spectra are reduced to common
 radial frequency bins, and per-gene group differences are tested
-with :meth:`~quadsv.ComparatorIrregular.test_diff_freq`.
+with :meth:`~sonic.ComparatorIrregular.test_diff_freq`.
 
 For AnnData samples:
 
@@ -281,7 +281,7 @@ For AnnData samples:
 
    import anndata as ad
    import numpy as np
-   from quadsv import Comparator
+   from sonic import Comparator
 
    paths = [
        "control_1.h5ad",
@@ -321,7 +321,7 @@ For :class:`spatialdata.SpatialData` grids, keep the same
 
    import numpy as np
    import spatialdata as sd
-   from quadsv import Comparator
+   from sonic import Comparator
 
    samples = [sd.read_zarr(path) for path in zarr_paths]
    design = np.array([0, 0, 0, 1, 1, 1])
@@ -349,4 +349,4 @@ Next steps
   of slides.
 - :doc:`/guides/scaling`. Performance and complexity reference.
 - :doc:`/guides/theory`. Mathematical background.
-- :doc:`/autoapi/quadsv/index`. Full API reference.
+- :doc:`/autoapi/sonic/index`. Full API reference.

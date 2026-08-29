@@ -9,7 +9,7 @@ from unittest.mock import patch
 import numpy as np
 import pandas as pd
 
-from quadsv.detectors.grid import DetectorGrid
+from sonic.detectors.grid import DetectorGrid
 
 
 class MockCoord:
@@ -83,7 +83,7 @@ class MockSpatialData:
 
 def _patch_rasterize(mock_da):
     """Patch rasterize_table (used internally by DetectorGrid) to return `mock_da`."""
-    return patch("quadsv.detectors.grid.rasterize_table", return_value=mock_da, create=True)
+    return patch("sonic.detectors.grid.rasterize_table", return_value=mock_da, create=True)
 
 
 class TestDetectorGrid(unittest.TestCase):
@@ -120,7 +120,7 @@ class TestDetectorGrid(unittest.TestCase):
 
     def test_compute_qstat_returns_dataframe(self):
         """DetectorGrid.compute_qstat produces a DataFrame with expected columns."""
-        with patch("quadsv._rasterize.rasterize_table", return_value=self.mock_da):
+        with patch("sonic._rasterize.rasterize_table", return_value=self.mock_da):
             detector = DetectorGrid(kernel_method="gaussian", bandwidth=1.0)
             self._setup(detector)
             df = detector.compute_qstat(features=None, n_jobs=1, return_pval=True, chunk_size=2)
@@ -133,7 +133,7 @@ class TestDetectorGrid(unittest.TestCase):
 
     def test_min_count_filtering(self):
         """Features below min_count are filtered out."""
-        with patch("quadsv._rasterize.rasterize_table", return_value=self.mock_da):
+        with patch("sonic._rasterize.rasterize_table", return_value=self.mock_da):
             detector = DetectorGrid(kernel_method="gaussian", bandwidth=1.0)
             self._setup(detector, min_count=5)
             df = detector.compute_qstat(features=None, n_jobs=1, return_pval=False, chunk_size=2)
@@ -144,7 +144,7 @@ class TestDetectorGrid(unittest.TestCase):
 
     def test_kernel_reuse_same_shape(self):
         """Kernel is kept across successive compute_qstat calls once setup is done."""
-        with patch("quadsv._rasterize.rasterize_table", return_value=self.mock_da):
+        with patch("sonic._rasterize.rasterize_table", return_value=self.mock_da):
             detector = DetectorGrid(kernel_method="gaussian", bandwidth=1.0)
             self._setup(detector)
             df1 = detector.compute_qstat(n_jobs=1, return_pval=False)
@@ -167,7 +167,7 @@ class TestDetectorGrid(unittest.TestCase):
         raster_data = np.random.randn(len(features), ny, nx)
         mock_da = MockDataArray(raster_data, features)
 
-        with patch("quadsv._rasterize.rasterize_table", return_value=mock_da):
+        with patch("sonic._rasterize.rasterize_table", return_value=mock_da):
             detector = DetectorGrid(kernel_method="car", rho=0.8)
             detector.setup_data(
                 self.sdata,
@@ -190,7 +190,7 @@ class TestDetectorGrid(unittest.TestCase):
 
     def test_docstring_example_compute_rstat_symmetric(self):
         """Test docstring example: compute_rstat in symmetric (pairwise) mode."""
-        with patch("quadsv._rasterize.rasterize_table", return_value=self.mock_da):
+        with patch("sonic._rasterize.rasterize_table", return_value=self.mock_da):
             detector = DetectorGrid(kernel_method="car", rho=0.8, workers=4)
             detector.setup_data(
                 self.sdata,
@@ -216,7 +216,7 @@ class TestDetectorGrid(unittest.TestCase):
 
     def test_docstring_example_compute_rstat_bipartite(self):
         """Test docstring example: compute_rstat in bipartite (X vs Y) mode."""
-        with patch("quadsv._rasterize.rasterize_table", return_value=self.mock_da):
+        with patch("sonic._rasterize.rasterize_table", return_value=self.mock_da):
             detector = DetectorGrid(kernel_method="gaussian", bandwidth=2.0, workers=4)
             detector.setup_data(
                 self.sdata,
@@ -248,7 +248,7 @@ class TestDetectorGrid(unittest.TestCase):
 
     def test_compute_qstat_no_pval(self):
         """compute_qstat returns only Q and Z_score when return_pval=False."""
-        with patch("quadsv._rasterize.rasterize_table", return_value=self.mock_da):
+        with patch("sonic._rasterize.rasterize_table", return_value=self.mock_da):
             detector = DetectorGrid(kernel_method="gaussian", bandwidth=1.0)
             self._setup(detector)
             df = detector.compute_qstat(features=None, n_jobs=1, return_pval=False, chunk_size=2)
@@ -268,7 +268,7 @@ class TestDetectorGrid(unittest.TestCase):
         table = MockTable(table_X, list(features))
         sdata = MockSpatialData("cells", table)
 
-        with patch("quadsv._rasterize.rasterize_table", return_value=mock_da):
+        with patch("sonic._rasterize.rasterize_table", return_value=mock_da):
             detector = DetectorGrid(kernel_method="gaussian", bandwidth=1.0, workers=1)
             detector.setup_data(
                 sdata, bins="bins", table_name="cells", col_key="col", row_key="row"
@@ -286,7 +286,7 @@ class TestDetectorGrid(unittest.TestCase):
 
     def test_parallel_qstat_single_job(self):
         """compute_qstat with n_jobs=1 produces consistent results."""
-        with patch("quadsv._rasterize.rasterize_table", return_value=self.mock_da):
+        with patch("sonic._rasterize.rasterize_table", return_value=self.mock_da):
             detector = DetectorGrid(kernel_method="gaussian", bandwidth=1.0)
             self._setup(detector)
             df = detector.compute_qstat(features=None, n_jobs=1, return_pval=True, chunk_size=2)
@@ -306,7 +306,7 @@ class TestDetectorGrid(unittest.TestCase):
         table = MockTable(table_X, list(features))
         sdata = MockSpatialData("cells", table)
 
-        with patch("quadsv._rasterize.rasterize_table", return_value=mock_da):
+        with patch("sonic._rasterize.rasterize_table", return_value=mock_da):
             detector = DetectorGrid(kernel_method="gaussian", bandwidth=1.0)
             detector.setup_data(
                 sdata, bins="bins", table_name="cells", col_key="col", row_key="row"
@@ -336,7 +336,7 @@ class TestDetectorGrid(unittest.TestCase):
 
     def test_parallel_qstat_workers_parameter(self):
         """DetectorGrid passes `workers` to FFTKernel via kernel_params_."""
-        with patch("quadsv._rasterize.rasterize_table", return_value=self.mock_da):
+        with patch("sonic._rasterize.rasterize_table", return_value=self.mock_da):
             detector = DetectorGrid(kernel_method="gaussian", bandwidth=1.0, workers=2)
             self._setup(detector)
             df = detector.compute_qstat(features=None, n_jobs=1, return_pval=True, chunk_size=2)
@@ -358,7 +358,7 @@ class TestDetectorGrid(unittest.TestCase):
         table = MockTable(table_X, list(features))
         sdata = MockSpatialData("cells", table)
 
-        with patch("quadsv._rasterize.rasterize_table", return_value=mock_da):
+        with patch("sonic._rasterize.rasterize_table", return_value=mock_da):
             detector = DetectorGrid(kernel_method="car", rho=0.8)
             detector.setup_data(
                 sdata, bins="bins", table_name="cells", col_key="col", row_key="row"
@@ -382,7 +382,7 @@ class TestDetectorGrid(unittest.TestCase):
 
     def test_parallel_qstat_n_jobs_auto(self):
         """compute_qstat with n_jobs=-1 uses all available cores."""
-        with patch("quadsv._rasterize.rasterize_table", return_value=self.mock_da):
+        with patch("sonic._rasterize.rasterize_table", return_value=self.mock_da):
             with patch("os.cpu_count", return_value=4):
                 detector = DetectorGrid(kernel_method="gaussian", bandwidth=1.0)
                 self._setup(detector)
@@ -426,9 +426,9 @@ class TestDetectorGridStatistic(unittest.TestCase):
         """``DetectorGrid.compute_qstat`` must equal a raw
         ``spatial_q_test(FFTKernel, z_scored_grid)`` — same FFTKernel, same
         per-feature grid z-score, so the gap is pure float-precision."""
-        from quadsv.statistics import spatial_q_test
+        from sonic.statistics import spatial_q_test
 
-        with patch("quadsv._rasterize.rasterize_table", return_value=self.mock_da):
+        with patch("sonic._rasterize.rasterize_table", return_value=self.mock_da):
             detector = DetectorGrid(kernel_method="gaussian", bandwidth=1.5)
             self._setup(detector)
             df = detector.compute_qstat(n_jobs=1, return_pval=False, show_progress=False)
@@ -444,7 +444,7 @@ class TestDetectorGridStatistic(unittest.TestCase):
 
     def test_missing_bins_match_observed_mean_imputation_for_q_and_r(self):
         """Structural NaNs become zero residuals; observed zeros remain data."""
-        from quadsv.statistics import spatial_q_test
+        from sonic.statistics import spatial_q_test
 
         raster = self.raster_data.copy()
         raster[0, 0, 0] = 0.0  # observed biological zero, not missing
@@ -455,7 +455,7 @@ class TestDetectorGridStatistic(unittest.TestCase):
         mean_filled = np.where(np.isnan(raster), means, raster)
         filled_da = MockDataArray(mean_filled, self.features)
 
-        with patch("quadsv._rasterize.rasterize_table", return_value=missing_da):
+        with patch("sonic._rasterize.rasterize_table", return_value=missing_da):
             detector = DetectorGrid(kernel_method="gaussian", bandwidth=1.5)
             self._setup(detector)
             df = detector.compute_qstat(n_jobs=1, return_pval=False, show_progress=False)

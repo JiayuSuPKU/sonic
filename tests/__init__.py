@@ -1,3 +1,3 @@
 """
-Unit tests for quadsv package.
+Unit tests for sonic package.
 """

@@ -2,7 +2,7 @@
 Non-uniform FFT (NUFFT) spectra, kernel and spatial tests for irregular data
 
 When data sit on a regular grid (e.g., a rasterized Visium slide),
-:func:`quadsv.power_spectrum_2d` computes :math:`|\\hat{x}(k)|^2` with a plain
+:func:`sonic.power_spectrum_2d` computes :math:`|\\hat{x}(k)|^2` with a plain
 2D FFT. For data whose spatial coordinates are **irregular** — e.g.,
 imaging-based in situ platforms, Slide-seq, or a Visium slide read straight
 from ``adata.obsm['spatial']`` without rasterization — :func:`power_spectrum_2d_nufft`
@@ -16,8 +16,8 @@ evaluates the type-1 NUFFT
 on the same uniform ``(ny, nx)`` k-space grid that :func:`power_spectrum_2d`
 would produce for a rasterized input of the same physical extent, and returns
 :math:`|\\hat c|^2` in the scipy FFT layout (DC at ``[0, 0]``). Anything
-downstream — :func:`quadsv.comparators.features.radial_bin_spectrum`,
-:class:`quadsv.ComparatorIrregular` — works identically.
+downstream — :func:`sonic.comparators.features.radial_bin_spectrum`,
+:class:`sonic.ComparatorIrregular` — works identically.
 
 Notation (shared across this module)
 ------------------------------------
@@ -55,8 +55,8 @@ import scipy.fft
 import scipy.sparse as sp
 from scipy.stats import chi2, norm
 
-from quadsv.kernels.base import Kernel
-from quadsv.kernels.fft import FFTKernel
+from sonic.kernels.base import Kernel
+from sonic.kernels.fft import FFTKernel
 
 __all__ = [
     "power_spectrum_2d_nufft",
@@ -213,7 +213,7 @@ def power_spectrum_2d_nufft(
     This function computes the power spectrum :math:`P(k) = |\\hat{c}(k)|^2` of
     one or more non-uniform spatial signals via a type-1 NUFFT.
     The output has the same ``(ny, nx)`` layout as
-    :func:`quadsv.kernels.fft.power_spectrum_2d` with ``fft_solver='fft2'``: DC at
+    :func:`sonic.kernels.fft.power_spectrum_2d` with ``fft_solver='fft2'``: DC at
     ``[0, 0]``, Nyquist at ``[ny/2, nx/2]`` (when dimensions are even).
 
     Parameters
@@ -331,10 +331,10 @@ class NUFFTKernel(Kernel):
     """
     Spatial kernel over **irregular** 2D coordinates evaluated via NUFFTs.
 
-    Parallels :class:`quadsv.kernels.fft.FFTKernel` (which requires a regular grid) and
-    implements the :class:`~quadsv.kernels.Kernel` interface so it plugs into
-    :func:`quadsv.statistics.spatial_q_test` /
-    :func:`quadsv.statistics.spatial_r_test` the same way.
+    Parallels :class:`sonic.kernels.fft.FFTKernel` (which requires a regular grid) and
+    implements the :class:`~sonic.kernels.Kernel` interface so it plugs into
+    :func:`sonic.statistics.spatial_q_test` /
+    :func:`sonic.statistics.spatial_r_test` the same way.
 
     The band-limited approximation of the ``n × n`` irregular-point operator is
     ``K ≈ (1/n') · U · diag(λ) · Uᴴ``, where ``U`` is the ``n × n'`` type-2
@@ -343,11 +343,11 @@ class NUFFTKernel(Kernel):
     ``xᵀ K x = (1/n') Σ_k λ(k) |x̂(k)|²`` with ``x̂ = Uᴴ x`` (a single type-1 NUFFT).
     The matrix-vector primitive :meth:`Kx` uses the companion two-shot NUFFT
     ``K z = (1/n') · U · (λ ⊙ Uᴴ z)`` and backs the Hutchinson-based
-    cumulant estimator (:func:`quadsv.statistics._hutchinson_cumulants`)
+    cumulant estimator (:func:`sonic.statistics._hutchinson_cumulants`)
     and the bipartite R-test cross matrix.
 
-    :func:`quadsv.spatial_q_test` always uses the k-space Parseval path
-    (:meth:`xtKx`); :func:`quadsv.spatial_r_test` dispatches on shape —
+    :func:`sonic.spatial_q_test` always uses the k-space Parseval path
+    (:meth:`xtKx`); :func:`sonic.spatial_r_test` dispatches on shape —
     paired diagonal for ``M_x == M_y`` via :meth:`xtKy`, full ``(M_x, M_y)``
     cross matrix via :meth:`Kx` otherwise. The matmul counterparts
     (:meth:`xtKx_matmul` / :meth:`xtKy_matmul`) are exposed for callers that
@@ -396,7 +396,7 @@ class NUFFTKernel(Kernel):
         of :class:`FFTKernel` due to an oversampled internal grid.
         ``neighbor_degree`` is chosen so the internal-grid-ring cutoff matches
         the median k-th nearest-neighbor distance among the coords — matching
-        :class:`~quadsv.kernels.MatrixKernel`'s mutual-k-NN graph
+        :class:`~sonic.kernels.MatrixKernel`'s mutual-k-NN graph
         semantic up to the band-limit of the internal grid. See
         :func:`_resolve_k_neighbors_on_coords` for the mapping detail.
         Pass ``neighbor_degree`` directly to bypass this and use the
@@ -1230,7 +1230,7 @@ class NUFFTKernel(Kernel):
 def _standardize_features(X: np.ndarray) -> np.ndarray:
     """Z-score each column (ddof=1), leaving constant columns as zeros.
 
-    Matches :func:`quadsv.statistics.spatial_q_test`'s convention. Used by the
+    Matches :func:`sonic.statistics.spatial_q_test`'s convention. Used by the
     NUFFT dispatch to standardize at the ``n`` irregular points before the
     type-1 NUFFT.
     """
@@ -1259,7 +1259,7 @@ def _q_test_nufft(  # noqa: C901
     NUFFT precision and is exposed for callers that prefer the direct
     round-trip; :func:`spatial_q_test` always uses the spectral path.
 
-    Null moments route through :func:`quadsv.statistics.compute_null_params`,
+    Null moments route through :func:`sonic.statistics.compute_null_params`,
     which on graph kernels defaults to the empirical moment estimator over
     ``HKH``-centered probes (see :meth:`NUFFTKernel.trace` /
     :meth:`NUFFTKernel.square_trace`).
@@ -1273,7 +1273,7 @@ def _q_test_nufft(  # noqa: C901
         ``(n,)`` or ``(n, M)``.
     kernel : NUFFTKernel
     null_params : dict, optional
-        Pre-built moments (see :func:`quadsv.compute_null_params`). Read
+        Pre-built moments (see :func:`sonic.compute_null_params`). Read
         keys depend on the null approximation selected via
         ``null_params['method']``: ``'mean_Q'`` / ``'var_Q'`` for CLT,
         ``'scale_g'`` / ``'df_h'`` (or ``'mean_Q'`` / ``'var_Q'`` as
@@ -1326,7 +1326,7 @@ def _q_test_nufft(  # noqa: C901
         # finite-n ratio correction; for NUFFT graph kernels the
         # ``'empirical'`` default on trace()/square_trace() ensures the
         # corrections capture the spreading-kernel smoothing too.
-        from quadsv.statistics import compute_null_params
+        from sonic.statistics import compute_null_params
 
         p = compute_null_params(kernel, method="clt")
         return float(p["mean_Q"]), float(p["var_Q"])
@@ -1358,7 +1358,7 @@ def _q_test_nufft(  # noqa: C901
             pvals = chi2.sf(Q_arr / g, df=h)
 
     elif null_approx == "liu":
-        from quadsv.statistics import (
+        from sonic.statistics import (
             _hutchinson_cumulants,
             _liu_apply,
             _liu_prepare,

@@ -73,7 +73,7 @@ docs/_static/
 docs/_templates/
 
 # setuptools-scm generated version file (see [tool.setuptools_scm] in pyproject.toml)
-src/quadsv/_version.py
+src/sonic/_version.py
 
 # claude code
 CLAUDE.md

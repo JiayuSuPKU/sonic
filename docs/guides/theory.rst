@@ -130,8 +130,8 @@ mixture
 
 where :math:`\lambda_i` are the eigenvalues of the double-centred
 kernel :math:`\tilde{\mathbf{K}} = \mathbf{H}\mathbf{K}\mathbf{H}`.
-``quadsv`` ships three moment-matching fits, selected through the
-``method`` argument of :func:`~quadsv.compute_null_params`:
+``sonic`` ships three moment-matching fits, selected through the
+``method`` argument of :func:`~sonic.compute_null_params`:
 
 - ``"clt"``: a normal fit to :math:`(c_1, c_2)`. Valid for any
   :math:`\mathbf{K}`, including indefinite kernels. This is the
@@ -143,7 +143,7 @@ kernel :math:`\tilde{\mathbf{K}} = \mathbf{H}\mathbf{K}\mathbf{H}`.
   :math:`(c_1, c_2, c_3, c_4)`. PSD kernels only. Tightest tail.
 
 Here :math:`c_p = \operatorname{tr}(\tilde{\mathbf{K}}^p)` is the
-:math:`p`-th spectral power sum. ``quadsv`` also applies a
+:math:`p`-th spectral power sum. ``sonic`` also applies a
 finite-:math:`n` Dirichlet(1/2) correction to
 :math:`\operatorname{Var}[Q_n]`. See :doc:`/guides/scaling` for the
 formula, the cumulant-evaluation paths (FFT / NUFFT analytic,
@@ -207,5 +207,5 @@ See also
 - :doc:`/guides/kernels` for kernel selection and design.
 - :doc:`/guides/scaling` for null-distribution and operator
   complexity.
-- :doc:`/autoapi/quadsv/statistics/index` for the statistical-test
+- :doc:`/autoapi/sonic/statistics/index` for the statistical-test
   API.

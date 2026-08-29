@@ -5,7 +5,7 @@ from __future__ import annotations
 import numpy as np
 import pytest
 
-from quadsv.comparators.features import (
+from sonic.comparators.features import (
     adapt_frequency_edges,
     align_spectra_by_rotation,
     apply_rotations_to_spectra,
@@ -20,7 +20,7 @@ from quadsv.comparators.features import (
     stream_polar_features,
     stream_radial_features,
 )
-from quadsv.kernels.fft import power_spectrum_2d
+from sonic.kernels.fft import power_spectrum_2d
 
 
 def _axis_angle_error(observed: float, expected: float) -> float:

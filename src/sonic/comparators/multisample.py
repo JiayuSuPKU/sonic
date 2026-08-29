@@ -1,7 +1,7 @@
 """Statistical comparison primitives for comparator outputs.
 
-Spectral feature construction lives in :mod:`quadsv.comparators.features`.
-Spectrum normalization lives in :mod:`quadsv.comparators.normalization`.
+Spectral feature construction lives in :mod:`sonic.comparators.features`.
+Spectrum normalization lives in :mod:`sonic.comparators.normalization`.
 This module consumes normalized or raw per-sample arrays and provides:
 
 - ``compare_two_groups`` and ``compare_two_groups_masked`` for binary labels.
@@ -9,7 +9,7 @@ This module consumes normalized or raw per-sample arrays and provides:
 - Scalar DC-expression companions ``compare_two_groups_scalar`` and
   ``compare_glm_scalar`` with analytic t-distribution tests.
 
-The public comparator classes in :mod:`quadsv.comparators` wrap these
+The public comparator classes in :mod:`sonic.comparators` wrap these
 array-level functions for AnnData and SpatialData inputs.
 """
 
@@ -27,8 +27,8 @@ import pandas as pd
 from scipy.stats import ks_2samp  # noqa: F401  (exposed for downstream calibration tests)
 from scipy.stats import t as _t_dist
 
-from quadsv.comparators.normalization import _normalize_shape_apply
-from quadsv.statistics import apply_bh_correction, cauchy_combine, liu_sf
+from sonic.comparators.normalization import _normalize_shape_apply
+from sonic.statistics import apply_bh_correction, cauchy_combine, liu_sf
 
 __all__ = [
     "compare_two_groups",
@@ -590,7 +590,7 @@ def _estimate_two_group_null_covariance(
     It computes the observed per-gene weighted log-L2 statistic, the pooled
     within-group covariance of residual log-spectra, and the contrast-scaled
     Liu eigenvalues used by both :func:`compare_two_groups` and
-    :meth:`quadsv.comparators.base._ComparatorBase.estimate_null_covariance`.
+    :meth:`sonic.comparators.base._ComparatorBase.estimate_null_covariance`.
     """
     if spectra.ndim != 3:
         raise ValueError(f"spectra must be 3D (n_samples, n_genes, n_bins), got {spectra.shape}.")
@@ -1026,7 +1026,7 @@ def compare_two_groups(  # noqa: C901
         mixture-χ² approximation for the L2 quadratic form:
         under H₀ the statistic ``T² = D'WD`` is distributed as a
         weighted sum of χ²₁ variables whose tail is integrated via Liu's
-        approximation (see :func:`quadsv.statistics.liu_sf`).
+        approximation (see :func:`sonic.statistics.liu_sf`).
         ``'permutation'`` uses the empirical sample-label permutation
         null and is the only option that respects the
         ``n_perm`` / ``random_state`` / ``max_exact_permutations`` arguments.
@@ -1064,7 +1064,7 @@ def compare_two_groups(  # noqa: C901
     normalize_shape : bool, default False
         If True, divide each per-(sample, gene) spectrum by its sum along
         the trailing (frequency) axis before the statistic is computed
-        (i.e., apply :func:`quadsv.comparators.normalization.normalize_shape`
+        (i.e., apply :func:`sonic.comparators.normalization.normalize_shape`
         to ``spectra`` first). Use to isolate shape-only /
         frequency-redistribution signals independent of overall amplitude.
         Works with every valid ``statistic=`` value.
@@ -1452,7 +1452,7 @@ def compare_glm_masked(  # noqa: C901
         Optional non-negative weights over frequency bins, same semantics as
         :func:`compare_glm`.
     normalize_shape : bool, default False
-        If True, apply :func:`quadsv.comparators.normalization.normalize_shape`
+        If True, apply :func:`sonic.comparators.normalization.normalize_shape`
         before fitting each gene model.
     min_resid_df : int, default 1
         Minimum per-gene residual degrees of freedom required for testing.
@@ -1499,7 +1499,7 @@ def compare_two_groups_scalar(
 
     The natural companion to :func:`compare_two_groups`: tested on the DC scalars
     (per-gene grid means) produced by
-    :func:`quadsv.comparators.features.compute_sample_spectrum`.
+    :func:`sonic.comparators.features.compute_sample_spectrum`.
 
     For each gene, the function reports ``Statistic = abs(t)`` where ``t`` is
     the Welch two-sample t statistic, and ``P_value`` is the analytic two-sided

@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+- **QuadSV is now SONIC** (Spatial Organization through Nonrandom-pattern
+  Inference and Comparison). The canonical distribution and import package are
+  `sonic`; the `quadsv` distribution and import namespace remain as a
+  compatibility bridge for existing users.
+
 ### Added
 - **GLM design API for cross-sample pattern comparison.** New public
   `compare_glm(spectra, design, contrast, …)` generalises the
@@ -44,11 +50,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   eigenvalues, effective rank, residual df, and masked-path eligibility
   metadata used by `test_diff_freq(..., statistic="log_l2", null="analytic")`.
 - **Top-level convenience exports**:
-  `quadsv.Detector(data, …)` and `quadsv.Comparator(data_list, …)`
+  `sonic.Detector(data, …)` and `sonic.Comparator(data_list, …)`
   factories that dispatch on `AnnData` vs `SpatialData`;
-  `quadsv.compute_null_params`, `quadsv.auto_chunk_size`,
-  `quadsv.liu_sf` promoted to top level (canonical
-  `quadsv.statistics` paths still work).
+  `sonic.compute_null_params`, `sonic.auto_chunk_size`,
+  `sonic.liu_sf` promoted to top level (canonical
+  `sonic.statistics` paths still work).
 - **Public-API freeze test** (`tests/test_public_api.py`) snapshots
   `__all__`, docstring presence, canonical-path identity, and
   asserts removed legacy paths raise `ModuleNotFoundError`.
@@ -75,16 +81,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   input boilerplate is different.
 
 ### Changed
-- **Breaking: package layout migrated to `src/quadsv/`** with the
+- **Breaking: package layout migrated to `src/sonic/`** with the
   four conceptual layers as physical subpackages —
-  `quadsv.kernels.{fft,nufft}`,
-  `quadsv.detectors.{base,irregular,grid}`,
-  `quadsv.comparators.{__init__,multisample}`. `import quadsv` and
-  `from quadsv import …` keep working; editable installs must be
+  `sonic.kernels.{fft,nufft}`,
+  `sonic.detectors.{base,irregular,grid}`,
+  `sonic.comparators.{__init__,multisample}`. `import sonic` and
+  `from sonic import …` keep working; editable installs must be
   reissued (`pip install -e ".[dev]"`). Lint / format commands now
   target `src/ tests/`.
 - **Breaking: unified `normalize_*` surface API in
-  `quadsv.comparators.multisample`** (no aliases):
+  `sonic.comparators.multisample`** (no aliases):
     * `normalize_by_background` → `normalize_background`
     * `residualize_against_covariates` → `normalize_covariates`
     * `shape_normalize` → `normalize_shape`
@@ -125,8 +131,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Breaking: default `null` switched from `"permutation"` to
   `"analytic"` across the spectral comparison surface** —
   `Comparator.test_diff_freq`,
-  `quadsv.comparators.multisample.compare_two_groups`, and
-  `quadsv.comparators.multisample.compare_two_groups_masked`. The
+  `sonic.comparators.multisample.compare_two_groups`, and
+  `sonic.comparators.multisample.compare_two_groups_masked`. The
   analytic Wald test (Liu mixture-χ² null) bypasses the small-n permutation
   BH-floor and is the only path that works on every dispatch target
   (binary permutation/analytic + GLM analytic), so it makes a single sensible
@@ -138,7 +144,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   package default `null="analytic"` is treated as a no-op for that
   statistic.
 - **Breaking: statistical-test naming cleanup** in
-  `quadsv.comparators.multisample` and the corresponding
+  `sonic.comparators.multisample` and the corresponding
   `Comparator.test_diff_*` methods:
     * **`compare_designs` → `compare_glm`.** The plural form was
       awkward (one design per call); `compare_glm` names the test
@@ -154,7 +160,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
       t-distribution null.
     * **`null="liu"` alias retired.** The `liu` token referred to
       the numerical algorithm used to integrate the analytic χ² mixture
-      tail (see `quadsv.statistics.liu_sf`), not a separate
+      tail (see `sonic.statistics.liu_sf`), not a separate
       statistical concept. Single canonical token: `analytic`.
 - **Breaking: Comparator attribute surface narrowed** (sklearn-style
   moderate-privacy convention). The public surface is now `samples`,
@@ -168,7 +174,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `_spectrum_fft_solver`, `_fft_chunk_size`, `_spacing_override`,
   `_bins`, `_table_name`, `_col_key`, `_row_key`, `_value_key`.
 - **Breaking: Comparator test methods renamed and aligned with the
-  standalone `compare_*` API** in `quadsv.comparators.multisample`:
+  standalone `compare_*` API** in `sonic.comparators.multisample`:
     * `.test_pattern()`    → `.test_diff_freq()` — gains a new
       `normalize_shape: bool = False` keyword, forwarded to its
       dispatch target (`compare_two_groups`,
@@ -189,7 +195,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   retired.** Use the equivalent
   `cmp.test_diff_freq(..., normalize_shape=True)` keyword path for the
   one-shot non-destructive test, or call
-  `quadsv.comparators.multisample.normalize_shape(cmp.spectra_)`
+  `sonic.comparators.multisample.normalize_shape(cmp.spectra_)`
   directly to obtain the standalone transform. The previous in-place
   method silently mutated `cmp.spectra_` and surprised subsequent
   `.test_diff_freq()`/`.test_diff_expr()` calls on the same comparator.
@@ -214,12 +220,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `log_l2 + null='analytic'` or `welch_t_cauchy`. `_AVAILABLE_STATISTICS`
   now reads `("log_l2", "welch_t_cauchy")`.
 - **Breaking: six legacy-path shim modules removed** —
-  `quadsv.fft`, `quadsv.nufft`, `quadsv.detector`,
-  `quadsv.detector_grid`, `quadsv._detector_base`,
-  `quadsv.multisample`. Use the canonical subpackage paths.
+  `sonic.fft`, `sonic.nufft`, `sonic.detector`,
+  `sonic.detector_grid`, `sonic._detector_base`,
+  `sonic.multisample`. Use the canonical subpackage paths.
 - **Breaking: backend ABCs `Kernel` and `MatrixKernelBase` no
-  longer re-exported from top-level `quadsv`**. They live at
-  `quadsv.kernels` and are intended for backend authors.
+  longer re-exported from top-level `sonic`**. They live at
+  `sonic.kernels` and are intended for backend authors.
 
 ### Fixed
 - CI workflow install step referenced non-existent extras
@@ -228,13 +234,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## Release Process
 
-- [ ] Run full test suite: `pytest tests/ --cov=quadsv`
-- [ ] Check documentation builds: `sphinx-build -b html docs/ docs/_build/`
-- [ ] Update version in `pyproject.toml`
-- [ ] Update this CHANGELOG
-- [ ] Create git tag: `git tag -a v0.1.0 -m "Release v0.1.0"`
-- [ ] Build package: `python -m build`
-- [ ] Upload to PyPI: `python -m twine upload dist/*`
+The next planned release is `1.0.0`. Until it is ready, keep its changes under
+`Unreleased`.
+
+- [ ] Complete and review the package documentation.
+- [ ] Run the full test suite: `pytest tests/ --cov=sonic`.
+- [ ] Run lint checks: `ruff check src tests`.
+- [ ] Build the documentation without warnings:
+  `sphinx-build -W -b html docs/ docs/_build/`.
+- [ ] Confirm the `sonic` and `quadsv` trusted publishers target the renamed
+  GitHub repository and the `release.yml` workflow.
+- [ ] Update the compatibility package requirement to `sonic>=1,<2` in
+  `compat/quadsv/pyproject.toml`.
+- [ ] Confirm the new Read the Docs project builds successfully and legacy
+  documentation links remain available or redirect.
+- [ ] Add a dated `1.0.0` section below `Unreleased`, leaving a new empty
+  `Unreleased` section for future changes.
+- [ ] Commit the release preparation and create an annotated tag:
+  `git tag -a v1.0.0 -m "SONIC 1.0.0"`.
+- [ ] Build both distributions: `python -m build` and
+  `python -m build compat/quadsv --outdir compat-dist`.
+- [ ] Verify their metadata:
+  `python -m twine check dist/* compat-dist/*`.
+- [ ] Push `v1.0.0`, then publish its GitHub Release to trigger trusted
+  publishing of SONIC followed by the QuadSV compatibility package.
+- [ ] Verify clean installations of `sonic==1.0.0` and `quadsv==1.0.0` from
+  PyPI.
 
 ## [0.1.0] - 2026-02-02
 

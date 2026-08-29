@@ -19,14 +19,14 @@ warnings.filterwarnings("ignore", category=UserWarning, message=".*pkg_resources
 
 import spatialdata as sd
 
-from quadsv._rasterize import _mean_fill_missing
-from quadsv.comparators.base import (
+from sonic._rasterize import _mean_fill_missing
+from sonic.comparators.base import (
     _ComparatorBase,
     _run_per_sample,
     _unpack_sample_quads,
     _validate_common,
 )
-from quadsv.comparators.features import (
+from sonic.comparators.features import (
     compute_sample_spectrum,
     estimate_rotations_from_landmarks,
     stream_geomean_landmark,
@@ -82,7 +82,7 @@ class ComparatorGrid(_ComparatorBase):
     shape + table into a dense ``(n_genes, ny, nx)`` image, which is then fed
     to the batched 2D FFT. All samples are expected to share the same
     rasterization schema (``bins`` / ``table_name`` / ``col_key`` / ``row_key``
-    / ``value_key``) — this mirrors :class:`~quadsv.DetectorGrid`.
+    / ``value_key``) — this mirrors :class:`~sonic.DetectorGrid`.
 
     Parameters
     ----------
@@ -118,7 +118,7 @@ class ComparatorGrid(_ComparatorBase):
         Peak memory is ``O(chunk · ny · nx · 8 B)`` and the full ``(n_genes, ny,
         nx)`` raster / 2D spectra are *never* held in either mode.
         ``'auto'`` sizes the chunk from the (lazily-known) lattice shapes via
-        :func:`quadsv.statistics.resolve_chunk_size` — the FFT cache sweet-spot
+        :func:`sonic.statistics.resolve_chunk_size` — the FFT cache sweet-spot
         cap (32) capped further by the live-memory budget.
         In 2d mode the rotation is learned from a streamed cross-gene geometric-mean
         landmark by default, or from an explicit ``landmark_genes`` set passed
@@ -243,7 +243,7 @@ class ComparatorGrid(_ComparatorBase):
         ``_qstat_worker_fft``). Returns the lazy ``(n_genes, ny, nx)``
         ``DataArray``.
         """
-        from quadsv._rasterize import rasterize_table
+        from sonic._rasterize import rasterize_table
 
         img = rasterize_table(
             sdata,
@@ -536,7 +536,7 @@ class ComparatorGrid(_ComparatorBase):
         spectrum + radial-binning pipeline as the gene panel via
         :meth:`_covariate_features_from_array`.
         """
-        from quadsv._rasterize import rasterize_table
+        from sonic._rasterize import rasterize_table
 
         keys = list(keys)
         out: list[np.ndarray] = []

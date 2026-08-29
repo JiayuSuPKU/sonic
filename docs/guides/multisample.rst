@@ -4,8 +4,8 @@ Cross-sample Comparison
 Suppose you have two groups of spatial-omics samples (for example a
 set of healthy controls and a set of cancer sections) and want to
 ask which genes show the biggest spatial-pattern difference between
-the groups. The :class:`~quadsv.ComparatorIrregular` and
-:class:`~quadsv.ComparatorGrid` classes give you a frequency-domain
+the groups. The :class:`~sonic.ComparatorIrregular` and
+:class:`~sonic.ComparatorGrid` classes give you a frequency-domain
 pipeline that does this without spatial registration. The default
 null is an analytic Wald test (``null="analytic"``);
 a label-permutation null is available on the binary path with
@@ -33,7 +33,7 @@ cancer slides have no shared anatomy.
 Five-step pipeline
 ------------------
 
-:class:`~quadsv.ComparatorIrregular` chains five stages:
+:class:`~sonic.ComparatorIrregular` chains five stages:
 
 1. Per-sample 2-D power spectra (``compute_spectra``).
 2. Reduction to a low-dimensional feature vector. The default is
@@ -58,13 +58,13 @@ Five-step pipeline
 
    The **DC scalar** is the per-sample grid mean, i.e. total
    normalised expression. It is tested across groups with
-   :meth:`~quadsv.ComparatorIrregular.test_diff_expr`, which runs
+   :meth:`~sonic.ComparatorIrregular.test_diff_expr`, which runs
    an analytic Welch-Satterthwaite t-test with BH-FDR. This is a
    spatially-agnostic differential-expression test.
 
    The **AC spectrum** is the pattern shape, with DC exactly zero.
    It is tested with
-   :meth:`~quadsv.ComparatorIrregular.test_diff_freq` using one of
+   :meth:`~sonic.ComparatorIrregular.test_diff_freq` using one of
    the two statistics listed below.
 
    The two tests carry complementary information. A gene may be
@@ -85,7 +85,7 @@ common dispatch, so they are directly comparable:
    * - ``log_l2`` (default)
      - Quadratic form ``T² = D'WD`` on log-spectra differences.
        Supports analytic ``null="analytic"`` (Liu mixture-χ² tail; the
-       default on :meth:`~quadsv.ComparatorIrregular.test_diff_freq`)
+       default on :meth:`~sonic.ComparatorIrregular.test_diff_freq`)
        and ``null="permutation"`` on the binary path. The analytic null
        bypasses the BH-FDR floor that the exact permutation test
        hits at small per-arm n, and is the only path that works on
@@ -95,8 +95,8 @@ common dispatch, so they are directly comparable:
        null is built in; remains well-calibrated at very small n.
        Binary path only.
 
-Both run through :func:`quadsv.comparators.multisample.compare_two_groups`
-(or :meth:`quadsv.ComparatorIrregular.test_diff_freq` for the class API);
+Both run through :func:`sonic.comparators.multisample.compare_two_groups`
+(or :meth:`sonic.ComparatorIrregular.test_diff_freq` for the class API);
 flip ``statistic="log_l2"`` ↔ ``statistic="welch_t_cauchy"`` to compare on
 the same fitted spectra.
 
@@ -105,12 +105,12 @@ Minimal pattern-comparison call
 
 If every sample is an :class:`anndata.AnnData` with shared
 ``var_names`` and coordinates in ``obsm["spatial"]``, the
-:func:`~quadsv.Comparator` factory is enough:
+:func:`~sonic.Comparator` factory is enough:
 
 .. code-block:: python
 
    import numpy as np
-   from quadsv import Comparator
+   from sonic import Comparator
 
    design = np.array([0, 0, 0, 1, 1, 1])  # one label per sample
    cmp = (
@@ -136,20 +136,20 @@ Picking a class
 
 Two backends, mirroring the detector layer:
 
-- :class:`~quadsv.ComparatorIrregular` takes a list of
+- :class:`~sonic.ComparatorIrregular` takes a list of
   :class:`anndata.AnnData` (irregular spots, common across Visium,
   Slide-seq, Stereo-seq, MERFISH). Spectra are computed with a
   batched type-1 NUFFT. Each sample keeps its own grid shape and
   spacing. Cross-sample comparability comes from radial binning in
   physical-frequency space.
-- :class:`~quadsv.ComparatorGrid` takes a list of
+- :class:`~sonic.ComparatorGrid` takes a list of
   :class:`spatialdata.SpatialData` (regular rasterised bins, e.g.
   Visium HD). Spectra are computed with a single batched 2-D FFT
   per sample.
 
 Sparse ``adata.X`` and layer matrices are not densified up front.
 The spectrum loop converts exactly one gene column at a time. The
-:func:`~quadsv.Comparator` factory dispatches between the two
+:func:`~sonic.Comparator` factory dispatches between the two
 classes based on the input list type. Mixed lists raise
 ``TypeError``.
 
@@ -164,7 +164,7 @@ carries a low-frequency stripe pattern in group 1 only.
 
    import anndata as ad
    import numpy as np
-   from quadsv import ComparatorIrregular
+   from sonic import ComparatorIrregular
 
    rng = np.random.default_rng(3)
    ny = nx = 32
@@ -201,14 +201,14 @@ The implanted gene ``g0`` ranks first in the resulting table.
 Walkthrough (SpatialData / FFT)
 -------------------------------
 
-For rasterised-grid samples, swap in :class:`~quadsv.ComparatorGrid`
+For rasterised-grid samples, swap in :class:`~sonic.ComparatorGrid`
 and pass the same bin / table / coord keys you would pass to
-:class:`~quadsv.DetectorGrid`:
+:class:`~sonic.DetectorGrid`:
 
 .. code-block:: python
 
    import spatialdata as sd
-   from quadsv import ComparatorGrid
+   from sonic import ComparatorGrid
 
    samples_sd = [sd.read_zarr(p) for p in paths_by_group]
    design = np.array([0] * len(paths_a) + [1] * len(paths_b))
@@ -248,8 +248,8 @@ Mixed coordinate units (NUFFT path)
 
    If ``grid_shape`` and ``spacing`` are left unset, each sample's
    k-grid is auto-inferred from its coords via
-   :func:`quadsv.kernels.nufft._infer_grid_from_coords`.
-   :func:`quadsv.kernels.nufft.power_spectrum_2d_nufft` is the
+   :func:`sonic.kernels.nufft._infer_grid_from_coords`.
+   :func:`sonic.kernels.nufft.power_spectrum_2d_nufft` is the
    lower-level primitive that runs one sample at a time.
 
 
@@ -257,13 +257,13 @@ Visium hex grids
 ----------------
 
 For 10x Visium slides,
-:func:`quadsv.utils.load_visium_sample` reads a Space Ranger output
+:func:`sonic.utils.load_visium_sample` reads a Space Ranger output
 directory into an :class:`anndata.AnnData`. You can feed that
 :class:`~anndata.AnnData` directly to
-:class:`~quadsv.ComparatorIrregular`. The NUFFT backend handles the
+:class:`~sonic.ComparatorIrregular`. The NUFFT backend handles the
 hex layout natively, no manual rasterisation needed. If you do want
 the explicit hex-to-grid rasterisation,
-:func:`quadsv.utils.visium_to_grid` returns a ``(n_genes, 78, 128)``
+:func:`sonic.utils.visium_to_grid` returns a ``(n_genes, 78, 128)``
 array and the physical spacing ``(dy, dx) = (100·√3/2, 50)`` μm per
 cell for v1 Visium. The smallest resolvable pattern is roughly
 ``2 · 86.6 μm ≈ 173 μm`` along the coarser axis (the Nyquist
@@ -273,7 +273,7 @@ limit).
 Choosing covariate maps for residualisation
 -------------------------------------------
 
-:meth:`~quadsv.ComparatorIrregular.normalize_covariates` takes one
+:meth:`~sonic.ComparatorIrregular.normalize_covariates` takes one
 of two shapes — a sequence of column-name strings shared across
 samples, or a sequence of per-sample image arrays:
 
@@ -313,12 +313,12 @@ See also
 
 - :doc:`/guides/quickstart` for the single-sample workflow.
 - :doc:`/guides/scaling` for how the FFT and NUFFT routines scale.
-- :class:`quadsv.ComparatorIrregular` and
-  :class:`quadsv.ComparatorGrid` for the class reference.
-- :func:`quadsv.comparators.multisample.compare_two_groups`,
-  :func:`quadsv.comparators.multisample.compare_two_groups_masked`,
-  and :func:`quadsv.comparators.multisample.compare_glm` for the
+- :class:`sonic.ComparatorIrregular` and
+  :class:`sonic.ComparatorGrid` for the class reference.
+- :func:`sonic.comparators.multisample.compare_two_groups`,
+  :func:`sonic.comparators.multisample.compare_two_groups_masked`,
+  and :func:`sonic.comparators.multisample.compare_glm` for the
   array-level primitives.
-- :func:`quadsv.kernels.fft.power_spectrum_2d` and
-  :func:`quadsv.kernels.nufft.power_spectrum_2d_nufft` for the
+- :func:`sonic.kernels.fft.power_spectrum_2d` and
+  :func:`sonic.kernels.nufft.power_spectrum_2d_nufft` for the
   spectrum primitives.

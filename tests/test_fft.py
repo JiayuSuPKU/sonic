@@ -7,12 +7,12 @@ import unittest
 
 import numpy as np
 
-from quadsv.kernels import MatrixKernel
-from quadsv.kernels.fft import FFTKernel
-from quadsv.statistics import spatial_q_test, spatial_r_test
-from quadsv.statistics import spatial_q_test as spatial_q_test_standard
-from quadsv.statistics import spatial_r_test as spatial_r_test_standard
-from quadsv.utils import compute_torus_distance_matrix
+from sonic.kernels import MatrixKernel
+from sonic.kernels.fft import FFTKernel
+from sonic.statistics import spatial_q_test, spatial_r_test
+from sonic.statistics import spatial_q_test as spatial_q_test_standard
+from sonic.statistics import spatial_r_test as spatial_r_test_standard
+from sonic.utils import compute_torus_distance_matrix
 
 
 class TestFFTKernelBasics(unittest.TestCase):
@@ -601,7 +601,7 @@ class TestFFTKernelNullParamsRoundTrip(unittest.TestCase):
 
     def test_qtest_fft_null_params_round_trip(self):
         """FFT Q-test with pre-computed eigenvalues should match the internal path."""
-        from quadsv.statistics import compute_null_params
+        from sonic.statistics import compute_null_params
 
         data = np.random.randn(self.ny, self.nx)
         Q_auto, p_auto = spatial_q_test(data, self.kernel)
@@ -618,7 +618,7 @@ class TestFFTKernelNullParamsRoundTrip(unittest.TestCase):
 
     def test_rtest_fft_null_params_round_trip(self):
         """FFT R-test with pre-computed var_R should match exactly."""
-        from quadsv.statistics import compute_null_params
+        from sonic.statistics import compute_null_params
 
         x = np.random.randn(self.ny, self.nx)
         y = np.random.randn(self.ny, self.nx)
@@ -789,7 +789,7 @@ class TestFFTWelchCltNull(unittest.TestCase):
     """
 
     def setUp(self):
-        from quadsv.statistics import compute_null_params
+        from sonic.statistics import compute_null_params
 
         self._compute_null_params = compute_null_params
         self.ny = self.nx = 32

@@ -10,10 +10,10 @@ from joblib import Parallel, delayed
 from scipy.stats import norm
 from tqdm import tqdm
 
-from quadsv.detectors.base import Detector
-from quadsv.kernels import Kernel, MatrixKernel
-from quadsv.kernels.nufft import NUFFTKernel, _standardize_features
-from quadsv.statistics import apply_bh_correction, compute_null_params, spatial_q_test
+from sonic.detectors.base import Detector
+from sonic.kernels import Kernel, MatrixKernel
+from sonic.kernels.nufft import NUFFTKernel, _standardize_features
+from sonic.statistics import apply_bh_correction, compute_null_params, spatial_q_test
 
 __all__ = ["DetectorIrregular"]
 
@@ -135,9 +135,9 @@ def _pvals_from_null(Q: np.ndarray, null_params: dict) -> np.ndarray:
 
     Used by the sparse fast path in :func:`_qstat_worker`, where the quadratic
     form has already been computed via
-    :meth:`~quadsv.kernels.MatrixKernel.xtKx_standardized` and only the p-value
+    :meth:`~sonic.kernels.MatrixKernel.xtKx_standardized` and only the p-value
     stage remains. Mirrors the dispatch logic in
-    :func:`quadsv.statistics.spatial_q_test`.
+    :func:`sonic.statistics.spatial_q_test`.
     """
     from scipy.stats import chi2 as _chi2
 
@@ -154,7 +154,7 @@ def _pvals_from_null(Q: np.ndarray, null_params: dict) -> np.ndarray:
         z = (Q - mu) / np.sqrt(var)
         return _chi2.sf(z**2, df=1)
     if method == "liu":
-        from quadsv.statistics import (
+        from sonic.statistics import (
             _liu_apply,
             _liu_prepare_from_cumulants,
         )
@@ -302,9 +302,9 @@ class DetectorIrregular(Detector):
     Univariate (Q-test) and bivariate (R-test) kernel-based spatial statistics.
     Supports two backends:
 
-    - ``backend='matrix'`` — :class:`~quadsv.MatrixKernel` (dense or implicit
+    - ``backend='matrix'`` — :class:`~sonic.MatrixKernel` (dense or implicit
       sparse-precision, auto-selected by ``n``). Good up to ~10⁴ spots.
-    - ``backend='nufft'`` — :class:`~quadsv.NUFFTKernel`, ``O(n log n)`` quadratic
+    - ``backend='nufft'`` — :class:`~sonic.NUFFTKernel`, ``O(n log n)`` quadratic
       forms on arbitrary point sets. Recommended for ≥ 10⁴ spots.
 
     The core test statistics are:
@@ -342,7 +342,7 @@ class DetectorIrregular(Detector):
         Input container set by :meth:`setup_data`.
     min_cells : int or None
         Minimum non-zero count per feature; set by :meth:`setup_data`.
-    kernel\_ : :class:`~quadsv.kernels.Kernel` or None
+    kernel\_ : :class:`~sonic.kernels.Kernel` or None
         The built kernel; populated by :meth:`setup_data`.
     kernel_method\_, kernel_params\_, n
         See :class:`Detector`.
@@ -350,7 +350,7 @@ class DetectorIrregular(Detector):
     Examples
     --------
     >>> import anndata as ad, numpy as np
-    >>> from quadsv import DetectorIrregular
+    >>> from sonic import DetectorIrregular
     >>> rng = np.random.default_rng(0)
     >>> adata = ad.AnnData(X=rng.standard_normal((200, 5)))
     >>> adata.obsm["spatial"] = rng.standard_normal((200, 2))
@@ -510,12 +510,12 @@ class DetectorIrregular(Detector):
         n_jobs: int = 1,
         budget_bytes: int = 2 * (1 << 30),
     ) -> int:
-        """Thin wrapper around :func:`quadsv.statistics.auto_chunk_size`.
+        """Thin wrapper around :func:`sonic.statistics.auto_chunk_size`.
 
         Delegates to the shared helper so the chunk-size policy stays
         in one place across :class:`DetectorIrregular`,
-        :class:`DetectorGrid`, and :func:`~quadsv.spatial_q_test` /
-        :func:`~quadsv.spatial_r_test`. See the helper's docstring for
+        :class:`DetectorGrid`, and :func:`~sonic.spatial_q_test` /
+        :func:`~sonic.spatial_r_test`. See the helper's docstring for
         the cache sweet-spot caps and per-feature memory model.
 
         Parameters
@@ -530,10 +530,10 @@ class DetectorIrregular(Detector):
         Returns
         -------
         int
-            Batch size to use inside :func:`~quadsv.spatial_q_test` /
-            :func:`~quadsv.spatial_r_test`.
+            Batch size to use inside :func:`~sonic.spatial_q_test` /
+            :func:`~sonic.spatial_r_test`.
         """
-        from quadsv.statistics import auto_chunk_size
+        from sonic.statistics import auto_chunk_size
 
         if self.kernel_ is None:
             # Kernel not built yet — fall back to a conservative MatrixKernel
@@ -897,7 +897,7 @@ class DetectorIrregular(Detector):
         ``self.kernel_method_`` (``'clt'`` for Moran's I, ``'welch'`` for all other
         kernels) and cannot be overridden through this method. For full control
         over the null method (including ``'liu'``), call
-        :func:`quadsv.statistics.spatial_q_test` directly.
+        :func:`sonic.statistics.spatial_q_test` directly.
 
         Examples
         --------
@@ -1048,14 +1048,14 @@ class DetectorIrregular(Detector):
         Under H₀: features are spatially independent.
         Under H₁: significant spatial co-clustering or co-dispersion.
 
-        Unlike :func:`quadsv.statistics.spatial_r_test`, this method always returns R-statistics
+        Unlike :func:`sonic.statistics.spatial_r_test`, this method always returns R-statistics
         for all requested feature pairs in the symmetric mode (``features_y=None``). For
         ``features_x=[A, B, C]``, the output contains
         ``(A, A), (A, B), (A, C), (B, A), (B, B), (B, C), (C, A), (C, B), (C, C)``.
 
         P-value calculation uses a normal approximation based on Tr(K²) and is not
         configurable through this method. For finer control over the null model,
-        call :func:`quadsv.statistics.spatial_r_test` directly.
+        call :func:`sonic.statistics.spatial_r_test` directly.
 
         Zero-variance features are handled gracefully (assigned R=0, P=1).
 
@@ -1247,7 +1247,7 @@ class DetectorIrregular(Detector):
     ) -> pd.DataFrame:
         """NUFFT dispatch for :meth:`compute_qstat`. Builds null params once
         (n-point-scaled) and delegates per-feature work to
-        :func:`quadsv.spatial_q_test` on Path A (spectral).
+        :func:`sonic.spatial_q_test` on Path A (spectral).
 
         The NUFFT Q-test targets the n-point operator ``K``; moments come from
         :meth:`NUFFTKernel.trace` / :meth:`~NUFFTKernel.square_trace` /

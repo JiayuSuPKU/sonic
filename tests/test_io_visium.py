@@ -1,4 +1,4 @@
-"""Unit tests for quadsv.utils Visium loader + hex rasterizer."""
+"""Unit tests for sonic.utils Visium loader + hex rasterizer."""
 
 from __future__ import annotations
 
@@ -12,7 +12,7 @@ import pandas as pd
 import pytest
 import scipy.sparse as sp
 
-from quadsv.utils import (
+from sonic.utils import (
     VISIUM_V1_SPOT_SPACING_UM,
     load_visium_sample,
     visium_hex_spacing_um,

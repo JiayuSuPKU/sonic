@@ -9,7 +9,7 @@ import scipy.sparse as sp
 from scipy.special import gamma, kv
 from scipy.stats import chi2, norm
 
-from quadsv.kernels.base import Kernel
+from sonic.kernels.base import Kernel
 
 __all__ = ["FFTKernel", "power_spectrum_2d"]
 
@@ -24,7 +24,7 @@ def power_spectrum_2d(
 
     The result is *translation-invariant*: shifting the input image leaves the power
     spectrum unchanged. This makes the spectrum a natural alignment-free representation
-    of a spatial pattern. Use :func:`quadsv.comparators.features.radial_bin_spectrum`
+    of a spatial pattern. Use :func:`sonic.comparators.features.radial_bin_spectrum`
     to further reduce the 2D spectrum to a 1D radial-binned vector that is also
     rotation-invariant.
 
@@ -165,7 +165,7 @@ class FFTKernel(Kernel):
         self.n_grid: int = self.ny * self.nx
         """Total number of grid points (``ny * nx``)."""
         self.n: int = self.n_grid
-        """Alias for ``n_grid`` to satisfy the :class:`~quadsv.kernels.Kernel` interface."""
+        """Alias for ``n_grid`` to satisfy the :class:`~sonic.kernels.Kernel` interface."""
 
         # FFT solver selection
         if fft_solver not in ("fft2", "rfft2"):
@@ -740,11 +740,11 @@ def _q_test_fft(  # noqa: C901
         Pre-constructed FFT kernel object for grid data.
     null_params : dict, optional
         Pre-computed null distribution parameters from
-        :func:`quadsv.statistics.compute_null_params`. When supplied, the
+        :func:`sonic.statistics.compute_null_params`. When supplied, the
         cached ``eigenvalues`` / ``mean_Q`` / ``var_Q`` entries are reused
         in the p-value stage to avoid recomputing the spectrum on every
         call — useful when running the same kernel against many features
-        (e.g., in :class:`quadsv.DetectorGrid`). If None, the
+        (e.g., in :class:`sonic.DetectorGrid`). If None, the
         spectrum and moments are computed on the fly.
     return_pval : bool, default True
         If True, returns (Q, pval) tuple; if False, returns Q only.
@@ -821,7 +821,7 @@ def _q_test_fft(  # noqa: C901
 
     # 3. P-value approximation. Dispatch on the user-selected null method
     # (``null_params['method']``) mirroring the MatrixKernel path in
-    # :func:`quadsv.statistics.spatial_q_test`: any of 'clt' / 'welch' / 'liu'.
+    # :func:`sonic.statistics.spatial_q_test`: any of 'clt' / 'welch' / 'liu'.
     # Default: CLT for Moran (indefinite K → Welch/Liu degenerate),
     # Liu for everything else. When `null_params` is supplied the caller's
     # cached moments are reused so we don't retraverse the spectrum per feature.
@@ -843,7 +843,7 @@ def _q_test_fft(  # noqa: C901
         # Fall back to compute_null_params so we get H-centered moments
         # with the finite-n ratio correction — raw trace(K), 2·trace(K²)
         # would inflate the null variance (see compute_null_params docstring).
-        from quadsv.statistics import compute_null_params
+        from sonic.statistics import compute_null_params
 
         p = compute_null_params(kernel, method="clt")
         return float(p["mean_Q"]), float(p["var_Q"])
@@ -873,7 +873,7 @@ def _q_test_fft(  # noqa: C901
             pvals = chi2.sf(Q_arr / g, df=h)
 
     elif null_approx == "liu":
-        from quadsv.statistics import _liu_apply, _liu_prepare, _liu_prepare_from_cumulants
+        from sonic.statistics import _liu_apply, _liu_prepare, _liu_prepare_from_cumulants
 
         # Dirichlet(1/2) variance correction: pass ``n`` so ``sigma_Q``
         # uses ``2·(m·c_2 − c_1²)/(m+2)`` rather than the large-n limit
@@ -967,7 +967,7 @@ def _r_test_fft(
         Pre-constructed FFT kernel object for grid data.
     null_params : dict, optional
         Pre-computed null parameters from
-        :func:`quadsv.statistics.compute_null_params`. Only the
+        :func:`sonic.statistics.compute_null_params`. Only the
         ``var_R = trace(K²)`` entry is consumed here; when None, it is
         computed on the fly from ``kernel.square_trace()``.
     return_pval : bool, default True

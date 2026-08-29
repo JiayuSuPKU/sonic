@@ -2,6 +2,7 @@
 include README.md
 include LICENSE
 include pyproject.toml
+recursive-include src/sonic *.py
 recursive-include src/quadsv *.py
 recursive-exclude tests *
 recursive-exclude data *

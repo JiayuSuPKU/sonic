@@ -19,8 +19,8 @@ except ImportError:
 
 HAS_SPATIALDATA = importlib.util.find_spec("spatialdata") is not None
 
-from quadsv.kernels import MatrixKernel
-from quadsv.statistics import compute_null_params, spatial_q_test, spatial_r_test
+from sonic.kernels import MatrixKernel
+from sonic.statistics import compute_null_params, spatial_q_test, spatial_r_test
 
 
 class TestTutorialBasicQTest(unittest.TestCase):
@@ -171,7 +171,7 @@ class TestTutorialAnnDataWorkflow(unittest.TestCase):
         2. Build kernel from obsm['spatial']
         3. Verify kernel properties
         """
-        from quadsv.detectors.irregular import DetectorIrregular
+        from sonic.detectors.irregular import DetectorIrregular
 
         # Initialize detector with kernel config, then attach data
         detector = DetectorIrregular(kernel_method="car", k_neighbors=10, rho=0.9)
@@ -187,7 +187,7 @@ class TestTutorialAnnDataWorkflow(unittest.TestCase):
 
     def test_anndata_qstat_computation(self):
         """Test: Compute Q-statistics for subset of genes."""
-        from quadsv.detectors.irregular import DetectorIrregular
+        from sonic.detectors.irregular import DetectorIrregular
 
         detector = DetectorIrregular(kernel_method="car", k_neighbors=10, rho=0.9)
         detector.setup_data(self.adata, min_cells_frac=0.05)
@@ -209,7 +209,7 @@ class TestTutorialAnnDataWorkflow(unittest.TestCase):
 
     def test_anndata_rstat_computation(self):
         """Test: Compute pairwise R-statistics."""
-        from quadsv.detectors.irregular import DetectorIrregular
+        from sonic.detectors.irregular import DetectorIrregular
 
         detector = DetectorIrregular(kernel_method="car", k_neighbors=10, rho=0.9)
         detector.setup_data(self.adata, min_cells_frac=0.05)
@@ -242,7 +242,7 @@ class TestTutorialFFTKernel(unittest.TestCase):
 
     def test_fft_kernel_basic(self):
         """Test: Basic FFT kernel construction and Q-test."""
-        from quadsv.kernels.fft import FFTKernel
+        from sonic.kernels.fft import FFTKernel
 
         # Create FFT kernel
         kernel_fft = FFTKernel(shape=self.grid_shape, method="car", rho=0.9, topology="square")
@@ -263,7 +263,7 @@ class TestTutorialFFTKernel(unittest.TestCase):
 
         For a small regular grid, compare FFT and spatial kernels.
         """
-        from quadsv.kernels.fft import FFTKernel
+        from sonic.kernels.fft import FFTKernel
 
         # Create spatial kernel from grid coordinates
         x = np.linspace(0, 1, 50)

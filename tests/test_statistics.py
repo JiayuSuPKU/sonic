@@ -7,8 +7,8 @@ import unittest
 import numpy as np
 from scipy.sparse import csc_matrix, csr_matrix
 
-from quadsv.kernels import MatrixKernel
-from quadsv.statistics import (
+from sonic.kernels import MatrixKernel
+from sonic.statistics import (
     apply_bh_correction,
     auto_chunk_size,
     cauchy_combine,
@@ -24,7 +24,7 @@ class TestMultipleTestingHelpers(unittest.TestCase):
     """Public p-value combination and adjustment helpers."""
 
     def test_helpers_are_exported_from_statistics(self):
-        import quadsv.statistics as statistics
+        import sonic.statistics as statistics
 
         assert "apply_bh_correction" in statistics.__all__
         assert "cauchy_combine" in statistics.__all__
@@ -357,7 +357,7 @@ class TestKernelPrimitivesAndNullParams(unittest.TestCase):
         """Public Q/R dispatchers accept the canonical kwargs."""
         import inspect
 
-        from quadsv import spatial_q_test, spatial_r_test
+        from sonic import spatial_q_test, spatial_r_test
 
         canonical_q = {"null_params", "return_pval", "is_standardized"}
         canonical_r = {"null_params", "return_pval", "is_standardized"}

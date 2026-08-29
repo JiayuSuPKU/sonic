@@ -8,7 +8,7 @@ import numpy as np
 import pytest
 import scipy.sparse as sp
 
-from quadsv.kernels import MatrixKernel
+from sonic.kernels import MatrixKernel
 
 
 class TestMatrixKernel(unittest.TestCase):

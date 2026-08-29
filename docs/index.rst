@@ -20,7 +20,7 @@ Welcome
    :hidden:
    :caption: API Reference
 
-   autoapi/quadsv/index
+   autoapi/sonic/index
 
 .. toctree::
    :maxdepth: 1
@@ -29,7 +29,8 @@ Welcome
 
    changelog
 
-`quadsv <https://github.com/JiayuSuPKU/quadsv>`_ is a Python library
+**SONIC** (Spatial Organization through Nonrandom-pattern Inference and
+Comparison) is a Python library
 for **detecting** and **comparing** spatial patterns in omics data. 
 With it you can score how much each gene's expression depends on space, find gene
 pairs that share a spatial pattern, and compare patterns across multiple samples 
@@ -66,7 +67,7 @@ Quick example
 .. code-block:: python
 
    import numpy as np
-   from quadsv import NUFFTKernel, spatial_q_test
+   from sonic import NUFFTKernel, spatial_q_test
 
    # Spatial coordinates and one gene's expression vector
    rng = np.random.default_rng(0)
@@ -115,4 +116,4 @@ Reporting issues
 ----------------
 
 Please open a ticket on the
-`GitHub Issues page <https://github.com/JiayuSuPKU/quadsv/issues>`_.
+`GitHub Issues page <https://github.com/JiayuSuPKU/sonic/issues>`_.

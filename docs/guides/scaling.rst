@@ -10,7 +10,7 @@ Modern spatial-omics datasets (with :math:`n` from :math:`10^3` to
 :math:`10^7` spots and :math:`m` from :math:`10^3` to :math:`10^4`
 features) make that intractable.
 
-``quadsv`` replaces the dense baseline with scalable operators that
+``sonic`` replaces the dense baseline with scalable operators that
 never materialise :math:`\tilde{\mathbf{K}}` and never run a full
 eigendecomposition. This page summarises the three orthogonal axes
 of the design: null-distribution approximations, structured or
@@ -39,7 +39,7 @@ An exact *p*-value can be obtained by Davies' inversion of
 but only after paying :math:`\mathcal{O}(n^3)` for the full spectrum
 plus :math:`\mathcal{O}(Kn)` per feature, where :math:`K` is the
 number of quadrature nodes. To avoid the eigendecomposition
-entirely, ``quadsv`` ships two moment-matching fits that evaluate in
+entirely, ``sonic`` ships two moment-matching fits that evaluate in
 :math:`\mathcal{O}(1)` per feature once the cumulants are cached:
 
 - **Welch-Satterthwaite** and **CLT** match :math:`c_1, c_2` to a
@@ -295,14 +295,14 @@ Default recommendation
 ----------------------
 
 - **Continuous kernels on arbitrary coordinates (Gaussian,
-  Matérn).** Use :class:`~quadsv.NUFFTKernel` with Liu.
+  Matérn).** Use :class:`~sonic.NUFFTKernel` with Liu.
   :math:`\mathcal{O}(n)` memory,
   :math:`\mathcal{O}(n \log n)` time per feature, no power loss.
 - **Regular rasterised grids (Visium HD, imaging).** Use
-  :class:`~quadsv.FFTKernel` with Liu. Same asymptotic complexity
+  :class:`~sonic.FFTKernel` with Liu. Same asymptotic complexity
   as NUFFT, smaller constant.
 - **General graph kernels (phylogenetic trees, single-cell k-NN
-  graphs).** Use :class:`~quadsv.MatrixKernel` with
+  graphs).** Use :class:`~sonic.MatrixKernel` with
   ``method="car"`` (sparse precision).
   :math:`\mathcal{O}(n \log n)` per feature after a
   :math:`\mathcal{O}(n^{3/2})` one-time factorisation.

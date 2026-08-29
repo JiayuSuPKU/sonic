@@ -1,4 +1,4 @@
-"""Unit tests for :mod:`quadsv._rasterize`.
+"""Unit tests for :mod:`sonic._rasterize`.
 
 The two helpers in ``_rasterize.py`` do thin, testable work:
 
@@ -24,7 +24,7 @@ import pytest
 import scipy.sparse as sp
 import xarray as xr
 
-from quadsv._rasterize import _mean_fill_missing, ensure_csc_table, rasterize_table
+from sonic._rasterize import _mean_fill_missing, ensure_csc_table, rasterize_table
 
 
 class _FakeTable:
@@ -112,7 +112,7 @@ class TestRasterizeTable:
         sdata = _FakeSData({"tbl": table})
         sentinel = xr.DataArray(np.zeros((4, 3, 3)), dims=("c", "y", "x"))
 
-        with patch("quadsv._rasterize.sd.rasterize_bins", return_value=sentinel) as mock_rb:
+        with patch("sonic._rasterize.sd.rasterize_bins", return_value=sentinel) as mock_rb:
             out = rasterize_table(
                 sdata,
                 bins="bins",
@@ -158,7 +158,7 @@ class TestRasterizeTable:
             attrs={"transformations": {"global": "sentinel"}},
         )
 
-        with patch("quadsv._rasterize.sd.rasterize_bins", return_value=sentinel):
+        with patch("sonic._rasterize.sd.rasterize_bins", return_value=sentinel):
             out = rasterize_table(
                 sdata,
                 bins="bins",
@@ -178,7 +178,7 @@ class TestRasterizeTable:
         sdata = _FakeSData({"tbl": table})
         sentinel = types.SimpleNamespace(data=np.zeros((2, 2), dtype=int))
 
-        with patch("quadsv._rasterize.sd.rasterize_bins", return_value=sentinel):
+        with patch("sonic._rasterize.sd.rasterize_bins", return_value=sentinel):
             out = rasterize_table(
                 sdata,
                 bins="bins",

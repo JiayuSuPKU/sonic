@@ -17,10 +17,10 @@ from joblib import Parallel, delayed
 from scipy.stats import norm
 from tqdm import tqdm
 
-from quadsv._rasterize import _mean_fill_missing
-from quadsv.detectors.base import Detector
-from quadsv.kernels.fft import FFTKernel
-from quadsv.statistics import apply_bh_correction, spatial_q_test
+from sonic._rasterize import _mean_fill_missing
+from sonic.detectors.base import Detector
+from sonic.kernels.fft import FFTKernel
+from sonic.statistics import apply_bh_correction, spatial_q_test
 
 __all__ = ["DetectorGrid"]
 
@@ -105,7 +105,7 @@ class DetectorGrid(Detector):
     1. **Construct** with kernel method + kernel hyperparameters / grid controls.
     2. **Setup** with :meth:`setup_data` passing the :class:`spatialdata.SpatialData`
        plus the bin / table / col / row keys. Setup rasterizes the table and
-       builds the :class:`~quadsv.FFTKernel` at the resulting grid shape.
+       builds the :class:`~sonic.FFTKernel` at the resulting grid shape.
     3. **Compute** with :meth:`compute_qstat` / :meth:`compute_rstat`.
 
     Parameters
@@ -115,7 +115,7 @@ class DetectorGrid(Detector):
         ``'car'``.
     **kernel_params
         Kernel hyperparameters plus grid controls (``spacing``, ``topology``,
-        ``fft_solver``, ``workers``). See :class:`~quadsv.FFTKernel`.
+        ``fft_solver``, ``workers``). See :class:`~sonic.FFTKernel`.
 
     Attributes
     ----------
@@ -123,7 +123,7 @@ class DetectorGrid(Detector):
         Input container set by :meth:`setup_data`.
     min_count : int or None
         Feature count threshold; set by :meth:`setup_data`.
-    kernel\_ : :class:`~quadsv.FFTKernel` or None
+    kernel\_ : :class:`~sonic.FFTKernel` or None
         Built in :meth:`setup_data` once the grid shape is known.
     kernel_method\_, kernel_params\_, n
         See :class:`Detector`.
@@ -279,7 +279,7 @@ class DetectorGrid(Detector):
         This method ensures the underlying matrix is in CSC sparse format for efficient
         column-wise operations required by rasterize_bins.
         """
-        from quadsv._rasterize import rasterize_table
+        from sonic._rasterize import rasterize_table
 
         img_key = f"rasterized_{table_name}"
         logger.info("Rasterizing %s into %s...", table_name, img_key)
@@ -323,14 +323,14 @@ class DetectorGrid(Detector):
     # Auto-tuning helpers
     # ------------------------------------------------------------------
     def _auto_chunk_size(self, budget_bytes: int = 2 * (1 << 30)) -> int:
-        """Thin wrapper around :func:`quadsv.statistics.auto_chunk_size`.
+        """Thin wrapper around :func:`sonic.statistics.auto_chunk_size`.
 
         Delegates to the shared helper so the FFT chunk-size policy
         (cache sweet spot of 32, per-feature ``~24·n`` bytes) is kept
-        in one place — see :func:`~quadsv.statistics.auto_chunk_size`
+        in one place — see :func:`~sonic.statistics.auto_chunk_size`
         for the full model.
         """
-        from quadsv.statistics import auto_chunk_size
+        from sonic.statistics import auto_chunk_size
 
         return auto_chunk_size(self.kernel_, budget_bytes=budget_bytes)
 

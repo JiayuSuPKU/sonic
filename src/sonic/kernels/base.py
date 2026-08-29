@@ -9,11 +9,11 @@ This module hosts the two ABCs:
   expressed through a single ``self._K`` buffer.
 - :class:`MatrixKernelBase`: matrix-form kernels with dense / sparse
   / sparse-precision auto-switching. Subclass this for a new matrix
-  backend; :class:`~quadsv.MatrixKernel` is the standard concrete
+  backend; :class:`~sonic.MatrixKernel` is the standard concrete
   subclass.
 
-Concrete classes live in sibling modules: :mod:`quadsv.kernels.matrix`,
-:mod:`quadsv.kernels.fft`, and :mod:`quadsv.kernels.nufft`.
+Concrete classes live in sibling modules: :mod:`sonic.kernels.matrix`,
+:mod:`sonic.kernels.fft`, and :mod:`sonic.kernels.nufft`.
 """
 
 from __future__ import annotations
@@ -34,13 +34,13 @@ __all__ = ["Kernel", "MatrixKernelBase"]
 
 class Kernel(ABC):
     """
-    Abstract base class shared by all spatial kernels in :mod:`quadsv`.
+    Abstract base class shared by all spatial kernels in :mod:`sonic`.
 
     Concrete backends:
 
     - :class:`MatrixKernel` — explicit n×n kernel or its sparse precision matrix.
-    - :class:`quadsv.kernels.fft.FFTKernel` — grid kernel via its eigenvalue spectrum.
-    - :class:`quadsv.kernels.nufft.NUFFTKernel` — irregular-point kernel evaluated through a
+    - :class:`sonic.kernels.fft.FFTKernel` — grid kernel via its eigenvalue spectrum.
+    - :class:`sonic.kernels.nufft.NUFFTKernel` — irregular-point kernel evaluated through a
       type-1 / type-2 NUFFT round-trip.
 
     Required interface
@@ -55,7 +55,7 @@ class Kernel(ABC):
     .. note::
 
         The empirical data centering (z-scoring) inside
-        :func:`quadsv.spatial_q_test` / :func:`~quadsv.spatial_r_test`
+        :func:`sonic.spatial_q_test` / :func:`~sonic.spatial_r_test`
         breaks independence across spatial obervations. As a result,
         the null distribution of the test statistic ``Q = Zᵀ K Z = Xᵀ (H K H) X / σ²``
         with ``H = I - 𝟏𝟏ᵀ/n`` should inspect the spectrum of a centered kernel ``HKH``.
@@ -497,7 +497,7 @@ class MatrixKernelBase(Kernel):
         Examples
         --------
         >>> import numpy as np
-        >>> from quadsv import MatrixKernel
+        >>> from sonic import MatrixKernel
         >>> rng = np.random.default_rng(0)
         >>> coords = rng.standard_normal((40, 2))
         >>> kernel = MatrixKernel.from_coordinates(coords, method="matern")
@@ -540,7 +540,7 @@ class MatrixKernelBase(Kernel):
         Bilinear form ``x^T K y`` (paired diagonal for batched inputs).
 
         For ``(n, M)`` batches returns ``(M,)`` — the diagonal of ``X^T K Y``
-        in the same column order, matching :func:`quadsv.spatial_r_test`.
+        in the same column order, matching :func:`sonic.spatial_r_test`.
         Sparse ``x`` is preserved; only ``K @ y`` is densified.
 
         Parameters
@@ -556,7 +556,7 @@ class MatrixKernelBase(Kernel):
         Examples
         --------
         >>> import numpy as np
-        >>> from quadsv import MatrixKernel
+        >>> from sonic import MatrixKernel
         >>> rng = np.random.default_rng(0)
         >>> coords = rng.standard_normal((40, 2))
         >>> kernel = MatrixKernel.from_coordinates(coords, method="matern")
@@ -648,7 +648,7 @@ class MatrixKernelBase(Kernel):
             ``(n,)`` or ``(n, M)``. Columns correspond to features.
         means, stds : np.ndarray
             ``(M,)`` per-feature mean and std (``ddof=1`` to match
-            :func:`quadsv.statistics.spatial_q_test`).
+            :func:`sonic.statistics.spatial_q_test`).
 
         Returns
         -------

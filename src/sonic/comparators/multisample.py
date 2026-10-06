@@ -20,7 +20,7 @@ import logging
 import math
 import warnings
 from collections.abc import Sequence
-from typing import Any, Literal, NotRequired, TypedDict
+from typing import Any, Literal, TypedDict
 
 import numpy as np
 import pandas as pd
@@ -45,7 +45,18 @@ _AVAILABLE_STATISTICS = ("log_l2", "welch_t_cauchy")
 _NULL_OPTIONS = ("permutation", "analytic")
 
 
-class _AnalyticNullState(TypedDict):
+class _AnalyticNullMetadata(TypedDict, total=False):
+    """Optional metadata, using the TypedDict syntax supported by Python 3.10."""
+
+    n_obs_A: int | np.ndarray
+    n_obs_B: int | np.ndarray
+    design_columns: list[str]
+    contrast_vector: np.ndarray
+    beta: np.ndarray
+    n_obs: int | np.ndarray
+
+
+class _AnalyticNullState(_AnalyticNullMetadata):
     """Internal contract shared by analytic DF tests and covariance diagnostics.
 
     The common fields below are returned by every analytic null estimator and
@@ -118,16 +129,6 @@ class _AnalyticNullState(TypedDict):
     contrast_scale: float | np.ndarray
     df_resid: int | np.ndarray
     eligible: np.ndarray
-
-    # Two-group-only metadata.
-    n_obs_A: NotRequired[int | np.ndarray]
-    n_obs_B: NotRequired[int | np.ndarray]
-
-    # GLM-only metadata.
-    design_columns: NotRequired[list[str]]
-    contrast_vector: NotRequired[np.ndarray]
-    beta: NotRequired[np.ndarray]
-    n_obs: NotRequired[int | np.ndarray]
 
 
 # ---------------------------------------------------------------------------

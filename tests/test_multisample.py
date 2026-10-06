@@ -8,6 +8,7 @@ import pytest
 from scipy.stats import kstest
 
 from sonic.comparators.multisample import (
+    _AnalyticNullState,
     compare_glm,
     compare_glm_masked,
     compare_glm_scalar,
@@ -16,6 +17,18 @@ from sonic.comparators.multisample import (
     compare_two_groups_scalar,
 )
 from sonic.comparators.normalization import normalize_shape
+
+
+def test_analytic_null_metadata_stays_optional_on_python_310():
+    assert _AnalyticNullState.__optional_keys__ == {
+        "n_obs_A",
+        "n_obs_B",
+        "design_columns",
+        "contrast_vector",
+        "beta",
+        "n_obs",
+    }
+    assert {"observed", "eigenvalues", "eligible"} <= _AnalyticNullState.__required_keys__
 
 
 class TestTwoGroupNullCalibration:

@@ -812,6 +812,7 @@ class DetectorIrregular(Detector):
             # compute means and stds (ddof=1 for sample std, consistent with statistics.py)
             n_obs = X.shape[0]
             if sp.issparse(X):
+                X = X.astype(np.float64, copy=False)
                 means = np.array(X.mean(axis=0)).flatten()
                 X2 = X.copy()
                 X2.data **= 2
@@ -1226,6 +1227,8 @@ class DetectorIrregular(Detector):
         else:
             raise ValueError(f"source must be 'var' or 'obs', got '{source}'.")
 
+        # Integer count products can overflow before the variance is computed.
+        X_csc = X_csc.astype(np.float64, copy=False)
         nnz_per = np.asarray((X_csc != 0).sum(axis=0)).ravel()
         means = np.asarray(X_csc.mean(axis=0)).ravel()
         sq = X_csc.multiply(X_csc)

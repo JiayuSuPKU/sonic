@@ -1358,3 +1358,58 @@ class TestComparatorCrossConsistency:
         p_g = df_g.loc[common, "P_value"].to_numpy()
         rho, _ = spearmanr(p_n, p_g)
         assert rho >= 0.5, f"Spearman(P_nufft, P_fft) = {rho:.2f}"
+
+
+@pytest.mark.parametrize("indices", [[2, 0], np.array([False, True, True])])
+def test_irregular_subset_keeps_coordinate_and_scale_alignment(indices):
+    rng = np.random.default_rng(2)
+    scales = [0.5, 1.0, 2.0]
+    samples = []
+    for n, scale in zip([12, 16, 20], scales, strict=True):
+        sample = ad.AnnData(rng.uniform(1, 5, (n, 2)))
+        sample.obsm["spatial"] = rng.uniform(0, 3, (n, 2)) / scale
+        sample.obs["covariate"] = rng.normal(size=n)
+        samples.append(sample)
+    kwargs = {"grid_shape": (8, 8), "spacing": (0.5, 0.5), "freq_edges": np.linspace(0, 1, 4)}
+    comparator = ComparatorIrregular(samples, unit_scales=scales, **kwargs).compute_spectra(
+        n_jobs=1, progress=False
+    )
+    before = comparator.spectra_.copy()
+    sub = comparator.subset(indices)
+    selected = np.arange(3)[indices]
+    reference = ComparatorIrregular(
+        [samples[i] for i in selected], unit_scales=[scales[i] for i in selected], **kwargs
+    ).compute_spectra(n_jobs=1, progress=False)
+    np.testing.assert_allclose(sub.spectra_, reference.spectra_)
+    sub.compute_spectra(n_jobs=1, progress=False)
+    np.testing.assert_allclose(sub.spectra_, reference.spectra_)
+    sub.normalize_covariates(["covariate"])
+    reference.normalize_covariates(["covariate"])
+    np.testing.assert_allclose(sub.spectra_, reference.spectra_)
+    np.testing.assert_array_equal(comparator.spectra_, before)
+
+
+@pytest.mark.parametrize("fitted", [False, True])
+def test_grid_subset_keeps_spacing_override_when_recomputed(monkeypatch, fitted):
+    rng = np.random.default_rng(3)
+    samples = _install_grid_rasters(
+        monkeypatch, [rng.normal(size=(2, 8, 8)) for _ in range(3)], ["x", "y"]
+    )
+    spacing = [(1.0, 1.0), (0.8, 1.0), (1.0, 0.8)]
+    kwargs = {
+        "bins": "bins",
+        "table_name": "table",
+        "col_key": "col",
+        "row_key": "row",
+        "freq_edges": np.linspace(0, 0.5, 4),
+    }
+    comparator = ComparatorGrid(samples, spacing=spacing, **kwargs)
+    if fitted:
+        comparator.compute_spectra(n_jobs=1, progress=False)
+    sub = comparator.subset([2, 0]).compute_spectra(n_jobs=1, progress=False)
+    reference = ComparatorGrid(
+        [samples[2], samples[0]], spacing=[spacing[2], spacing[0]], **kwargs
+    ).compute_spectra(n_jobs=1, progress=False)
+    assert sub._spacings == reference._spacings
+    np.testing.assert_allclose(sub.spectra_, reference.spectra_)
+    assert comparator._spacing_override == spacing

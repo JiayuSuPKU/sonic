@@ -591,5 +591,30 @@ def test_matrix_detector_r_matches_standalone(rho):
     np.testing.assert_allclose([row.R, row.P_value], [r, p], rtol=1e-10)
 
 
+@pytest.mark.parametrize("backend", ["matrix", "nufft"])
+def test_detector_integer_counts_keep_variable_features(backend):
+    values = np.column_stack([np.arange(8) * 100, np.arange(8)[::-1] * 100, np.ones(8)])
+    counts = anndata.AnnData(sp.csc_matrix(values.astype(np.int16)))
+    counts.var_names = ["x", "y", "constant"]
+    counts.obsm["spatial"] = np.column_stack([np.arange(8), np.zeros(8)])
+    reference = counts.copy()
+    reference.X = reference.X.astype(float)
+    kwargs = {"grid_shape": (8, 8), "spacing": (1.0, 1.0)} if backend == "nufft" else {}
+    results = []
+    for data in (counts, reference):
+        detector = DetectorIrregular(
+            backend=backend, kernel_method="gaussian", bandwidth=1.0, **kwargs
+        ).setup_data(data)
+        result = detector.compute_qstat(n_jobs=1, chunk_size=1, show_progress=False)
+        if "Feature" in result.columns:
+            result = result.set_index("Feature")
+        result = result.sort_index()
+        assert list(result.index) == ["x", "y"]
+        results.append(result[["Q", "P_value"]].to_numpy())
+    np.testing.assert_allclose(*results)
+    assert counts.X.dtype == np.int16
+    np.testing.assert_array_equal(counts.X.toarray(), values)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -653,12 +653,17 @@ class _ComparatorBase:
         sub.freq_edges_requested_ = self.freq_edges_requested_
         sub.frequency_bin_intervals_ = self.frequency_bin_intervals_
         sub._supported_frequency_bin_mask = self._supported_frequency_bin_mask
-        if self._spacings is not None and len(self._spacings) == len(self.samples):
-            sub._spacings = [self._spacings[i] for i in idx]
-        if self._grid_shapes and len(self._grid_shapes) == len(self.samples):
-            sub._grid_shapes = [self._grid_shapes[i] for i in idx]
-        if self._raw_2d_spectra is not None and len(self._raw_2d_spectra) == len(self.samples):
-            sub._raw_2d_spectra = [self._raw_2d_spectra[i] for i in idx]
+        for name in (
+            "_spacings",
+            "_grid_shapes",
+            "_raw_2d_spectra",
+            "_coords",
+            "_unit_scales",
+            "_spacing_override",
+        ):
+            values = getattr(self, name, None)
+            if values is not None and len(values) == len(self.samples):
+                setattr(sub, name, [values[i] for i in idx])
         return sub
 
     # ------------------------------------------------------------------

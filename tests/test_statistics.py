@@ -439,5 +439,30 @@ def test_cached_degenerate_welch_null_on_fourier_backends(backend):
     assert p == 1.0
 
 
+@pytest.mark.parametrize("dtype,scale", [(np.int16, 100), (np.int32, 100_000), (np.int64, 10**10)])
+@pytest.mark.parametrize("sparse_type", [csr_matrix, csc_matrix])
+def test_sparse_integer_q_matches_float(dtype, scale, sparse_type):
+    values = np.column_stack([np.arange(8), np.arange(8)[::-1]]) * scale
+    counts = sparse_type(values.astype(dtype))
+    before = counts.copy()
+    coords = np.column_stack([np.arange(8), np.zeros(8)])
+    kernel = MatrixKernel.from_coordinates(coords, method="gaussian")
+    expected = spatial_q_test(values.astype(float), kernel)
+    np.testing.assert_allclose(spatial_q_test(counts, kernel, chunk_size=1), expected)
+    assert counts.dtype == dtype
+    assert (counts != before).nnz == 0
+
+
+def test_small_chunks_respect_worker_budget(monkeypatch):
+    per_feature = 16 * 1024**2
+    assert resolve_chunk_size(32, per_feature, n_jobs=4, budget_bytes=128 * 1024**2) == 2
+    assert resolve_chunk_size(32, 100, n_jobs=4, budget_bytes=400) == 1
+    with pytest.raises(ValueError, match="cannot fit one feature per worker"):
+        resolve_chunk_size(32, 100, n_jobs=4, budget_bytes=399)
+    monkeypatch.setattr("sonic.statistics.os.cpu_count", lambda: 8)
+    assert resolve_chunk_size(32, 100, n_jobs=-1, budget_bytes=1600) == 2
+    assert resolve_chunk_size(32, 100, n_jobs=-2, budget_bytes=1400) == 2
+
+
 if __name__ == "__main__":
     unittest.main()

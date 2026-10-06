@@ -167,9 +167,12 @@ def auto_chunk_size(
     Returns
     -------
     int
-        A ``chunk_size`` in ``[8, chunk_cap]``. The lower bound of 8
-        ensures measurements stay meaningful even when a single feature
-        consumes most of the per-worker budget.
+        A ``chunk_size`` in ``[1, chunk_cap]`` within the estimated memory budget.
+
+    Raises
+    ------
+    ValueError
+        If one feature per worker exceeds ``budget_bytes``.
     """
     # Lazy imports to avoid circular dependency with the FFT / NUFFT modules.
     from sonic.kernels.fft import FFTKernel
@@ -226,7 +229,12 @@ def resolve_chunk_size(
     Returns
     -------
     int
-        A chunk size in ``[min(8, chunk_cap), chunk_cap]``.
+        A chunk size in ``[1, chunk_cap]``.
+
+    Raises
+    ------
+    ValueError
+        If one feature per worker exceeds ``budget_bytes``.
     """
     cap = max(1, int(chunk_cap))
     per_feat = max(1, int(per_feat_bytes))
@@ -236,10 +244,15 @@ def resolve_chunk_size(
         n_workers = max(1, (os.cpu_count() or 1) + 1 + requested_workers)
     else:
         n_workers = max(1, requested_workers)
-    per_worker_budget = max(per_feat, int(budget_bytes) // n_workers)
+    per_worker_budget = int(budget_bytes) // n_workers
     mem_cap = int(per_worker_budget // per_feat)
-    floor = min(8, cap)
-    return int(np.clip(min(mem_cap, cap), floor, cap))
+    if mem_cap < 1:
+        raise ValueError(
+            f"budget_bytes={budget_bytes} cannot fit one feature per worker "
+            f"({per_feat} bytes each across {n_workers} workers). "
+            "Increase budget_bytes or reduce n_jobs."
+        )
+    return min(mem_cap, cap)
 
 
 def _liu_prepare_from_cumulants(
@@ -851,6 +864,8 @@ def _q_test_matrix(  # noqa: C901
     """
     is_sparse = sp.issparse(Xn)
     if is_sparse:
+        # Promote before squaring integer counts, while preserving sparsity.
+        Xn = Xn.astype(np.float64, copy=False)
         n, M = Xn.shape if Xn.ndim == 2 else (Xn.shape[0], 1)
         if Xn.ndim == 1 or M == 1:
             Xn = Xn.reshape(-1, 1)

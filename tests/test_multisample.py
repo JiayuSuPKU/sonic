@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import itertools
+
 import numpy as np
 import pandas as pd
 import pytest
@@ -812,3 +814,44 @@ class TestNormalizeShapeComparisonOptions:
             rtol=1e-12,
             atol=1e-15,
         )
+
+
+@pytest.mark.parametrize("masked", [False, True])
+@pytest.mark.parametrize("exact", [False, True])
+def test_permutation_tail_uses_exact_or_sampled_correction(masked, exact):
+    values = np.array([0, 0, 0, 10, 10, 10], dtype=float)
+    groups = np.array([0, 0, 0, 1, 1, 1])
+    spectra = np.exp(values[:, None, None])
+    n_perm, seed = 17, 2
+    if exact:
+        assignments = []
+        for indices in itertools.combinations(range(6), 3):
+            labels = np.ones(6, dtype=int)
+            labels[list(indices)] = 0
+            assignments.append(labels)
+    else:
+        rng = np.random.default_rng(seed)
+        labels = groups.copy()
+        assignments = []
+        for _ in range(n_perm):
+            rng.shuffle(labels)
+            assignments.append(labels.copy())
+    ge = sum(abs(values[g == 0].mean() - values[g == 1].mean()) >= 10 for g in assignments)
+    expected = ge / len(assignments) if exact else (ge + 1) / (len(assignments) + 1)
+    kwargs = {
+        "null": "permutation",
+        "n_perm": n_perm,
+        "random_state": seed,
+        "max_exact_permutations": 10000 if exact else 0,
+    }
+    if masked:
+        # Extra missing samples exercise the per-gene exchangeability subset.
+        spectra = np.concatenate([spectra, np.ones((2, 1, 1))])
+        groups = np.concatenate([groups, [0, 1]])
+        presence = np.array([True] * 6 + [False] * 2)[:, None]
+        result = compare_two_groups_masked(spectra, groups, presence, **kwargs)
+    else:
+        result = compare_two_groups(spectra, groups, **kwargs)
+    assert result.P_value.iloc[0] == pytest.approx(expected)
+    if exact:
+        assert expected == 0.1

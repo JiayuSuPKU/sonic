@@ -225,8 +225,7 @@ def _exchangeable_group_labels(
 
     For small samples the total number of distinct two-group label
     assignments (``C(n, n_a)``) can be tiny compared to the user's
-    requested ``n_perm``, which means the permutation p-value is floored
-    at ``1/(C(n, n_a) + 1)``. In that regime an **exact** enumeration
+    requested ``n_perm``. In that regime an **exact** enumeration
     of every possible relabelling is both cheaper and strictly more
     accurate (zero Monte-Carlo noise, sharp p-values).
 
@@ -281,11 +280,14 @@ def _exchangeable_group_labels(
 def _permutation_pvalue(
     observed: np.ndarray,
     null_samples: np.ndarray,
+    *,
+    is_exact: bool = False,
 ) -> np.ndarray:
-    """One-sided ``Pr(null >= observed)`` with an additive ``+1`` correction."""
+    """One-sided ``Pr(null >= observed)``; +1 correction only for sampled nulls."""
     n_perm = null_samples.shape[0]
     ge = (null_samples >= observed[None, :]).sum(axis=0)
-    return (ge + 1.0) / (n_perm + 1.0)
+    correction = 0.0 if is_exact else 1.0
+    return (ge + correction) / (n_perm + correction)
 
 
 def _run_statistic_with_perm(
@@ -1153,8 +1155,7 @@ def compare_two_groups(  # noqa: C901
     observed, null_dist = _run_statistic_with_perm(
         statistic, spectra, group_codes, perm_labels, freq_weights=freq_weights
     )
-    # Tail probability is Pr(null >= observed), with +1 smoothing.
-    pvals = _permutation_pvalue(observed, null_dist)
+    pvals = _permutation_pvalue(observed, null_dist, is_exact=is_exact)
 
     df = _comparison_frame(n_genes, gene_names, observed, pvals)
     return df
@@ -1324,7 +1325,7 @@ def compare_two_groups_masked(  # noqa: C901
             # Per-gene exchange set — enumerate exactly when C(n_obs, n_a_obs)
             # is small, otherwise sample. Subsets are typically smaller than
             # the global one so the exact path kicks in more often here.
-            perm_labels, _ = _exchangeable_group_labels(
+            perm_labels, is_exact = _exchangeable_group_labels(
                 sub_groups,
                 n_perm,
                 rng,
@@ -1333,7 +1334,7 @@ def compare_two_groups_masked(  # noqa: C901
             observed, null = _run_statistic_with_perm(
                 statistic, sub, sub_groups, perm_labels, freq_weights=freq_weights
             )
-            pval = _permutation_pvalue(observed, null)
+            pval = _permutation_pvalue(observed, null, is_exact=is_exact)
             row["Statistic"] = float(observed[0])
             row["P_value"] = float(pval[0])
         rows.append(row)

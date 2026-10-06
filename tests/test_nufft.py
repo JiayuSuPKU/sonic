@@ -347,20 +347,77 @@ def test_nufft_spectrum_and_moments_match_real_operator(shape, centering):
                 np.testing.assert_allclose(p, expected, rtol=1e-8, atol=1e-10)
 
 
-def test_nufft_indefinite_spectrum_is_not_silently_clipped():
+@pytest.mark.parametrize("method", ["gaussian", "matern"])
+def test_nufft_projected_kernel_matches_its_null_spectrum(method):
+    from sonic.statistics import compute_null_params
+
+    rng = np.random.default_rng(0)
+    kernel = NUFFTKernel(
+        rng.uniform(0, 8, (40, 2)),
+        grid_shape=(8, 8),
+        spacing=(1.0, 1.0),
+        method=method,
+        bandwidth=2.0,
+        eps=1e-12,
+    )
+    assert np.min(kernel._fft_kernel.spectrum) >= 0
+    dense = kernel.Kx(np.eye(kernel.n))
+    values = np.linalg.eigvalsh(dense)
+    assert values.min() >= -1e-10
+    np.testing.assert_allclose(kernel.eigenvalues(), values[::-1], atol=1e-9)
+    np.testing.assert_allclose(kernel.trace(), np.trace(dense))
+    np.testing.assert_allclose(kernel.square_trace(), np.sum(dense**2))
+    data = rng.normal(size=(kernel.n, 4))
+    q, p = spatial_q_test(data, kernel)
+    expected = liu_sf(q, values[values > 1e-9], n=kernel.n)
+    np.testing.assert_allclose(p, expected, rtol=1e-8)
+    params = compute_null_params(kernel, method="liu")
+    np.testing.assert_allclose(spatial_q_test(data, kernel, null_params=params), [q, p])
+
+
+def test_nufft_indefinite_spectrum_uses_clt():
+    from sonic.statistics import compute_null_params
+
     kernel = NUFFTKernel(
         np.random.default_rng(0).uniform(0, 8, (40, 2)),
         grid_shape=(8, 8),
         spacing=(1.0, 1.0),
-        method="gaussian",
-        bandwidth=2.0,
+        method="moran",
     )
     assert np.min(kernel._real_spectrum()) < -1e-3
     with pytest.raises(NotImplementedError, match="indefinite"):
         kernel.eigenvalues()
-    # The existing cumulant fallback still makes the public Q-test available.
-    _, p = spatial_q_test(np.arange(kernel.n, dtype=float), kernel)
-    assert 0 <= p <= 1
+    data = np.arange(kernel.n, dtype=float)
+    params = compute_null_params(kernel, method="clt")
+    np.testing.assert_allclose(
+        spatial_q_test(data, kernel), spatial_q_test(data, kernel, null_params=params)
+    )
+    for method in ("welch", "liu"):
+        with pytest.raises(ValueError, match="require a PSD kernel"):
+            compute_null_params(kernel, method=method)
+
+
+def test_nufft_broad_psd_support_still_uses_liu_probes():
+    from unittest.mock import patch
+
+    from sonic import statistics
+
+    kernel = NUFFTKernel(
+        np.random.default_rng(2).uniform(0, 8, (40, 2)),
+        grid_shape=(8, 8),
+        spacing=(1.0, 1.0),
+        method="gaussian",
+    )
+    kernel._TOEPLITZ_R_THRESHOLD = 0  # Force the supported broad-PSD fallback cheaply.
+    with patch.object(
+        statistics, "_hutchinson_cumulants", wraps=statistics._hutchinson_cumulants
+    ) as probe:
+        params = statistics.compute_null_params(kernel, method="liu")
+        probe.assert_called_once_with(kernel, n_probes=60)
+    data = np.arange(kernel.n, dtype=float)
+    np.testing.assert_allclose(
+        spatial_q_test(data, kernel), spatial_q_test(data, kernel, null_params=params)
+    )
 
 
 class TestNUFFTTwoPathsAgree:

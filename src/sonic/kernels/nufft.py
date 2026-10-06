@@ -346,6 +346,10 @@ class NUFFTKernel(Kernel):
     cumulant estimator (:func:`sonic.statistics._hutchinson_cumulants`)
     and the bipartite R-test cross matrix.
 
+    Gaussian and Matérn use the PSD-projected spectrum supplied by
+    :class:`FFTKernel`; the projection applies to both the operator and its null
+    moments. Moran retains its signed spectrum and uses the CLT Q-test null.
+
     :func:`sonic.spatial_q_test` always uses the k-space Parseval path
     (:meth:`xtKx`); :func:`sonic.spatial_r_test` dispatches on shape —
     paired diagonal for ``M_x == M_y`` via :meth:`xtKy`, full ``(M_x, M_y)``
@@ -664,7 +668,7 @@ class NUFFTKernel(Kernel):
         """
         lam = self._real_spectrum()
         lam_abs_max = float(np.abs(lam).max())
-        if lam.min() < -np.finfo(float).eps * lam_abs_max:
+        if lam.min() < -64 * np.finfo(float).eps * lam_abs_max:
             return None  # The PSD square-root factorization cannot drop negative modes.
 
         lam_flat = lam.ravel()
@@ -734,8 +738,10 @@ class NUFFTKernel(Kernel):
         (indefinite ``Λ`` like Moran, or broad-support kernels like CAR
         at strong coupling) raise ``NotImplementedError`` rather than
         falling back to an approximate density reconstruction. For Liu's
-        method, use :func:`compute_null_params(..., method='liu', liu_n_probes=...)`
+        method on broad-support PSD kernels, use
+        :func:`compute_null_params(..., method='liu', liu_n_probes=...)`
         to get cumulant-based Liu directly from :math:`2m` matvecs.
+        Indefinite kernels use ``method='clt'`` instead.
 
         Parameters
         ----------
@@ -779,10 +785,10 @@ class NUFFTKernel(Kernel):
                 "Full NUFFT spectrum unavailable for this configuration "
                 "(indefinite spectrum or broad spectral support: r > "
                 f"{self._TOEPLITZ_R_THRESHOLD}). Use "
+                "`method='clt'` for indefinite kernels, or "
                 "`compute_null_params(..., method='liu', liu_n_probes=60)` "
-                "for Liu's approximation via Hutchinson-estimated "
-                "cumulants, or `eigenvalues(k=...)` for a Lanczos "
-                "top-k."
+                "for broad-support PSD kernels. `eigenvalues(k=...)` "
+                "provides a Lanczos top-k."
             )
         pad = max(0, n - len(toep))
         spectrum = np.concatenate([toep, np.zeros(pad)]) if pad else toep[:n]
@@ -1224,17 +1230,12 @@ def _q_test_nufft(  # noqa: C901
     # Dispatch on the user-selected null approximation. This mirrors the
     # MatrixKernel path in `spatial_q_test`: the caller picks one of
     # {'clt', 'welch', 'liu'} via ``null_params['method']``; defaults keep
-    # backward-compatible behavior — CLT for Moran (its kernel is
-    # indefinite so Welch/Liu are degenerate) and Liu for the PSD kernels.
-    if null_params is not None and "method" in null_params:
-        null_approx = str(null_params["method"])
-    else:
-        null_approx = "clt" if kernel.method == "moran" else "liu"
-    if kernel.method == "moran" and null_approx != "clt":
-        raise ValueError(
-            f"Moran's I kernel is indefinite; only null_method='clt' is "
-            f"supported for the Q-test. Got method={null_approx!r}."
-        )
+    # CLT for signed spectra and Liu for PSD kernels.
+    from sonic.statistics import _resolve_q_null_method
+
+    null_approx = _resolve_q_null_method(
+        kernel, None if null_params is None else null_params.get("method"), default="liu"
+    )
 
     def _get_mean_var() -> tuple[float, float]:
         """Mean/var of Q under H0 — from user-supplied params or recompute."""
@@ -1296,15 +1297,10 @@ def _q_test_nufft(  # noqa: C901
                     "compute_null_params(kernel, method='liu')."
                 )
             # Try the exact Toeplitz-M eigendecomposition; if that's
-            # unavailable (broad-support or indefinite Λ), fall back
-            # to Hutchinson-estimated cumulants.
+            # unavailable for a broad-support PSD kernel, fall back to
+            # Hutchinson-estimated cumulants. Signed kernels were rejected above.
             try:
                 evals = kernel.eigenvalues(return_full_layout=True)
-                if evals.min() < -0.1:
-                    raise ValueError(
-                        "Kernel has significant negative eigenvalues; "
-                        "Liu's method may be invalid."
-                    )
                 sig_evals = evals[evals > 1e-9]
                 coef = _liu_prepare(sig_evals, n=n_kernel)
             except NotImplementedError:

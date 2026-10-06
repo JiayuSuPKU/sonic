@@ -86,6 +86,10 @@ class FFTKernel(Kernel):
     Operates on evenly-spaced grid data (raster data) with spectral decomposition
     via FFT under periodic (torus) boundary conditions.
 
+    Gaussian and Matérn kernels are projected onto the PSD cone by zeroing
+    negative Fourier weights. This regularizes the periodic approximation;
+    kernel applications, statistics, and null moments all use that spectrum.
+
     Attributes
     ----------
     ny, nx : int
@@ -378,7 +382,8 @@ class FFTKernel(Kernel):
                 spectrum_2d = scipy.fft.fft2(K_img, workers=self.workers)
             else:
                 spectrum_2d = scipy.fft.rfft2(K_img, workers=self.workers)
-            return np.real(spectrum_2d).ravel()
+            # Project the operator itself, not just the spectrum used by the null.
+            return np.maximum(np.real(spectrum_2d).ravel(), 0.0)
 
         elif self.method == "matern":
             bw = self.params["bandwidth"]
@@ -393,7 +398,7 @@ class FFTKernel(Kernel):
                 spectrum_2d = scipy.fft.fft2(K_img, workers=self.workers)
             else:
                 spectrum_2d = scipy.fft.rfft2(K_img, workers=self.workers)
-            return np.real(spectrum_2d).ravel()
+            return np.maximum(np.real(spectrum_2d).ravel(), 0.0)
 
         # --- Graph-based Kernels (Moran / Graph Laplacian / CAR) ---
         elif self.method in ["moran", "graph_laplacian", "car"]:
@@ -775,20 +780,16 @@ def _q_test_fft(  # noqa: C901
     # 3. P-value approximation. Dispatch on the user-selected null method
     # (``null_params['method']``) mirroring the MatrixKernel path in
     # :func:`sonic.statistics.spatial_q_test`: any of 'clt' / 'welch' / 'liu'.
-    # Default: CLT for Moran (indefinite K → Welch/Liu degenerate),
-    # Liu for everything else. When `null_params` is supplied the caller's
+    # Default: CLT for signed spectra, Liu for PSD spectra.
+    # When `null_params` is supplied the caller's
     # cached moments are reused so we don't retraverse the spectrum per feature.
     Q_arr = np.atleast_1d(Q).astype(float).ravel()
 
-    if null_params is not None and "method" in null_params:
-        null_approx = str(null_params["method"])
-    else:
-        null_approx = "clt" if kernel.method == "moran" else "liu"
-    if kernel.method == "moran" and null_approx != "clt":
-        raise ValueError(
-            f"Moran's I kernel is indefinite; only null_method='clt' is "
-            f"supported for the Q-test. Got method={null_approx!r}."
-        )
+    from sonic.statistics import _resolve_q_null_method
+
+    null_approx = _resolve_q_null_method(
+        kernel, None if null_params is None else null_params.get("method"), default="liu"
+    )
 
     def _get_mean_var() -> tuple[float, float]:
         if null_params is not None and "mean_Q" in null_params and "var_Q" in null_params:
@@ -840,10 +841,6 @@ def _q_test_fft(  # noqa: C901
                     "compute_null_params(kernel, method='liu')."
                 )
             evals = kernel.eigenvalues(return_full_layout=True)
-            if evals.min() < -0.1:
-                raise ValueError(
-                    "Kernel has significant negative eigenvalues; Liu's method may be invalid."
-                )
             # Keep the same signed cumulants as compute_null_params.
             sig_evals = evals[np.abs(evals) > 1e-9]
             coef = _liu_prepare(sig_evals, n=n_kernel)

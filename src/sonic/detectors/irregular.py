@@ -13,7 +13,12 @@ from tqdm import tqdm
 from sonic.detectors.base import Detector
 from sonic.kernels import Kernel, MatrixKernel
 from sonic.kernels.nufft import NUFFTKernel, _standardize_features
-from sonic.statistics import apply_bh_correction, compute_null_params, spatial_q_test
+from sonic.statistics import (
+    _resolve_q_null_method,
+    apply_bh_correction,
+    compute_null_params,
+    spatial_q_test,
+)
 
 __all__ = ["DetectorIrregular"]
 
@@ -932,7 +937,7 @@ class DetectorIrregular(Detector):
             )
 
         # 2. Compute Null Distribution
-        null_method = "clt" if self.kernel_method_ in ["moran"] else "welch"
+        null_method = _resolve_q_null_method(self.kernel_)
         logger.info("Computing null distribution approximation (method=%s)...", null_method)
         null_params = compute_null_params(self.kernel_, method=null_method)
 
@@ -1257,9 +1262,8 @@ class DetectorIrregular(Detector):
         if return_pval:
             # Delegate to compute_null_params — it auto-falls back to
             # Hutchinson-cumulant Liu when the NUFFT spectrum is
-            # unavailable (broad support / indefinite Λ). Moran is
-            # indefinite → CLT enforced there.
-            nm = "clt" if kernel.method == "moran" else "liu"
+            # unavailable for broad PSD support. Signed spectra use CLT.
+            nm = _resolve_q_null_method(kernel, default="liu")
             null_params = compute_null_params(kernel, method=nm)
 
         logger.info("Preparing %s features (layer=%s)...", source, layer)

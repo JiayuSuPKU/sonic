@@ -23,6 +23,41 @@ from sonic.statistics import (
 )
 
 
+@pytest.mark.parametrize("backend", ["fft2", "rfft2", "nufft"])
+def test_null_routing_rejects_signed_spectra_even_with_a_psd_name(backend):
+    shape = (8, 8)
+    rng = np.random.default_rng(0)
+    if backend == "nufft":
+        kernel = NUFFTKernel(
+            rng.uniform(0, 8, (40, 2)),
+            grid_shape=shape,
+            spacing=(1.0, 1.0),
+            method="gaussian",
+        )
+        fourier_kernel = kernel._fft_kernel
+        data = rng.normal(size=kernel.n)
+    else:
+        kernel = FFTKernel(shape, method="gaussian", fft_solver=backend)
+        fourier_kernel = kernel
+        data = rng.normal(size=shape)
+    cached = {method: compute_null_params(kernel, method=method) for method in ("welch", "liu")}
+    # Model a legacy/custom spectrum: the family name alone does not certify PSD.
+    fourier_kernel.spectrum = FFTKernel(
+        shape, method="moran", fft_solver=fourier_kernel.fft_solver
+    ).spectrum.copy()
+    explicit = compute_null_params(kernel, method="clt")
+    np.testing.assert_allclose(
+        spatial_q_test(data, kernel), spatial_q_test(data, kernel, null_params=explicit)
+    )
+    for method in ("welch", "liu"):
+        with pytest.raises(ValueError, match="require a PSD kernel"):
+            compute_null_params(kernel, method=method)
+        with pytest.raises(ValueError, match="require a PSD kernel"):
+            spatial_q_test(data, kernel, null_params=cached[method])
+    with pytest.raises(ValueError, match="require a PSD kernel"):
+        compute_null_params(kernel, method="liu", liu_n_probes=4)
+
+
 class TestMultipleTestingHelpers(unittest.TestCase):
     """Public p-value combination and adjustment helpers."""
 

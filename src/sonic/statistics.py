@@ -292,6 +292,10 @@ def _liu_prepare_from_cumulants(
     for the final p-value calculation; the input cumulants are not
     needed beyond this point.
     """
+    # ponytail: TODO estimate centered/scaled traces of B = HKH - tr(HKH)/m * H
+    # directly, and correct the third/fourth moments for sample standardization.
+    # The current Liu fit corrects only variance; validate its shape/admissibility
+    # and null calibration before replacing this raw-cumulant approximation.
     s1 = c[3] / (np.sqrt(c[2]) ** 3 + _DELTA)
     s2 = c[4] / (c[2] ** 2 + _DELTA)
 
@@ -602,6 +606,27 @@ def liu_sf(
     return _liu_apply(t, coef)
 
 
+def _resolve_q_null_method(
+    kernel: Kernel, method: str | None = None, *, default: str = "welch"
+) -> str:
+    """Use CLT for Moran/signed Fourier kernels; reject explicit PSD-only fits."""
+    indefinite = getattr(kernel, "method", None) == "moran"
+    # NUFFT uses this same Fourier spectrum to apply the irregular-point kernel.
+    fourier_kernel = getattr(kernel, "_fft_kernel", kernel)
+    spectrum = getattr(fourier_kernel, "spectrum", None)
+    if spectrum is not None:
+        tolerance = 64 * np.finfo(float).eps * float(np.max(np.abs(spectrum)))
+        indefinite |= bool(np.min(spectrum) < -tolerance)
+    if method is None:
+        return "clt" if indefinite else default
+    if indefinite and method != "clt":
+        raise ValueError(
+            "Indefinite kernels support only null_method='clt' for the Q-test; "
+            f"Welch and Liu require a PSD kernel. Got method={method!r}."
+        )
+    return method
+
+
 def compute_null_params(
     kernel: Kernel,
     method: str = "welch",
@@ -629,6 +654,9 @@ def compute_null_params(
         - 'clt': Central Limit Theorem (Z-score normal approximation)
         - 'welch': Welch-Satterthwaite moment matching (fast, uses traces)
         - 'liu': Liu eigenvalue-based approximation (accurate tail, slower)
+
+        Welch and Liu require PSD kernels. Moran and Fourier kernels with
+        negative weights beyond roundoff require an explicit ``method='clt'``.
     k_eigen : int, optional
         Number of top eigenvalues to compute if method='liu' and kernel is sparse.
         If None, computes all available eigenvalues. Ignored when
@@ -733,19 +761,7 @@ def compute_null_params(
 
     assert method in ["clt", "welch", "liu"], "Method must be 'clt', 'welch', or 'liu'."
 
-    # Moran's I kernel is indefinite (non-PSD) — its eigenvalues span both
-    # signs, and its trace is ≈ 0 by construction. Welch / Liu are both
-    # PSD-assuming moment-matching schemes (Welch needs ``mean_Q > 0``;
-    # Liu fits a shifted χ² to a Σλ·χ²₁ mixture that only makes sense when
-    # the λ are non-negative). Force ``'clt'`` for Moran — a direct Normal
-    # approximation on the CLT-limit distribution of the standardized Q —
-    # across all three backends.
-    kernel_method = getattr(kernel, "method", None)
-    if kernel_method == "moran" and method != "clt":
-        raise ValueError(
-            f"Moran's I kernel is indefinite; only null_method='clt' is "
-            f"supported for the Q-test. Got method={method!r}."
-        )
+    _resolve_q_null_method(kernel, method)
 
     # Centered traces can be computed cheaply from two additional numbers:
     #   s1 = 𝟏ᵀ K 𝟏,   s2 = ‖K·𝟏‖² = 𝟏ᵀ K² 𝟏
@@ -767,8 +783,8 @@ def compute_null_params(
         #   - ``liu_n_probes is not None``: Hutchinson — 2·m matvecs.
         #   - ``liu_n_probes is None``: try the kernel's full
         #     eigendecomposition first, fall back to Hutchinson if the
-        #     kernel can't produce a full spectrum (NUFFT with broad
-        #     support or indefinite Λ → ``NotImplementedError``).
+        #     PSD kernel can't produce a full spectrum (NUFFT with broad
+        #     support → ``NotImplementedError``). Signed kernels were rejected above.
         if liu_n_probes is not None:
             c = _hutchinson_cumulants(kernel, n_probes=int(liu_n_probes))
         else:
@@ -882,13 +898,9 @@ def _q_test_matrix(  # noqa: C901
         return Q
 
     # P-value from cached null_params (pre-resolved by spatial_q_test).
-    kernel_method = getattr(kernel, "method", None)
-    null_approx_method = null_params.get("method", "welch") if null_params else "welch"
-    if kernel_method == "moran" and null_approx_method != "clt":
-        raise ValueError(
-            f"Moran's I kernel is indefinite; only null_method='clt' is "
-            f"supported for the Q-test. Got method={null_approx_method!r}."
-        )
+    null_approx_method = _resolve_q_null_method(
+        kernel, null_params.get("method", "welch") if null_params else "welch"
+    )
 
     if null_approx_method == "clt":
         mu_Q = null_params["mean_Q"]
@@ -1048,7 +1060,6 @@ def spatial_q_test(  # noqa: C901
     is_matrix_path = not (is_fft or is_nufft)
 
     # Resolve null_params once (cached across chunks).
-    kernel_method = getattr(kernel, "method", None)
     if (
         return_pval
         and null_params is not None
@@ -1067,7 +1078,7 @@ def spatial_q_test(  # noqa: C901
                 "null_params; pass a Kernel object or provide "
                 "null_params=compute_null_params(kernel)."
             )
-        default_method = "clt" if kernel_method == "moran" else "welch"
+        default_method = _resolve_q_null_method(kernel)
         null_params = compute_null_params(kernel, method=default_method)
 
     # Determine M on the trailing axis.

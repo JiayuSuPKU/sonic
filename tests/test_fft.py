@@ -176,6 +176,34 @@ class TestSpatialQTest(unittest.TestCase):
         assert np.isclose(Q1, Q2, rtol=1e-9)
 
 
+@pytest.mark.parametrize("method", ["gaussian", "matern"])
+@pytest.mark.parametrize("solver", ["fft2", "rfft2"])
+@pytest.mark.parametrize("shape", [(8, 8), (7, 9)])
+def test_continuous_kernel_projects_the_applied_operator(method, solver, shape):
+    coords = np.column_stack([axis.ravel() for axis in np.indices(shape)])
+    distances = compute_torus_distance_matrix(coords, domain_dims=shape)
+    bandwidth = 3.0
+    if method == "gaussian":
+        raw = np.exp(-0.5 * (distances / bandwidth) ** 2)
+    else:
+        t = np.sqrt(3.0) * distances / bandwidth
+        raw = (1.0 + t) * np.exp(-t)  # Matérn nu=1.5, independent dense reference.
+    values, vectors = np.linalg.eigh(raw)
+    assert values.min() < -1e-3  # Exercise substantive periodic-boundary negatives.
+    projected = (vectors * np.maximum(values, 0.0)) @ vectors.T
+    kernel = FFTKernel(
+        shape, method=method, bandwidth=bandwidth, fft_solver=solver, centering=False
+    )
+    applied = kernel.Kx(np.eye(kernel.n).reshape(*shape, kernel.n)).reshape(kernel.n, kernel.n)
+    np.testing.assert_allclose(applied, projected, atol=1e-12)
+    assert np.min(kernel.spectrum) >= 0
+    np.testing.assert_allclose(kernel.trace(), np.trace(projected))
+    np.testing.assert_allclose(kernel.square_trace(), np.sum(projected**2))
+    x, y = np.random.default_rng(3).normal(size=(2, kernel.n))
+    np.testing.assert_allclose(kernel.xtKx(x.reshape(shape)), x @ projected @ x)
+    np.testing.assert_allclose(kernel.xtKy(x.reshape(shape), y.reshape(shape)), x @ projected @ y)
+
+
 class TestSpatialRTest(unittest.TestCase):
     """Test FFT-based spatial R test (bivariate)."""
 

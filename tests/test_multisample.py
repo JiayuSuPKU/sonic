@@ -855,3 +855,70 @@ def test_permutation_tail_uses_exact_or_sampled_correction(masked, exact):
     assert result.P_value.iloc[0] == pytest.approx(expected)
     if exact:
         assert expected == 0.1
+
+
+@pytest.mark.parametrize("masked", [False, True])
+@pytest.mark.parametrize("exact", [False, True])
+@pytest.mark.parametrize("dtype", [np.float32, np.float64])
+def test_streamed_permutations_match_materialized_weighted_null(masked, exact, dtype):
+    rng = np.random.default_rng(37)
+    spectra = rng.lognormal(size=(8, 4, 5)).astype(dtype)
+    spectra[0, 0, 0] = 0
+    spectra[1, 0, 1] = 1e-20
+    spectra[:, 2] = 1  # Every permutation ties for this gene.
+    original = spectra.copy()
+    groups = np.repeat([0, 1], 4)
+    weights = np.array([0, 1, 2, 3, 4], dtype=float)
+    weights /= weights.sum()
+    presence = np.ones((8, 4), dtype=bool)
+    if masked:
+        presence[[0, 4], 1] = False
+        presence[:3, 3] = False  # Too few observations in group A.
+
+    def statistic(values, labels):
+        a = np.log(np.maximum(values[labels == 0], 1e-12)).mean(axis=0)
+        b = np.log(np.maximum(values[labels == 1], 1e-12)).mean(axis=0)
+        return np.sqrt(np.sum(weights * (a - b) ** 2, axis=-1))
+
+    # Materialize the reference null, retaining the public API's RNG sequence.
+    perm_rng = np.random.default_rng(19)
+    expected = []
+    for gene in range(4):
+        keep = presence[:, gene]
+        labels = groups[keep].copy()
+        if min(np.bincount(labels, minlength=2)) < 2:
+            expected.append((np.nan, np.nan))
+            continue
+        if exact:
+            assignments = []
+            for indices in itertools.combinations(range(len(labels)), int((labels == 0).sum())):
+                assignment = np.ones(len(labels), dtype=int)
+                assignment[list(indices)] = 0
+                assignments.append(assignment)
+        elif not masked and gene > 0:
+            pass  # Unmasked genes use the same relabellings.
+        else:
+            assignments = []
+            for _ in range(43):
+                perm_rng.shuffle(labels)
+                assignments.append(labels.copy())
+        observed = statistic(spectra[keep, gene], groups[keep])
+        null = np.array([statistic(spectra[keep, gene], assignment) for assignment in assignments])
+        correction = 0 if exact else 1
+        pvalue = ((null >= observed).sum() + correction) / (len(null) + correction)
+        expected.append((observed, pvalue))
+
+    kwargs = {
+        "null": "permutation",
+        "freq_weights": weights,
+        "n_perm": 43,
+        "random_state": 19,
+        "max_exact_permutations": 10000 if exact else 0,
+    }
+    if masked:
+        result = compare_two_groups_masked(spectra, groups, presence, **kwargs)
+    else:
+        result = compare_two_groups(spectra, groups, **kwargs)
+    result = result.set_index("Feature").loc[[str(i) for i in range(4)]]
+    np.testing.assert_allclose(result[["Statistic", "P_value"]], expected, equal_nan=True)
+    np.testing.assert_array_equal(spectra, original)

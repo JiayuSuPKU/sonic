@@ -12,6 +12,27 @@ from sonic.comparators.normalization import (
 )
 
 
+@pytest.mark.parametrize("dtype", [np.float32, np.float64])
+@pytest.mark.parametrize("fit_intercept", [False, True])
+def test_covariate_normalization_matches_projection_and_preserves_inputs(dtype, fit_intercept):
+    rng = np.random.default_rng(8)
+    spectra = rng.lognormal(size=(12, 20)).astype(dtype)
+    covariates = rng.lognormal(size=(2, 20)).astype(dtype)
+    covariates[1] = covariates[0]  # Rank-deficient designs still use the pseudoinverse.
+    original = spectra.copy()
+    original_covariates = covariates.copy()
+    log_spec = np.log(spectra + 1e-12)
+    design = np.log(covariates + 1e-12).T
+    if fit_intercept:
+        design = np.column_stack([np.ones(20), design])
+    expected = np.exp(log_spec - (design @ np.linalg.pinv(design) @ log_spec.T).T)
+    actual = normalize_covariates(spectra, covariates, fit_intercept=fit_intercept)
+    assert actual.dtype == expected.dtype
+    np.testing.assert_allclose(actual, expected, rtol=1e-6 if dtype == np.float32 else 1e-12)
+    np.testing.assert_array_equal(spectra, original)
+    np.testing.assert_array_equal(covariates, original_covariates)
+
+
 class TestNormalizationPrimitives:
     """Primitive ``normalize_*`` helper behavior."""
 

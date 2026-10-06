@@ -273,8 +273,10 @@ def normalize_covariates(
     if fit_intercept:
         X = np.hstack([np.ones((n_bins, 1)), X])
     pinv = np.linalg.pinv(X)
-    fitted = (X @ pinv @ log_spec.T).T
-    return np.exp(log_spec - fitted)
+    fitted = (X @ (pinv @ log_spec.T)).T
+    # Reuse the fitted-value buffer for residuals and their exponentials.
+    np.subtract(log_spec, fitted, out=fitted)
+    return np.exp(fitted, out=fitted)
 
 
 def normalize_shape(

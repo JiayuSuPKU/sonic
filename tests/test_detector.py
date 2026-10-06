@@ -616,5 +616,25 @@ def test_detector_integer_counts_keep_variable_features(backend):
     np.testing.assert_array_equal(counts.X.toarray(), values)
 
 
+@pytest.mark.parametrize("sparse", [False, True])
+@pytest.mark.parametrize("keys", [None, ["y", "missing", "x"]])
+def test_prepare_var_view_respects_layer_order_and_preserves_inputs(sparse, keys):
+    values = np.column_stack([np.arange(8) + 1.0, np.arange(8)[::-1] + 2.0])
+    data = anndata.AnnData(np.zeros_like(values))
+    data.var_names = ["x", "y"]
+    data.layers["counts"] = sp.csc_matrix(values) if sparse else values.copy()
+    data.obsm["spatial"] = np.column_stack([np.arange(8), np.zeros(8)])
+    detector = DetectorIrregular(kernel_method="gaussian").setup_data(data)
+    matrix, names, means, stds = detector._prepare_data("var", keys, 1, layer="counts")
+    columns = [0, 1] if keys is None else [1, 0]
+    assert names == [data.var_names[i] for i in columns]
+    np.testing.assert_array_equal(matrix.toarray(), values[:, columns])
+    np.testing.assert_allclose(means, values[:, columns].mean(axis=0))
+    np.testing.assert_allclose(stds, values[:, columns].std(axis=0, ddof=1))
+    np.testing.assert_array_equal(data.X, 0)
+    counts = data.layers["counts"].toarray() if sparse else data.layers["counts"]
+    np.testing.assert_array_equal(counts, values)
+
+
 if __name__ == "__main__":
     unittest.main()

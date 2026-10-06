@@ -158,29 +158,6 @@ def _resolve_freq_weights(freq_weights: np.ndarray | None, n_bins: int) -> np.nd
     return w / total
 
 
-def _stat_log_l2(
-    group_a: np.ndarray,
-    group_b: np.ndarray,
-    freq_weights: np.ndarray | None = None,
-) -> np.ndarray:
-    """Weighted L2 distance between mean log-spectra. Vectorized over genes.
-
-    The (default) uniform-weight case reduces to the plain L2 distance on
-    ``n_bins`` frequency bins - up to an overall ``1/sqrt(n_bins)`` scale that is
-    irrelevant under a permutation null. Non-uniform weights (which must be
-    non-negative and sum to 1) let the user emphasize low or high
-    frequencies the same way a kernel spectrum does (polynomial vs
-    exponential decay, etc.).
-    """
-    eps = 1e-12
-    log_a = np.log(np.maximum(group_a, eps)).mean(axis=0)  # (n_genes, n_bins)
-    log_b = np.log(np.maximum(group_b, eps)).mean(axis=0)
-    diff = log_a - log_b  # (n_genes, n_bins)
-    n_bins = diff.shape[-1]
-    w = _resolve_freq_weights(freq_weights, n_bins)
-    return np.sqrt(np.sum(w * diff**2, axis=-1))
-
-
 def _welch_test(group_a: np.ndarray, group_b: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
     """Signed Welch t-statistic and analytic two-sided p-value along axis 0.
 
@@ -277,19 +254,6 @@ def _exchangeable_group_labels(
     return perm_labels, False
 
 
-def _permutation_pvalue(
-    observed: np.ndarray,
-    null_samples: np.ndarray,
-    *,
-    is_exact: bool = False,
-) -> np.ndarray:
-    """One-sided ``Pr(null >= observed)``; +1 correction only for sampled nulls."""
-    n_perm = null_samples.shape[0]
-    ge = (null_samples >= observed[None, :]).sum(axis=0)
-    correction = 0.0 if is_exact else 1.0
-    return (ge + correction) / (n_perm + correction)
-
-
 def _run_statistic_with_perm(
     stat_name: str,
     spectra: np.ndarray,
@@ -297,28 +261,35 @@ def _run_statistic_with_perm(
     perm_labels: np.ndarray,
     *,
     freq_weights: np.ndarray | None = None,
+    is_exact: bool = False,
 ) -> tuple[np.ndarray, np.ndarray]:
-    """Compute observed statistic + null distribution for one statistic. Internal.
+    """Compute observed log-L2 statistics and permutation tail probabilities.
 
     ``perm_labels`` is a ``(n_perm_used, n_samples)`` matrix of group
     relabellings (as produced by :func:`_exchangeable_group_labels`).
-
-    ``freq_weights`` is forwarded only to statistics that accept it (currently
-    ``log_l2``); other statistics ignore it.
+    Log spectra and weights are prepared once. Only per-gene exceedance
+    counts are retained; no permutations-by-genes null matrix is allocated.
+    Exhaustive enumeration uses the exact tail; sampled nulls get +1 correction.
     """
     if stat_name != "log_l2":
         raise ValueError(f"Permutation statistic must be 'log_l2', got {stat_name!r}.")
     uniq = np.unique(group_codes)
     a_val = uniq[0]
-    a_mask = group_codes == a_val
+    log_spectra = np.maximum(spectra, 1e-12)
+    np.log(log_spectra, out=log_spectra)
+    weights = _resolve_freq_weights(freq_weights, spectra.shape[-1])
 
-    observed = _stat_log_l2(spectra[a_mask], spectra[~a_mask], freq_weights=freq_weights)
-    n_perm = perm_labels.shape[0]
-    null = np.empty((n_perm, spectra.shape[1]))
-    for p in range(n_perm):
-        a = perm_labels[p] == a_val
-        null[p] = _stat_log_l2(spectra[a], spectra[~a], freq_weights=freq_weights)
-    return observed, null
+    def statistic(a: np.ndarray) -> np.ndarray:
+        diff = log_spectra[a].mean(axis=0) - log_spectra[~a].mean(axis=0)
+        return np.sqrt(np.sum(weights * diff**2, axis=-1))
+
+    observed = statistic(group_codes == a_val)
+    exceedances = np.zeros(spectra.shape[1], dtype=np.int64)
+    for labels in perm_labels:
+        exceedances += statistic(labels == a_val) >= observed
+    correction = 0.0 if is_exact else 1.0
+    pvals = (exceedances + correction) / (len(perm_labels) + correction)
+    return observed, pvals
 
 
 # ---------------------------------------------------------------------------
@@ -389,8 +360,8 @@ def _log_l2_analytic_pvalues(
 ) -> np.ndarray:
     """Analytic p-values for ``log_l2`` via Liu's mixture-χ² tail.
 
-    ``statistic`` is the ``(n_genes,)`` per-gene statistic returned by
-    :func:`_stat_log_l2` (square root of the quadratic form ``D'WD``).
+    ``statistic`` is the ``(n_genes,)`` log-L2 distance between group means
+    (square root of the quadratic form ``D'WD``).
     Squaring it here gives the H₀ statistic distributed as ``Σ_k λ_k χ²_1``,
     which Liu's approximation handles directly.
     """
@@ -1152,10 +1123,9 @@ def compare_two_groups(  # noqa: C901
             n_samples,
             int((group_codes == 0).sum()),
         )
-    observed, null_dist = _run_statistic_with_perm(
-        statistic, spectra, group_codes, perm_labels, freq_weights=freq_weights
+    observed, pvals = _run_statistic_with_perm(
+        statistic, spectra, group_codes, perm_labels, freq_weights=freq_weights, is_exact=is_exact
     )
-    pvals = _permutation_pvalue(observed, null_dist, is_exact=is_exact)
 
     df = _comparison_frame(n_genes, gene_names, observed, pvals)
     return df
@@ -1331,10 +1301,14 @@ def compare_two_groups_masked(  # noqa: C901
                 rng,
                 max_exact_permutations=max_exact_permutations,
             )
-            observed, null = _run_statistic_with_perm(
-                statistic, sub, sub_groups, perm_labels, freq_weights=freq_weights
+            observed, pval = _run_statistic_with_perm(
+                statistic,
+                sub,
+                sub_groups,
+                perm_labels,
+                freq_weights=freq_weights,
+                is_exact=is_exact,
             )
-            pval = _permutation_pvalue(observed, null, is_exact=is_exact)
             row["Statistic"] = float(observed[0])
             row["P_value"] = float(pval[0])
         rows.append(row)

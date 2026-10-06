@@ -30,6 +30,7 @@ from typing import Any
 import numpy as np
 import pandas as pd
 import scipy.ndimage
+from scipy.sparse import csr_matrix
 from tqdm.auto import tqdm
 
 from sonic.kernels.fft import power_spectrum_2d
@@ -491,18 +492,7 @@ def radial_bin_spectrum(
         If ``spectrum``'s last two dims do not match the expected shape implied by
         ``grid_shape`` and ``fft_solver``.
     """
-    ny, nx = grid_shape
-    expected_kx = nx if fft_solver == "fft2" else nx // 2 + 1
-    if spectrum.shape[-2:] != (ny, expected_kx):
-        raise ValueError(
-            f"spectrum last two dims {spectrum.shape[-2:]} do not match "
-            f"expected ({ny}, {expected_kx}) for fft_solver='{fft_solver}'."
-        )
-
-    # Compute the assignment of each FFT cell to a radial bin.
-    # When using rfft2, some FFT cells need to be double-counted (via weights2d).
-    # Bins with no FFT cells (counts == 0) will be assigned NA values downstream.
-    idx, weights2d, counts, n_bins, keep = _radial_bin_index_and_counts(
+    reducer, counts = _radial_bin_reducer(
         grid_shape,
         n_bins=n_bins,
         fft_solver=fft_solver,
@@ -511,19 +501,53 @@ def radial_bin_spectrum(
         edges=edges,
     )
 
-    leading = spectrum.shape[:-2]
-    flat = spectrum.reshape(-1, ny * expected_kx)  # (n_items, ny * n_kx)
-    flat = flat[:, keep]
+    return _apply_radial_reducer(spectrum, grid_shape, fft_solver, reducer, counts)
 
-    # Accumulate radial power per FFT cells into their respective radial bins.
-    out = np.zeros((flat.shape[0], n_bins))
-    for b in range(flat.shape[0]):
-        np.add.at(out[b], idx, flat[b] * weights2d)
-    # Normalize the bin sums by the number of FFT cells in each bin.
-    nonempty = counts > 0
-    out[:, nonempty] /= counts[nonempty]  # bin-mean power
-    out[:, ~nonempty] = np.nan
-    return out.reshape(*leading, out.shape[-1])
+
+def _radial_bin_reducer(
+    grid_shape: tuple[int, int],
+    *,
+    n_bins: int = 30,
+    fft_solver: str = "rfft2",
+    exclude_dc: bool = True,
+    spacing: tuple[float, float] | None = None,
+    edges: np.ndarray | None = None,
+) -> tuple[csr_matrix, np.ndarray]:
+    """Build a sparse bin-mean operator, reusable across a sample's chunks."""
+    idx, weights, counts, n_bins, keep = _radial_bin_index_and_counts(
+        grid_shape,
+        n_bins=n_bins,
+        fft_solver=fft_solver,
+        exclude_dc=exclude_dc,
+        spacing=spacing,
+        edges=edges,
+    )
+    reducer = csr_matrix(
+        (weights / counts[idx], (idx, np.flatnonzero(keep))),
+        shape=(n_bins, keep.size),
+    )
+    return reducer, counts
+
+
+def _apply_radial_reducer(
+    spectrum: np.ndarray,
+    grid_shape: tuple[int, int],
+    fft_solver: str,
+    reducer: csr_matrix,
+    counts: np.ndarray,
+) -> np.ndarray:
+    """Reduce a spectrum batch while preserving leading axes and empty bins."""
+    ny, nx = grid_shape
+    expected_kx = nx if fft_solver == "fft2" else nx // 2 + 1
+    if spectrum.shape[-2:] != (ny, expected_kx):
+        raise ValueError(
+            f"spectrum last two dims {spectrum.shape[-2:]} do not match "
+            f"expected ({ny}, {expected_kx}) for fft_solver='{fft_solver}'."
+        )
+    flat = spectrum.reshape(-1, reducer.shape[1])
+    out = (reducer @ flat.T).T
+    out[:, counts == 0] = np.nan
+    return out.reshape(*spectrum.shape[:-2], reducer.shape[0])
 
 
 def _radial_bin_index_and_counts(
@@ -715,23 +739,18 @@ def stream_radial_features(
     if edges is None:
         raise ValueError("stream_radial_features requires explicit radial bin edges.")
 
-    parts: list[np.ndarray] = []
+    reducer, counts = _radial_bin_reducer(
+        grid_shape, fft_solver=fft_solver, spacing=spacing, edges=edges
+    )
+    out = np.empty((n_genes, reducer.shape[0]), dtype=float)
     for start in range(0, n_genes, chunk_size):
         stop = min(start + chunk_size, n_genes)
         spec_chunk = spectrum_chunk_fn(start, stop)
-        parts.append(
-            radial_bin_spectrum(
-                spec_chunk,
-                grid_shape=grid_shape,
-                fft_solver=fft_solver,
-                spacing=spacing,
-                edges=edges,
-            )
-        )
+        out[start:stop] = _apply_radial_reducer(spec_chunk, grid_shape, fft_solver, reducer, counts)
         del spec_chunk
         if pbar is not None:
             pbar.update(1)
-    return np.concatenate(parts, axis=0)
+    return out
 
 
 def stream_geomean_landmark(
@@ -873,7 +892,7 @@ def stream_polar_features(
     """
     coords, n_radius = _physical_polar_coords(grid_shape, spacing, freq_edges, n_theta)
     feat_len = n_radius * n_theta
-    parts: list[np.ndarray] = []
+    out = np.empty((n_genes, feat_len), dtype=np.float64)
     for start in range(0, n_genes, chunk_size):
         stop = min(start + chunk_size, n_genes)
         spec_chunk = spectrum_chunk_fn(start, stop)
@@ -884,14 +903,14 @@ def stream_polar_features(
         full = _to_full_2d(spec_chunk, grid_shape, fft_solver)  # (m, ny, nx)
         shifted = np.fft.fftshift(full, axes=(-2, -1))
         m = shifted.shape[0]
-        block = np.empty((m, feat_len), dtype=np.float64)
         for j in range(m):
-            block[j] = scipy.ndimage.map_coordinates(shifted[j], coords, order=1, mode="reflect")
-        parts.append(block)
+            out[start + j] = scipy.ndimage.map_coordinates(
+                shifted[j], coords, order=1, mode="reflect"
+            )
         del spec_chunk, full, shifted
         if pbar is not None:
             pbar.update(1)
-    return np.concatenate(parts, axis=0)
+    return out
 
 
 # ---------------------------------------------------------------------------

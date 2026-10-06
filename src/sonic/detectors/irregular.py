@@ -797,9 +797,9 @@ class DetectorIrregular(Detector):
             # check if keys are in var
             if keys is not None:
                 valid = [g for g in keys if g in self.adata.var_names]
-                adata_tmp = self.adata[:, valid].copy()
+                adata_tmp = self.adata[:, valid]
             else:
-                adata_tmp = self.adata.copy()
+                adata_tmp = self.adata
 
             # extract feature matrix
             if layer is not None:

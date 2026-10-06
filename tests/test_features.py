@@ -547,6 +547,31 @@ class TestPhysicalFrequencyBinning:
             )
 
 
+@pytest.mark.parametrize("shape", [(8, 8), (7, 9)])
+@pytest.mark.parametrize("solver", ["fft2", "rfft2"])
+def test_radial_reduction_preserves_missing_bins_and_ignores_excluded_nans(shape, solver):
+    ny, nx = shape
+    kx = np.fft.fftfreq(nx) if solver == "fft2" else np.fft.rfftfreq(nx)
+    radius = np.hypot(np.fft.fftfreq(ny)[:, None], kx[None, :])
+    weights = np.ones(radius.shape)
+    if solver == "rfft2":
+        weights[:, 1 : (nx + 1) // 2] = 2
+    edges = np.array([0.10, 0.11, 0.2, 0.35])
+    # Multiple leading axes and a non-contiguous spectrum layout.
+    spectra = np.random.default_rng(2).uniform(size=radius.shape + (3, 2)).transpose(2, 3, 0, 1)
+    spectra[..., (radius < edges[0]) | (radius > edges[-1])] = np.nan
+    spectra[0, 0, 1, 1] = np.nan  # An included NaN affects its bin alone.
+    expected = np.full((3, 2, 3), np.nan)
+    for i, (left, right) in enumerate(zip(edges[:-1], edges[1:], strict=True)):
+        keep = (radius >= left) & ((radius <= right) if i == 2 else (radius < right))
+        if keep.any():
+            expected[..., i] = (spectra[..., keep] * weights[keep]).sum(axis=-1) / weights[
+                keep
+            ].sum()
+    got = radial_bin_spectrum(spectra, shape, fft_solver=solver, edges=edges)
+    np.testing.assert_allclose(got, expected, rtol=1e-12, equal_nan=True)
+
+
 class TestStreamingFeatureHelpers:
     """Streaming helpers should match full-stack feature construction."""
 

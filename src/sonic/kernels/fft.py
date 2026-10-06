@@ -636,9 +636,10 @@ class FFTKernel(Kernel):
             full_fft = np.zeros((self.ny, self.nx), dtype=self.spectrum.dtype)
             rfft_size = self.nx // 2 + 1
             full_fft[:, :rfft_size] = self.spectrum.reshape(self.ny, rfft_size)
-            for i in range(self.ny):
-                for j in range(1, rfft_size - 1):
-                    full_fft[i, self.nx - j] = full_fft[i, j].conj()
+            # Reflect both frequency axes; odd widths have no Nyquist column.
+            mirror = np.arange(1, (self.nx + 1) // 2)
+            rows = (-np.arange(self.ny)) % self.ny
+            full_fft[:, self.nx - mirror] = full_fft[rows[:, None], mirror].conj()
             spec = full_fft.ravel()
 
         if self.centering:
@@ -810,19 +811,13 @@ def _q_test_fft(  # noqa: C901
             pvals = chi2.sf(z_scores**2, df=1)
 
     elif null_approx == "welch":
+        from sonic.statistics import _welch_apply
+
         if null_params is not None and "scale_g" in null_params and "df_h" in null_params:
-            g = float(null_params["scale_g"])
-            h = float(null_params["df_h"])
+            pvals = _welch_apply(Q_arr, null_params)
         else:
             mean_Q, var_Q = _get_mean_var()
-            if mean_Q <= 0 or var_Q <= 0:
-                pvals = np.ones_like(Q_arr)
-                g = h = None
-            else:
-                g = var_Q / (2.0 * mean_Q)
-                h = 2.0 * mean_Q**2 / var_Q
-        if g is not None:
-            pvals = chi2.sf(Q_arr / g, df=h)
+            pvals = _welch_apply(Q_arr, {"mean_Q": mean_Q, "var_Q": var_Q})
 
     elif null_approx == "liu":
         from sonic.statistics import _liu_apply, _liu_prepare, _liu_prepare_from_cumulants
@@ -849,7 +844,8 @@ def _q_test_fft(  # noqa: C901
                 raise ValueError(
                     "Kernel has significant negative eigenvalues; Liu's method may be invalid."
                 )
-            sig_evals = evals[evals > 1e-9]
+            # Keep the same signed cumulants as compute_null_params.
+            sig_evals = evals[np.abs(evals) > 1e-9]
             coef = _liu_prepare(sig_evals, n=n_kernel)
         pvals = np.atleast_1d(_liu_apply(Q_arr, coef))
 

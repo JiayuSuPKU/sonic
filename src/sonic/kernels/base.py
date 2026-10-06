@@ -871,6 +871,8 @@ class MatrixKernelBase(Kernel):
     def _standardize_precision(self, M):
         """Scale precision M so that covariance K has unit diagonal, without forming dense K when implicit."""
         diag_K = self._compute_inv_diag(M).copy()
+        # _compute_inv_diag may factorize M; the scaled precision needs a new LU.
+        self._lu = None
         diag_K[diag_K <= 0] = 1e-12
         s = 1.0 / np.sqrt(diag_K)
         if sp.issparse(M):

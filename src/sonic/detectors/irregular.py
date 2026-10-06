@@ -143,9 +143,9 @@ def _pvals_from_null(Q: np.ndarray, null_params: dict) -> np.ndarray:
 
     method = null_params.get("method", "welch")
     if method == "welch":
-        g = null_params["scale_g"]
-        d = null_params["df_h"]
-        return _chi2.sf(Q / g, df=d)
+        from sonic.statistics import _welch_apply
+
+        return _welch_apply(Q, null_params)
     if method == "clt":
         mu = null_params["mean_Q"]
         var = null_params["var_Q"]
@@ -1092,14 +1092,12 @@ class DetectorIrregular(Detector):
             )
 
         # 1. Compute Null Params for R
-        # We need Trace(KK^T) which is Trace(K^2) for symmetric K
-        # compute_null_params already computes var_Q = 2*Tr(K^2).
-        # var_R = Tr(K^2) = var_Q / 2.
+        # R uses Trace(K^2), without the finite-sample Q variance correction.
         logger.info("Computing null distribution for R statistic...")
         q_null = compute_null_params(self.kernel_, method="clt")
         null_params = {
             "mean_R": 0.0,
-            "var_R": q_null["var_Q"] / 2.0,  # Derive from existing trace calculation
+            "var_R": q_null["var_R"],
         }
 
         # 2. Prepare Data

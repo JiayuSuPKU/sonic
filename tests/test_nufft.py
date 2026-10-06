@@ -107,7 +107,7 @@ class TestBatchedValues:
 
 
 from sonic.kernels.nufft import NUFFTKernel
-from sonic.statistics import spatial_q_test, spatial_r_test
+from sonic.statistics import liu_sf, spatial_q_test, spatial_r_test
 from sonic.utils import get_rect_coords
 
 
@@ -318,6 +318,49 @@ class TestNUFFTKernelTrace:
             f"method={method} centering={centering}: analytic={s_ana:.5g} "
             f"vs truth={truth:.5g} (rel={abs(s_ana - truth) / truth:.3g})"
         )
+
+
+@pytest.mark.parametrize("shape", [(8, 8), (8, 9), (9, 8), (9, 9)])
+@pytest.mark.parametrize("centering", [False, True])
+def test_nufft_spectrum_and_moments_match_real_operator(shape, centering):
+    rng = np.random.default_rng(7)
+    coords = rng.uniform(0, 8, (40, 2))
+    for method in ("car", "moran", "gaussian"):
+        kernel = NUFFTKernel(
+            coords,
+            grid_shape=shape,
+            spacing=(1.0, 1.0),
+            method=method,
+            centering=centering,
+            eps=1e-12,
+            **({"bandwidth": 0.7} if method == "gaussian" else {}),
+        )
+        dense = kernel.Kx(np.eye(kernel.n))
+        np.testing.assert_allclose(kernel.trace(), np.trace(dense), rtol=1e-10, atol=1e-10)
+        np.testing.assert_allclose(kernel.square_trace(), np.sum(dense**2), rtol=1e-10)
+        if method != "moran":
+            eigenvalues = np.linalg.eigvalsh(dense)[::-1]
+            np.testing.assert_allclose(kernel.eigenvalues(), eigenvalues, atol=1e-9)
+            if centering:
+                q, p = spatial_q_test(rng.normal(size=(kernel.n, 10)), kernel)
+                expected = liu_sf(q, eigenvalues[eigenvalues > 1e-9], n=kernel.n)
+                np.testing.assert_allclose(p, expected, rtol=1e-8, atol=1e-10)
+
+
+def test_nufft_indefinite_spectrum_is_not_silently_clipped():
+    kernel = NUFFTKernel(
+        np.random.default_rng(0).uniform(0, 8, (40, 2)),
+        grid_shape=(8, 8),
+        spacing=(1.0, 1.0),
+        method="gaussian",
+        bandwidth=2.0,
+    )
+    assert np.min(kernel._real_spectrum()) < -1e-3
+    with pytest.raises(NotImplementedError, match="indefinite"):
+        kernel.eigenvalues()
+    # The existing cumulant fallback still makes the public Q-test available.
+    _, p = spatial_q_test(np.arange(kernel.n, dtype=float), kernel)
+    assert 0 <= p <= 1
 
 
 class TestNUFFTTwoPathsAgree:

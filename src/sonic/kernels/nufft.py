@@ -592,26 +592,41 @@ class NUFFTKernel(Kernel):
     _TOEPLITZ_R_THRESHOLD: int = 2000
     _TOEPLITZ_LAM_TOL: float = 1e-5
 
+    def _real_spectrum(self) -> np.ndarray:
+        """Centered Fourier weights for the real operator returned by Kx.
+
+        Even grids contain -Nyquist but not +Nyquist. Taking the real part
+        of Kx splits each weight between a mode and its true negative;
+        these are distinct at irregular coordinates.
+        """
+        ny, nx = self.grid_shape
+        lam = np.zeros((2 * (ny // 2) + 1, 2 * (nx // 2) + 1))
+        lam[:ny, :nx] = np.fft.fftshift(self._fft_kernel.spectrum.reshape(ny, nx))
+        return 0.5 * (lam + lam[::-1, ::-1])
+
     def _coord_phi(self) -> np.ndarray:
-        """Coord-density function ``φ(k)`` on k-grid (DC at [0, 0]).
+        """Coord-density ``φ(k)`` on a doubled mode range, DC at [0, 0].
 
         ``φ(Δ) = (1/n) · Σ_i exp(-iΔ·y_i)`` — one type-1 NUFFT of the
-        all-ones vector. Symmetrized so ``φ[k] = conj(φ[-k mod N])``
-        holds exactly (fixes Nyquist self-conjugate bins that NUFFT
-        samples as complex on even-length grids; needed for strict
-        Hermiticity of the induced ``G_{k,k'} = n·φ(k'-k)``).
-        Cached on the instance (coord-only).
+        all-ones vector. The range includes every signed mode difference
+        of ``_real_spectrum``. Off-grid φ is not periodic at the original
+        grid size, so differences must never wrap at that period.
         """
         cache = getattr(self, "_phi_cache", None)
         if cache is not None:
             return cache
-        ones = np.ones(self.n, dtype=float)
-        phi_hat_centered = self._nufft_type1(ones).squeeze()  # finufft DC-centered
-        phi = np.fft.ifftshift(phi_hat_centered) / self.n  # DC at [0, 0]
-        ny, nx = phi.shape
-        ii = np.arange(ny)[:, None]
-        jj = np.arange(nx)[None, :]
-        phi = 0.5 * (phi + np.conj(phi[(-ii) % ny, (-jj) % nx]))
+        ny, nx = self.grid_shape
+        phi_hat_centered = finufft.nufft2d1(
+            self._y_scaled,
+            self._x_scaled,
+            np.ones(self.n, dtype=complex),
+            n_modes=(2 * ny + 1, 2 * nx + 1),
+            eps=self._eps,
+            isign=-1,
+        )
+        # Odd mode counts pair every frequency with its actual negative.
+        phi_hat_centered = 0.5 * (phi_hat_centered + phi_hat_centered[::-1, ::-1].conj())
+        phi = np.fft.ifftshift(phi_hat_centered) / self.n
         self._phi_cache = phi
         return phi
 
@@ -647,21 +662,10 @@ class NUFFTKernel(Kernel):
             Eigenvalues (descending) or ``None`` to signal "no full
             spectrum available for this configuration".
         """
-        lam = self._fft_kernel.spectrum.reshape(self.grid_shape)
-        # PSD detection — gaussian/matern/car/graph_laplacian are PSD by
-        # construction; their FFT spectra carry sub-1% numerical noise
-        # that shouldn't disqualify Toeplitz-M. Only flag truly
-        # indefinite kernels (moran, sign-balanced Λ).
-        psd_methods = ("gaussian", "matern", "car", "graph_laplacian")
+        lam = self._real_spectrum()
         lam_abs_max = float(np.abs(lam).max())
-        if self.method in psd_methods:
-            if lam_abs_max > 0:
-                # Sanity clip: even PSD kernels shouldn't show a negative
-                # lobe bigger than a few percent of the peak.
-                if lam.min() < -0.05 * lam_abs_max:
-                    return None
-        elif lam.min() < -1e-3 * lam_abs_max:
-            return None  # truly indefinite
+        if lam.min() < -np.finfo(float).eps * lam_abs_max:
+            return None  # The PSD square-root factorization cannot drop negative modes.
 
         lam_flat = lam.ravel()
         lam_max = float(np.abs(lam_flat).max())
@@ -676,13 +680,16 @@ class NUFFTKernel(Kernel):
 
         ny, nx = self.grid_shape
         nprime = ny * nx
-        mask = mask_flat.reshape(ny, nx)
-        iy, ix = np.where(mask)
+        iy, ix = np.where(mask_flat.reshape(lam.shape))
+        iy = iy - lam.shape[0] // 2
+        ix = ix - lam.shape[1] // 2
         lam_r_sqrt = np.sqrt(np.maximum(lam_flat[mask_flat], 0.0))
 
         phi = self._coord_phi()
-        dy = (iy[None, :] - iy[:, None]) % ny
-        dx = (ix[None, :] - ix[:, None]) % nx
+        # Negative indices select the corresponding signed modes in phi's
+        # DC-at-origin layout; the doubled range contains every difference.
+        dy = iy[None, :] - iy[:, None]
+        dx = ix[None, :] - ix[:, None]
         G_r = self.n * phi[dy, dx]
         if self.centering:
             # (HU)ᴴ(HU) = G − (1/n)(Uᴴ𝟏)(Uᴴ𝟏)ᴴ = G − n · conj(φ_r) φ_rᵀ.
@@ -719,8 +726,8 @@ class NUFFTKernel(Kernel):
           :meth:`_eigvals_toeplitz_M`. Applies when ``Λ`` is PSD and
           the support size
           ``r = #{k : |λ(k)| > 10⁻⁵ · max|λ|}`` is below
-          ``_TOEPLITZ_R_THRESHOLD`` (default 2000). Exact to NUFFT
-          ``eps``; cost dominated by ``O(r³)`` eigvalsh on a dense
+          ``_TOEPLITZ_R_THRESHOLD`` (default 2000). Accuracy is limited by
+          spectral truncation and NUFFT ``eps``; cost is ``O(r³)`` on a dense
           ``r × r`` reduced matrix. Cached per ``centering`` mode.
 
         Full-spectrum requests that fall outside Toeplitz-M's reach
@@ -1083,69 +1090,6 @@ class NUFFTKernel(Kernel):
     # Null-moment estimators — doubled-grid linear-convolution analytic
     # (default) and Rademacher Hutchinson probe (opt-in second opinion).
     # ------------------------------------------------------------------
-    def _coord_power_spectrum_doubled(self) -> np.ndarray:
-        """``|φ(j)|²`` on a doubled ``(2·ny, 2·nx)`` k-grid (DC-at-[0,0]).
-
-        The analytic ``trace(K²)`` formula
-
-        .. math::
-
-            \\operatorname{tr}(K_n^2) \\;=\\; \\frac{n^2}{n'^2}
-            \\sum_{k,k'} \\lambda(k)\\,\\lambda(k')\\,|\\varphi(k'-k)|^{2}
-
-        sums over differences ``Δ = k' - k`` that range in
-        ``{-(ny-1), ..., ny-1}`` (per dim). Evaluating the sum as a 2D
-        FFT convolution on the native ``(ny, nx)`` grid is a *circular*
-        convolution at period ``n'``, which silently wraps values of
-        ``|φ|²`` beyond ``ny/2`` — a valid approximation only when
-        coords coincide exactly with the k-grid (``|φ|² = δ``, the
-        regular-grid collapse). For irregular coords or a typical
-        oversampled NUFFT grid (``n' > n``), ``|φ(j)|²`` is *not*
-        periodic at ``n'`` and the wraparound over-estimates
-        ``tr(K²)`` — up to ~45% on broad-spectrum kernels like CAR.
-
-        This method evaluates ``|φ|²`` on a doubled ``(2·ny, 2·nx)``
-        grid via a separate type-1 NUFFT of the all-ones vector onto
-        the doubled mode-range. Paired with zero-padding of ``λ`` to
-        the same doubled layout in :meth:`square_trace`, the
-        doubled-grid FFT convolution then realizes a true linear
-        convolution on the ``Δ ∈ [-(ny-1), ny-1]`` support with no
-        wraparound. Cost: one extra type-1 NUFFT on a ``2n'``-point
-        mode grid (same coords); cached per instance (coord-only).
-
-        Returns
-        -------
-        np.ndarray
-            ``(2·ny, 2·nx)`` real, non-negative, with ``|φ(0)|² = 1``
-            at ``[0, 0]`` (DC-at-origin layout).
-        """
-        cache = getattr(self, "_phi2_doubled_cache", None)
-        if cache is not None:
-            return cache
-        ny, nx = self.grid_shape
-        ny2, nx2 = 2 * ny, 2 * nx
-        ones = np.ones(self.n, dtype=complex)
-        # One type-1 NUFFT of the ones vector onto the doubled mode grid.
-        # Match _nufft_type1's (isign=-1, eps=self._eps) convention.
-        phi_hat_centered = finufft.nufft2d1(
-            self._y_scaled,
-            self._x_scaled,
-            ones,
-            n_modes=(ny2, nx2),
-            eps=self._eps,
-            isign=-1,
-        )  # (ny2, nx2) complex, finufft DC-centered
-        phi = np.fft.ifftshift(phi_hat_centered) / self.n  # DC at [0, 0]
-        # Symmetrize so φ[k] = conj(φ[-k mod 2N]) holds exactly — fixes
-        # the Nyquist-row self-conjugate bins that NUFFT samples as
-        # complex on even-length grids. Mirrors :meth:`_coord_phi`.
-        ii = np.arange(ny2)[:, None]
-        jj = np.arange(nx2)[None, :]
-        phi = 0.5 * (phi + np.conj(phi[(-ii) % ny2, (-jj) % nx2]))
-        phi2 = np.abs(phi) ** 2
-        self._phi2_doubled_cache = phi2
-        return phi2
-
     def trace(self) -> float:
         """``trace(K)`` (raw) or ``trace(HKH)`` (centered).
 
@@ -1166,46 +1110,20 @@ class NUFFTKernel(Kernel):
     def square_trace(self) -> float:
         """``trace(K²)`` (raw) or ``trace((HKH)²)`` (centered).
 
-        Closed-form ``(n²/n'²) · λᵀ Ψ λ`` with Toeplitz
-        ``Ψ_{k,k'} = |φ(k'-k)|²``, evaluated as a *linear*
-        (non-circular) 2D convolution of ``|φ|²`` with ``λ`` via a
-        doubled-grid FFT in ``O(n' log n')``. ``φ(j) = (1/n) Σ_i
-        exp(-ij·y_i)`` is evaluated on a ``(2·ny, 2·nx)`` mode grid by
-        a separate type-1 NUFFT of the ones vector (see
-        :meth:`_coord_power_spectrum_doubled`), and ``λ`` is zero-padded
-        to the same doubled layout so the FFT convolution does not wrap
-        values of ``|φ|²`` across the ``n'``-period — a silent bias of
-        up to ~45% on broad-spectrum kernels (CAR, graph_laplacian) on
-        the typical oversampled NUFFT grid. On a regular grid where
-        coords coincide with the k-grid, ``|φ|² = δ`` and the formula
-        collapses to ``(n/n')² · Σ_k λ(k)²``. Adjusts by
-        ``-2·s₂/n + s₁²/n²`` when ``centering=True``.
-
-        Observed band-limit residuals vs. explicit ``Kx(I)`` truth:
-        ≲ ``1e-7`` on Gaussian / Matern, ``~0.1 %`` on CAR, ``~1 %``
-        on graph_laplacian, and ``~0.05–1.2 %`` on Moran (indefinite
-        ``Λ``) — accurate across regular, irregular, and clustered
-        coord layouts.
+        Evaluate ``(n²/n'²) · Σ λ(k) λ(k') |φ(k'-k)|²`` by linear
+        convolution. The real operator's weights include both Nyquist
+        signs, and the doubled mode range contains every difference.
+        Centering subtracts ``2·s₂/n − s₁²/n²``.
         """
         ny, nx = self.grid_shape
         nprime = ny * nx
-        lam = self._fft_kernel.spectrum.reshape(ny, nx)
-        phi2_d = self._coord_power_spectrum_doubled()  # (2·ny, 2·nx)
-        # Zero-pad ``λ`` to the doubled grid, preserving DC-at-origin.
-        # Embedding the fftshift'd (DC-centered) ``λ`` at offset
-        # ``(ny - ny//2, nx - nx//2)`` of the doubled centered array
-        # aligns its DC bin with the doubled grid's DC and leaves the
-        # freshly-introduced higher-frequency bins zero — the analytic
-        # identity only needs ``λ`` supported on the original k-grid.
-        lam_centered = np.fft.fftshift(lam)
+        lam = self._real_spectrum()
+        phi2_d = np.abs(self._coord_phi()) ** 2
         lam_pad_centered = np.zeros_like(phi2_d)
-        sy, sx = ny - ny // 2, nx - nx // 2
-        lam_pad_centered[sy : sy + ny, sx : sx + nx] = lam_centered
+        sy = phi2_d.shape[0] // 2 - lam.shape[0] // 2
+        sx = phi2_d.shape[1] // 2 - lam.shape[1] // 2
+        lam_pad_centered[sy : sy + lam.shape[0], sx : sx + lam.shape[1]] = lam
         lam_pad = np.fft.ifftshift(lam_pad_centered)
-        # Linear conv (2·ny, 2·nx). With ``lam_pad`` zero outside the
-        # original support, the circular wraparound at period 2·n' only
-        # reaches indices where ``lam_pad`` vanishes and contributes
-        # nothing to the final sum.
         lam_f = np.fft.fft2(lam_pad)
         phi2_f = np.fft.fft2(phi2_d)
         conv = np.fft.ifft2(lam_f * phi2_f).real  # (|φ|² ⋆ λ)(k)
@@ -1341,21 +1259,13 @@ def _q_test_nufft(  # noqa: C901
             pvals = chi2.sf(z_scores**2, df=1)
 
     elif null_approx == "welch":
-        # Welch-Satterthwaite: Q ~ g · χ²(df=h) with g = var / (2·mean),
-        # h = 2·mean² / var. Requires mean > 0 (PSD kernel).
+        from sonic.statistics import _welch_apply
+
         if null_params is not None and "scale_g" in null_params and "df_h" in null_params:
-            g = float(null_params["scale_g"])
-            h = float(null_params["df_h"])
+            pvals = _welch_apply(Q_arr, null_params)
         else:
             mean_Q, var_Q = _get_mean_var()
-            if mean_Q <= 0 or var_Q <= 0:
-                pvals = np.ones_like(Q_arr)
-                g = h = None
-            else:
-                g = var_Q / (2.0 * mean_Q)
-                h = 2.0 * mean_Q**2 / var_Q
-        if g is not None:
-            pvals = chi2.sf(Q_arr / g, df=h)
+            pvals = _welch_apply(Q_arr, {"mean_Q": mean_Q, "var_Q": var_Q})
 
     elif null_approx == "liu":
         from sonic.statistics import (

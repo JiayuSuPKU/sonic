@@ -529,9 +529,26 @@ def _liu_apply(t: float | np.ndarray, coef: dict[str, float]) -> np.ndarray:
     across array ``t`` in a single :func:`scipy.stats.ncx2.sf` call.
     """
     t = np.asarray(t, dtype=float)
+    if coef["sigma_Q"] <= 0:
+        return np.ones_like(t)
     t_star = (t - coef["mu_Q"]) / (coef["sigma_Q"] + _DELTA)
     tfinal = t_star * coef["sigma_x"] + coef["mu_x"]
     return ncx2.sf(tfinal, coef["dof_x"], max(coef["delta_x"], 1e-9))
+
+
+def _welch_apply(t: float | np.ndarray, params: dict) -> np.ndarray:
+    """Apply the Welch null, treating a deterministic Q as uninformative."""
+    t = np.asarray(t, dtype=float)
+    if params.get("var_Q", 1.0) <= 0 or params.get("mean_Q", 1.0) <= 0:
+        return np.ones_like(t)
+    if "scale_g" in params and "df_h" in params:
+        g, h = params["scale_g"], params["df_h"]
+    else:
+        g = params["var_Q"] / (2.0 * params["mean_Q"])
+        h = 2.0 * params["mean_Q"] ** 2 / params["var_Q"]
+    if g <= 0 or h <= 0:
+        return np.ones_like(t)
+    return chi2.sf(t / g, df=h)
 
 
 def liu_sf(
@@ -756,7 +773,12 @@ def compute_null_params(
             c = _hutchinson_cumulants(kernel, n_probes=int(liu_n_probes))
         else:
             try:
-                vals = kernel.eigenvalues(k=k_eigen)
+                from sonic.kernels.fft import FFTKernel
+
+                if isinstance(kernel, FFTKernel):
+                    vals = kernel.eigenvalues(k=k_eigen, return_full_layout=True)
+                else:
+                    vals = kernel.eigenvalues(k=k_eigen)
                 sig = vals[np.abs(vals) > 1e-9]
                 c = {p: float(np.sum(sig**p)) for p in (1, 2, 3, 4)}
             except NotImplementedError:
@@ -790,7 +812,8 @@ def compute_null_params(
                 params["scale_g"] = var_Q / (2.0 * mean_Q)
                 params["df_h"] = (2.0 * mean_Q**2) / var_Q
             else:
-                params["scale_g"] = 1.0
+                # Zero scale denotes the degenerate null; _welch_apply returns 1.
+                params["scale_g"] = 0.0
                 params["df_h"] = 1.0
 
     return params
@@ -876,9 +899,7 @@ def _q_test_matrix(  # noqa: C901
         else:
             pval = np.ones(max(np.atleast_1d(Q).size, 1), dtype=float)
     elif null_approx_method == "welch":
-        g = null_params["scale_g"]
-        d = null_params["df_h"]
-        pval = chi2.sf(np.atleast_1d(Q) / g, df=d)
+        pval = _welch_apply(np.atleast_1d(Q), null_params)
     elif null_approx_method == "liu":
         coef = null_params.get("liu_coef")
         if coef is None:

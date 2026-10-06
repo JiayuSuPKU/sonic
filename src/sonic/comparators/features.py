@@ -478,6 +478,7 @@ def radial_bin_spectrum(
         same frequency units as ``spacing`` (or normalized if ``spacing`` is None).
         When supplied, this overrides ``n_bins`` and gives every sample identical
         bin boundaries — required for cross-sample comparisons in physical units.
+        Frequencies outside the edges are discarded; the final edge is included.
 
     Returns
     -------
@@ -501,7 +502,7 @@ def radial_bin_spectrum(
     # Compute the assignment of each FFT cell to a radial bin.
     # When using rfft2, some FFT cells need to be double-counted (via weights2d).
     # Bins with no FFT cells (counts == 0) will be assigned NA values downstream.
-    idx, weights2d, counts, n_bins = _radial_bin_index_and_counts(
+    idx, weights2d, counts, n_bins, keep = _radial_bin_index_and_counts(
         grid_shape,
         n_bins=n_bins,
         fft_solver=fft_solver,
@@ -512,9 +513,7 @@ def radial_bin_spectrum(
 
     leading = spectrum.shape[:-2]
     flat = spectrum.reshape(-1, ny * expected_kx)  # (n_items, ny * n_kx)
-    if exclude_dc:
-        k = _radial_frequency_grid(ny, nx, fft_solver, spacing=spacing)
-        flat = flat[:, k.ravel() > 0.0]
+    flat = flat[:, keep]
 
     # Accumulate radial power per FFT cells into their respective radial bins.
     out = np.zeros((flat.shape[0], n_bins))
@@ -535,8 +534,8 @@ def _radial_bin_index_and_counts(
     exclude_dc: bool = True,
     spacing: tuple[float, float] | None = None,
     edges: np.ndarray | None = None,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray, int]:
-    """Return flattened bin indices, FFT-cell weights, and per-bin counts."""
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, int, np.ndarray]:
+    """Return bin indices, weights, counts, bin count, and the FFT-cell mask."""
     # Compute the radial frequency for each 2D FFT cell.
     ny, nx = grid_shape
     expected_kx = nx if fft_solver == "fft2" else nx // 2 + 1
@@ -556,7 +555,11 @@ def _radial_bin_index_and_counts(
 
     # Bin index for each spectrum cell (0..n_bins-1).
     k_flat = k.ravel()
-    idx = np.clip(np.digitize(k_flat, edges) - 1, 0, n_bins - 1)
+    # Match histogram intervals: [left, right), with the final edge included.
+    keep = (k_flat >= edges[0]) & (k_flat <= edges[-1])
+    if exclude_dc:
+        keep &= k_flat > 0.0
+    idx = np.minimum(np.digitize(k_flat[keep], edges) - 1, n_bins - 1)
 
     # For rfft2 the negative-kx half is implicit but corresponds to conjugate
     # entries with identical |X|^2. To make per-bin sums match what fft2 would
@@ -570,18 +573,13 @@ def _radial_bin_index_and_counts(
     else:
         weights2d = np.ones(ny * expected_kx)
 
-    if exclude_dc:
-        # Remove only the true zero-frequency cell; keep nonzero low frequencies
-        # in the first radial interval.
-        keep = k_flat > 0.0
-        idx = idx[keep]
-        weights2d = weights2d[keep]
+    weights2d = weights2d[keep]
 
     # Count the number of FFT cells in each bin.
     counts = np.zeros(n_bins)
     np.add.at(counts, idx, weights2d)
 
-    return idx, weights2d, counts, n_bins
+    return idx, weights2d, counts, n_bins, keep
 
 
 def radial_bin_counts(

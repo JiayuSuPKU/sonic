@@ -4,10 +4,13 @@ Unit tests for statistical functions.
 
 import unittest
 
+import anndata as ad
 import numpy as np
+import pytest
 from scipy.sparse import csc_matrix, csr_matrix
 
-from sonic.kernels import MatrixKernel
+from sonic import Detector
+from sonic.kernels import FFTKernel, MatrixKernel, NUFFTKernel
 from sonic.statistics import (
     apply_bh_correction,
     auto_chunk_size,
@@ -367,6 +370,38 @@ class TestKernelPrimitivesAndNullParams(unittest.TestCase):
         for fn in (spatial_r_test,):
             sig = set(inspect.signature(fn).parameters)
             self.assertTrue(canonical_r.issubset(sig), f"{fn.__name__} missing {canonical_r - sig}")
+
+
+def test_identity_kernel_q_is_uninformative():
+    rng = np.random.default_rng(0)
+    data = ad.AnnData(csc_matrix(rng.normal(size=(80, 2))))
+    data.var_names = ["x", "y"]
+    data.obsm["spatial"] = np.column_stack([np.arange(80), np.zeros(80)])
+    detector = Detector(data, kernel_method="gaussian", bandwidth=0.01).setup_data(data)
+    params = compute_null_params(detector.kernel_, method="welch")
+    assert params["var_Q"] == 0
+    q, p = spatial_q_test(data.X, detector.kernel_, null_params=params)
+    np.testing.assert_allclose(q, 79)
+    np.testing.assert_array_equal(p, [1, 1])
+    result = detector.compute_qstat(n_jobs=1, show_progress=False)
+    np.testing.assert_array_equal(result.P_value, [1, 1])
+    np.testing.assert_array_equal(liu_sf(q, np.ones(79), n=80), [1, 1])
+
+
+@pytest.mark.parametrize("backend", ["fft2", "rfft2", "nufft"])
+def test_cached_degenerate_welch_null_on_fourier_backends(backend):
+    shape = (8, 8)
+    data = np.random.default_rng(0).normal(size=shape)
+    if backend == "nufft":
+        coords = np.column_stack([a.ravel() for a in np.indices(shape)])
+        kernel = NUFFTKernel(coords, grid_shape=shape, spacing=(1.0, 1.0))
+        data = data.ravel()
+    else:
+        kernel = FFTKernel(shape, fft_solver=backend, bandwidth=0.01)
+    # A cached deterministic null must take the same guard as uncached moments.
+    params = {"method": "welch", "mean_Q": 63.0, "var_Q": 0.0, "scale_g": 0.0, "df_h": 1.0}
+    _, p = spatial_q_test(data, kernel, null_params=params)
+    assert p == 1.0
 
 
 if __name__ == "__main__":

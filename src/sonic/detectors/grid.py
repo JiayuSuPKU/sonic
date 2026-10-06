@@ -493,6 +493,9 @@ class DetectorGrid(Detector):
             rfft_spectrum = self.kernel_.eigenvalues().reshape(ny, nx // 2 + 1)
 
         weights = np.sqrt(np.abs(rfft_spectrum))
+        if self.kernel_.fft_solver == "rfft2":
+            # Include the conjugate modes omitted by rfft2.
+            weights[:, 1 : (nx + 1) // 2] *= np.sqrt(2.0)
 
         # Broadcast multiply
         weighted_freq = freq_data * weights[None, :, :]
@@ -593,6 +596,7 @@ class DetectorGrid(Detector):
         logger.info("Processing in %d chunks of size ~%d...", len(chunks_x), chunk_size)
 
         sigma = np.sqrt(self.kernel_.square_trace())
+        spectral_sign = np.sign(self.kernel_.eigenvalues())
         results_list = []
 
         # 5. Block Iteration
@@ -617,7 +621,7 @@ class DetectorGrid(Detector):
                 # --- CROSS-BATCH CORRELATION ---
                 # R_block shape: (chunk_size, chunk_size) -> Very small
                 # This step reduces millions of pixels down to a simple correlation number
-                R_block = np.matmul(embeddings_x, embeddings_y.conj().T).real
+                R_block = np.matmul(embeddings_x * spectral_sign, embeddings_y.conj().T).real
 
                 # Normalize by grid size (rfft2 is unnormalized)
                 R_block /= nx * ny

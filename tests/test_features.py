@@ -234,6 +234,25 @@ class TestRadialBinning:
         assert np.all(np.asarray(counts) > 0)
 
 
+@pytest.mark.parametrize("shape", [(8, 8), (7, 9)])
+@pytest.mark.parametrize("solver", ["fft2", "rfft2"])
+@pytest.mark.parametrize("exclude_dc", [False, True])
+def test_radial_bins_discard_out_of_band_modes(shape, solver, exclude_dc):
+    ky = np.fft.fftfreq(shape[0])[:, None]
+    kx = np.fft.fftfreq(shape[1])[None, :]
+    radius = np.hypot(ky, kx)
+    edges = np.array([0.125, 0.25, 0.5])
+    power = radius**2
+    power[(radius < edges[0]) | (radius > edges[-1])] = 1000.0
+    counts, _ = np.histogram(radius, bins=edges)
+    sums, _ = np.histogram(radius, bins=edges, weights=power)
+    if solver == "rfft2":
+        power = power[:, : shape[1] // 2 + 1]
+    kwargs = {"fft_solver": solver, "edges": edges, "exclude_dc": exclude_dc}
+    np.testing.assert_allclose(radial_bin_counts(shape, **kwargs), counts)
+    np.testing.assert_allclose(radial_bin_spectrum(power, shape, **kwargs), sums / counts)
+
+
 class TestRotationAlignment:
     """Rotation alignment APIs on small synthetic spectra."""
 

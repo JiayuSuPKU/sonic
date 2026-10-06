@@ -8,9 +8,12 @@ from unittest.mock import patch
 import anndata
 import numpy as np
 import pandas as pd
+import pytest
 import scipy.sparse as sp
 
+from sonic import Detector
 from sonic.detectors.irregular import DetectorIrregular
+from sonic.statistics import spatial_r_test
 
 
 class TestDetectorIrregular(unittest.TestCase):
@@ -574,6 +577,18 @@ class TestDetectorIrregularBackendParity(unittest.TestCase):
         q_n = df_n.loc[common, "Q"].to_numpy()
         rho, _ = spearmanr(q_m, q_n)
         self.assertGreaterEqual(rho, 0.7, msg=f"Spearman(Q_matrix, Q_nufft) = {rho:.2f}")
+
+
+@pytest.mark.parametrize("rho", [0.1, 0.9])
+def test_matrix_detector_r_matches_standalone(rho):
+    rng = np.random.default_rng(123)
+    data = anndata.AnnData(rng.normal(size=(80, 2)))
+    data.var_names = ["x", "y"]
+    data.obsm["spatial"] = rng.uniform(size=(80, 2))
+    detector = Detector(data, kernel_method="car", rho=rho, k_neighbors=4).setup_data(data)
+    row = detector.compute_rstat(["x"], ["y"], n_jobs=1, show_progress=False).iloc[0]
+    r, p = spatial_r_test(data.X[:, 0], data.X[:, 1], detector.kernel_)
+    np.testing.assert_allclose([row.R, row.P_value], [r, p], rtol=1e-10)
 
 
 if __name__ == "__main__":

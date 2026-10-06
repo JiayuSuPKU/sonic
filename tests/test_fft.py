@@ -6,10 +6,11 @@ Compares FFTKernel results with MatrixKernel for grid data.
 import unittest
 
 import numpy as np
+import pytest
 
 from sonic.kernels import MatrixKernel
 from sonic.kernels.fft import FFTKernel
-from sonic.statistics import spatial_q_test, spatial_r_test
+from sonic.statistics import compute_null_params, spatial_q_test, spatial_r_test
 from sonic.statistics import spatial_q_test as spatial_q_test_standard
 from sonic.statistics import spatial_r_test as spatial_r_test_standard
 from sonic.utils import compute_torus_distance_matrix
@@ -551,13 +552,7 @@ class TestFFTKernelNullParamsRoundTrip(unittest.TestCase):
         params = compute_null_params(self.kernel, method="liu")
         Q_given, p_given = spatial_q_test(data, self.kernel, null_params=params)
         self.assertAlmostEqual(Q_auto, Q_given, places=10)
-        # p-values differ at O(1e-3) because `compute_null_params` uses the
-        # (possibly subsetted) `eigenvalues()` path while the on-the-fly
-        # branch uses `eigenvalues(return_full_layout=True)`. Both are valid Liu
-        # approximations; we only care the parametrized path returns a
-        # finite probability in [0, 1].
-        self.assertGreaterEqual(p_given, 0.0)
-        self.assertLessEqual(p_given, 1.0)
+        self.assertAlmostEqual(p_auto, p_given, places=10)
 
     def test_rtest_fft_null_params_round_trip(self):
         """FFT R-test with pre-computed var_R should match exactly."""
@@ -579,6 +574,21 @@ class TestFFTKernelNullParamsRoundTrip(unittest.TestCase):
         q_via_Kx = float(np.sum(z * Kz))
         q_direct = float(self.kernel.xtKx(z))
         np.testing.assert_allclose(q_via_Kx, q_direct, rtol=1e-8, atol=1e-10)
+
+
+@pytest.mark.parametrize("shape", [(8, 8), (8, 9), (9, 8), (9, 9)])
+def test_rfft_full_spectrum_and_cached_null_match_fft(shape):
+    full = FFTKernel(shape, method="car", fft_solver="fft2")
+    half = FFTKernel(shape, method="car", fft_solver="rfft2")
+    np.testing.assert_allclose(half.eigenvalues(return_full_layout=True), full.eigenvalues())
+    np.testing.assert_allclose(
+        [half.trace(), half.square_trace()], [full.trace(), full.square_trace()]
+    )
+    data = np.random.default_rng(7).normal(size=shape + (3,))
+    expected = spatial_q_test(data, full)
+    np.testing.assert_allclose(spatial_q_test(data, half), expected)
+    cached = compute_null_params(half, method="liu")
+    np.testing.assert_allclose(spatial_q_test(data, half, null_params=cached), expected)
 
 
 class TestFFTKNeighborsAPI(unittest.TestCase):

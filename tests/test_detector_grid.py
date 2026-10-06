@@ -8,8 +8,10 @@ from unittest.mock import patch
 
 import numpy as np
 import pandas as pd
+import pytest
 
 from sonic.detectors.grid import DetectorGrid
+from sonic.statistics import spatial_r_test
 
 
 class MockCoord:
@@ -473,6 +475,35 @@ class TestDetectorGridStatistic(unittest.TestCase):
         missing_embeddings = detector._compute_batch_spectral_embeddings(missing_da, self.features)
         filled_embeddings = detector._compute_batch_spectral_embeddings(filled_da, self.features)
         np.testing.assert_allclose(missing_embeddings, filled_embeddings, rtol=1e-10, atol=1e-12)
+
+
+@pytest.mark.parametrize("shape", [(8, 8), (7, 9)])
+@pytest.mark.parametrize("solver", ["fft2", "rfft2"])
+@pytest.mark.parametrize("method", ["car", "moran"])
+def test_grid_detector_r_matches_standalone(shape, solver, method):
+    yy, xx = np.indices(shape)
+    data = np.array(
+        [
+            np.cos(2 * np.pi * xx / shape[1]) + 1.5 * (-1.0) ** (xx + yy),
+            np.random.default_rng(5).normal(size=shape),
+        ]
+    )
+    names = ["x", "y"]
+    raster = MockDataArray(data, names)
+    sdata = MockSpatialData("cells", MockTable(data.reshape(2, -1).T, names))
+    with patch("sonic._rasterize.rasterize_table", return_value=raster):
+        detector = DetectorGrid(kernel_method=method, fft_solver=solver).setup_data(
+            sdata, bins="bins", table_name="cells", col_key="col", row_key="row"
+        )
+    for features_y in (None, names):
+        result = detector.compute_rstat(
+            names, features_y, chunk_size=1, workers=1, show_progress=False
+        )
+        for row in result.itertuples():
+            r, p = spatial_r_test(
+                data[names.index(row.Feature_1)], data[names.index(row.Feature_2)], detector.kernel_
+            )
+            np.testing.assert_allclose([row.R, row.P_value], [r, p], rtol=1e-10, atol=1e-12)
 
 
 if __name__ == "__main__":

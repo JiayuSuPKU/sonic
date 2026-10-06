@@ -2,6 +2,7 @@
 Unit tests for kernel classes and methods.
 """
 
+import pickle
 import unittest
 
 import numpy as np
@@ -546,6 +547,19 @@ class TestXtKxStandardized(unittest.TestCase):
         self.assertAlmostEqual(q[2], 0.0, places=12)
         # Middle column has nonzero std → nonzero Q.
         self.assertGreater(q[1], 0.0)
+
+
+def test_standardized_precision_lu_survives_pickle():
+    # Cross the production threshold for implicit inversion, without a dense matrix.
+    n = 5001
+    precision = sp.diags(np.linspace(1, 4, n), format="csc")
+    kernel = MatrixKernel.from_matrix(
+        precision, is_precision=True, method="car", standardize=True, centering=False
+    )
+    vector = np.linspace(-1, 1, n)
+    np.testing.assert_allclose(kernel.Kx(vector), vector, atol=1e-12)
+    restored = pickle.loads(pickle.dumps(kernel))
+    np.testing.assert_allclose(restored.Kx(vector), kernel.Kx(vector), atol=1e-12)
 
 
 if __name__ == "__main__":

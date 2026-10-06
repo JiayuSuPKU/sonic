@@ -245,7 +245,7 @@ class TestTutorialFFTKernel(unittest.TestCase):
         from sonic.kernels.fft import FFTKernel
 
         # Create FFT kernel
-        kernel_fft = FFTKernel(shape=self.grid_shape, method="car", rho=0.9, topology="square")
+        kernel_fft = FFTKernel(shape=self.grid_shape, method="car", rho=0.9)
 
         # Verify properties
         self.assertEqual(kernel_fft.ny, self.grid_shape[0])
@@ -279,7 +279,7 @@ class TestTutorialFFTKernel(unittest.TestCase):
         )
 
         # Create FFT kernel for same grid
-        kernel_fft = FFTKernel(shape=(50, 50), method="car", rho=0.9, topology="square")
+        kernel_fft = FFTKernel(shape=(50, 50), method="car", rho=0.9)
 
         # Generate test data
         np.random.seed(42)

@@ -132,7 +132,7 @@ import spatialdata as sd
 from sonic import Detector
 
 sdata = sd.read_zarr("visium_hd.zarr/")
-detector = Detector(sdata, kernel_method='car', rho=0.9, topology='square').setup_data(
+detector = Detector(sdata, kernel_method='car', rho=0.9).setup_data(
     sdata,
     bins='Visium_HD_bin',
     table_name='table',

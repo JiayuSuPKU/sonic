@@ -18,10 +18,8 @@ jobs:
         with:
           python-version: "3.12"
       - run: python -m pip install build twine
-      - run: python -m build
-      - run: python -m build compat/quadsv --outdir compat-dist
-      - run: python -m twine check dist/* compat-dist/*
-      - name: Verify release version and wheel ownership
+      - name: Pin QuadSV to this SONIC release
+        id: release
         env:
           RELEASE_TAG: ${{ github.event.release.tag_name }}
         run: |
@@ -29,6 +27,21 @@ jobs:
             v*) version="${RELEASE_TAG#v}" ;;
             *) echo "Release tag must start with v"; exit 1 ;;
           esac
+          sed -i -E \
+            "s#^dependencies = \[\"sonic-spatial[^\"]*\"\]$#dependencies = [\"sonic-spatial==${version}\"]#" \
+            compat/quadsv/pyproject.toml
+          grep -Fqx \
+            "dependencies = [\"sonic-spatial==${version}\"]" \
+            compat/quadsv/pyproject.toml
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+      - run: python -m build
+      - run: python -m build compat/quadsv --outdir compat-dist
+      - run: python -m twine check dist/* compat-dist/*
+      - name: Verify release version and wheel ownership
+        env:
+          RELEASE_VERSION: ${{ steps.release.outputs.version }}
+        run: |
+          version="$RELEASE_VERSION"
           sonic_wheel="dist/sonic_spatial-${version}-py3-none-any.whl"
           quadsv_wheel="compat-dist/quadsv-${version}-py3-none-any.whl"
           test -f "$sonic_wheel"
@@ -37,7 +50,7 @@ jobs:
           ! unzip -Z1 "$sonic_wheel" | grep -q '^quadsv/'
           unzip -Z1 "$quadsv_wheel" | grep -qx 'quadsv/__init__.py'
           unzip -p "$quadsv_wheel" 'quadsv-*.dist-info/METADATA' |
-            grep -Eq '^Requires-Dist: sonic-spatial(<2,>=1\.0\.0rc1|>=1\.0\.0rc1,<2)$'
+            grep -Fx "Requires-Dist: sonic-spatial==${version}"
       - uses: actions/upload-artifact@v4
         with:
           name: sonic-dist

@@ -40,67 +40,10 @@ class TestFFTKernelBasics(unittest.TestCase):
         assert kernel.spectrum is not None
         assert len(kernel.spectrum) == 60  # 10 * (10//2 +1)
 
-    def test_fft_kernel_init_hex(self):
-        """Test FFTKernel initialization with hexagonal grid."""
-        shape = (8, 8)
-        kernel = FFTKernel(
-            shape, topology="hex", method="matern", bandwidth=1.0, nu=1.5, fft_solver="fft2"
-        )
-        assert kernel.ny == 8
-        assert kernel.nx == 8
-        assert len(kernel.spectrum) == 64
-
-    def test_hex_kernel_nonsquare_anisotropic_signal(self):
-        """Regression: hex topology must give correct xtKx on non-square grids.
-
-        Visium slides are 78 rows x 64 (or 128) cols, never square. The earlier
-        implementation swapped axes inside ``_precompute_hex_torus`` and only worked
-        when ``ny == nx``. This test checks agreement with the dense Matern kernel
-        on a non-square grid with a directional signal, where the axis-swap bug is
-        observable.
-        """
-        import numpy as np
-        from scipy.spatial.distance import pdist, squareform
-        from scipy.special import gamma, kv
-
-        ny, nx = 6, 10
-        bw, nu = 2.0, 1.5
-
-        # Physical Visium hex coords for each spot (r, c).
-        coords = np.array(
-            [[r * np.sqrt(3) / 2, (2 * c + (r % 2)) / 2.0] for r in range(ny) for c in range(nx)]
-        )
-        d = squareform(pdist(coords))
-        factor = (np.sqrt(2 * nu) * d) / bw
-        with np.errstate(divide="ignore", invalid="ignore"):
-            K = (2 ** (1 - nu) / gamma(nu)) * (factor**nu) * kv(nu, factor)
-        K[d == 0] = 1.0
-
-        kernel = FFTKernel(
-            (ny, nx),
-            topology="hex",
-            method="matern",
-            bandwidth=bw,
-            nu=nu,
-            fft_solver="fft2",
-            centering=False,
-        )
-        rng = np.random.default_rng(0)
-        # Two distinctly anisotropic signals:
-        sig_x = np.broadcast_to(np.sin(2 * np.pi * np.arange(nx) / nx), (ny, nx)).astype(float)
-        sig_y = np.broadcast_to(np.sin(2 * np.pi * np.arange(ny) / ny)[:, None], (ny, nx)).astype(
-            float
-        )
-        sig_rand = rng.standard_normal((ny, nx))
-
-        for sig in (sig_x, sig_y, sig_rand):
-            Q_dense = sig.ravel() @ K @ sig.ravel()
-            Q_fft = kernel.xtKx(sig)
-            # Allow up to 10% deviation due to torus periodic-BC wrap-around.
-            assert abs(Q_fft - Q_dense) / abs(Q_dense) < 0.10, (
-                f"Hex FFTKernel disagrees with dense Matern: dense={Q_dense:.4f}, "
-                f"fft={Q_fft:.4f}"
-            )
+    def test_fft_kernel_rejects_hex(self):
+        """Staggered hex grids require a block FFT and must fail closed."""
+        with self.assertRaisesRegex(ValueError, "supports only topology='square'"):
+            FFTKernel((8, 8), topology="hex", method="matern")
 
     def test_fft_matern_eigenvalues(self):
         """Test eigenvalues method."""
@@ -640,7 +583,7 @@ class TestFFTKernelNullParamsRoundTrip(unittest.TestCase):
 
 class TestFFTKNeighborsAPI(unittest.TestCase):
     """``FFTKernel`` accepts ``k_neighbors`` for graph kernels and converts
-    to ``neighbor_degree`` based on topology. Matches the MatrixKernel k-NN
+    to ``neighbor_degree`` on the square grid. Matches the MatrixKernel k-NN
     semantic so users don't have to think in FFT-ring units.
     """
 
@@ -652,21 +595,6 @@ class TestFFTKNeighborsAPI(unittest.TestCase):
                 k_obj.params["neighbor_degree"],
                 expected_deg,
                 f"k={k} on square should map to neighbor_degree={expected_deg}",
-            )
-
-    def test_hex_k_to_degree_mapping(self):
-        """Hex grid: k=6 → 1 (first ring), k=12 → 2, k=18 → 3.
-
-        This also exercises the tolerance-based ring grouping —
-        hex distances like √3/2 produce numerical clusters that would
-        otherwise split a single physical shell.
-        """
-        for k, expected_deg in [(6, 1), (12, 2), (18, 3)]:
-            k_obj = FFTKernel((32, 32), topology="hex", method="moran", k_neighbors=k)
-            self.assertEqual(
-                k_obj.params["neighbor_degree"],
-                expected_deg,
-                f"k={k} on hex should map to neighbor_degree={expected_deg}",
             )
 
     def test_k_neighbors_works_for_all_graph_kernels(self):
@@ -725,30 +653,6 @@ class TestFFTKNeighborsAPI(unittest.TestCase):
                 expected_deg,
                 f"square k={k} → expected deg={expected_deg}, "
                 f"got {k_obj.params['neighbor_degree']}",
-            )
-
-    def test_arbitrary_k_on_hex_rounds_up(self):
-        """Hex cumulative ring sizes: 6, 12, 18, 24, … (hex has 6·d nbrs at
-        degree d). Any k inside a ring should map to the smallest enclosing
-        degree.
-        """
-        cases_hex = [
-            (1, 1),
-            (5, 1),
-            (6, 1),
-            (7, 2),
-            (11, 2),
-            (12, 2),
-            (13, 3),
-            (17, 3),
-            (18, 3),
-        ]
-        for k, expected_deg in cases_hex:
-            k_obj = FFTKernel((32, 32), topology="hex", method="moran", k_neighbors=k)
-            self.assertEqual(
-                k_obj.params["neighbor_degree"],
-                expected_deg,
-                f"hex k={k} → expected deg={expected_deg}",
             )
 
     def test_k_zero_and_negative_raise(self):

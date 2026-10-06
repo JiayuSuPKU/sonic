@@ -79,7 +79,7 @@ class Detector(ABC):
         """Return ``{default: value}`` after merging user overrides.
 
         Subclasses must validate unknown keys and fill in backend-specific
-        defaults (e.g. ``fft_solver`` / ``spacing`` / ``topology`` for
+        defaults (e.g. ``fft_solver`` / ``spacing`` for
         :class:`DetectorGrid`; ``k_neighbors`` vs ``neighbor_degree`` for
         the matrix vs NUFFT backends of :class:`DetectorIrregular`).
         """

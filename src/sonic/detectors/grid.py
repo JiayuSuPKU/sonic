@@ -114,8 +114,9 @@ class DetectorGrid(Detector):
         One of ``'gaussian'``, ``'matern'``, ``'moran'``, ``'graph_laplacian'``,
         ``'car'``.
     **kernel_params
-        Kernel hyperparameters plus grid controls (``spacing``, ``topology``,
-        ``fft_solver``, ``workers``). See :class:`~sonic.FFTKernel`.
+        Kernel hyperparameters plus grid controls (``spacing``, ``fft_solver``,
+        ``workers``). ``topology='square'`` remains accepted for compatibility.
+        See :class:`~sonic.FFTKernel`.
 
     Attributes
     ----------

@@ -251,7 +251,6 @@ Code:
        kernel_method="car",
        rho=0.9,
        neighbor_degree=1,
-       topology="square",
    ).setup_data(
        sdata,
        bins="square_008um",       # name of the bin element in sdata

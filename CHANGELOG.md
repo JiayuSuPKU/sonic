@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Removed
+- **Incorrect FFT hex topology.** `FFTKernel(topology="hex")` now fails
+  with migration guidance because a scalar 2-D FFT does not preserve the
+  parity-dependent neighbours of a staggered hex grid. Use `NUFFTKernel`
+  with physical coordinates for continuous kernels or `MatrixKernel` with
+  an explicit adjacency/precision matrix for graph kernels. Explicit
+  `topology="square"` remains accepted for compatibility.
+
 ## [1.0.0rc1] - 2026-08-29
 
 ### Changed

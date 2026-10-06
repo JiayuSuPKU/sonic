@@ -92,8 +92,9 @@ class FFTKernel(Kernel):
         Grid dimensions (number of rows and columns).
     n_grid : int
         Total number of grid points (``ny * nx``).
-    topology : {'square', 'hex'}
-        Grid topology. ``'hex'`` mirrors 10x Visium hexagonal layouts.
+    topology : {'square'}
+        Grid topology. Only rectangular grids are supported; the parameter is
+        retained for compatibility with callers that explicitly pass ``'square'``.
     method : str
         Kernel method (``'gaussian'``, ``'matern'``, ``'moran'``, ``'graph_laplacian'``,
         ``'car'``).
@@ -136,8 +137,10 @@ class FFTKernel(Kernel):
             Grid dimensions (ny, nx).
         spacing : tuple of float, default (1.0, 1.0)
             Physical distance between pixels (dy, dx).
-        topology : {'square', 'hex'}, default 'square'
-            Grid topology. 'hex' is for Visium-like hexagonal layouts.
+        topology : {'square'}, default 'square'
+            Grid topology. Only rectangular grids are supported. For hexagonal
+            data, use :class:`~sonic.NUFFTKernel` with physical coordinates or
+            :class:`~sonic.MatrixKernel` with an explicit graph.
         method : str, default 'matern'
             Kernel method: 'gaussian', 'matern', 'moran', 'graph_laplacian', 'car'.
         workers : Optional[int], default None
@@ -151,7 +154,6 @@ class FFTKernel(Kernel):
         Examples
         --------
         >>> kernel = FFTKernel((64, 64), method='gaussian', bandwidth=2.0)
-        >>> kernel = FFTKernel((64, 64), topology='hex', method='matern')
         """
         super().__init__(centering=centering)
         ny, nx = shape
@@ -178,20 +180,24 @@ class FFTKernel(Kernel):
         """Length of the flattened spectrum buffer (``ny*nx`` for ``fft2``, ``ny*(nx//2+1)`` for ``rfft2``)."""
 
         # Sanity Checks
-        if topology not in ("square", "hex"):
-            raise ValueError(f"topology must be 'square' or 'hex', got '{topology}'")
+        if topology != "square":
+            raise ValueError(
+                f"FFTKernel supports only topology='square', got {topology!r}. "
+                "For hexagonal data, use NUFFTKernel with physical coordinates "
+                "or MatrixKernel with an explicit adjacency/precision matrix."
+            )
         if method not in self._available_kernels:
             raise ValueError(f"method must be one of {self._available_kernels}, got '{method}'")
 
         self.topology: str = topology
-        """Grid topology (``'square'`` or ``'hex'``)."""
+        """Grid topology (always ``'square'``)."""
         self.method: str = method
         """Kernel method name."""
 
         # Update kernel parameters from defaults. Graph kernels accept an
         # additional ``k_neighbors`` as a convenience (k-NN semantic): it's
-        # converted to the closest ``neighbor_degree`` (FFT-ring semantic)
-        # based on the grid topology — see _k_neighbors_to_degree below.
+        # converted to the closest ``neighbor_degree`` (FFT-ring semantic) —
+        # see _k_neighbors_to_degree below.
         params = self._get_default_params(method).copy()
         k_neighbors_user = None
         if kwargs:
@@ -210,10 +216,7 @@ class FFTKernel(Kernel):
 
         # 1. Precompute Distances
         # For Periodic: Distances wrap around (min(d, L-d)).
-        if self.topology == "hex":
-            self._min_dist_sq = self._precompute_hex_torus()
-        else:
-            self._min_dist_sq = self._precompute_square_dists()
+        self._min_dist_sq = self._precompute_square_dists()
 
         # Resolve k_neighbors → neighbor_degree now that the distance grid is built.
         if k_neighbors_user is not None:
@@ -231,9 +234,8 @@ class FFTKernel(Kernel):
     def _unique_ring_distances(self) -> np.ndarray:
         """Tolerance-grouped unique squared distances on the grid.
 
-        Groups numerically-close values into a single "ring" so hex and other
-        irrational-coordinate topologies report physical shells consistently.
-        Returns sorted ascending, starting with 0 (self). Internal helper.
+        Groups numerically-close values into a single physical shell. Returns
+        sorted ascending, starting with 0 (self). Internal helper.
         """
         flat = np.sort(self._min_dist_sq.ravel())
         tol = 1e-6 * max(1.0, float(flat[-1]))
@@ -249,8 +251,8 @@ class FFTKernel(Kernel):
         grid cells (excluding self) is ≥ ``k_neighbors``. Topology-aware via
         :meth:`_unique_ring_distances`:
 
-        - Square: k=4 → 1 (N/S/E/W), k=8 → 2 (+diagonals), k=12 → 3.
-        - Hex:    k=6 → 1, k=12 → 2, k=18 → 3.
+        For a square grid, k=4 → 1 (N/S/E/W), k=8 → 2
+        (+diagonals), and k=12 → 3.
         """
         if k_neighbors < 1:
             raise ValueError(f"k_neighbors must be ≥ 1, got {k_neighbors}")
@@ -362,53 +364,6 @@ class FFTKernel(Kernel):
         yy, xx = np.meshgrid(y, x, indexing="ij")
         return yy**2 + xx**2
 
-    def _precompute_hex_torus(self):
-        """Squared torus distances on a hexagonal grid (Visium convention).
-
-        Spot ``(r, c)`` lies at physical ``(y, x) = (r * sqrt(3)/2, c + 0.5 * (r%2))``
-        in units of the center-to-center horizontal step — i.e., odd rows are shifted
-        half a step in +x, matching the 10x Visium ``array_row`` / ``array_col``
-        layout.
-
-        Returns an ``(ny, nx)`` array consistent with the ``(ny, nx)`` signal shape
-        expected by :meth:`xtKx`. (The previous implementation returned ``(nx, ny)``
-        and scrambled the spectrum for non-square grids, silently breaking anisotropic
-        signals on any real Visium slide — Visium is never square. Tests covered only
-        square hex grids so the bug was invisible. Fixed.)
-
-        Periodicity in the y direction is well-defined only when ``ny`` is even (so
-        the row-parity shift is preserved under wrap-around); callers feeding odd
-        ``ny`` will get a near-periodic but slightly off torus and a warning is
-        emitted.
-        """
-        if self.ny % 2 != 0:
-            warnings.warn(
-                f"Hex topology expects an even number of rows (ny); got ny={self.ny}. "
-                "Periodic boundary conditions are approximate for odd ny.",
-                UserWarning,
-                stacklevel=2,
-            )
-        r = np.arange(self.ny)  # row index, first (ny) axis
-        c = np.arange(self.nx)  # col index, second (nx) axis
-        rr, cc = np.meshgrid(r, c, indexing="ij")  # both shape (ny, nx)
-
-        y_phys = rr * (np.sqrt(3) / 2.0)
-        x_phys = cc + 0.5 * (rr % 2)
-        coords_grid = np.stack([y_phys, x_phys], axis=-1)  # (ny, nx, 2)
-
-        # Torus periods: width in x is nx, height in y is ny * sqrt(3)/2.
-        P_y = np.array([self.ny * (np.sqrt(3) / 2.0), 0.0])
-        P_x = np.array([0.0, float(self.nx)])
-
-        min_d2 = np.full((self.ny, self.nx), np.inf)
-        for k in (-1, 0, 1):
-            for m in (-1, 0, 1):
-                shift = k * P_y + m * P_x
-                shifted = coords_grid + shift.reshape(1, 1, 2)
-                d2 = np.sum(shifted**2, axis=-1)
-                min_d2 = np.minimum(min_d2, d2)
-        return min_d2
-
     def _compute_eigenvalues(self):  # noqa: C901
         """Spectral decomposition of the kernel using fft2 or rfft2.
 
@@ -444,11 +399,8 @@ class FFTKernel(Kernel):
         elif self.method in ["moran", "graph_laplacian", "car"]:
             degree_order = self.params["neighbor_degree"]
 
-            # Tolerance-based ring grouping: hex distances like 1.0 arise from
-            # sqrt(3)/2 products and split into several numerical clusters
-            # (e.g. 0.9999998 and 1.0000003) that are *physically the same
-            # shell*. Without this, degree_order=1 on hex returns only 2 cells
-            # instead of the full 6-neighbour ring.
+            # Tolerance-based grouping keeps numerically-close distances in
+            # the same physical shell.
             unique_dists = self._unique_ring_distances()
 
             if degree_order < len(unique_dists):

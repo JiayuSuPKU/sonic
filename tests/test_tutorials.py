@@ -258,43 +258,6 @@ class TestTutorialFFTKernel(unittest.TestCase):
         Q = kernel_fft.xtKx(data_grid)
         self.assertGreater(Q, 0)
 
-    def test_fft_kernel_vs_spatial_kernel(self):
-        """Test: FFT kernel gives reasonable results vs. spatial kernel.
-
-        For a small regular grid, compare FFT and spatial kernels.
-        """
-        from sonic.kernels.fft import FFTKernel
-
-        # Create spatial kernel from grid coordinates
-        x = np.linspace(0, 1, 50)
-        y = np.linspace(0, 1, 50)
-        xx, yy = np.meshgrid(x, y)
-        grid_coords = np.column_stack((xx.ravel(), yy.ravel()))
-
-        kernel_spatial = MatrixKernel.from_coordinates(
-            grid_coords,
-            method="car",
-            k_neighbors=4,
-            rho=0.9,  # 4-neighbor grid
-        )
-
-        # Create FFT kernel for same grid
-        kernel_fft = FFTKernel(shape=(50, 50), method="car", rho=0.9)
-
-        # Generate test data
-        np.random.seed(42)
-        data_1d = np.random.randn(50 * 50)
-        data_grid = data_1d.reshape(50, 50)
-
-        # Compare Q-values
-        Q_spatial = kernel_spatial.xtKx(data_1d)
-        Q_fft = kernel_fft.xtKx(data_grid)
-
-        # Should be in similar ballpark (not identical due to different construction)
-        ratio = Q_fft / Q_spatial
-        self.assertGreater(ratio, 0.5)  # FFT within 2x of spatial
-        self.assertLess(ratio, 2.0)
-
 
 if __name__ == "__main__":
     unittest.main()

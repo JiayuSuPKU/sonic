@@ -480,7 +480,9 @@ class TestDetectorGridStatistic(unittest.TestCase):
 @pytest.mark.parametrize("shape", [(8, 8), (7, 9)])
 @pytest.mark.parametrize("solver", ["fft2", "rfft2"])
 @pytest.mark.parametrize("method", ["car", "moran"])
-def test_grid_detector_r_matches_standalone(shape, solver, method):
+def test_grid_detector_r_matches_standalone(shape, solver, method, monkeypatch):
+    # This checks numerical parity, not the production memory-cleanup policy.
+    monkeypatch.setattr("gc.collect", lambda: None)
     yy, xx = np.indices(shape)
     data = np.array(
         [

@@ -4,12 +4,22 @@ Unit tests for kernel classes and methods.
 
 import pickle
 import unittest
+from unittest.mock import patch
 
 import numpy as np
 import pytest
 import scipy.sparse as sp
+from scipy.linalg import hadamard
 
 from sonic.kernels import MatrixKernel
+
+
+class _SmallImplicitKernel(MatrixKernel):
+    """Exercise the real implicit builder without a large dense reference."""
+
+    def _build_kernel(self):
+        self._implicit_threshold = 0
+        return super()._build_kernel()
 
 
 class TestMatrixKernel(unittest.TestCase):
@@ -210,16 +220,9 @@ class TestMatrixKernel(unittest.TestCase):
         """Implicit sparse-precision path (CAR) eigenvalues match the dense
         ``eigvalsh(HKH)`` reference (top-k, since eigsh can't return all).
         """
-        n_side = 20
-        x = np.linspace(0, 10, n_side)
-        y = np.linspace(0, 10, n_side)
-        xx, yy = np.meshgrid(x, y)
-        coords = np.column_stack((xx.ravel(), yy.ravel()))
-        # Force sparse-implicit representation — use the CAR method which
-        # stores the precision M = I − ρW and solves for K·v on demand.
-        kernel = MatrixKernel(coords, method="car", k_neighbors=4, rho=0.9)
-        # Build reference HKH eigvals directly from the realized K.
-        K = kernel.realization()
+        kernel = _SmallImplicitKernel(self.coords, method="car", k_neighbors=4, rho=0.9)
+        self.assertTrue(kernel.stores_precision)
+        K = np.linalg.inv(kernel._K.toarray())
         n = kernel.n
         H = np.eye(n) - np.ones((n, n)) / n
         ref_descending = np.sort(np.linalg.eigvalsh(H @ K @ H))[::-1]
@@ -252,7 +255,7 @@ class TestMatrixKernel(unittest.TestCase):
         np.testing.assert_almost_equal(sq_trace, expected, decimal=10)
 
     def test_car_implicit(self):
-        """Test CAR kernel in implicit mode (larger N)."""
+        """Cross the production implicit threshold without materializing K."""
         # Create larger dataset
         n_large = 6400
         x = np.linspace(0, 10, int(np.sqrt(n_large)))
@@ -260,8 +263,7 @@ class TestMatrixKernel(unittest.TestCase):
         xx, yy = np.meshgrid(x, y)
         coords_large = np.column_stack((xx.ravel(), yy.ravel()))
 
-        # Construct the kernel in raw mode — the test compares against
-        # ``x.T @ K @ x`` which is raw (not ``(Hx)ᵀ K (Hx)``).
+        # Raw mode lets us check the defining precision solve M @ Kx = x.
         kernel = MatrixKernel(
             coords_large,
             mode="coords",
@@ -273,24 +275,10 @@ class TestMatrixKernel(unittest.TestCase):
         self.assertEqual(kernel.n, n_large)
         self.assertTrue(kernel.stores_precision)  # Should be implicit due to size
 
-        true_K = kernel.realization()
-        self.assertEqual(true_K.shape, (n_large, n_large))
-
-        # check if xtKx gives the same result as direct computation
         x = np.random.randn(n_large)
-        result = kernel.xtKx(x)
-        expected = x.T @ true_K @ x
-        self.assertAlmostEqual(result, expected, places=5)
-
-        # check trace computation
-        trace_result = kernel.trace() / (n_large**2)
-        expected_trace = np.trace(true_K) / (n_large**2)
-        self.assertAlmostEqual(trace_result, expected_trace, places=5)
-
-        # check square trace computation
-        sq_trace_result = kernel.square_trace() / (n_large**2)
-        expected_sq_trace = np.sum(true_K**2) / (n_large**2)
-        self.assertAlmostEqual(sq_trace_result, expected_sq_trace, places=4)
+        Kx = kernel.Kx(x)
+        np.testing.assert_allclose(kernel._K @ Kx, x, rtol=1e-10, atol=1e-12)
+        np.testing.assert_allclose(kernel.xtKx(x), x @ Kx, rtol=1e-10)
 
 
 class TestMatrixKernelStandardization(unittest.TestCase):
@@ -343,68 +331,28 @@ class TestMatrixKernelStandardization(unittest.TestCase):
 class TestMatrixKernelImplicitTrace(unittest.TestCase):
     """Test trace and square_trace for implicit kernel matrices."""
 
-    def setUp(self):
-        """Set up a large dataset for implicit kernel testing."""
-        np.random.seed(42)
-        # Create large grid that exceeds implicit_threshold (5000)
-        n_side = 72  # 72x72 = 5184 > 5000
-        x = np.linspace(0, 10, n_side)
-        y = np.linspace(0, 10, n_side)
-        xx, yy = np.meshgrid(x, y)
-        self.coords = np.column_stack((xx.ravel(), yy.ravel()))
-        self.n = self.coords.shape[0]
-
-    def test_implicit_trace_accuracy(self):
-        """Test trace() estimation for implicit CAR kernel."""
-        kernel = MatrixKernel.from_coordinates(
-            self.coords,
-            method="car",
-            k_neighbors=4,
-            rho=0.85,
+    def test_implicit_moments_match_dense(self):
+        """Orthogonal ±1 probes give exact moments through the real LU solves."""
+        coords = np.indices((4, 4)).reshape(2, -1).T
+        kernel = _SmallImplicitKernel(
+            coords, method="car", k_neighbors=4, rho=0.85, centering=False
         )
         self.assertTrue(kernel.stores_precision)
-        self.assertEqual(kernel.n, self.n)
-
-        # Compute trace via implicit method (Hutchinson's trick)
-        implicit_trace = kernel.trace()
-
-        # Compute trace directly from realization (ground truth)
-        K_realized = kernel.realization()
-        true_trace = np.trace(K_realized)
-
-        # 0.5% budget: Hutchinson with n_probes=15 on a 72×72 CAR whose
-        # spectrum has a heavy large-eigenvalue tail — Hutchinson averages
-        # that tail efficiently, so the probe-noise band tightens well below
-        # the naive 1/√15 ≈ 26% heuristic for flatter spectra.
-        rel_error = np.abs(implicit_trace - true_trace) / (np.abs(true_trace) + 1e-10)
-        self.assertLess(
-            rel_error, 0.005, msg=f"Trace estimation relative error {rel_error:.4f} exceeds 0.5%"
-        )
-
-    def test_implicit_square_trace_accuracy(self):
-        """Test square_trace() estimation for implicit CAR kernel."""
-        kernel = MatrixKernel.from_coordinates(
-            self.coords,
-            method="car",
-            k_neighbors=4,
-            rho=0.85,
-        )
-        self.assertTrue(kernel.stores_precision)
-
-        # Compute square trace via implicit method
-        implicit_sq_trace = kernel.square_trace()
-
-        # Compute square trace directly from realization
-        K_realized = kernel.realization()
-        true_sq_trace = np.sum(K_realized**2)
-
-        # Relative error check
-        rel_error = np.abs(implicit_sq_trace - true_sq_trace) / (np.abs(true_sq_trace) + 1e-10)
-        self.assertLess(
-            rel_error,
-            0.005,
-            msg=f"Square trace estimation relative error {rel_error:.4f} exceeds 0.5%",
-        )
+        raw = np.linalg.inv(kernel._K.toarray())
+        H = np.eye(kernel.n) - np.ones((kernel.n, kernel.n)) / kernel.n
+        # Replace only the probe draw, eliminating sampling error in this unit test.
+        with patch("sonic.kernels.base.np.random.default_rng") as rng:
+            rng.return_value.choice.return_value = hadamard(kernel.n)
+            for centering in (False, True):
+                with self.subTest(centering=centering):
+                    kernel.centering = centering
+                    expected = H @ raw @ H if centering else raw
+                    np.testing.assert_allclose(kernel.realization(), expected, atol=1e-12)
+                    np.testing.assert_allclose(
+                        [kernel.trace(n_probes=kernel.n), kernel.square_trace(n_probes=kernel.n)],
+                        [np.trace(expected), np.sum(expected**2)],
+                        rtol=1e-10,
+                    )
 
 
 class TestKernelUtilities(unittest.TestCase):

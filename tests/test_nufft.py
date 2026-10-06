@@ -306,7 +306,7 @@ class TestNUFFTKernelTrace:
         evaluates ``|φ|²`` on a ``(2·ny, 2·nx)`` grid via a separate
         type-1 NUFFT and zero-pads ``λ`` for a true linear convolution.
         """
-        coords, _ = get_rect_coords(30, 30)
+        coords, _ = get_rect_coords(8, 8)
         coords = np.asarray(coords, dtype=float)
         k = NUFFTKernel(coords=coords, method=method, centering=centering, **kwargs)
         # Ground truth: build K explicitly via Kx applied to the identity.

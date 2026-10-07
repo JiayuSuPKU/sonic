@@ -580,15 +580,120 @@ class TestDetectorIrregularBackendParity(unittest.TestCase):
 
 
 @pytest.mark.parametrize("rho", [0.1, 0.9])
-def test_matrix_detector_r_matches_standalone(rho):
+@pytest.mark.parametrize("offset", [0.0, 1e8])
+def test_matrix_detector_r_matches_standalone(rho, offset):
     rng = np.random.default_rng(123)
-    data = anndata.AnnData(rng.normal(size=(80, 2)))
+    data = anndata.AnnData(offset + rng.normal(size=(80, 2)))
     data.var_names = ["x", "y"]
     data.obsm["spatial"] = rng.uniform(size=(80, 2))
     detector = Detector(data, kernel_method="car", rho=rho, k_neighbors=4).setup_data(data)
     row = detector.compute_rstat(["x"], ["y"], n_jobs=1, show_progress=False).iloc[0]
     r, p = spatial_r_test(data.X[:, 0], data.X[:, 1], detector.kernel_)
     np.testing.assert_allclose([row.R, row.P_value], [r, p], rtol=1e-10)
+
+
+@pytest.mark.parametrize("kind", ["dense", "sparse", "precision"])
+@pytest.mark.parametrize("offset", [0.0, 1e8])
+def test_matrix_r_centering_is_stable_and_workspace_is_chunked(kind, offset, monkeypatch):
+    from scipy.stats import norm
+
+    from sonic.detectors.irregular import _rstat_worker_chunked
+    from sonic.kernels import MatrixKernel
+
+    n = 5001 if kind == "precision" else 64
+    matrix = sp.diags([-np.ones(n - 1), np.full(n, 4.0), -np.ones(n - 1)], [-1, 0, 1], format="csc")
+    kernel = MatrixKernel.from_matrix(
+        matrix.toarray() if kind == "dense" else matrix, is_precision=kind == "precision"
+    )
+    assert kernel.stores_precision == (kind == "precision")
+    values = offset + np.random.default_rng(8).uniform(1, 5, (n, 5))
+    means, stds = values.mean(0), values.std(0, ddof=1)
+    z = (values - means) / stds
+    z -= z.mean(0)
+    kz = sp.linalg.spsolve(matrix, z) if kind == "precision" else matrix @ z
+    expected = z.T @ kz[:, :2]
+    sparse = sp.csc_matrix(values)
+    toarray = sp.csc_matrix.toarray
+
+    def bounded_toarray(self, *args, **kwargs):
+        # Five X features must never be densified together for a two-Y chunk.
+        assert self.shape[1] <= 2
+        return toarray(self, *args, **kwargs)
+
+    monkeypatch.setattr(sp.csc_matrix, "toarray", bounded_toarray)
+    rows = _rstat_worker_chunked(
+        sparse,
+        [0, 1],
+        list(range(5)),
+        kernel,
+        {"var_R": 4.0},
+        means,
+        stds,
+        [str(i) for i in range(5)],
+        True,
+    )
+    actual = pd.DataFrame(rows)
+    np.testing.assert_allclose(actual.R, expected.ravel(), rtol=1e-10, atol=1e-9)
+    np.testing.assert_allclose(
+        actual.P_value, 2 * norm.sf(np.abs(expected.ravel()) / 2), atol=1e-10
+    )
+    np.testing.assert_array_equal(sparse.data, values.T.ravel())
+
+
+def test_matrix_r_defaults_to_all_retained_features():
+    data = anndata.AnnData(np.random.default_rng(42).uniform(1, 5, (32, 3)))
+    data.X[:, 2] = 1.0
+    data.var_names = ["x", "y", "constant"]
+    data.obsm["spatial"] = np.random.default_rng(0).uniform(size=(32, 2))
+    detector = DetectorIrregular(kernel_method="gaussian").setup_data(data)
+    implicit = detector.compute_rstat(n_jobs=1, show_progress=False)
+    explicit = detector.compute_rstat(["x", "y"], n_jobs=1, show_progress=False)
+    assert len(implicit) == 4
+    pd.testing.assert_frame_equal(
+        implicit.set_index(["Feature_1", "Feature_2"]).sort_index(),
+        explicit.set_index(["Feature_1", "Feature_2"]).sort_index(),
+    )
+
+
+@pytest.mark.parametrize("return_pval", [False, True])
+@pytest.mark.parametrize("features", [None, ["missing"], []])
+def test_matrix_q_empty_selection_has_normal_schema(features, return_pval, monkeypatch):
+    data = anndata.AnnData(np.ones((16, 2)))
+    data.obsm["spatial"] = np.random.default_rng(0).uniform(size=(16, 2))
+    detector = DetectorIrregular(kernel_method="gaussian").setup_data(data)
+
+    def unexpected_calibration(*args, **kwargs):
+        pytest.fail("Empty results do not need null calibration")
+
+    monkeypatch.setattr("sonic.detectors.irregular.compute_null_params", unexpected_calibration)
+    result = detector.compute_qstat(
+        features=features, n_jobs=1, return_pval=return_pval, show_progress=False
+    )
+    assert result.empty
+    assert result.index.name == "Feature"
+    assert list(result.columns) == (
+        ["Q", "P_value", "Z_score", "P_adj"] if return_pval else ["Q", "Z_score"]
+    )
+
+
+@pytest.mark.parametrize("backend", ["matrix", "nufft"])
+def test_r_zero_null_variance_is_nonsignificant(backend):
+    from sonic.kernels import MatrixKernel
+
+    rng = np.random.default_rng(92)
+    data = anndata.AnnData(rng.uniform(1, 4, (64, 2)))
+    data.obsm["spatial"] = rng.uniform(0, 8, (64, 2))
+    kwargs = {"grid_shape": (8, 8), "spacing": (1.0, 1.0)} if backend == "nufft" else {}
+    detector = DetectorIrregular(
+        backend=backend, kernel_method="gaussian", bandwidth=1e6, **kwargs
+    ).setup_data(data)
+    if backend == "matrix":
+        detector.kernel_ = MatrixKernel.from_matrix(np.zeros((64, 64)))
+    assert detector.kernel_.square_trace() == 0
+    result = detector.compute_rstat(n_jobs=1, workers=1, show_progress=False)
+    assert len(result) == 4
+    np.testing.assert_array_equal(result.Z_score, 0)
+    np.testing.assert_array_equal(result[["P_value", "P_adj"]], 1)
 
 
 @pytest.mark.parametrize("backend", ["matrix", "nufft"])

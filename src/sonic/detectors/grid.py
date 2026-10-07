@@ -35,10 +35,10 @@ logger = logging.getLogger(__name__)
 
 
 class _OccupiedGridKernel:
-    """Null operator on observed cells, scaled to the reported full-grid Q.
+    """Null operator on observed cells, scaled to the reported full-grid Q/R.
 
     For m observed cells in an N-cell raster, mean filling followed by grid
-    standardization gives Q_grid = (N-1)/(m-1) * Q_observed. Restrict the
+    standardization gives Q_grid = (N-1)/(m-1) * Q_observed (likewise R). Restrict the
     kernel to those m cells and center there before fitting the existing null.
     """
 
@@ -49,7 +49,7 @@ class _OccupiedGridKernel:
         self.observed = observed
         self.n = int(observed.sum())
         if self.n < 2:
-            raise ValueError("Grid Q calibration requires at least two observed cells.")
+            raise ValueError("Grid null calibration requires at least two observed cells.")
         self.scale = (kernel.n - 1) / (self.n - 1)
         self.method = kernel.method
         shape = observed.shape
@@ -570,7 +570,7 @@ class DetectorGrid(Detector):
 
         return df.sort_values(by="Q", ascending=False)
 
-    def _compute_batch_spectral_embeddings(self, raster_layer, feature_names):
+    def _compute_batch_spectral_embeddings(self, raster_layer, feature_names, *, observed=None):
         """
         Helper: Loads data, standardizes, and computes weighted spectral components.
         Returns matrix of shape (n_features, n_spectral_components).
@@ -579,6 +579,8 @@ class DetectorGrid(Detector):
         # Shape: (N_features, Y, X)
         data = raster_layer.sel(c=feature_names).values
         n_feats, ny, nx = data.shape
+        if observed is not None and np.any(np.isnan(data) != ~observed):
+            raise ValueError("Grid R-test features must share the same observed-cell mask.")
 
         # 2. Standardize (In-place to save memory)
         # Mean-fill structural holes first; after centering they become zero
@@ -627,6 +629,11 @@ class DetectorGrid(Detector):
         Compute the bivariate spatial R-statistic across feature pairs.
 
         Requires :meth:`setup_data` to have been called.
+
+        P-values use a two-sided normal null with variance ``trace(K²)``.
+        For structural holes, K is restricted and centered on observed cells,
+        then scaled to the full-grid standardization. All tested features must
+        share the same observed-cell mask.
 
         Parameters
         ----------
@@ -708,7 +715,13 @@ class DetectorGrid(Detector):
         )
         logger.info("Processing in %d chunks of size ~%d...", len(chunks_x), chunk_size)
 
-        sigma = np.sqrt(self.kernel_.square_trace())
+        observed = ~np.isnan(raster_layer.sel(c=[features_x[0]]).values[0])
+        sigma = 0.0
+        if return_pval:
+            null_kernel = (
+                self.kernel_ if observed.all() else _OccupiedGridKernel(self.kernel_, observed)
+            )
+            sigma = np.sqrt(null_kernel.square_trace())
         spectral_sign = np.sign(self.kernel_.eigenvalues())
         results_list = []
 
@@ -716,7 +729,9 @@ class DetectorGrid(Detector):
         x_iter = tqdm(chunks_x, desc="Processing X chunks") if show_progress else chunks_x
         for i, batch_x_names in enumerate(x_iter):
             # Load Embeddings X (High Memory Usage)
-            embeddings_x = self._compute_batch_spectral_embeddings(raster_layer, batch_x_names)
+            embeddings_x = self._compute_batch_spectral_embeddings(
+                raster_layer, batch_x_names, observed=observed
+            )
 
             start_j = i if mode == "symmetric" else 0
 
@@ -728,7 +743,7 @@ class DetectorGrid(Detector):
                     embeddings_y = embeddings_x  # Reference, no copy
                 else:
                     embeddings_y = self._compute_batch_spectral_embeddings(
-                        raster_layer, batch_y_names
+                        raster_layer, batch_y_names, observed=observed
                     )
 
                 # --- CROSS-BATCH CORRELATION ---

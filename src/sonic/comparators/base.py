@@ -705,7 +705,7 @@ class _ComparatorBase:
             self.spectra_[i] = _normalize_background(self.spectra_[i])
         return self
 
-    def normalize_covariates(self, covariates: Sequence[Any]) -> _ComparatorBase:
+    def normalize_covariates(self, covariates: Sequence[Any]) -> _ComparatorBase:  # noqa: C901
         """Regress out per-sample covariate spectra from :attr:`spectra_`.
 
         Two input modes, detected from the first element's type:
@@ -793,6 +793,9 @@ class _ComparatorBase:
                 )
             cov_feat = cov_feat[..., : self.spectra_.shape[-1]]
             self._validate_covariate_features(cov_feat, sample_index=i, mode=covariate_mode)
+            cov_features_per_sample[i] = cov_feat
+        # Validate every sample before modifying any spectra.
+        for i, cov_feat in enumerate(cov_features_per_sample):
             self.spectra_[i] = _normalize_covariates(self.spectra_[i], cov_feat)
         return self
 

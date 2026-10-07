@@ -1007,9 +1007,13 @@ class TestComparatorIrregularNormalizeCovariates:
         rng = np.random.default_rng(2)
         samples = self._build_samples()
         cmp = ComparatorIrregular(samples).compute_spectra(progress=False)
+        before = cmp.spectra_.copy()
         arrays = [rng.standard_normal((1, 4, 4)) for _ in samples]
+        # The first sample is valid, but a later sample has insufficient support.
+        arrays[0] = rng.standard_normal((1, *cmp._grid_shapes[0]))
         with pytest.raises(ValueError, match="covariate features contain non-finite"):
             cmp.normalize_covariates(arrays)
+        np.testing.assert_array_equal(cmp.spectra_, before)
 
     def test_rejects_empty_covariate_sequence(self):
         samples = self._build_samples()

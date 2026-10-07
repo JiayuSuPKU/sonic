@@ -191,9 +191,7 @@ def _rstat_worker_chunked(
     results = []
     sigma = np.sqrt(null_params["var_R"])
 
-    # Slice X and Y blocks as *sparse* — no densification for standardization.
-    # The only unavoidable densification is ``K @ Y_block`` for kernels whose
-    # apply is naturally dense (LU solve / BLAS matmul); done once per Y-chunk.
+    # Keep sparse products when stable; otherwise center bounded dense blocks.
     Y_block = X_csc[:, y_chunk_indices]  # (n, n_y) sparse
     X_block = X_csc[:, x_indices]  # (n, n_x) sparse
 
@@ -204,46 +202,56 @@ def _rstat_worker_chunked(
     y_valid = y_stds > 1e-9
     x_valid = x_stds > 1e-9
 
-    if hasattr(kernel_obj, "_apply_K_dense") and hasattr(kernel_obj, "_K_column_sums"):
-        # Sparse-preserving cross R-test.
-        # R[i,j] = (x_i - μx[i])ᵀ K (y_j - μy[j]) / (σx[i] σy[j])
-        #        = ( x_iᵀ K y_j - μx[i]·K_sumᵀy_j - μy[j]·K_sumᵀx_i
-        #            + μx[i]·μy[j]·K_total ) / (σx[i]·σy[j])
-        # Every term is computed from sparse X / Y blocks and the kernel's
-        # cached (K·1, 1ᵀK1) moments.
-        K_sum, K_total = kernel_obj._K_column_sums()  # (n,), scalar
-        KY = kernel_obj._apply_K_dense(Y_block.toarray())  # (n, n_y) dense, once
-        R_raw = np.asarray(X_block.T @ KY)  # (n_x, n_y) sparse.T @ dense
-        ksum_x = np.asarray(X_block.T @ K_sum).ravel()  # (n_x,)
-        ksum_y = np.asarray(Y_block.T @ K_sum).ravel()  # (n_y,)
-        R_corrected = (
-            R_raw
-            - x_means[:, None] * ksum_y[None, :]
-            - y_means[None, :] * ksum_x[:, None]
-            + np.outer(x_means, y_means) * K_total
+    sx = np.where(x_valid, x_stds, 1.0)
+    sy = np.where(y_valid, y_stds, 1.0)
+    R_block = None
+    if sp.issparse(getattr(kernel_obj, "_K", None)) and not kernel_obj.stores_precision:
+        KY = kernel_obj._K @ Y_block
+        raw = (X_block.T @ KY).toarray()
+        K_sum, K_total = kernel_obj._K_column_sums()
+        # Keep both cross terms even for a non-symmetric precomputed matrix.
+        left = x_means[:, None] * np.asarray(KY.sum(axis=0))
+        right = np.asarray(X_block.T @ K_sum).ravel()[:, None] * y_means[None, :]
+        offset = np.outer(x_means, y_means) * K_total
+        corrected = raw - left - right + offset
+        magnitude = (
+            (abs(X_block).T @ abs(KY)).toarray() + np.abs(left) + np.abs(right) + np.abs(offset)
         )
-        sx = np.where(x_valid, x_stds, 1.0)
-        sy = np.where(y_valid, y_stds, 1.0)
-        R_block = R_corrected / (sx[:, None] * sy[None, :])
-        R_block[~x_valid, :] = 0.0
-        R_block[:, ~y_valid] = 0.0
-    else:
-        # Fallback for raw matrices without the Kernel helpers: old dense path.
-        Y_dense = Y_block.toarray()
-        Zy = np.zeros_like(Y_dense)
-        if np.any(y_valid):
-            Zy[:, y_valid] = (Y_dense[:, y_valid] - y_means[y_valid]) / y_stds[y_valid]
-        KZy = kernel_obj.dot(Zy) if hasattr(kernel_obj, "dot") else np.asarray(kernel_obj @ Zy)
-        X_dense = X_block.toarray()
-        Zx = np.zeros_like(X_dense)
-        if np.any(x_valid):
-            Zx[:, x_valid] = (X_dense[:, x_valid] - x_means[x_valid]) / x_stds[x_valid]
-        R_block = Zx.T @ KZy  # (n_x, n_y)
+        valid = x_valid[:, None] & y_valid[None, :]
+        # Match Q's safeguard: recenter if cancellation loses four or more digits.
+        if np.all(np.isfinite(corrected)) and np.all(
+            np.abs(corrected[valid]) >= 1e-4 * magnitude[valid]
+        ):
+            R_block = corrected / (sx[:, None] * sy[None, :])
+        del KY
+
+    if R_block is None:
+        Zy = Y_block.astype(float, copy=False).toarray()
+        Zy -= y_means
+        Zy /= sy
+        Zy[:, ~y_valid] = 0.0
+        if hasattr(kernel_obj, "Kx"):
+            KZy = kernel_obj.Kx(Zy)
+        else:
+            KZy = kernel_obj.dot(Zy) if hasattr(kernel_obj, "dot") else np.asarray(kernel_obj @ Zy)
+        R_block = np.empty((len(x_indices), len(y_chunk_indices)))
+        # Bound X's dense workspace by the same chunk size as Y.
+        for start in range(0, len(x_indices), len(y_chunk_indices)):
+            sl = slice(start, start + len(y_chunk_indices))
+            Zx = X_block[:, sl].astype(float, copy=False).toarray()
+            Zx -= x_means[sl]
+            Zx /= sx[sl]
+            R_block[sl] = Zx.T @ KZy
+    R_block[~x_valid, :] = 0.0
+    R_block[:, ~y_valid] = 0.0
 
     # Vectorized p-value / z-score stage
     if return_pval and sigma > 0:
         Z_scores_block = R_block / sigma
         P_block = 2 * norm.sf(np.abs(Z_scores_block))
+    elif return_pval:
+        Z_scores_block = np.zeros_like(R_block)
+        P_block = np.ones_like(R_block)
     else:
         Z_scores_block = np.full_like(R_block, np.nan)
         P_block = np.full_like(R_block, np.nan)
@@ -741,7 +749,7 @@ class DetectorIrregular(Detector):
 
         return X_csc, names, means, stds
 
-    def compute_qstat(
+    def compute_qstat(  # noqa: C901
         self,
         source: str = "var",
         features: list[str] | None = None,
@@ -812,7 +820,8 @@ class DetectorIrregular(Detector):
         Under H₀: feature has no spatial structure.
         Under H₁: significant spatial signal (clustering or dispersion).
 
-        Zero-variance features are assigned Q=0, P_value=1.0.
+        Features failing the expression or variance filters are omitted. If no
+        features remain, returns an empty result with the usual columns.
 
         The null approximation depends on both method and backend. Gaussian,
         Matérn, CAR and graph-Laplacian kernels use upper-tail ``welch`` on the
@@ -870,15 +879,18 @@ class DetectorIrregular(Detector):
                 show_progress=show_progress,
             )
 
-        # 2. Compute Null Distribution
-        null_method = _resolve_q_null_method(self.kernel_)
-        logger.info("Computing null distribution approximation (method=%s)...", null_method)
-        null_params = compute_null_params(self.kernel_, method=null_method)
-
-        # 3. Prepare Data
+        # 2. Prepare Data
         X_csc, names, means, stds = self._prepare_data(
             source=source, keys=features, min_cells=self.min_cells, layer=layer
         )
+        if not names:
+            columns = ["Q", "P_value", "Z_score", "P_adj"] if return_pval else ["Q", "Z_score"]
+            return pd.DataFrame(columns=columns, index=pd.Index([], name="Feature"), dtype=float)
+
+        # 3. Compute Null Distribution
+        null_method = _resolve_q_null_method(self.kernel_)
+        logger.info("Computing null distribution approximation (method=%s)...", null_method)
+        null_params = compute_null_params(self.kernel_, method=null_method)
 
         # 4. Parallel Execution
         n_feats = len(names)
@@ -1013,7 +1025,8 @@ class DetectorIrregular(Detector):
         configurable through this method. For finer control over the null model,
         call :func:`sonic.statistics.spatial_r_test` directly.
 
-        Zero-variance features are handled gracefully (assigned R=0, P=1).
+        Features failing the expression or variance filters are omitted.
+        A zero-variance null returns Z_score=0 and P_value=1.
 
         Examples
         --------
@@ -1092,7 +1105,9 @@ class DetectorIrregular(Detector):
 
         # 3. Generate Y chunks (for pre-computing K@Y)
         if mode == "symmetric":
-            valid_feats = [f for f in features_x if f in name_to_idx]
+            valid_feats = (
+                names if features_x is None else [f for f in features_x if f in name_to_idx]
+            )
             valid_y_indices = [name_to_idx[f] for f in valid_feats]
         else:
             valid_y = [f for f in features_y if f in name_to_idx]
@@ -1308,7 +1323,6 @@ class DetectorIrregular(Detector):
         """
         kernel = self.kernel_
         var_R = float(kernel.square_trace()) if return_pval else 0.0
-        null_params = {"var_R": var_R}
 
         if features_x is None and features_y is not None:
             raise ValueError("Provide features_x when features_y is specified.")
@@ -1342,9 +1356,6 @@ class DetectorIrregular(Detector):
         y_iter = (
             tqdm(y_chunks, desc=f"R (NUFFT, {self.kernel_method_})") if show_progress else y_chunks
         )
-        # Silence pyflakes about ``null_params`` now that we bypass the
-        # dispatch helper; ``var_R`` below is the authoritative source.
-        del null_params
         for ysl in y_iter:
             Y_block = np.asarray(X_y[:, ysl].todense(), dtype=np.float64)
             Yz = _standardize_features(Y_block)
@@ -1354,8 +1365,8 @@ class DetectorIrregular(Detector):
                 for j, name_y in enumerate(names_y[ysl]):
                     r = float(R_chunk[i, j])
                     row = {"Feature_1": name_x, "Feature_2": name_y, "R": r}
-                    if return_pval and var_R > 0:
-                        z = r / np.sqrt(var_R)
+                    if return_pval:
+                        z = r / np.sqrt(var_R) if var_R > 0 else 0.0
                         row["Z_score"] = z
                         row["P_value"] = float(2.0 * norm.sf(abs(z)))
                     results.append(row)

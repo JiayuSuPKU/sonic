@@ -615,8 +615,11 @@ def test_masked_grid_q_rejects_mismatched_feature_masks():
 
 @pytest.mark.parametrize("shape", [(8, 8), (7, 9)])
 @pytest.mark.parametrize("solver", ["fft2", "rfft2"])
-@pytest.mark.parametrize("method", ["car", "moran"])
-def test_grid_detector_r_matches_standalone(shape, solver, method, monkeypatch):
+@pytest.mark.parametrize("method", ["gaussian", "car", "moran"])
+@pytest.mark.parametrize("masked", [False, True])
+def test_grid_detector_r_matches_standalone(shape, solver, method, masked, monkeypatch):
+    from sonic.kernels import MatrixKernel
+
     # This checks numerical parity, not the production memory-cleanup policy.
     monkeypatch.setattr("gc.collect", lambda: None)
     yy, xx = np.indices(shape)
@@ -626,6 +629,11 @@ def test_grid_detector_r_matches_standalone(shape, solver, method, monkeypatch):
             np.random.default_rng(5).normal(size=shape),
         ]
     )
+    observed = np.ones(shape, dtype=bool)
+    if masked:
+        observed = np.random.default_rng(81).random(shape) > 0.55
+        data[:, ~observed] = np.nan
+    original = data.copy()
     names = ["x", "y"]
     raster = MockDataArray(data, names)
     sdata = MockSpatialData("cells", MockTable(data.reshape(2, -1).T, names))
@@ -633,15 +641,44 @@ def test_grid_detector_r_matches_standalone(shape, solver, method, monkeypatch):
         detector = DetectorGrid(kernel_method=method, fft_solver=solver).setup_data(
             sdata, bins="bins", table_name="cells", col_key="col", row_key="row"
         )
-    for features_y in (None, names):
+    reference = detector.kernel_
+    if masked:
+        n = int(np.prod(shape))
+        matrix = reference.Kx(np.eye(n).reshape(*shape, n)).reshape(n, n)
+        idx = np.flatnonzero(observed)
+        scale = (n - 1) / (len(idx) - 1)
+        reference = MatrixKernel.from_matrix(scale * matrix[np.ix_(idx, idx)])
+    for features_y, return_pval in ((None, True), (names, True), (names, False)):
         result = detector.compute_rstat(
-            names, features_y, chunk_size=1, workers=1, show_progress=False
+            names, features_y, return_pval=return_pval, chunk_size=1, workers=1, show_progress=False
         )
         for row in result.itertuples():
+            x, y = data[[names.index(row.Feature_1), names.index(row.Feature_2)]]
             r, p = spatial_r_test(
-                data[names.index(row.Feature_1)], data[names.index(row.Feature_2)], detector.kernel_
+                x[observed] if masked else x, y[observed] if masked else y, reference
             )
-            np.testing.assert_allclose([row.R, row.P_value], [r, p], rtol=1e-10, atol=1e-12)
+            np.testing.assert_allclose(row.R, r, rtol=1e-10, atol=1e-12)
+            if return_pval:
+                np.testing.assert_allclose(row.P_value, p, rtol=1e-10, atol=1e-12)
+            else:
+                assert "P_value" not in result
+    np.testing.assert_array_equal(data, original)
+
+
+@pytest.mark.parametrize("chunk_size", [1, 2])
+def test_grid_r_rejects_mismatched_feature_masks(chunk_size, monkeypatch):
+    monkeypatch.setattr("gc.collect", lambda: None)
+    data = np.random.default_rng(2).normal(size=(2, 8, 8))
+    data[1, 0, 0] = np.nan
+    names = ["x", "y"]
+    raster = MockDataArray(data, names)
+    sdata = MockSpatialData("cells", MockTable(np.ones((64, 2)), names))
+    with patch("sonic._rasterize.rasterize_table", return_value=raster):
+        detector = DetectorGrid(kernel_method="gaussian").setup_data(
+            sdata, bins="bins", table_name="cells", col_key="col", row_key="row"
+        )
+    with pytest.raises(ValueError, match="same observed-cell mask"):
+        detector.compute_rstat(chunk_size=chunk_size, workers=1, show_progress=False)
 
 
 if __name__ == "__main__":

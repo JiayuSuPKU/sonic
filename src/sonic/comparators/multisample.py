@@ -173,10 +173,15 @@ def _welch_test(group_a: np.ndarray, group_b: np.ndarray) -> tuple[np.ndarray, n
     var_b = group_b.var(axis=0, ddof=1) if n_b > 1 else np.zeros_like(mean_b)
     se2_a = var_a / max(n_a, 1)
     se2_b = var_b / max(n_b, 1)
-    se2 = se2_a + se2_b + 1e-30
-    t_stat = (mean_a - mean_b) / np.sqrt(se2)
+    se2 = se2_a + se2_b
+    with np.errstate(divide="ignore", invalid="ignore"):
+        t_stat = (mean_a - mean_b) / np.sqrt(se2)
+    t_stat = np.where((se2 == 0) & (mean_a == mean_b), 0.0, t_stat)
     if n_a > 1 and n_b > 1:
-        df = (se2**2) / ((se2_a**2) / max(n_a - 1, 1) + (se2_b**2) / max(n_b - 1, 1) + 1e-30)
+        # Normalize variance contributions before squaring: no scale-dependent
+        # epsilon, and no underflow/overflow from squaring the variances.
+        fraction_a = np.divide(se2_a, se2, out=np.zeros_like(se2), where=se2 > 0)
+        df = 1.0 / (fraction_a**2 / (n_a - 1) + (1.0 - fraction_a) ** 2 / (n_b - 1))
     else:
         df = np.full_like(mean_a, float(max(n_a + n_b - 2, 1)))
     df = np.maximum(df, 1.0)
@@ -444,9 +449,10 @@ def _build_design_matrix(
     - ``np.ndarray`` of shape ``(n_samples, p)`` is accepted as-is; columns
       are labelled ``x0, x1, ...``. The caller is responsible for including
       an intercept column if desired.
-    - ``pd.DataFrame``: encoded via :func:`patsy.dmatrix` with the formula
-      ``~ <col1> + <col2> + ...``, which adds an intercept and one-hot
-      encodes categoricals (Treatment contrast against the first level).
+    - ``pd.DataFrame``: encoded via :func:`patsy.dmatrix`, adding an intercept
+      and one-hot encoding categoricals (Treatment contrast against the first
+      level). Column names are treated literally, including punctuation and
+      spaces. Missing values raise rather than dropping sample rows.
       If patsy is not installed, raise ``ImportError`` with an install hint.
     """
     if isinstance(design, np.ndarray):
@@ -474,9 +480,18 @@ def _build_design_matrix(
             "Install via `pip install patsy` or pass a pre-built numpy "
             "design matrix instead."
         ) from e
-    formula = "~ " + " + ".join(str(c) for c in design.columns)
-    design_matrix = patsy.dmatrix(formula, design, return_type="dataframe")
-    return design_matrix.to_numpy().astype(float), list(design_matrix.columns)
+    # Use safe formula identifiers even for spaces, punctuation, keywords or
+    # columns named like Patsy builtins. Restore user-facing contrast names.
+    aliases = [f"_sonic_column_{i}" for i in range(len(design.columns))]
+    formula = "~ " + " + ".join(aliases)
+    design_matrix = patsy.dmatrix(
+        formula, design.set_axis(aliases, axis=1), return_type="dataframe", NA_action="raise"
+    )
+    columns = list(design_matrix.columns)
+    for alias, name in zip(aliases, design.columns, strict=True):
+        term_slice = design_matrix.design_info.term_name_slices[alias]
+        columns[term_slice] = [str(name) + c[len(alias) :] for c in columns[term_slice]]
+    return design_matrix.to_numpy().astype(float), columns
 
 
 def _resolve_contrast(

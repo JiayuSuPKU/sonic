@@ -412,7 +412,11 @@ class ComparatorIrregular(_ComparatorBase):
         )
 
         angles = estimate_rotations_from_landmarks(
-            landmarks, grids, fft_solver=self._spectrum_fft_solver, progress=progress
+            landmarks,
+            grids,
+            fft_solver=self._spectrum_fft_solver,
+            spacings=self._spacings,
+            progress=progress,
         )
         self.rotation_angles_ = angles
 

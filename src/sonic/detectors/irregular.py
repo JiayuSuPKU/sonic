@@ -93,7 +93,7 @@ def _qstat_worker(
 
         b_means = means[batch_global_indices]
         b_stds = stds[batch_global_indices]
-        valid_mask = b_stds > 1e-9
+        valid_mask = b_stds > 1e-12
 
         if use_sparse_fastpath:
             X_batch_sp = X_csc[:, local_slice]
@@ -204,8 +204,8 @@ def _rstat_worker_chunked(
     y_stds = stds[y_chunk_indices]
     x_means = means[x_indices]
     x_stds = stds[x_indices]
-    y_valid = y_stds > 1e-9
-    x_valid = x_stds > 1e-9
+    y_valid = y_stds > 1e-12
+    x_valid = x_stds > 1e-12
 
     sx = np.where(x_valid, x_stds, 1.0)
     sy = np.where(y_valid, y_stds, 1.0)
@@ -746,7 +746,8 @@ class DetectorIrregular(Detector):
             raise ValueError("Source must be either 'obs' or 'var'.")
 
         # Filter constant features and those with too few non-zeros
-        to_keep = (stds > 0) & (X_csc.getnnz(axis=0) >= min_cells)
+        nnz_per = np.asarray((X_csc != 0).sum(axis=0)).ravel()
+        to_keep = (stds > 0) & (nnz_per >= min_cells)
         X_csc = X_csc[:, to_keep]
         names = [names[i] for i in range(len(names)) if to_keep[i]]
         means = means[to_keep]

@@ -701,11 +701,17 @@ class _ComparatorBase:
     # Post-fit transforms
     # ------------------------------------------------------------------
     def normalize_background(self) -> _ComparatorBase:
-        """Apply per-sample geometric-mean background normalization in place."""
+        """Normalize each sample using its observed genes' geometric mean.
+
+        Genes excluded by ``presence_`` neither contribute to the background
+        nor get transformed. Samples with no observed genes are left unchanged.
+        """
         if self.spectra_ is None:
             raise RuntimeError("Call .compute_spectra() before .normalize_background().")
         for i in range(self.spectra_.shape[0]):
-            self.spectra_[i] = _normalize_background(self.spectra_[i])
+            observed = slice(None) if self.presence_ is None else self.presence_[i]
+            if self.presence_ is None or observed.any():
+                self.spectra_[i, observed] = _normalize_background(self.spectra_[i, observed])
         return self
 
     def normalize_covariates(self, covariates: Sequence[Any]) -> _ComparatorBase:  # noqa: C901

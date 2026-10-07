@@ -1473,3 +1473,59 @@ def test_comparator_rebudgets_for_actual_sample_jobs(monkeypatch, backend):
     np.testing.assert_allclose(comparator.spectra_, parallel, rtol=1e-10)
     with pytest.raises(ValueError, match="cannot fit one feature"):
         comparator.compute_spectra(n_jobs=2, progress=False, memory_budget_bytes=budget // 4)
+
+
+def test_background_normalization_ignores_absent_genes():
+    from sonic.comparators.normalization import normalize_background
+
+    spectra = np.random.default_rng(3).lognormal(size=(3, 4, 5))
+    presence = np.array([[True, True, False, False], [True] * 4, [False] * 4])
+    spectra[~presence] = 0.0
+    comparator = _comparator_from_spectra(spectra.copy(), presence)
+    original = comparator.spectra_.copy()
+    result = comparator.normalize_background()
+    assert result is comparator
+    for i in (0, 1):
+        np.testing.assert_allclose(
+            result.spectra_[i, presence[i]], normalize_background(original[i, presence[i]])
+        )
+    np.testing.assert_array_equal(result.spectra_[~presence], original[~presence])
+    np.testing.assert_array_equal(result.presence_, presence)
+    np.testing.assert_array_equal(spectra, original)
+
+
+@pytest.mark.parametrize("backend", ["grid", "nufft"])
+def test_2d_alignment_respects_physical_spacing(backend, monkeypatch):
+    shape = (64, 64)
+    spacings = [(1.0, 1.0), (2.0, 1.0)]
+    yy, xx = np.indices(shape)
+    rasters = [np.cos(2 * np.pi * (yy * dy + xx * dx) / 16)[None] for dy, dx in spacings]
+    names = ["same_pattern"]
+    frequency = np.sqrt(2) / 16
+    kwargs = {
+        "feature_mode": "2d",
+        "spacing": spacings,
+        "workers": 1,
+        "freq_edges": np.array([frequency - 0.01, frequency + 0.01]),
+        "n_theta_bins": 180,
+    }
+    if backend == "grid":
+        samples = _install_grid_rasters(monkeypatch, rasters, names)
+        comparator = ComparatorGrid(
+            samples,
+            gene_names=names,
+            bins="bins",
+            table_name="table",
+            col_key="col",
+            row_key="row",
+            **kwargs,
+        )
+    else:
+        samples = _grid_samples_to_adata(rasters, names, spacings)
+        comparator = ComparatorIrregular(samples, grid_shape=shape, **kwargs)
+    comparator.compute_spectra(n_jobs=1, progress=False)
+    np.testing.assert_allclose(comparator.rotation_angles_, 0.0, atol=1.0)
+    features = comparator.spectra_[:, 0]
+    cosine = features[0] @ features[1] / np.linalg.norm(features[0]) / np.linalg.norm(features[1])
+    assert cosine > 0.94
+    np.testing.assert_array_equal(np.argmax(features, axis=1), 45)

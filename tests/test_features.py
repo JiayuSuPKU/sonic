@@ -696,3 +696,58 @@ def test_spectrum_centering_preserves_dc_and_input(solver, dtype, offset):
     )
     np.testing.assert_array_equal(dc, sample.mean(axis=(1, 2)))
     np.testing.assert_array_equal(sample, original)
+
+
+@pytest.mark.parametrize("solver", ["fft2", "rfft2"])
+@pytest.mark.parametrize("angle", [0.0, 30.0, -40.0])
+def test_rotation_uses_physical_frequencies_on_rectangular_grids(solver, angle):
+    shapes = [(64, 64), (65, 97)]
+    spacings = [(1.0, 1.0), (2.0, 0.5)]
+
+    def spectrum(shape, spacing, direction):
+        fy = np.fft.fftfreq(shape[0], d=spacing[0])[:, None]
+        fx = np.fft.fftfreq(shape[1], d=spacing[1])[None, :]
+        theta = np.deg2rad(direction)
+        result = []
+        for radius in (0.08, 0.16):
+            ky, kx = radius * np.sin(theta), radius * np.cos(theta)
+            result.append(
+                sum(
+                    np.exp(-((fy - sign * ky) ** 2 + (fx - sign * kx) ** 2) / (2 * 0.025**2))
+                    for sign in (-1, 1)
+                )
+            )
+        result = np.array(result)
+        return result if solver == "fft2" else result[..., : shape[1] // 2 + 1]
+
+    spectra = [spectrum(shapes[0], spacings[0], 50), spectrum(shapes[1], spacings[1], 50 - angle)]
+    originals = [x.copy() for x in spectra]
+    rotated, angles = align_spectra_by_rotation(
+        spectra,
+        shapes,
+        target_spectra=spectra,
+        fft_solver=solver,
+        spacings=spacings,
+        n_theta=360,
+    )
+    assert TestRotationSimulation._canon_err(angles[1], angle) < 2.0
+    expected = spectrum(shapes[1], spacings[1], 50)
+    assert np.linalg.norm(rotated[1] - expected) / np.linalg.norm(expected) < 0.08
+    features = []
+    for spec, shape, spacing, recovered in zip(spectra, shapes, spacings, angles, strict=True):
+        features.append(
+            stream_polar_features(
+                lambda start, stop, spec=spec: spec[start:stop],
+                2,
+                shape,
+                recovered,
+                chunk_size=1,
+                freq_edges=np.linspace(0, 0.22, 12),
+                spacing=spacing,
+                n_theta=72,
+                fft_solver=solver,
+            )
+        )
+    assert np.linalg.norm(features[1] - features[0]) / np.linalg.norm(features[0]) < 0.08
+    for before, after in zip(originals, spectra, strict=True):
+        np.testing.assert_array_equal(before, after)

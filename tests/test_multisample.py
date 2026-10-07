@@ -550,6 +550,14 @@ class TestStatisticAliases:
 class TestScalarTwoGroupComparison:
     """Scalar differential-expression calibration and power."""
 
+    def test_welch_constant_features_have_defined_tails(self):
+        values = np.repeat([[2.0, 3.0, 0.0], [2.0, 9.0, 0.0]], 4, axis=0)
+        result = compare_two_groups_scalar(values, np.repeat([0, 1], 4)).set_index("Feature")
+        np.testing.assert_array_equal(result.loc[["0", "2"], "Statistic"], 0.0)
+        np.testing.assert_array_equal(result.loc[["0", "2"], "P_value"], 1.0)
+        assert np.isinf(result.loc["1", "Statistic"])
+        assert result.loc["1", "P_value"] == np.finfo(float).tiny
+
     def test_welch_analytic_is_uniform_under_h0(self):
         rng = np.random.default_rng(0)
         n_samples, n_genes = 10, 1000
@@ -559,14 +567,15 @@ class TestScalarTwoGroupComparison:
         _, ks_p = kstest(df.P_value.to_numpy(), "uniform")
         assert ks_p > 0.01, f"analytic-Welch p-values not uniform under H0, KS p={ks_p:.4f}"
 
-    def test_welch_analytic_matches_scipy(self):
+    @pytest.mark.parametrize("scale", [1.0, 1e-8, 1e-100, 1e100])
+    def test_welch_analytic_matches_scipy(self, scale):
         from scipy.stats import ttest_ind
 
         rng = np.random.default_rng(2)
         n_per, n_genes = 5, 50
         a = rng.normal(0.0, 1.0, size=(n_per, n_genes))
         b = rng.normal(0.3, 1.5, size=(n_per, n_genes))
-        values = np.concatenate([a, b], axis=0)
+        values = np.concatenate([a, b], axis=0) * scale
         groups = np.array([0] * n_per + [1] * n_per)
         df = compare_two_groups_scalar(values, groups)
         df = df.set_index("Feature").loc[[str(i) for i in range(n_genes)]]
@@ -981,3 +990,58 @@ def test_masked_liu_reuses_fits_without_changing_tails(mode, amplitude):
         actual = _log_l2_pvalues_from_state(state)
         assert fitted.call_count == np.unique(state["contrast_scale"][state["eligible"]]).size
     np.testing.assert_array_equal(actual, expected)
+
+
+@pytest.mark.parametrize("path", ["glm", "masked_glm", "scalar"])
+@pytest.mark.parametrize("contrast_kind", ["str", "dict"])
+def test_glm_metadata_names_preserve_contrasts(path, contrast_kind):
+    rng = np.random.default_rng(6)
+    design = pd.DataFrame(
+        {
+            "age": rng.normal(size=24),
+            "treatment": pd.Categorical(np.repeat(["A", "B"], 12)),
+            "nuisance": rng.normal(size=24),
+        }
+    )
+    spectra = rng.lognormal(size=(24, 4, 3))
+    presence = np.ones((24, 4), dtype=bool)
+    presence[0, 0] = False
+
+    def compare(frame, contrast):
+        if path == "glm":
+            result = compare_glm(spectra, frame, contrast)
+        elif path == "masked_glm":
+            result = compare_glm_masked(spectra, frame, contrast, presence)
+        else:
+            result = compare_glm_scalar(spectra.mean(axis=-1), frame, contrast)
+        return result.sort_values("Feature").reset_index(drop=True)
+
+    for new_name in ["age-years", "treatment group", "Q", "class", "quote'\"[x]"]:
+        # Numeric and categorical names must remain usable in both contrast forms.
+        for column, term in [("age", "age"), ("treatment", "treatment[T.B]")]:
+            reference_contrast = column if contrast_kind == "str" else {term: 1.0}
+            renamed_contrast = (
+                new_name if contrast_kind == "str" else {new_name + term[len(column) :]: 1.0}
+            )
+            reference = compare(design, reference_contrast)
+            actual = compare(design.rename(columns={column: new_name}), renamed_contrast)
+            pd.testing.assert_frame_equal(actual, reference)
+
+
+def test_welch_cauchy_is_invariant_to_spectral_units():
+    rng = np.random.default_rng(25)
+    spectra = rng.uniform(1, 5, size=(12, 4, 3))
+    groups = np.repeat([0, 1], 6)
+    presence = np.ones((12, 4), dtype=bool)
+    presence[0, 0] = False
+    for mask in (None, presence):
+        results = []
+        for scale in (1.0, 1e-8):
+            kwargs = {"statistic": "welch_t_cauchy"}
+            result = (
+                compare_two_groups(spectra * scale, groups, **kwargs)
+                if mask is None
+                else compare_two_groups_masked(spectra * scale, groups, mask, **kwargs)
+            )
+            results.append(result.sort_values("Feature")["P_value"].to_numpy())
+        np.testing.assert_allclose(*results, rtol=1e-10)

@@ -655,6 +655,51 @@ def test_matrix_r_defaults_to_all_retained_features():
     )
 
 
+@pytest.mark.parametrize("sparse", [False, True])
+@pytest.mark.parametrize("scale", [1.0, 1e-10])
+def test_matrix_detector_small_signals_match_standalone(sparse, scale):
+    from sonic.statistics import spatial_q_test
+
+    rng = np.random.default_rng(41)
+    coords = rng.uniform(0, 8, (64, 2))
+    signal = 3 + np.cos(coords[:, 0])
+    values = np.c_[signal, signal + 0.1 * rng.normal(size=64)]
+    data = anndata.AnnData(sp.csc_matrix(values * scale) if sparse else values * scale)
+    data.var_names = ["x", "y"]
+    data.obsm["spatial"] = coords
+    detector = DetectorIrregular(kernel_method="gaussian", bandwidth=1.0).setup_data(data)
+    q = detector.compute_qstat(n_jobs=1, show_progress=False).loc["x"]
+    r = detector.compute_rstat(["x"], ["y"], n_jobs=1, show_progress=False).iloc[0]
+    expected_q = spatial_q_test(values[:, 0], detector.kernel_)
+    expected_r = spatial_r_test(values[:, 0], values[:, 1], detector.kernel_)
+    np.testing.assert_allclose([q.Q, q.P_value], expected_q, rtol=1e-10)
+    np.testing.assert_allclose([r.R, r.P_value], expected_r, rtol=1e-10)
+    np.testing.assert_array_equal(data.X.toarray() if sparse else data.X, values * scale)
+
+
+@pytest.mark.parametrize("format", ["csr", "csc"])
+def test_min_cells_ignores_explicit_sparse_zeros(format):
+    values = np.zeros((32, 2))
+    values[0, 0] = 1
+    values[:, 1] = np.arange(32) + 1
+    stored = sp.csc_matrix(
+        (values.T.ravel(), np.tile(np.arange(32), 2), np.arange(3) * 32), shape=values.shape
+    ).asformat(format)
+    clean = stored.copy()
+    clean.eliminate_zeros()
+    outputs = []
+    for matrix in (stored, clean):
+        data = anndata.AnnData(matrix)
+        data.var_names = ["one_cell", "many_cells"]
+        data.obsm["spatial"] = np.random.default_rng(0).uniform(size=(32, 2))
+        detector = DetectorIrregular(kernel_method="gaussian").setup_data(data, min_cells=10)
+        outputs.append(detector.compute_qstat(n_jobs=1, show_progress=False))
+    assert list(outputs[0].index) == ["many_cells"]
+    pd.testing.assert_frame_equal(*outputs)
+    assert stored.nnz == 64
+    np.testing.assert_array_equal(stored.toarray(), values)
+
+
 @pytest.mark.parametrize("return_pval", [False, True])
 @pytest.mark.parametrize("features", [None, ["missing"], []])
 def test_matrix_q_empty_selection_has_normal_schema(features, return_pval, monkeypatch):

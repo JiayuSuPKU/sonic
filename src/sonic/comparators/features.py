@@ -831,6 +831,8 @@ def _physical_polar_coords(
     spacing: tuple[float, float] | None,
     freq_edges: np.ndarray,
     n_theta: int,
+    *,
+    angle_deg: float = 0.0,
 ) -> tuple[np.ndarray, int]:
     """Pixel sample coords for a **physical-frequency** polar grid.
 
@@ -851,7 +853,9 @@ def _physical_polar_coords(
     dy, dx = spacing if spacing is not None else (1.0 / ny, 1.0 / nx)
     edges = np.asarray(freq_edges, dtype=float)
     radii = 0.5 * (edges[:-1] + edges[1:])  # (n_radius,) cycles/unit
-    thetas = np.linspace(0.0, np.pi, n_theta, endpoint=False)
+    # Sample the original spectrum at the inverse rotation. Applying the
+    # angle here preserves physical directions on anisotropic FFT grids.
+    thetas = np.linspace(0.0, np.pi, n_theta, endpoint=False) - np.deg2rad(angle_deg)
     rr, tt = np.meshgrid(radii, thetas, indexing="ij")  # (n_radius, n_theta)
     cy, cx = ny // 2, nx // 2  # fftshift puts DC at floor(n/2)
     yy = cy + rr * np.sin(tt) * ny * dy
@@ -883,28 +887,26 @@ def stream_polar_features(
     :func:`_physical_polar_coords`), different lattices are **cross-sample
     aligned**, exactly as the radial path is.
 
-    For each gene-chunk: 2D power spectrum → rotate by ``angle_deg`` →
-    :func:`_to_full_2d` (mirror the rfft half-plane) → fftshift → resample at the
-    physical-frequency polar grid → flatten, discarding the dense 2D block. The
+    For each gene-chunk: 2D power spectrum → :func:`_to_full_2d` (mirror the
+    rfft half-plane) → fftshift → resample at the rotated physical-frequency
+    polar coordinates → flatten, discarding the dense 2D block. The
     full ``(n_genes, ny, n_kx)`` aligned stack is never held. Returns
     ``(n_genes, n_radius·n_theta)``.
     """
-    coords, n_radius = _physical_polar_coords(grid_shape, spacing, freq_edges, n_theta)
+    coords, n_radius = _physical_polar_coords(
+        grid_shape, spacing, freq_edges, n_theta, angle_deg=angle_deg
+    )
     feat_len = n_radius * n_theta
     out = np.empty((n_genes, feat_len), dtype=np.float64)
     for start in range(0, n_genes, chunk_size):
         stop = min(start + chunk_size, n_genes)
         spec_chunk = spectrum_chunk_fn(start, stop)
-        if angle_deg != 0.0:
-            spec_chunk = apply_rotations_to_spectra(
-                [spec_chunk], [grid_shape], np.asarray([angle_deg]), fft_solver=fft_solver
-            )[0]
         full = _to_full_2d(spec_chunk, grid_shape, fft_solver)  # (m, ny, nx)
         shifted = np.fft.fftshift(full, axes=(-2, -1))
         m = shifted.shape[0]
         for j in range(m):
             out[start + j] = scipy.ndimage.map_coordinates(
-                shifted[j], coords, order=1, mode="reflect"
+                shifted[j], coords, order=1, mode="constant", cval=0.0
             )
         del spec_chunk, full, shifted
         if pbar is not None:
@@ -947,35 +949,13 @@ def _to_full_2d(power: np.ndarray, grid_shape: tuple[int, int], fft_solver: str)
     return full
 
 
-def _polar_resample(
-    spectrum_2d: np.ndarray,
-    n_theta: int,
-    n_radius: int,
-) -> np.ndarray:
-    """
-    Resample a 2D spectrum (already shifted so DC is at center) onto a polar grid.
-
-    Returns shape ``(n_theta, n_radius)``.
-    """
-    ny, nx = spectrum_2d.shape
-    cy, cx = (ny - 1) / 2.0, (nx - 1) / 2.0
-    r_max = min(cy, cx)
-    radii = np.linspace(1.0, r_max, n_radius)
-    thetas = np.linspace(0.0, np.pi, n_theta, endpoint=False)
-    R, T = np.meshgrid(radii, thetas, indexing="ij")  # (n_r, n_t)
-    yy = cy + R * np.sin(T)
-    xx = cx + R * np.cos(T)
-    coords = np.stack([yy.ravel(), xx.ravel()], axis=0)
-    sampled = scipy.ndimage.map_coordinates(spectrum_2d, coords, order=1, mode="reflect")
-    return sampled.reshape(n_radius, n_theta).T  # (n_theta, n_radius)
-
-
 def _build_landmark_polar_stack(
     spectra: np.ndarray,
     grid_shape: tuple[int, int],
     fft_solver: str,
     n_theta: int,
-    n_radius: int,
+    freq_edges: np.ndarray,
+    spacing: tuple[float, float],
 ) -> np.ndarray:
     """Build a ``(n_landmarks, n_theta, n_radius)`` polar stack for one sample.
 
@@ -985,9 +965,14 @@ def _build_landmark_polar_stack(
     """
     full = _to_full_2d(spectra, grid_shape, fft_solver)  # (n_landmarks, ny, nx)
     shifted = np.fft.fftshift(full, axes=(-2, -1))
+    coords, n_radius = _physical_polar_coords(grid_shape, spacing, freq_edges, n_theta)
     out = np.empty((shifted.shape[0], n_theta, n_radius), dtype=float)
     for j in range(shifted.shape[0]):
-        polar = _polar_resample(shifted[j], n_theta, n_radius)
+        polar = (
+            scipy.ndimage.map_coordinates(shifted[j], coords, order=1, mode="constant", cval=0.0)
+            .reshape(n_radius, n_theta)
+            .T
+        )
         out[j] = polar - polar.mean(axis=0, keepdims=True)
     return out
 
@@ -1000,6 +985,7 @@ def estimate_rotations_from_landmarks(
     reference_index: int = 0,
     n_theta: int = 180,
     n_radius: int = 64,
+    spacings: Sequence[tuple[float, float]] | None = None,
     progress: bool = False,
 ) -> np.ndarray:
     """
@@ -1035,6 +1021,9 @@ def estimate_rotations_from_landmarks(
         accurate to ``180 / n_theta`` degrees.
     n_radius : int, default 64
         Radial resolution of the polar resampling.
+    spacings : sequence of (dy, dx), optional
+        Physical pixel spacings for each sample; defaults to unit spacing.
+        Landmarks share physical radii up to the smallest sampling Nyquist.
     progress : bool, default False
         If True, show a tqdm bar over non-reference samples.
 
@@ -1053,6 +1042,15 @@ def estimate_rotations_from_landmarks(
     n_samples = len(landmark_spectra)
     if reference_index < 0 or reference_index >= n_samples:
         raise ValueError(f"reference_index {reference_index} out of range [0, {n_samples})")
+    if len(grid_shapes) != n_samples:
+        raise ValueError("grid_shapes must have one entry per sample.")
+    if spacings is None:
+        spacings = [(1.0, 1.0)] * n_samples
+    if len(spacings) != n_samples:
+        raise ValueError("spacings must have one entry per sample.")
+    spacings = [_validate_spacing(s) for s in spacings]
+    f_max = min(0.5 / max(s) for s in spacings)
+    freq_edges = np.linspace(0.0, f_max, n_radius + 1)
 
     n_landmarks = landmark_spectra[reference_index].shape[0]
     for i, s in enumerate(landmark_spectra):
@@ -1067,7 +1065,8 @@ def estimate_rotations_from_landmarks(
         grid_shapes[reference_index],
         fft_solver,
         n_theta,
-        n_radius,
+        freq_edges,
+        spacings[reference_index],
     )
     ref_hat = np.fft.fft(ref_polar, axis=1)  # (n_landmarks, n_theta, n_radius)
 
@@ -1079,7 +1078,7 @@ def estimate_rotations_from_landmarks(
         if i == reference_index:
             continue
         cur_polar = _build_landmark_polar_stack(
-            landmark_spectra[i], grid_shapes[i], fft_solver, n_theta, n_radius
+            landmark_spectra[i], grid_shapes[i], fft_solver, n_theta, freq_edges, spacings[i]
         )
         cur_hat = np.fft.fft(cur_polar, axis=1)
         # Per-landmark circular cross-correlation along theta; sum across
@@ -1097,6 +1096,7 @@ def apply_rotations_to_spectra(
     angles_deg: np.ndarray,
     *,
     fft_solver: str = "fft2",
+    spacings: Sequence[tuple[float, float]] | None = None,
     progress: bool = False,
 ) -> list[np.ndarray]:
     """
@@ -1116,6 +1116,9 @@ def apply_rotations_to_spectra(
         ``len(spectra)``.
     fft_solver : {'fft2', 'rfft2'}, default 'fft2'
         FFT layout of ``spectra``.
+    spacings : sequence of (dy, dx), optional
+        Physical pixel spacings per sample; defaults to unit spacing. Rotations
+        preserve physical frequencies, including on rectangular FFT grids.
     progress : bool, default False
         Show a tqdm bar across samples.
 
@@ -1139,6 +1142,11 @@ def apply_rotations_to_spectra(
         raise ValueError(
             f"grid_shapes length {len(grid_shapes)} does not match spectra length {len(spectra)}."
         )
+    if spacings is None:
+        spacings = [(1.0, 1.0)] * len(spectra)
+    if len(spacings) != len(spectra):
+        raise ValueError("spacings must have one entry per sample.")
+    spacings = [_validate_spacing(s) for s in spacings]
     out: list[np.ndarray] = []
     # strict=False: lengths are already verified above.
     iter_samples: Any = enumerate(zip(spectra, grid_shapes, strict=False))
@@ -1151,8 +1159,15 @@ def apply_rotations_to_spectra(
             continue
         full = _to_full_2d(spec_i, shape, fft_solver)  # (n, ny, nx)
         full_shift = np.fft.fftshift(full, axes=(-2, -1))
-        rot = scipy.ndimage.rotate(
-            full_shift, angle=-angle_deg, axes=(-2, -1), reshape=False, order=1, mode="reflect"
+        # Convert the inverse physical rotation into FFT-pixel coordinates.
+        # fftshift's DC is at floor(n/2), including for even dimensions.
+        extent_y, extent_x = np.asarray(shape) * spacings[i]
+        c, s = np.cos(np.deg2rad(angle_deg)), np.sin(np.deg2rad(angle_deg))
+        matrix = np.eye(3)
+        matrix[1:, 1:] = [[c, -s * extent_y / extent_x], [s * extent_x / extent_y, c]]
+        center = np.array([0, shape[0] // 2, shape[1] // 2])
+        rot = scipy.ndimage.affine_transform(
+            full_shift, matrix, offset=center - matrix @ center, order=1, mode="constant", cval=0.0
         )
         rot = np.fft.ifftshift(rot, axes=(-2, -1))
         if fft_solver == "rfft2":
@@ -1172,6 +1187,7 @@ def align_spectra_by_rotation(
     reference_index: int = 0,
     n_theta: int = 180,
     n_radius: int = 64,
+    spacings: Sequence[tuple[float, float]] | None = None,
     progress: bool = False,
 ) -> tuple[list[np.ndarray] | None, np.ndarray]:
     """
@@ -1222,6 +1238,8 @@ def align_spectra_by_rotation(
     reference_index : int, default 0
     n_theta : int, default 180
     n_radius : int, default 64
+    spacings : sequence of (dy, dx), optional
+        Physical pixel spacings per sample; defaults to unit spacing.
     progress : bool, default False
 
     Returns
@@ -1247,6 +1265,7 @@ def align_spectra_by_rotation(
         reference_index=reference_index,
         n_theta=n_theta,
         n_radius=n_radius,
+        spacings=spacings,
         progress=progress,
     )
     if target_spectra is None:
@@ -1261,6 +1280,7 @@ def align_spectra_by_rotation(
         grid_shapes,
         angles,
         fft_solver=fft_solver,
+        spacings=spacings,
         progress=progress,
     )
     return rotated, angles

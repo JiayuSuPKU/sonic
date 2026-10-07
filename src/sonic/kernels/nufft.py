@@ -1288,9 +1288,8 @@ def _r_test_nufft(
     - Bipartite (``M_x != M_y``) — returns the full ``(M_x, M_y)`` cross
       matrix via ``Xᵀ · self.Kx(Y)``.
 
-    In either case ``var_R = kernel.square_trace()`` (the default
-    ``centering=True`` returns ``trace((HKH)²)``, which is exactly
-    ``Var[Xᵀ K Y]`` on z-scored inputs).
+    In either case ``var_R = trace((HKH)²)``, independent of the kernel's
+    trace view, since both inputs are z-scored.
 
     Parameters
     ----------
@@ -1331,10 +1330,8 @@ def _r_test_nufft(
     if null_params is not None and "var_R" in null_params:
         var_R = float(null_params["var_R"])
     else:
-        # kernel.square_trace() returns trace((HKH)²) by default (centering=True),
-        # which is exactly Var[R] for Zₓᵀ K Zᵧ with both X, Y z-scored.
-        var_R = float(kernel.square_trace())
-    sigma = float(np.sqrt(max(var_R, 1e-30)))
-    z_scores = R / sigma
-    pvals = 2.0 * norm.sf(np.abs(z_scores))
+        from sonic.statistics import _r_null_variance
+
+        var_R = _r_null_variance(kernel)
+    pvals = 2.0 * norm.sf(np.abs(R / np.sqrt(var_R))) if var_R > 0 else np.ones_like(R)
     return R.squeeze(), pvals.squeeze()

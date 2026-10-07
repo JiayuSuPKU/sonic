@@ -852,7 +852,7 @@ def _r_test_fft(
     null_params : dict, optional
         Pre-computed null parameters from
         :func:`sonic.statistics.compute_null_params`. Only the
-        ``var_R = trace(K²)`` entry is consumed here; when None, it is
+        ``var_R = trace((HKH)²)`` entry is consumed here; when None, it is
         computed on the fly from ``kernel.square_trace()``.
     return_pval : bool, default True
         If True, returns (R, pval) tuple; if False, returns R only.
@@ -938,11 +938,12 @@ def _r_test_fft(
     if null_params is not None and "var_R" in null_params:
         var_R = float(null_params["var_R"])
     else:
-        # kernel.square_trace() returns trace((HKH)²) by default (centering=True).
-        var_R = float(kernel.square_trace())
+        from sonic.statistics import _r_null_variance
+
+        var_R = _r_null_variance(kernel)
     sigma = np.sqrt(var_R)
 
-    if sigma > 1e-12:
+    if sigma > 0:
         z_scores = R / sigma
         pval = 2 * norm.sf(np.abs(z_scores))
     else:

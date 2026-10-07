@@ -85,6 +85,14 @@ class TestTwoGroupNullCalibration:
 class TestLogL2AnalyticNull:
     """Analytic Liu mixture null for ``log_l2``."""
 
+    def test_no_residual_df_rejects_analytic_but_allows_permutation(self):
+        spectra = np.array([[[1.0, 2.0, 3.0]], [[2.0, 3.0, 4.0]]])
+        groups = np.array([0, 1])
+        with pytest.raises(ValueError, match="positive residual degrees of freedom"):
+            compare_two_groups(spectra, groups)
+        result = compare_two_groups(spectra, groups, null="permutation")
+        np.testing.assert_array_equal(result["P_value"], 1.0)
+
     def test_synthetic_h0_pvalues_are_uniform(self):
         rng = np.random.default_rng(0)
         n_a, n_b, K = 4, 4, 30
@@ -310,6 +318,82 @@ def test_glm_nuisance_offset_and_units_preserve_contrast(path, offset, scale):
 
     np.testing.assert_allclose(compare(shifted), compare(design), rtol=2e-6, atol=1e-10)
     np.testing.assert_array_equal(design[:, 2], covariate)
+
+
+@pytest.mark.parametrize("path", ["spectral", "masked", "scalar"])
+def test_glm_contrast_scale_preserves_pvalues_and_estimability(path):
+    rng = np.random.default_rng(33)
+    groups = np.repeat([0, 1], 6)
+    design = np.column_stack([np.ones(12), groups])
+    values = rng.normal(size=(12, 5)) + 0.8 * groups[:, None]
+    spectra = np.exp(values[:, :, None] + rng.normal(size=(12, 5, 3)))
+    presence = np.ones((12, 5), dtype=bool)
+    presence[0, 0] = False
+
+    def compare(matrix, contrast):
+        if path == "scalar":
+            result = compare_glm_scalar(values, matrix, contrast)
+        elif path == "masked":
+            result = compare_glm_masked(spectra, matrix, contrast, presence)
+        else:
+            result = compare_glm(spectra, matrix, contrast)
+        return result.set_index("Feature").sort_index()
+
+    expected = compare(design, np.array([0.0, 1.0]))
+    aliased = np.column_stack([design, groups])
+    for scale in (1.0, 1e-16, 1e-6, -1e6):
+        actual = compare(design, np.array([0.0, scale]))
+        np.testing.assert_allclose(
+            actual[["P_value", "P_adj"]], expected[["P_value", "P_adj"]], rtol=1e-12
+        )
+        with pytest.raises(ValueError, match="estimable"):
+            compare(aliased, np.array([0.0, scale, 0.0]))
+    with pytest.raises(ValueError, match="nonzero"):
+        compare(design, np.zeros(2))
+
+
+@pytest.mark.parametrize("path", ["spectral", "masked", "scalar"])
+def test_glm_rejects_colliding_encoded_design_names(path):
+    rng = np.random.default_rng(13)
+    x = rng.normal(size=12)
+    spectra = rng.lognormal(size=(12, 2, 3))
+    designs = [
+        pd.DataFrame({"Intercept": x}),
+        pd.DataFrame({"Intercept": pd.Categorical(np.repeat(["A", "B"], 6))}),
+        pd.DataFrame(np.column_stack([x, x**2]), columns=["x", "x"]),
+        pd.DataFrame({"x": x, "group": pd.Categorical(np.repeat(["A", "B"], 6))}).set_axis(
+            ["x", "x"], axis=1
+        ),
+        pd.DataFrame({"group": pd.Categorical(np.repeat(["A", "B"], 6)), "group[T.B]": x}),
+    ]
+    for design in designs:
+        with pytest.raises(ValueError, match="ambiguous after encoding"):
+            if path == "scalar":
+                compare_glm_scalar(spectra.mean(axis=-1), design, design.columns[0])
+            elif path == "masked":
+                compare_glm_masked(spectra, design, design.columns[0], np.ones((12, 2), bool))
+            else:
+                compare_glm(spectra, design, design.columns[0])
+
+
+def test_scalar_glm_perfect_fit_preserves_nonzero_effects():
+    values = np.tile([0.0, 1.0, 1e-9, -1e-9], (4, 1))
+    result = compare_glm_scalar(values, np.ones((4, 1)), np.ones(1)).set_index("Feature")
+    result = result.loc[["0", "1", "2", "3"]]
+    np.testing.assert_array_equal(result["Estimate"], values[0])
+    np.testing.assert_array_equal(result["Statistic"], [0, np.inf, np.inf, np.inf])
+    np.testing.assert_array_equal(result["P_value"], [1, 0, 0, 0])
+
+
+@pytest.mark.parametrize("value", [np.nan, np.inf, -np.inf])
+@pytest.mark.parametrize("target", ["response", "design", "contrast"])
+def test_scalar_glm_rejects_nonfinite_inputs(value, target):
+    values = np.arange(4.0)[:, None]
+    design = np.ones((4, 1))
+    contrast = np.ones(1)
+    {"response": values, "design": design, "contrast": contrast}[target].flat[0] = value
+    with pytest.raises(ValueError, match="finite"):
+        compare_glm_scalar(values, design, contrast)
 
 
 class TestCompareGLM:
@@ -1045,3 +1129,67 @@ def test_welch_cauchy_is_invariant_to_spectral_units():
             )
             results.append(result.sort_values("Feature")["P_value"].to_numpy())
         np.testing.assert_allclose(*results, rtol=1e-10)
+
+
+@pytest.mark.parametrize("n_b", [1, 5])
+@pytest.mark.parametrize("spectral", [False, True])
+def test_welch_requires_replication_in_both_groups(n_b, spectral):
+    values = np.r_[100.0, np.arange(1.0, n_b + 1)][:, None]
+    groups = np.r_[0, np.ones(n_b)]
+    with pytest.raises(ValueError, match="at least two samples in each group"):
+        if spectral:
+            compare_two_groups(values[..., None], groups, statistic="welch_t_cauchy")
+        else:
+            compare_two_groups_scalar(values, groups)
+
+
+@pytest.mark.parametrize("masked", [False, True])
+@pytest.mark.parametrize("poison", ["value", "weight"])
+@pytest.mark.parametrize("value", [np.nan, np.inf])
+def test_permutation_rejects_nonfinite_observations_and_weights(masked, poison, value):
+    spectra = np.random.default_rng(12).lognormal(size=(8, 2, 3))
+    groups = np.repeat([0, 1], 4)
+    weights = np.ones(3)
+    if poison == "value":
+        spectra[0, 0, 0] = value
+    else:
+        weights[0] = value
+    with pytest.raises(ValueError, match="finite"):
+        if masked:
+            compare_two_groups_masked(
+                spectra,
+                groups,
+                np.ones((8, 2), dtype=bool),
+                null="permutation",
+                freq_weights=weights,
+            )
+        else:
+            compare_two_groups(spectra, groups, null="permutation", freq_weights=weights)
+
+
+@pytest.mark.parametrize("masked", [False, True])
+def test_welch_cauchy_excludes_only_constant_bins(masked):
+    values = np.r_[np.arange(1.0, 7.0), np.arange(9.0, 15.0)]
+    groups = np.repeat([0, 1], 6)
+    spectra = np.stack([values, np.ones(12), 1 + groups], axis=1)[..., None]
+    presence = np.ones((12, 3), dtype=bool)
+    presence[0, 0] = False
+
+    def compare(array):
+        kwargs = {"statistic": "welch_t_cauchy"}
+        result = (
+            compare_two_groups_masked(array, groups, presence, **kwargs)
+            if masked
+            else compare_two_groups(array, groups, **kwargs)
+        )
+        return result.set_index("Feature").sort_index()
+
+    expected = compare(spectra)
+    padded = np.concatenate([spectra, np.zeros_like(spectra), np.ones_like(spectra)], axis=-1)
+    actual = compare(padded)
+    np.testing.assert_allclose(actual.P_value, expected.P_value, rtol=1e-12)
+    assert actual.loc["0", "P_value"] < 0.001
+    assert actual.loc["1", "P_value"] == 1.0
+    assert (
+        actual.loc["2", "P_value"] < 1e-100
+    )  # Different constants in the two arms remain informative.

@@ -4,7 +4,7 @@ from unittest.mock import patch
 
 import numpy as np
 import pytest
-from scipy.stats import beta, ncx2, norm
+from scipy.stats import beta, chi2, ncx2, norm
 
 from sonic.kernels import FFTKernel, MatrixKernel, NUFFTKernel
 from sonic.statistics import (
@@ -131,15 +131,67 @@ def test_normal_and_deterministic_limits_and_invalid_inputs():
 
 
 @pytest.mark.parametrize("noncentral", [False, True])
-def test_unstandardized_mixture_retains_previous_values(noncentral):
-    # Values captured from the pre-fix implementation, including noncentral inputs.
+def test_unstandardized_mixture_matches_liu_reference_across_scales(noncentral):
+    # Liu parameters calculated independently with 60-digit Decimal arithmetic,
+    # followed by SciPy's central/noncentral chi-square survival function.
     expected = (
-        [0.9427447399014605, 0.6150786517742615, 0.06667771283279807]
+        [0.9427447399105364, 0.6150786517776423, 0.06667771283096502]
         if noncentral
-        else [0.7727110823041565, 0.20738656261407634, 0.00243898059108601]
+        else [0.7727110822059136, 0.20738656243550757, 0.002438980581802866]
     )
-    actual = liu_sf([1, 5, 20], [0.3, 1, 2], deltas=[0.2, 1, 2] if noncentral else None)
-    np.testing.assert_allclose(actual, expected, rtol=1e-13)
+    for scale in (1e-200, 1e-3, 1.0, 1e200):
+        actual = liu_sf(
+            np.array([1, 5, 20]) * scale,
+            np.array([0.3, 1, 2]) * scale,
+            deltas=[0.2, 1, 2] if noncentral else None,
+        )
+        np.testing.assert_allclose(actual, expected, rtol=1e-13)
+
+
+@pytest.mark.parametrize("delta", [0.0, 2.0])
+def test_liu_single_component_is_exact_across_scales(delta):
+    q = np.array([0.5, 5.0, 20.0])
+    expected = chi2.sf(q, 3) if delta == 0 else ncx2.sf(q, 3, delta)
+    for scale in (1e-200, 1e-3, 1.0, 1e200):
+        actual = liu_sf(q * scale, [scale], dofs=[3], deltas=[delta])
+        np.testing.assert_allclose(actual, expected, rtol=1e-13)
+    np.testing.assert_array_equal(liu_sf([0, 1e-200, 1], [0]), [1, 0, 0])
+
+
+def test_gaussian_q_calibration_retains_small_eigenvalues():
+    rng = np.random.default_rng(11)
+    basis, _ = np.linalg.qr(np.column_stack([np.ones(16), rng.normal(size=(16, 15))]))
+    matrix = (basis[:, 1:] * np.arange(1, 16)) @ basis[:, 1:].T
+    expected = liu_sf([50, 150, 300], np.arange(1, 16))
+    for scale in (1.0, 1e-12, 1e-100):
+        kernel = MatrixKernel.from_matrix(matrix * scale)
+        params = compute_null_params(kernel, method="moments", dirichlet_correction=False)
+        np.testing.assert_allclose(
+            _moment_sf(np.array([50, 150, 300]) * scale, params["q_fit"]), expected, rtol=1e-12
+        )
+
+
+@pytest.mark.parametrize("backend", ["matrix", "fft2", "rfft2", "nufft"])
+def test_gaussian_q_probe_fit_is_scale_invariant(backend):
+    rng = np.random.default_rng(15)
+    coords = rng.uniform(0, 8, (32, 2))
+    results = []
+    for scale in (1.0, 1e-12, 1e-100):
+        if backend == "matrix":
+            kernel = MatrixKernel.from_matrix(np.diag(np.linspace(1, 2, 32)) * scale)
+        elif backend == "nufft":
+            kernel = NUFFTKernel(coords, (8, 8), (1, 1), method="gaussian")
+            kernel._fft_kernel.spectrum *= scale
+        else:
+            kernel = FFTKernel((8, 8), method="gaussian", fft_solver=backend)
+            kernel.spectrum *= scale
+        fit = compute_null_params(
+            kernel, method="moments", dirichlet_correction=False, n_probes=60
+        )["q_fit"]
+        if scale == 1.0:
+            q = fit["mu_Q"] + np.array([-1, 0, 1, 3]) * fit["sigma_Q"]
+        results.append(_moment_sf(q * scale, fit))
+    np.testing.assert_allclose(results[1:], [results[0], results[0]], rtol=1e-10)
 
 
 @pytest.mark.parametrize(
@@ -337,12 +389,11 @@ def test_shared_precision_moments_and_r_variance_match_exact_traces(method, corr
     precision._trace_rvs_cache = {"n_vectors": n, "rvs": probes, "Y": matrix @ probes}
     explicit = MatrixKernel.from_matrix(matrix, centering=centering)
     # Orthogonal probes eliminate Monte Carlo error; the raw diagnostic view
-    # must affect R only, not the centered Q moments.
+    # must not affect calibration of either standardized Q or R.
     kwargs = {"method": method, "dirichlet_correction": correction}
     if not centering and method == "moments":
         # Exact HKH eigenvalues give the reference even for the raw trace view.
         reference = compute_null_params(MatrixKernel.from_matrix(matrix), **kwargs)
-        reference["var_R"] = float(np.sum(matrix**2))
     else:
         reference = compute_null_params(explicit, **kwargs)
     actual = compute_null_params(precision, n_probes=n, **kwargs)

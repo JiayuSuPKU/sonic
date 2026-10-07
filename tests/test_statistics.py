@@ -575,7 +575,7 @@ def test_null_moments_project_raw_kernel_traces(backend, method, correction):
         spatial_q_test(data, kernels[0], null_params=expected),
         rtol=1e-10,
     )
-    assert actual["var_R"] == kernels[1].square_trace()
+    np.testing.assert_allclose(actual["var_R"], expected["var_R"], rtol=1e-10)
     assert kernels[1].centering is False
 
 
@@ -595,3 +595,108 @@ def test_clt_tail_is_invariant_to_small_kernel_scale(backend):
         params = compute_null_params(kernel, method="clt")
         pvalues.append(spatial_q_test(data, kernel, null_params=params)[1])
     np.testing.assert_allclose(pvalues[0], pvalues[1], rtol=1e-10)
+
+
+@pytest.mark.parametrize("backend", ["matrix", "fft2", "rfft2", "nufft"])
+def test_r_null_projects_raw_kernel_without_mutation(backend):
+    rng = np.random.default_rng(140)
+    coords = rng.uniform(0, 8, (40, 2))
+    x = rng.normal(size=(8, 8, 3) if backend in ("fft2", "rfft2") else (40, 3))
+    y = x + rng.normal(size=x.shape)
+    kernels = []
+    for centered in (True, False):
+        if backend == "matrix":
+            kernel = MatrixKernel.from_coordinates(coords, method="gaussian", centering=centered)
+        elif backend == "nufft":
+            kernel = NUFFTKernel(coords, (8, 8), (1, 1), method="gaussian", centering=centered)
+        else:
+            kernel = FFTKernel((8, 8), method="gaussian", fft_solver=backend, centering=centered)
+        kernels.append(kernel)
+    expected = spatial_r_test(x, y, kernels[0])
+    for method in (None, "clt", "welch", "moments"):
+        params = None if method is None else compute_null_params(kernels[1], method=method)
+        if params is not None:
+            np.testing.assert_allclose(params["var_R"], kernels[0].square_trace(), rtol=1e-10)
+        actual = spatial_r_test(x, y, kernels[1], null_params=params, chunk_size=1)
+        np.testing.assert_allclose(actual, expected, rtol=1e-9, atol=1e-12)
+        assert kernels[1].centering is False
+
+
+@pytest.mark.parametrize("sparse", [False, True])
+def test_blocked_centered_traces_preserve_constant_and_projection_limits(sparse):
+    n = 1100  # More than one 8 MiB row block.
+    for diagonal in (0.0, 1e-9):
+        raw = np.full((n, n), 0.1)
+        raw[np.diag_indices(n)] += diagonal
+        actual_diagonal = raw[0, 0] - raw[0, 1]
+        kernel = MatrixKernel.from_matrix(csr_matrix(raw) if sparse else raw)
+        # HKH = actual_diagonal * H: its n-1 nonzero eigenvalues are equal.
+        np.testing.assert_allclose(
+            [kernel.trace(), kernel.square_trace()],
+            [(n - 1) * actual_diagonal, (n - 1) * actual_diagonal**2],
+            rtol=1e-12,
+            atol=0,
+        )
+
+
+@pytest.mark.parametrize("sparse", [False, True])
+@pytest.mark.parametrize("centering", [False, True])
+@pytest.mark.parametrize("bandwidth", [100.0, 10000.0])
+def test_nearly_constant_matrix_null_matches_explicit_projection(sparse, centering, bandwidth):
+    rng = np.random.default_rng(30)
+    coords = rng.uniform(0, 1, (32, 2))
+    raw = MatrixKernel.from_coordinates(
+        coords, method="gaussian", bandwidth=bandwidth, centering=False
+    ).realization()
+    original = raw.copy()
+    # Use extended precision for the dense oracle so projection roundoff does
+    # not dominate the very small centered operator.
+    h = np.eye(32, dtype=np.longdouble) - np.longdouble(1) / 32
+    centered = np.asarray(h @ raw @ h, dtype=float)
+    reference = MatrixKernel.from_matrix(centered)
+    kernel = MatrixKernel.from_matrix(csr_matrix(raw) if sparse else raw, centering=centering)
+    expected = compute_null_params(reference)
+    actual = compute_null_params(kernel)
+    for key in ("mean_Q", "var_Q", "var_R"):
+        np.testing.assert_allclose(actual[key], expected[key], rtol=2e-6, atol=0)
+    x = np.column_stack([coords[:, 0], rng.normal(size=(32, 2))])
+    y = rng.normal(size=x.shape)
+    np.testing.assert_allclose(
+        spatial_q_test(x, kernel), spatial_q_test(x, reference), rtol=1e-5, atol=0
+    )
+    np.testing.assert_allclose(
+        spatial_r_test(x, y, kernel), spatial_r_test(x, y, reference), rtol=1e-5, atol=0
+    )
+    assert kernel.centering is centering
+    np.testing.assert_array_equal(raw, original)
+
+
+@pytest.mark.parametrize("backend", ["fft2", "rfft2", "nufft"])
+def test_r_pvalues_ignore_kernel_amplitude(backend):
+    rng = np.random.default_rng(10)
+    coords = rng.uniform(0, 8, (40, 2))
+    x = rng.normal(size=(40, 3) if backend == "nufft" else (8, 8, 3))
+    y = x + 0.5 * rng.normal(size=x.shape)
+    pvalues = []
+    for scale in (1.0, 1e-20, 0.0):
+        if backend == "nufft":
+            kernel = NUFFTKernel(coords, (8, 8), (1, 1), method="gaussian")
+            kernel._fft_kernel.spectrum *= scale
+        else:
+            kernel = FFTKernel((8, 8), method="gaussian", fft_solver=backend)
+            kernel.spectrum *= scale
+        pvalues.append(spatial_r_test(x, y, kernel)[1])
+    np.testing.assert_allclose(pvalues[0], pvalues[1], rtol=1e-9)
+    np.testing.assert_array_equal(pvalues[2], 1.0)
+
+
+@pytest.mark.parametrize("sparse_type", [csr_matrix, csc_matrix])
+def test_small_sparse_q_uses_dense_validity_cutoff(sparse_type):
+    rng = np.random.default_rng(3)
+    kernel = MatrixKernel.from_matrix(-np.diag(np.linspace(1, 2, 32)), method="moran")
+    data = rng.normal(size=(32, 2)) * [1e-14, 1.0]
+    expected = spatial_q_test(data, kernel)
+    actual = spatial_q_test(sparse_type(data), kernel)
+    np.testing.assert_allclose(actual, expected, atol=1e-12)
+    assert actual[0][0] == 0.0
+    assert actual[1][0] == 1.0

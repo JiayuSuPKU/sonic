@@ -744,6 +744,46 @@ class MatrixKernelBase(Kernel):
         self._trace_rvs_cache = {"n_vectors": n_vectors, "rvs": rvs, "Y": Y}
         return self._trace_rvs_cache
 
+    def _stable_centered_traces(self) -> tuple[float, float]:
+        """Trace and squared norm of explicit HKH, without raw-trace cancellation.
+
+        Only used when the subtraction formula loses at least half of float64
+        precision. Remove a constant offset before summing, then center rows in
+        blocks of at most 8 MiB (at least one row). Cache both moments so Q and R
+        reuse the fallback.
+        """
+        cached = getattr(self, "_centered_trace_cache", None)
+        if cached is not None:
+            return cached
+        offset = float(self._K[0, 0])
+        row_mean = np.empty(self.n)
+        col_offset = np.zeros(self.n)
+        chunk = max(1, (8 << 20) // (8 * self.n))
+        first = second = 0.0
+        for phase in (0, 1):
+            for start in range(0, self.n, chunk):
+                stop = min(start + chunk, self.n)
+                rows = self._K[start:stop]
+                block = (
+                    rows.toarray().astype(float, copy=False)
+                    if sp.issparse(rows)
+                    else np.array(rows, dtype=float, copy=True)
+                )
+                block -= offset  # H(K - offset * 11')H = HKH.
+                if phase == 0:
+                    row_mean[start:stop] = block.mean(axis=1)
+                    col_offset += block.sum(axis=0) / self.n
+                else:
+                    block -= row_mean[start:stop, None]
+                    block -= col_offset
+                    first += float(block[np.arange(stop - start), np.arange(start, stop)].sum())
+                    second += float(np.einsum("ij,ij->", block, block))
+                del block
+            if phase == 0:
+                col_offset -= row_mean.mean()
+        self._centered_trace_cache = (first, second)
+        return first, second
+
     def trace(self, n_probes: int | None = None) -> float:
         """``trace(K)`` (raw) or ``trace(HKH)`` (centered).
 
@@ -771,6 +811,9 @@ class MatrixKernelBase(Kernel):
         -------
         float
         """
+        cached = getattr(self, "_centered_trace_cache", None)
+        if self.centering and cached is not None:
+            return cached[0]
         if self.stores_precision:
             m = int(n_probes) if n_probes else 15
             cache = self._get_rvs_trace_cache(m)
@@ -782,7 +825,10 @@ class MatrixKernelBase(Kernel):
         if not self.centering:
             return raw
         s1, _ = self._ones_stats()
-        return raw - s1 / self.n
+        centered = raw - s1 / self.n
+        if not self.stores_precision and abs(centered) < np.sqrt(np.finfo(float).eps) * abs(raw):
+            return self._stable_centered_traces()[0]
+        return centered
 
     def square_trace(self, n_probes: int | None = None) -> float:
         """``trace(K²)`` (raw) or ``trace((HKH)²)`` (centered).
@@ -808,6 +854,9 @@ class MatrixKernelBase(Kernel):
         -------
         float
         """
+        cached = getattr(self, "_centered_trace_cache", None)
+        if self.centering and cached is not None:
+            return cached[1]
         if self.stores_precision:
             m = int(n_probes) if n_probes else 15
             cache = self._get_rvs_trace_cache(m)
@@ -819,7 +868,10 @@ class MatrixKernelBase(Kernel):
         if not self.centering:
             return raw
         s1, s2 = self._ones_stats()
-        return max(raw - 2.0 * s2 / self.n + s1**2 / (self.n**2), 0.0)
+        centered = raw - 2.0 * s2 / self.n + s1**2 / (self.n**2)
+        if not self.stores_precision and centered < np.sqrt(np.finfo(float).eps) * raw:
+            return self._stable_centered_traces()[1]
+        return max(centered, 0.0)
 
     def _compute_inv_diag(self, M):
         """Compute diagonal of K = M^{-1} using batched solves to save memory.

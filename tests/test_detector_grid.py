@@ -659,7 +659,10 @@ def test_grid_detector_r_matches_standalone(shape, solver, method, masked, monke
             )
             np.testing.assert_allclose(row.R, r, rtol=1e-10, atol=1e-12)
             if return_pval:
-                np.testing.assert_allclose(row.P_value, p, rtol=1e-10, atol=1e-12)
+                if row.Feature_1 == row.Feature_2:
+                    assert np.isnan([row.Z_score, row.P_value, row.P_adj]).all()
+                else:
+                    np.testing.assert_allclose(row.P_value, p, rtol=1e-10, atol=1e-12)
             else:
                 assert "P_value" not in result
     np.testing.assert_array_equal(data, original)
@@ -679,6 +682,39 @@ def test_grid_r_rejects_mismatched_feature_masks(chunk_size, monkeypatch):
         )
     with pytest.raises(ValueError, match="same observed-cell mask"):
         detector.compute_rstat(chunk_size=chunk_size, workers=1, show_progress=False)
+
+
+@pytest.mark.parametrize("bipartite", [False, True])
+def test_grid_r_self_pairs_and_kernel_scale(bipartite, monkeypatch):
+    from sonic.statistics import apply_bh_correction
+
+    monkeypatch.setattr("gc.collect", lambda: None)
+    data = np.random.default_rng(140).normal(size=(4, 8, 8))
+    names = ["a", "b", "c", "d"]
+    sdata = MockSpatialData("cells", MockTable(data.reshape(4, -1).T, names))
+    with patch("sonic._rasterize.rasterize_table", return_value=MockDataArray(data, names)):
+        detector = DetectorGrid(kernel_method="gaussian").setup_data(
+            sdata, bins="bins", table_name="cells", col_key="col", row_key="row"
+        )
+    args = {
+        "features_x": names,
+        "features_y": names if bipartite else None,
+        "workers": 1,
+        "show_progress": False,
+        "chunk_size": 2,
+    }
+    result = detector.compute_rstat(**args).set_index(["Feature_1", "Feature_2"]).sort_index()
+    self_pairs = result.index.get_level_values(0) == result.index.get_level_values(1)
+    assert self_pairs.sum() == 4
+    assert result.loc[self_pairs, ["Z_score", "P_value", "P_adj"]].isna().all().all()
+    cross = result.loc[~self_pairs]
+    np.testing.assert_array_equal(cross.P_adj, apply_bh_correction(cross.P_value))
+    detector.kernel_.spectrum *= 1e-20
+    scaled = detector.compute_rstat(**args).set_index(["Feature_1", "Feature_2"]).sort_index()
+    np.testing.assert_allclose(scaled.R / 1e-20, result.R, rtol=1e-12)
+    np.testing.assert_allclose(
+        scaled[["P_value", "P_adj"]], result[["P_value", "P_adj"]], rtol=1e-12
+    )
 
 
 if __name__ == "__main__":

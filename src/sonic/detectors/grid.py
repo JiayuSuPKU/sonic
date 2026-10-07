@@ -22,6 +22,7 @@ from sonic.detectors.base import Detector
 from sonic.kernels.fft import FFTKernel
 from sonic.statistics import (
     _TRACE_PROBE_BUDGET_BYTES,
+    _r_null_variance,
     _resolve_q_null_method,
     apply_bh_correction,
     compute_null_params,
@@ -684,6 +685,9 @@ class DetectorGrid(Detector):
         pandas.DataFrame
             Columns ``Feature_1``, ``Feature_2``, ``R``, ``Z_score`` and (if
             ``return_pval=True``) ``P_value``, ``P_adj``. Sorted by ``R`` desc.
+            Self-pairs retain their R score, with NaN inferential fields;
+            BH correction includes only cross-feature pairs. Use Q-tests for
+            single-feature spatial variability.
         """
         import gc  # Garbage collector
 
@@ -736,7 +740,7 @@ class DetectorGrid(Detector):
             null_kernel = (
                 self.kernel_ if observed.all() else _OccupiedGridKernel(self.kernel_, observed)
             )
-            sigma = np.sqrt(null_kernel.square_trace())
+            sigma = np.sqrt(_r_null_variance(null_kernel))
         spectral_sign = np.sign(self.kernel_.eigenvalues())
         results_list = []
 
@@ -796,7 +800,7 @@ class DetectorGrid(Detector):
                 batch_df = pd.DataFrame({"Feature_1": feat_1, "Feature_2": feat_2, "R": r_vals})
 
                 if return_pval:
-                    if sigma > 1e-12:
+                    if sigma > 0:
                         z_scores = r_vals / sigma
                         p_vals = 2 * norm.sf(np.abs(z_scores))
                     else:
@@ -823,6 +827,8 @@ class DetectorGrid(Detector):
         final_df = pd.concat(results_list, ignore_index=True)
 
         if return_pval and not final_df.empty:
+            self_pairs = final_df["Feature_1"] == final_df["Feature_2"]
+            final_df.loc[self_pairs, ["Z_score", "P_value"]] = np.nan
             final_df["P_adj"] = apply_bh_correction(final_df["P_value"])
 
         return final_df.sort_values(by="R", key=abs, ascending=False)

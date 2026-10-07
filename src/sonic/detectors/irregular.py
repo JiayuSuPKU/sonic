@@ -15,6 +15,7 @@ from sonic.kernels import Kernel, MatrixKernel
 from sonic.kernels.nufft import NUFFTKernel, _standardize_features
 from sonic.statistics import (
     _q_pvalues,
+    _r_null_variance,
     _resolve_q_null_method,
     _sparse_mean_std,
     apply_bh_correction,
@@ -1031,6 +1032,8 @@ class DetectorIrregular(Detector):
         for all requested feature pairs in the symmetric mode (``features_y=None``). For
         ``features_x=[A, B, C]``, the output contains
         ``(A, A), (A, B), (A, C), (B, A), (B, B), (B, C), (C, A), (C, B), (C, C)``.
+        Self-pairs retain their R score, with NaN inferential fields; BH correction
+        includes only cross-feature pairs. Use Q-tests for single-feature spatial variability.
 
         P-value calculation uses a normal approximation based on Tr(K²) and is not
         configurable through this method. For finer control over the null model,
@@ -1181,6 +1184,8 @@ class DetectorIrregular(Detector):
 
         # 7. Multiple testing correction (Benjamini-Hochberg)
         if return_pval:
+            self_pairs = df["Feature_1"] == df["Feature_2"]
+            df.loc[self_pairs, ["Z_score", "P_value"]] = np.nan
             df["P_adj"] = apply_bh_correction(df["P_value"])
 
         return df.sort_values(by="Z_score", key=abs, ascending=False)
@@ -1261,7 +1266,9 @@ class DetectorIrregular(Detector):
         X_kept, names_kept, means, stds = self._prepare_features_nufft(source, features, layer)
         n_feats = len(names_kept)
         if n_feats == 0:
-            cols = ["Feature", "Q", "Z_score", "P_value", "P_adj"]
+            cols = ["Feature", "Q"]
+            if return_pval:
+                cols += ["Z_score", "P_value", "P_adj"]
             return pd.DataFrame(columns=cols)
 
         logger.info("Testing %d features via NUFFT (n_jobs=%s)...", n_feats, n_jobs)
@@ -1331,11 +1338,10 @@ class DetectorIrregular(Detector):
     ) -> pd.DataFrame:
         """NUFFT dispatch for :meth:`compute_rstat`.
 
-        ``var_R`` comes from :meth:`NUFFTKernel.square_trace` (already
-        n-point-scaled analytic default).
+        ``var_R`` is the n-point square trace of the standardized operator HKH.
         """
         kernel = self.kernel_
-        var_R = float(kernel.square_trace()) if return_pval else 0.0
+        var_R = _r_null_variance(kernel) if return_pval else 0.0
 
         if features_x is None and features_y is not None:
             raise ValueError("Provide features_x when features_y is specified.")
@@ -1349,9 +1355,10 @@ class DetectorIrregular(Detector):
             X_y, names_y, means_y, stds_y = self._prepare_features_nufft(source, features_y, layer)
 
         if len(names_kept) == 0 or len(names_y) == 0:
-            return pd.DataFrame(
-                columns=["Feature_1", "Feature_2", "R", "Z_score", "P_value", "P_adj"]
-            )
+            columns = ["Feature_1", "Feature_2", "R"]
+            if return_pval:
+                columns += ["Z_score", "P_value", "P_adj"]
+            return pd.DataFrame(columns=columns)
 
         logger.info("Testing %d x %d feature pairs via NUFFT...", len(names_kept), len(names_y))
 
@@ -1389,5 +1396,7 @@ class DetectorIrregular(Detector):
 
         df = pd.DataFrame(results)
         if return_pval:
+            self_pairs = df["Feature_1"] == df["Feature_2"]
+            df.loc[self_pairs, ["Z_score", "P_value"]] = np.nan
             df["P_adj"] = apply_bh_correction(df["P_value"])
         return df.sort_values("R", ascending=False).reset_index(drop=True)

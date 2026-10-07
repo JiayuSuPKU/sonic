@@ -150,11 +150,11 @@ def _resolve_freq_weights(freq_weights: np.ndarray | None, n_bins: int) -> np.nd
     w = np.asarray(freq_weights, dtype=float).ravel()
     if w.shape != (n_bins,):
         raise ValueError(f"freq_weights must have length n_bins={n_bins}, got shape {w.shape}.")
-    if np.any(w < 0):
-        raise ValueError("freq_weights must be non-negative.")
+    if not np.all(np.isfinite(w)) or np.any(w < 0):
+        raise ValueError("freq_weights must be finite and non-negative.")
     total = float(w.sum())
-    if total <= 0:
-        raise ValueError("freq_weights must not sum to zero.")
+    if not np.isfinite(total) or total <= 0:
+        raise ValueError("freq_weights must have a positive finite sum.")
     return w / total
 
 
@@ -167,23 +167,24 @@ def _welch_test(group_a: np.ndarray, group_b: np.ndarray) -> tuple[np.ndarray, n
     Welch-Satterthwaite degrees of freedom from the t-distribution tail.
     """
     n_a, n_b = group_a.shape[0], group_b.shape[0]
+    if n_a < 2 or n_b < 2:
+        raise ValueError("Welch tests require at least two samples in each group.")
+    if not np.all(np.isfinite(group_a)) or not np.all(np.isfinite(group_b)):
+        raise ValueError("Welch tests require finite input values.")
     mean_a = group_a.mean(axis=0)
     mean_b = group_b.mean(axis=0)
-    var_a = group_a.var(axis=0, ddof=1) if n_a > 1 else np.zeros_like(mean_a)
-    var_b = group_b.var(axis=0, ddof=1) if n_b > 1 else np.zeros_like(mean_b)
-    se2_a = var_a / max(n_a, 1)
-    se2_b = var_b / max(n_b, 1)
+    var_a = group_a.var(axis=0, ddof=1)
+    var_b = group_b.var(axis=0, ddof=1)
+    se2_a = var_a / n_a
+    se2_b = var_b / n_b
     se2 = se2_a + se2_b
     with np.errstate(divide="ignore", invalid="ignore"):
         t_stat = (mean_a - mean_b) / np.sqrt(se2)
     t_stat = np.where((se2 == 0) & (mean_a == mean_b), 0.0, t_stat)
-    if n_a > 1 and n_b > 1:
-        # Normalize variance contributions before squaring: no scale-dependent
-        # epsilon, and no underflow/overflow from squaring the variances.
-        fraction_a = np.divide(se2_a, se2, out=np.zeros_like(se2), where=se2 > 0)
-        df = 1.0 / (fraction_a**2 / (n_a - 1) + (1.0 - fraction_a) ** 2 / (n_b - 1))
-    else:
-        df = np.full_like(mean_a, float(max(n_a + n_b - 2, 1)))
+    # Normalize variance contributions before squaring: no scale-dependent
+    # epsilon, and no underflow/overflow from squaring the variances.
+    fraction_a = np.divide(se2_a, se2, out=np.zeros_like(se2), where=se2 > 0)
+    df = 1.0 / (fraction_a**2 / (n_a - 1) + (1.0 - fraction_a) ** 2 / (n_b - 1))
     df = np.maximum(df, 1.0)
     pvals = 2.0 * _t_dist.sf(np.abs(t_stat), df)
     # Clip the floor to the smallest representable positive float so
@@ -278,6 +279,8 @@ def _run_statistic_with_perm(
     """
     if stat_name != "log_l2":
         raise ValueError(f"Permutation statistic must be 'log_l2', got {stat_name!r}.")
+    if not np.all(np.isfinite(spectra)):
+        raise ValueError("Permutation tests require finite spectra for observed samples.")
     uniq = np.unique(group_codes)
     a_val = uniq[0]
     log_spectra = np.maximum(spectra, 1e-12)
@@ -327,7 +330,10 @@ def _run_welch_t_cauchy_analytic(
     a_mask = group_codes == 0
     t_stat, per_bin_pvals = _welch_test(spectra[a_mask], spectra[~a_mask])
     abs_t = np.abs(t_stat)
-    combined = cauchy_combine(per_bin_pvals, axis=-1)
+    # A bin constant across all samples has no information about the contrast.
+    # Its p=1 would otherwise dominate the Cauchy sum and suppress other bins.
+    informative = np.any(spectra != spectra[:1], axis=0)
+    combined = cauchy_combine(per_bin_pvals, axis=-1, where=informative)
     return abs_t, combined, per_bin_pvals
 
 
@@ -360,8 +366,6 @@ def _maybe_warn_small_df_analytic(df_resid: int) -> None:
 def _log_l2_analytic_pvalues(
     statistic: np.ndarray,
     lambs: np.ndarray,
-    *,
-    eps: float = 1e-30,
 ) -> np.ndarray:
     """Analytic p-values for ``log_l2`` via Liu's mixture-χ² tail.
 
@@ -370,9 +374,8 @@ def _log_l2_analytic_pvalues(
     Squaring it here gives the H₀ statistic distributed as ``Σ_k λ_k χ²_1``,
     which Liu's approximation handles directly.
     """
-    lambs_safe = np.maximum(np.asarray(lambs, dtype=float), eps)
     statistic_sq = np.asarray(statistic, dtype=float) ** 2
-    return np.asarray(liu_sf(statistic_sq, lambs_safe), dtype=float)
+    return np.asarray(liu_sf(statistic_sq, lambs), dtype=float)
 
 
 def _effective_rank_from_eigenvalues(eigenvalues: np.ndarray) -> float:
@@ -392,8 +395,7 @@ def _log_l2_pvalues_from_state(state: _AnalyticNullState) -> np.ndarray:
     ``_estimate_*_null_covariance`` helpers. Unmasked states carry one
     eigenvalue vector reused for every gene; masked states carry a per-gene
     eigenvalue matrix and an ``eligible`` mask so skipped genes remain ``NaN``.
-    Genes with the same contrast scale share one Liu fit. Retaining the scale
-    in the fit preserves its absolute numerical safeguards and eigenvalue floor.
+    Genes with the same contrast scale share one Liu fit.
     """
     observed = np.asarray(state["observed"], dtype=float)
     eigenvalues = np.asarray(state["eigenvalues"], dtype=float)
@@ -452,7 +454,8 @@ def _build_design_matrix(
     - ``pd.DataFrame``: encoded via :func:`patsy.dmatrix`, adding an intercept
       and one-hot encoding categoricals (Treatment contrast against the first
       level). Column names are treated literally, including punctuation and
-      spaces. Missing values raise rather than dropping sample rows.
+      spaces. Missing values raise rather than dropping sample rows. Encoded
+      labels must be unique, including the generated ``Intercept`` column.
       If patsy is not installed, raise ``ImportError`` with an install hint.
     """
     if isinstance(design, np.ndarray):
@@ -487,10 +490,16 @@ def _build_design_matrix(
     design_matrix = patsy.dmatrix(
         formula, design.set_axis(aliases, axis=1), return_type="dataframe", NA_action="raise"
     )
+    names = list(map(str, design.columns))
     columns = list(design_matrix.columns)
-    for alias, name in zip(aliases, design.columns, strict=True):
+    for alias, name in zip(aliases, names, strict=True):
         term_slice = design_matrix.design_info.term_name_slices[alias]
-        columns[term_slice] = [str(name) + c[len(alias) :] for c in columns[term_slice]]
+        columns[term_slice] = [name + c[len(alias) :] for c in columns[term_slice]]
+    if "Intercept" in names or len(set(names)) != len(names) or len(set(columns)) != len(columns):
+        raise ValueError(
+            "Design column names are ambiguous after encoding (including the added "
+            "'Intercept'); rename conflicting columns or pass a numeric design matrix."
+        )
     return design_matrix.to_numpy().astype(float), columns
 
 
@@ -553,15 +562,20 @@ def _decompose_glm_design(
 
     Forming X'X squares the condition number. Check the contrast against
     the orthonormal row basis directly, without multiplying X's inverse by X.
+    Normalize the contrast for this check so its units cannot change estimability.
     """
+    if not np.isfinite(design_matrix).all() or not np.isfinite(contrast_vector).all():
+        raise ValueError("Design matrix and contrast must be finite.")
+    contrast_size = np.max(np.abs(contrast_vector), initial=0.0)
+    if contrast_size == 0:
+        raise ValueError("contrast must be nonzero.")
     u, singular, vt = np.linalg.svd(design_matrix, full_matrices=False)
     cutoff = np.finfo(float).eps * max(design_matrix.shape) * singular[0]
     rank = int(np.count_nonzero(singular > cutoff))
     rows = vt[:rank]
     inverse = (rows.T / singular[:rank]) @ u[:, :rank].T
-    estimable = np.allclose(
-        rows.T @ (rows @ contrast_vector), contrast_vector, rtol=1e-7, atol=1e-10
-    )
+    unit_contrast = contrast_vector / contrast_size
+    estimable = np.allclose(rows.T @ (rows @ unit_contrast), unit_contrast, rtol=1e-7, atol=1e-10)
     return inverse, rank, bool(estimable)
 
 
@@ -616,6 +630,9 @@ def _estimate_two_group_null_covariance(
     group_b = spectra[~group_a_mask]
     n_a = int(group_a_mask.sum())
     n_b = int((~group_a_mask).sum())
+    df_resid = n_a + n_b - 2
+    if df_resid <= 0:
+        raise ValueError("Analytic two-group tests require positive residual degrees of freedom.")
     weights = _resolve_freq_weights(freq_weights, n_bins)
 
     # Compute the weighted log-L2 statistic.
@@ -628,7 +645,6 @@ def _estimate_two_group_null_covariance(
     residuals_a = log_group_a - log_group_a.mean(axis=0, keepdims=True)
     residuals_b = log_group_b - log_group_b.mean(axis=0, keepdims=True)
     residuals = np.concatenate([residuals_a, residuals_b], axis=0)
-    df_resid = max(n_a + n_b - 2, 1)
     residual_2d = residuals.reshape(n_samples * n_genes, n_bins)
     sigma_log = (residual_2d.T @ residual_2d) / (n_genes * df_resid)
     _maybe_warn_small_df_analytic(df_resid)
@@ -638,7 +654,7 @@ def _estimate_two_group_null_covariance(
     weighted_cov = sqrt_weights[:, None] * sigma_log * sqrt_weights[None, :]
     weighted_cov_eigenvalues = np.maximum(np.linalg.eigvalsh(weighted_cov), 0.0)
     contrast_scale = (1.0 / max(n_a, 1)) + (1.0 / max(n_b, 1))
-    eigenvalues = np.maximum(weighted_cov_eigenvalues * contrast_scale, 1e-30)
+    eigenvalues = weighted_cov_eigenvalues * contrast_scale
     return {
         "mode": "two_group",
         "masked": False,
@@ -752,10 +768,7 @@ def _estimate_two_group_masked_null_covariance(  # noqa: C901
     weighted_cov = sqrt_weights[:, None] * sigma_log * sqrt_weights[None, :]
     weighted_cov_eigenvalues = np.maximum(np.linalg.eigvalsh(weighted_cov), 0.0)
     eigenvalues = np.full((n_genes, n_bins), np.nan, dtype=float)
-    eigenvalues[eligible] = np.maximum(
-        contrast_scale[eligible, None] * weighted_cov_eigenvalues[None, :],
-        1e-30,
-    )
+    eigenvalues[eligible] = contrast_scale[eligible, None] * weighted_cov_eigenvalues[None, :]
 
     return {
         "mode": "two_group",
@@ -836,7 +849,7 @@ def _estimate_glm_null_covariance(
     sqrt_weights = np.sqrt(weights)
     weighted_cov = sqrt_weights[:, None] * sigma_log * sqrt_weights[None, :]
     weighted_cov_eigenvalues = np.maximum(np.linalg.eigvalsh(weighted_cov), 0.0)
-    eigenvalues = np.maximum(weighted_cov_eigenvalues * contrast_scale, 1e-30)
+    eigenvalues = weighted_cov_eigenvalues * contrast_scale
     return {
         "mode": "glm",
         "masked": False,
@@ -955,10 +968,7 @@ def _estimate_glm_masked_null_covariance(  # noqa: C901
     weighted_cov = sqrt_weights[:, None] * sigma_log * sqrt_weights[None, :]
     weighted_cov_eigenvalues = np.maximum(np.linalg.eigvalsh(weighted_cov), 0.0)
     eigenvalues = np.full((n_genes, n_bins), np.nan, dtype=float)
-    eigenvalues[eligible] = np.maximum(
-        contrast_scale[eligible, None] * weighted_cov_eigenvalues[None, :],
-        1e-30,
-    )
+    eigenvalues[eligible] = contrast_scale[eligible, None] * weighted_cov_eigenvalues[None, :]
 
     return {
         "mode": "glm",
@@ -1023,13 +1033,16 @@ def compare_two_groups(  # noqa: C901
           permutation p-values would floor at ``1/(n_perm + 1)`` per
           bin, which would also floor the gene-level combined p-value
           and destroy BH-FDR power across thousands of genes. Yields
-          an extra ``P_value_per_bin`` column.
+          an extra ``P_value_per_bin`` column. Requires at least two samples
+          per arm. Bins constant across all samples are excluded from the
+          combination; genes with no informative bins receive p=1.
     null : {'analytic', 'permutation'}, default 'analytic'
         Null-distribution method. ``'analytic'`` (the default) uses Liu's
         mixture-χ² approximation for the L2 quadratic form:
         under H₀ the statistic ``T² = D'WD`` is distributed as a
         weighted sum of χ²₁ variables whose tail is integrated via Liu's
-        approximation (see :func:`sonic.statistics.liu_sf`).
+        approximation (see :func:`sonic.statistics.liu_sf`). Requires positive
+        residual degrees of freedom (``n_a + n_b > 2``).
         ``'permutation'`` uses the empirical sample-label permutation
         null and is the only option that respects the
         ``n_perm`` / ``random_state`` / ``max_exact_permutations`` arguments.
@@ -1381,9 +1394,11 @@ def compare_glm(
         Sample-level metadata. ``DataFrame`` columns are auto-encoded via
         :mod:`patsy` (treatment-coded categoricals + intercept);
         ``ndarray`` is passed through as the design matrix verbatim
-        (caller responsible for the intercept column).
+        (caller responsible for the intercept column). Encoded column labels
+        must be unique; a metadata column named ``Intercept`` collides
+        with the generated intercept and must be renamed.
     contrast : str, dict, or np.ndarray
-        Linear-contrast specification:
+        Nonzero, finite, estimable linear-contrast specification:
 
         - ``str`` — name of a design column. Auto-resolves treatment-coded
           categoricals (e.g., ``"genotype"`` matches ``"genotype[T.TG]"``).
@@ -1509,6 +1524,7 @@ def compare_two_groups_scalar(
     For each gene, the function reports ``Statistic = abs(t)`` where ``t`` is
     the Welch two-sample t statistic, and ``P_value`` is the analytic two-sided
     tail probability under the Welch-Satterthwaite t-distribution null.
+    Both groups must contain at least two samples, and values must be finite.
 
     Parameters
     ----------
@@ -1591,6 +1607,9 @@ def compare_glm_scalar(
     degrees of freedom. Passing ``log_expression=True`` fits the model on
     ``log(values + eps)``, which tests multiplicative changes in non-negative
     expression-like means.
+    Responses, design entries and contrast coefficients must be finite. With
+    zero residual variance, an exactly zero estimate has p=1 and a nonzero
+    estimate has p=0, independent of its units.
 
     Parameters
     ----------
@@ -1623,6 +1642,8 @@ def compare_glm_scalar(
 
     values = _maybe_log_expression(values, log_expression=log_expression, eps=eps)
 
+    if not np.isfinite(values).all():
+        raise ValueError("Scalar GLM responses must be finite.")
     design_matrix, design_columns = _build_design_matrix(design, n_samples)
     contrast_vector = _resolve_contrast(contrast, design_columns)
     design_inverse, rank, estimable = _decompose_glm_design(design_matrix, contrast_vector)
@@ -1651,13 +1672,12 @@ def compare_glm_scalar(
     se = np.sqrt(np.maximum(sigma2, 0.0) * contrast_var)
     with np.errstate(divide="ignore", invalid="ignore"):
         t_stat = estimate / se
-    zero_se = se <= np.finfo(float).tiny
-    t_stat[zero_se & np.isclose(estimate, 0.0)] = 0.0
-    perfect_effect = zero_se & ~np.isclose(estimate, 0.0)
+    zero_se = se == 0.0
+    t_stat[zero_se & (estimate == 0.0)] = 0.0
+    perfect_effect = zero_se & (estimate != 0.0)
     t_stat[perfect_effect] = np.sign(estimate[perfect_effect]) * np.inf
     observed = np.abs(t_stat)
     pvals = 2.0 * _t_dist.sf(observed, df_resid)
-    pvals = np.where(np.isnan(pvals), 1.0, pvals)
 
     if gene_names is None:
         gene_names = [str(i) for i in range(n_genes)]

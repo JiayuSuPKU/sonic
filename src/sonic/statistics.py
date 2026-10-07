@@ -32,6 +32,7 @@ for higher traces; its reduced eigendecomposition requires an explicit opt-in.
 from __future__ import annotations
 
 from collections.abc import Sequence
+from copy import copy
 
 import numpy as np
 import pandas as pd
@@ -58,8 +59,6 @@ __all__ = [
     "spatial_q_test",
     "spatial_r_test",
 ]
-
-_DELTA = 1e-10
 
 # Bound new probe workspace, allowing for eight live float64 blocks.
 _TRACE_PROBE_BUDGET_BYTES = 256 * (1 << 20)
@@ -112,7 +111,9 @@ def apply_bh_correction(p_values: np.ndarray | pd.Series | Sequence[float]) -> n
     return p_adj.reshape(pvals.shape)
 
 
-def cauchy_combine(pvals: np.ndarray, axis: int = -1) -> np.ndarray:
+def cauchy_combine(
+    pvals: np.ndarray, axis: int = -1, *, where: np.ndarray | None = None
+) -> np.ndarray:
     """
     Cauchy combination test.
 
@@ -131,6 +132,9 @@ def cauchy_combine(pvals: np.ndarray, axis: int = -1) -> np.ndarray:
         clipped away from them to keep :math:`\\tan` finite.
     axis : int, default -1
         Axis along which to combine.
+    where : np.ndarray of bool, optional
+        Broadcastable mask selecting informative tests. Slices with no
+        selected tests return 1. Unselected tests receive no weight.
 
     Returns
     -------
@@ -141,7 +145,18 @@ def cauchy_combine(pvals: np.ndarray, axis: int = -1) -> np.ndarray:
     clipped = np.clip(pvals, np.finfo(float).tiny, np.nextafter(1.0, 0.0))
     # cot(pi * p) is equivalent to tan(pi * (0.5 - p)) but avoids precision
     # loss for the ultra-small p-values produced by analytic Welch tests.
-    T = np.mean(1.0 / np.tan(np.pi * clipped), axis=axis)
+    cot = 1.0 / np.tan(np.pi * clipped)
+    if where is None:
+        T = np.mean(cot, axis=axis)
+    else:
+        where = np.broadcast_to(where, pvals.shape)
+        count = where.sum(axis=axis)
+        T = np.divide(
+            np.sum(cot, axis=axis, where=where),
+            count,
+            out=np.full(np.shape(count), -np.inf),
+            where=count > 0,
+        )
     return np.arctan2(1.0, T) / np.pi
 
 
@@ -277,53 +292,55 @@ def _spectrum_traces(lambs: np.ndarray, n: int, dofs: np.ndarray | None = None) 
     return {"mean": mean, "powers": b, "scale": scale, "source": "spectrum"}
 
 
-def _fit_gaussian_quadratic(mean: float, powers: dict[int, float], kurtosis: bool = False) -> dict:
+def _fit_gaussian_quadratic(
+    mean: float, powers: dict[int, float], kurtosis: bool = False, *, scale: float = 1.0
+) -> dict:
     r"""Fit the unstandardized Gaussian quadratic form with Liu's approximation.
 
-    ``powers[p]`` is the spectral power sum (including degrees of freedom and
-    noncentrality weights); the statistical cumulant is
-    ``2**(p-1) * (p-1)! * powers[p]``. No sample-standardization correction belongs
-    here. Preserve this calculation for ``liu_sf(...)`` and comparison.
+    ``powers[p]`` is the power sum of eigenvalues divided by ``scale`` (including
+    degrees of freedom and noncentrality weights); the statistical cumulant is
+    ``2**(p-1) * (p-1)! * powers[p] * scale**p``. No standardization correction belongs
+    here. Inputs from ``liu_sf`` are scaled before taking powers; all shape
+    calculations are dimensionless and use no additive numerical offsets.
     """
-    s1 = powers[3] / (np.sqrt(powers[2]) ** 3 + _DELTA)
-    s2 = powers[4] / (powers[2] ** 2 + _DELTA)
-
-    fit = "liu4"
+    coef = {
+        "model": "gaussian_quadratic",
+        "family": "normal",
+        "fit": "degenerate" if powers[2] <= 0 else "normal_fallback",
+        "mu_Q": float(mean),
+        "sigma_Q": float(np.sqrt(2.0) * np.sqrt(max(powers[2], 0.0)) * scale),
+    }
+    if powers[2] <= 0:
+        return coef
+    root = np.sqrt(powers[2])
+    s1 = powers[3] / root / powers[2]
+    s2 = powers[4] / powers[2] / powers[2]
+    if s1 <= 0 or s2 <= 0:
+        return coef
     s12 = s1**2
     if s12 > s2:
-        denom = s1 - np.sqrt(s12 - s2)
-        if abs(denom) < _DELTA:
-            # Catastrophic cancellation — fall back to the kurtosis path.
-            fit = "chi2_kurtosis"
-            delta_x = 0.0
-            dof_x = 1.0 / (s2 + _DELTA)
-        else:
-            a = 1.0 / denom
-            delta_x = s1 * a**3 - a**2
-            dof_x = a**2 - 2.0 * delta_x
+        # Rationalize 1 / (s1 - sqrt(s1² - s2)) to avoid cancellation.
+        a = (s1 + np.sqrt(s12 - s2)) / s2
+        delta_x = max(s1 * a**3 - a**2, 0.0)
+        dof_x = a**2 - 2.0 * delta_x
+        fit = "liu4"
     else:
         fit = "chi2_kurtosis" if kurtosis else "chi2_skewness"
         delta_x = 0.0
-        if kurtosis:
-            dof_x = 1.0 / (s2 + _DELTA)
-        else:
-            dof_x = 1.0 / (s12 + _DELTA)
-    dof_x = max(dof_x, _DELTA)
-    delta_x = max(delta_x, 0.0)
-
-    var_Q = 2.0 * powers[2]
-
-    return {
-        "model": "gaussian_quadratic",
-        "family": "ncx2",
-        "fit": fit if var_Q > 0 else "degenerate",
-        "mu_Q": float(mean),
-        "sigma_Q": float(np.sqrt(max(var_Q, 0.0))),
-        "mu_x": float(dof_x + delta_x),
-        "sigma_x": float(np.sqrt(2 * (dof_x + 2 * delta_x))),
-        "dof_x": float(dof_x),
-        "delta_x": float(delta_x),
-    }
+        dof_x = 1.0 / (s2 if kurtosis else s12)
+    if dof_x <= 0 or not np.isfinite(dof_x + delta_x):
+        return coef
+    coef.update(
+        {
+            "family": "ncx2",
+            "fit": fit,
+            "mu_x": float(dof_x + delta_x),
+            "sigma_x": float(np.sqrt(2 * (dof_x + 2 * delta_x))),
+            "dof_x": float(dof_x),
+            "delta_x": float(delta_x),
+        }
+    )
+    return coef
 
 
 def _prepare_moment_fit(
@@ -367,9 +384,26 @@ def _prepare_moment_fit(
         deltas = np.zeros_like(lambs)
     else:
         deltas = np.asarray(deltas, dtype=float)
-    mean = float(np.sum(lambs * (dofs + deltas)))
-    powers = {p: float(np.sum(lambs**p * (dofs + p * deltas))) for p in (2, 3, 4)}
-    return _fit_gaussian_quadratic(mean, powers, kurtosis=kurtosis)
+    if not (np.isfinite(lambs).all() and np.isfinite(dofs).all() and np.isfinite(deltas).all()):
+        raise ValueError(
+            "Mixture eigenvalues, degrees of freedom and noncentralities must be finite."
+        )
+    if np.any(dofs < 0) or np.any(deltas < 0):
+        raise ValueError("Mixture degrees of freedom and noncentralities must be non-negative.")
+    scale = float(np.max(np.abs(lambs), initial=0.0))
+    scaled = lambs / scale if scale else lambs
+    mean = float(np.sum(scaled * (dofs + deltas)) * scale)
+    powers = {p: float(np.sum(scaled**p * (dofs + p * deltas))) for p in (2, 3, 4)}
+    return _fit_gaussian_quadratic(mean, powers, kurtosis=kurtosis, scale=scale)
+
+
+def _centered_kernel(kernel: Kernel) -> Kernel:
+    """Use the standardized operator's trace view without changing caller state."""
+    if getattr(kernel, "centering", True):
+        return kernel
+    centered = copy(kernel)
+    centered.centering = True
+    return centered
 
 
 def _estimate_kernel_traces(  # noqa: C901
@@ -384,9 +418,9 @@ def _estimate_kernel_traces(  # noqa: C901
     r"""Collect Q traces and the R variance with one shared probe budget.
 
     ``max_order=2`` returns the mean and second trace of A=HKH for Welch/CLT.
-    Order four additionally estimates powers of A, or of the scaled contrast
+    Order four estimates scaled powers of A, or of the contrast
     B=A-tr(A)H/(n-1) when ``centered=True``. These are spectral power sums,
-    not statistical cumulants. ``var_R`` retains the kernel's centered/raw view.
+    not statistical cumulants. ``var_R`` is the second trace of HKH.
 
     Explicit kernels retain analytic lower traces where available. Precision
     kernels reuse cached raw probes and solves, then project them to HKH.
@@ -398,6 +432,7 @@ def _estimate_kernel_traces(  # noqa: C901
     """
     from sonic.kernels.fft import FFTKernel
 
+    kernel = _centered_kernel(kernel)
     if (
         isinstance(n_probes, (bool, np.bool_))
         or not np.isfinite(n_probes)
@@ -413,20 +448,21 @@ def _estimate_kernel_traces(  # noqa: C901
         raise ValueError("Spatial null calibration requires n >= 2.")
     if isinstance(kernel, FFTKernel):
         lam = np.asarray(kernel.eigenvalues(return_full_layout=True), dtype=float).copy()
+        lam[0] = 0.0  # Standardized Q and R project out the constant mode.
         var_R = float(np.sum(lam**2))
-        lam[0] = 0.0  # Q always projects out the constant mode.
         if centered and max_order == 4:
             return {**_spectrum_traces(lam, n), "var_R": var_R}
+        scale = float(np.max(np.abs(lam))) if max_order == 4 else 1.0
+        scaled = lam / scale if scale else lam
         return {
             "mean": float(lam.sum()),
-            "powers": {p: float(np.sum(lam**p)) for p in range(2, max_order + 1)},
-            "scale": 1.0,
+            "powers": {p: float(np.sum(scaled**p)) for p in range(2, max_order + 1)},
+            "scale": scale,
             "source": "spectrum",
             "var_R": var_R,
         }
 
     precision = bool(getattr(kernel, "stores_precision", False))
-    kernel_centered = getattr(kernel, "centering", True)
     c1 = c2 = var_R = None
     analytic = False
     # The constant-vector solve also converts cached KV into HKHV, without
@@ -434,16 +470,11 @@ def _estimate_kernel_traces(  # noqa: C901
     K1 = None
     if precision:
         K1 = np.asarray(kernel._apply_K_dense(np.ones((n, 1)))).ravel()
-    elif not kernel_centered:
-        K1 = np.asarray(kernel.Kx(np.ones(n))).ravel()
     if use_analytic_traces and not precision:
         try:
-            c1, c2 = float(kernel.trace()), float(kernel.square_trace())
+            c2 = float(kernel.square_trace())
+            c1 = float(kernel.trace())
             var_R = c2
-            if not kernel_centered:
-                dc = float(K1.sum() / n)
-                c1 -= dc
-                c2 = max(c2 - 2 * float(K1 @ K1) / n + dc**2, 0.0)
             analytic = True
         except (ValueError, NotImplementedError):
             c1 = c2 = var_R = None
@@ -467,52 +498,52 @@ def _estimate_kernel_traces(  # noqa: C901
             else:
                 V = rng.choice([-1.0, 1.0], size=(count, n)).T
                 Y = np.asarray(kernel._apply_K_dense(V) if precision else kernel.Kx(V))
-            raw_second = float(np.sum(Y * Y))
             means = V.mean(axis=0)
             U = Y if K1 is None else Y - K1[:, None] * means
             U = U - U.mean(axis=0)
-            yield V - means, U, raw_second
+            yield V - means, U
 
     # One extra pass is needed only to learn the global B offset. For small
     # jobs retain its single block; large jobs replay identical probe draws.
     mean_pass = centered and max_order == 4 and not analytic
     saved = None
-    sums = np.zeros(4)  # <V,AV>, ||AV||², ||V||², raw R second trace
+    sums = np.zeros(3)  # <V,AV>, ||AV||², ||V||²
     powers = dict.fromkeys(range(2, max_order + 1), 0.0)
-    scale = 0.0 if centered and max_order == 4 else 1.0
+    scale = 0.0 if max_order == 4 else 1.0
     largest_action = 0.0
     for phase in range(2 if mean_pass else 1):
         blocks = [saved] if phase == 1 and saved is not None else probe_blocks()
-        for V, U, raw_second in blocks:
+        for V, U in blocks:
             if phase == 0:
-                sums += [np.sum(V * U), np.sum(U * U), np.sum(V * V), raw_second]
+                sums += [np.sum(V * U), np.sum(U * U), np.sum(V * V)]
                 largest_action = max(largest_action, float(np.max(np.abs(U))))
             if mean_pass and phase == 0:
                 if block_size == n_probes:
-                    saved = (V, U, raw_second)
+                    saved = (V, U)
                 continue
             if max_order == 2:
                 continue
             if centered:
                 offset = c1 / m
                 U = U - offset * V
-                block_scale = float(np.max(np.abs(U)))
-                if block_scale <= 64 * np.finfo(float).eps * max(largest_action, abs(offset)):
-                    continue
-                # Rescale accumulated sums when a later block has a larger
-                # contrast, avoiding fourth-power overflow/underflow.
-                new_scale = max(scale, block_scale)
-                for p in powers:
-                    powers[p] *= (scale / new_scale) ** p
-                scale = new_scale
-                U /= scale
-                W = np.asarray(kernel.Kx(U))
-                W -= W.mean(axis=0)
+            block_scale = float(np.max(np.abs(U)))
+            if block_scale == 0 or (
+                centered
+                and block_scale <= 64 * np.finfo(float).eps * max(largest_action, abs(offset))
+            ):
+                continue
+            # Rescale accumulated sums when a later block has a larger
+            # action, avoiding fourth-power overflow/underflow.
+            new_scale = max(scale, block_scale)
+            for p in powers:
+                powers[p] *= (scale / new_scale) ** p
+            scale = new_scale
+            U /= scale
+            W = np.asarray(kernel.Kx(U))
+            W -= W.mean(axis=0)
+            if centered:
                 W -= offset * U
-                W /= scale
-            else:
-                W = np.asarray(kernel.Kx(U))
-                W -= W.mean(axis=0)
+            W /= scale
             powers[2] += float(np.sum(U * U))
             powers[3] += float(np.sum(U * W))
             powers[4] += float(np.sum(W * W))
@@ -522,15 +553,18 @@ def _estimate_kernel_traces(  # noqa: C901
             weight = m / sums[2] if centered else 1.0 / n_probes
             if not analytic:
                 c1, c2 = float(weight * sums[0]), float(weight * sums[1])
-                var_R = c2 if kernel_centered else float(sums[3] / n_probes)
+                var_R = c2
 
     powers = {p: float(weight * value) for p, value in powers.items()}
-    if max_order == 2 or not centered:
+    if max_order == 2:
         powers[2] = c2
     elif scale > 0:
-        b2_exact = c2 - c1**2 / m
-        if analytic and b2_exact > np.sqrt(np.finfo(float).eps) * c2:
-            powers[2] = b2_exact / scale**2
+        if not centered:
+            powers[2] = c2 / scale / scale
+        else:
+            b2_exact = c2 - c1**2 / m
+            if analytic and b2_exact > np.sqrt(np.finfo(float).eps) * c2:
+                powers[2] = b2_exact / scale / scale
     return {"mean": c1, "powers": powers, "scale": scale, "source": "probes", "var_R": var_R}
 
 
@@ -542,19 +576,18 @@ def _moment_sf(t: float | np.ndarray, coef: dict) -> np.ndarray:
     """
     t = np.asarray(t, dtype=float)
     if coef["sigma_Q"] <= 0:
+        if coef.get("model") == "gaussian_quadratic":
+            return np.asarray(t <= coef["mu_Q"], dtype=float)
         return np.ones_like(t)
-    if coef["model"] == "standardized_q":
-        z = (t - coef["mu_Q"]) / coef["sigma_Q"]
-        if coef["family"] == "normal":
-            return norm.sf(z)
-        x = z * coef["sigma_x"] + coef["mu_x"]
-        if coef["family"] == "beta":
-            return beta.sf(x, coef["alpha"], coef["beta"])
-        return ncx2.sf(x, coef["dof_x"], coef["delta_x"])
-    # Preserve the unstandardized Gaussian-mixture calculation (n=None).
-    t_star = (t - coef["mu_Q"]) / (coef["sigma_Q"] + _DELTA)
-    tfinal = t_star * coef["sigma_x"] + coef["mu_x"]
-    return ncx2.sf(tfinal, coef["dof_x"], max(coef["delta_x"], 1e-9))
+    z = (t - coef["mu_Q"]) / coef["sigma_Q"]
+    if coef["family"] == "normal":
+        return norm.sf(z)
+    x = z * coef["sigma_x"] + coef["mu_x"]
+    if coef["family"] == "beta":
+        return beta.sf(x, coef["alpha"], coef["beta"])
+    if coef["delta_x"] == 0:
+        return chi2.sf(x, coef["dof_x"])
+    return ncx2.sf(x, coef["dof_x"], coef["delta_x"])
 
 
 def _prepare_q_null(kernel: Kernel, null_params: dict | None = None) -> dict:  # noqa: C901
@@ -615,7 +648,7 @@ def _prepare_q_null(kernel: Kernel, null_params: dict | None = None) -> dict:  #
             )
         if any(fit.get(key) is None for key in required_fit):
             raise ValueError("Incomplete q_fit; rebuild with compute_null_params.")
-        if fit_model != model or (fit_model == "gaussian_quadratic" and fit["family"] != "ncx2"):
+        if fit_model != model or (fit_model == "gaussian_quadratic" and fit["family"] == "beta"):
             raise ValueError(
                 "q_fit model does not match null_params; rebuild with compute_null_params."
             )
@@ -666,7 +699,9 @@ def liu_sf(
     ``lambs`` are eigenvalue weights, ``dofs`` are degrees of freedom
     (default ones), and ``deltas`` are noncentralities (default zeros).
     ``kurtosis=True`` selects the kurtosis-based central chi-square fallback.
-    The returned probability has the same shape as ``t``.
+    The returned probability has the same shape as ``t``. Multiplying both
+    ``t`` and ``lambs`` by a positive constant preserves the fitted tail.
+    A zero-variance mixture returns p=1 at or below its mean and p=0 above it.
 
     This is the unstandardized eigenvalue-mixture model used by comparison.
     For sample-standardized spatial Q, use ``compute_null_params`` with
@@ -774,7 +809,8 @@ def compute_null_params(  # noqa: C901
     dict
         ``method``, ``model`` and ``tail`` identify the calibration path.
         ``mean_Q`` and ``var_Q`` describe its Q moments; ``var_R`` is the
-        kernel square trace used by the separate, two-sided normal R-test.
+        square trace of HKH used by the separate, two-sided normal R-test,
+        including when the kernel exposes raw traces with ``centering=False``.
 
         Welch also stores ``scale_g`` and ``df_h``. Moment matching stores ``q_fit``:
         its ``family`` names the distribution, while ``fit`` distinguishes
@@ -819,6 +855,7 @@ def compute_null_params(  # noqa: C901
     from sonic.kernels.nufft import NUFFTKernel
 
     # 1. Resolve policy and validate budgets before doing any kernel work.
+    kernel = _centered_kernel(kernel)
     method = _resolve_q_null_method(kernel, method, dirichlet_correction=dirichlet_correction)
     n = int(kernel.n)
     if n < 2:
@@ -842,7 +879,7 @@ def compute_null_params(  # noqa: C901
     # must be cheap; sparse/implicit full-spectrum requests fail immediately.
     if method == "moments":
         try:
-            if n_probes is not None or not getattr(kernel, "centering", True):
+            if n_probes is not None:
                 raise NotImplementedError("Use trace probes for this request.")
             if isinstance(kernel, NUFFTKernel) and k_eigen is None and not nufft_spectrum:
                 raise NotImplementedError("NUFFT moments default to analytic traces and probes.")
@@ -871,11 +908,12 @@ def compute_null_params(  # noqa: C901
                     vals = np.delete(vals, np.argmin(np.abs(vals)))
                 traces = _spectrum_traces(vals, n)
             else:
-                sig = vals[np.abs(vals) > 1e-9]
+                scale = float(np.max(np.abs(vals), initial=0.0))
+                scaled = vals / scale if scale else vals
                 traces = {
-                    "mean": float(np.sum(sig)),
-                    "powers": {p: float(np.sum(sig**p)) for p in (2, 3, 4)},
-                    "scale": 1.0,
+                    "mean": float(np.sum(scaled) * scale),
+                    "powers": {p: float(np.sum(scaled**p)) for p in (2, 3, 4)},
+                    "scale": scale,
                     "source": "spectrum",
                 }
         except NotImplementedError:
@@ -890,7 +928,9 @@ def compute_null_params(  # noqa: C901
                 traces["mean"], traces["powers"], traces["scale"], n
             )
         else:
-            params["q_fit"] = _fit_gaussian_quadratic(traces["mean"], traces["powers"])
+            params["q_fit"] = _fit_gaussian_quadratic(
+                traces["mean"], traces["powers"], scale=traces["scale"]
+            )
         params["mean_Q"] = params["q_fit"]["mu_Q"]
         params["var_Q"] = params["q_fit"]["sigma_Q"] ** 2
     else:
@@ -903,14 +943,9 @@ def compute_null_params(  # noqa: C901
             mean_Q, second = traces["mean"], traces["powers"][2]
             params["var_R"] = traces["var_R"]
         else:
-            mean_Q, second = float(kernel.trace()), float(kernel.square_trace())
+            second = float(kernel.square_trace())
+            mean_Q = float(kernel.trace())
             params["var_R"] = second
-            if not getattr(kernel, "centering", True):
-                ones = np.ones((kernel.ny, kernel.nx) if isinstance(kernel, FFTKernel) else n)
-                K1 = np.asarray(kernel.Kx(ones)).ravel()
-                dc = float(K1.sum() / n)
-                mean_Q -= dc
-                second = max(second - 2 * float(K1 @ K1) / n + dc**2, 0.0)
         m = n - 1
         var_Q = 2.0 * (m * second - mean_Q**2) / (m + 2) if dirichlet_correction else 2.0 * second
         var_Q = max(var_Q, 0.0)
@@ -971,7 +1006,7 @@ def _q_test_matrix(  # noqa: C901
     # directly centered dense workspace according to numerical safety and kernel type.
     if is_sparse and not is_standardized and hasattr(kernel, "xtKx_standardized"):
         means, stds = _sparse_mean_std(Xn)
-        valid_mask = stds > 0
+        valid_mask = stds > 1e-12
         Q = kernel.xtKx_standardized(Xn, means, stds)
     else:
         if is_standardized:
@@ -1229,6 +1264,11 @@ def spatial_q_test(  # noqa: C901
     return Q
 
 
+def _r_null_variance(kernel: Kernel) -> float:
+    """Variance of standardized X'KY, independent of the kernel's trace view."""
+    return max(float(_centered_kernel(kernel).square_trace()), 0.0)
+
+
 def _r_test_matrix(  # noqa: C901
     Xn: np.ndarray | sp.spmatrix,
     Yn: np.ndarray | sp.spmatrix,
@@ -1295,7 +1335,7 @@ def _r_test_matrix(  # noqa: C901
     if null_params is not None and "var_R" in null_params:
         var_R = float(null_params["var_R"])
     else:
-        var_R = float(kernel.square_trace())
+        var_R = _r_null_variance(kernel)
     sigma = np.sqrt(var_R)
     if sigma > 0:
         z_score = R / sigma
@@ -1396,10 +1436,8 @@ def spatial_r_test(  # noqa: C901
     is_nufft = isinstance(kernel, NUFFTKernel)
 
     # Resolve var_R once (cached across chunks).
-    if null_params is None:
-        null_params = {"var_R": float(kernel.square_trace())}
-    elif "var_R" not in null_params:
-        null_params = {**null_params, "var_R": float(kernel.square_trace())}
+    if return_pval and (null_params is None or "var_R" not in null_params):
+        null_params = {**(null_params or {}), "var_R": _r_null_variance(kernel)}
 
     Mx = _feature_count(Xn, is_fft=is_fft)
     My = _feature_count(Yn, is_fft=is_fft)

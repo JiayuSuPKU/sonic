@@ -431,7 +431,7 @@ class TestDetectorIrregular(unittest.TestCase):
         self.assertIn("P_adj", results.columns)
 
         # Results should be sorted by |Z_score| descending
-        abs_z = results["Z_score"].abs()
+        abs_z = results["Z_score"].dropna().abs()
         self.assertTrue(abs_z.is_monotonic_decreasing or len(results) <= 1)
 
         # Symmetric mode now returns all pairs including (A,A), (A,B), (B,A), etc.
@@ -700,6 +700,63 @@ def test_min_cells_ignores_explicit_sparse_zeros(format):
     np.testing.assert_array_equal(stored.toarray(), values)
 
 
+@pytest.mark.parametrize("backend", ["matrix", "nufft"])
+@pytest.mark.parametrize("bipartite", [False, True])
+def test_r_self_pairs_retain_scores_without_inference(backend, bipartite):
+    from sonic.statistics import apply_bh_correction
+
+    rng = np.random.default_rng(18)
+    data = anndata.AnnData(rng.normal(size=(64, 4)))
+    data.obsm["spatial"] = rng.uniform(0, 8, (64, 2))
+    kwargs = {"grid_shape": (8, 8), "spacing": (1.0, 1.0)} if backend == "nufft" else {}
+    detector = DetectorIrregular(backend=backend, kernel_method="gaussian", **kwargs).setup_data(
+        data
+    )
+    names = list(data.var_names)
+    args = {
+        "features_x": names,
+        "features_y": names if bipartite else None,
+        "n_jobs": 1,
+        "workers": 1,
+        "show_progress": False,
+        "chunk_size": 2,
+    }
+    result = detector.compute_rstat(**args).set_index(["Feature_1", "Feature_2"]).sort_index()
+    scores = (
+        detector.compute_rstat(**args, return_pval=False)
+        .set_index(["Feature_1", "Feature_2"])
+        .sort_index()
+    )
+    pd.testing.assert_series_equal(result.R, scores.R)
+    self_pairs = result.index.get_level_values(0) == result.index.get_level_values(1)
+    assert self_pairs.sum() == 4
+    assert result.loc[self_pairs, ["Z_score", "P_value", "P_adj"]].isna().all().all()
+    cross = result.loc[~self_pairs]
+    assert cross[["Z_score", "P_value", "P_adj"]].notna().all().all()
+    np.testing.assert_array_equal(cross.P_adj, apply_bh_correction(cross.P_value))
+
+
+@pytest.mark.parametrize("test", ["q", "r"])
+@pytest.mark.parametrize("return_pval", [False, True])
+@pytest.mark.parametrize("features", [[], ["missing"]])
+def test_nufft_empty_result_keeps_requested_schema(test, return_pval, features):
+    rng = np.random.default_rng(21)
+    data = anndata.AnnData(rng.normal(size=(32, 2)))
+    data.obsm["spatial"] = rng.uniform(0, 8, (32, 2))
+    detector = DetectorIrregular(backend="nufft", grid_shape=(8, 8), spacing=(1.0, 1.0)).setup_data(
+        data
+    )
+    kwargs = {"n_jobs": 1, "workers": 1, "show_progress": False, "return_pval": return_pval}
+    if test == "q":
+        full = detector.compute_qstat(**kwargs)
+        empty = detector.compute_qstat(features=features, **kwargs)
+    else:
+        full = detector.compute_rstat(**kwargs)
+        empty = detector.compute_rstat(features_x=features, **kwargs)
+    assert empty.empty
+    assert list(empty.columns) == list(full.columns)
+
+
 @pytest.mark.parametrize("return_pval", [False, True])
 @pytest.mark.parametrize("features", [None, ["missing"], []])
 def test_matrix_q_empty_selection_has_normal_schema(features, return_pval, monkeypatch):
@@ -737,8 +794,10 @@ def test_r_zero_null_variance_is_nonsignificant(backend):
     assert detector.kernel_.square_trace() == 0
     result = detector.compute_rstat(n_jobs=1, workers=1, show_progress=False)
     assert len(result) == 4
-    np.testing.assert_array_equal(result.Z_score, 0)
-    np.testing.assert_array_equal(result[["P_value", "P_adj"]], 1)
+    self_pairs = result.Feature_1 == result.Feature_2
+    assert result.loc[self_pairs, ["Z_score", "P_value", "P_adj"]].isna().all().all()
+    np.testing.assert_array_equal(result.loc[~self_pairs, "Z_score"], 0)
+    np.testing.assert_array_equal(result.loc[~self_pairs, ["P_value", "P_adj"]], 1)
 
 
 @pytest.mark.parametrize("backend", ["matrix", "nufft"])

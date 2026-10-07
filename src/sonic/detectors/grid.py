@@ -27,6 +27,7 @@ from sonic.statistics import (
     compute_null_params,
     spatial_q_test,
 )
+from sonic.utils import _DEFAULT_CHUNK_BUDGET, _parse_memory_budget
 
 __all__ = ["DetectorGrid"]
 
@@ -159,10 +160,10 @@ def _qstat_worker_fft(
     # Compute statistics
     if return_pval:
         stats, pvals = spatial_q_test(
-            data_chunk_transposed, kernel, null_params=null_params, return_pval=True
+            data_chunk_transposed, kernel, null_params=null_params, return_pval=True, chunk_size=-1
         )
     else:
-        stats = spatial_q_test(data_chunk_transposed, kernel, return_pval=False)
+        stats = spatial_q_test(data_chunk_transposed, kernel, return_pval=False, chunk_size=-1)
         pvals = None
 
     # Ensure array semantics for iteration (handle 0-d arrays)
@@ -423,51 +424,21 @@ class DetectorGrid(Detector):
     # ------------------------------------------------------------------
     # Auto-tuning helpers
     # ------------------------------------------------------------------
-    def _auto_chunk_size(self, budget_bytes: int = 2 * (1 << 30)) -> int:
-        """Thin wrapper around :func:`sonic.statistics.auto_chunk_size`.
+    def _auto_chunk_size(
+        self, budget_bytes: int = _DEFAULT_CHUNK_BUDGET, *, n_jobs: int = 1
+    ) -> int:
+        """Resolve an FFT batch within the workspace shared by ``n_jobs``."""
+        from sonic.utils import auto_chunk_size
 
-        Delegates to the shared helper so the FFT chunk-size policy
-        (cache sweet spot of 32, per-feature ``~24·n`` bytes) is kept
-        in one place — see :func:`~sonic.statistics.auto_chunk_size`
-        for the full model.
-        """
-        from sonic.statistics import auto_chunk_size
-
-        return auto_chunk_size(self.kernel_, budget_bytes=budget_bytes)
+        return auto_chunk_size(self.kernel_, n_jobs=n_jobs, budget_bytes=budget_bytes)
 
     def _auto_schedule(
         self, n_batches: int, n_jobs: int | str, workers: int | str | None
-    ) -> tuple[int, int | None]:
-        """Balance joblib ``n_jobs`` and scipy.fft ``workers`` to the CPU count.
+    ) -> tuple[int, int]:
+        """Balance outer batches and transform threads using the shared policy."""
+        from sonic.utils import resolve_parallelism
 
-        Both ``n_jobs`` and ``workers`` parallelize, and stacking them thrashes
-        cores. ``'auto'`` policy:
-
-        - If ``n_batches >= cpu_count``: parallelize across batches
-          (``n_jobs=cpu_count``), let each FFT call be single-threaded (``workers=1``).
-        - Otherwise (few batches, big grids): cap ``n_jobs`` at ``n_batches`` and
-          give each worker ``cpu_count / n_jobs`` FFT threads.
-
-        Concrete integers passed by the caller are respected.
-        """
-        import os
-
-        cpu = os.cpu_count() or 1
-        if n_jobs == "auto" or n_jobs == -1:
-            if n_batches >= cpu:
-                n_jobs_resolved = cpu
-                workers_resolved = 1 if workers == "auto" else workers
-            else:
-                n_jobs_resolved = max(1, n_batches)
-                workers_resolved = (
-                    max(1, cpu // max(1, n_batches)) if workers == "auto" else workers
-                )
-        else:
-            n_jobs_resolved = int(n_jobs)
-            workers_resolved = (
-                max(1, cpu // max(1, n_jobs_resolved)) if workers == "auto" else workers
-            )
-        return n_jobs_resolved, workers_resolved
+        return resolve_parallelism(n_jobs, workers, backend="fft", n_tasks=n_batches)
 
     def compute_qstat(
         self,
@@ -477,6 +448,8 @@ class DetectorGrid(Detector):
         return_pval: bool = True,
         chunk_size: int | str = "auto",
         show_progress: bool = True,
+        *,
+        memory_budget_bytes: int | str = _DEFAULT_CHUNK_BUDGET,
     ) -> pd.DataFrame:
         """
         Compute the spatial Q-statistic across features in parallel.
@@ -496,14 +469,22 @@ class DetectorGrid(Detector):
             and behaves like ``'auto'``.
         workers : int, ``'auto'``, or None, default ``'auto'``
             Threads for scipy.fft inside each worker. ``'auto'`` co-balances with
-            ``n_jobs``; ``None`` defers to scipy's default.
+            ``n_jobs`` and caps automatic threads at four; ``None`` uses one.
         return_pval : bool, default True
             Whether to compute p-values + Benjamini–Hochberg–adjusted p-values.
         chunk_size : int or ``'auto'``, default ``'auto'``
-            Features per worker batch. ``'auto'`` resolves to ``~256 MB / (ny·nx·24)``
-            via :meth:`_auto_chunk_size` and clips to ``[16, 1024]``.
+            Features per job. ``'auto'`` caps batches at 32 and divides a
+            ``memory_budget_bytes`` workspace estimate across resolved outer jobs.
         show_progress : bool, default True
             Show a tqdm progress bar over worker chunks.
+        memory_budget_bytes : int or str, default 2147483648 (2 GiB)
+            Bytes or a size string, e.g. ``"512 MB"`` or ``"2 GiB"``. Units are
+            case-insensitive: GB uses powers of 1000, GiB powers of 1024.
+            Positive estimated batch-workspace budget shared across actual jobs
+            for ``chunk_size='auto'``. More jobs divide this fixed budget; raise
+            it explicitly to allow larger batches. Excludes stored inputs,
+            kernels, retained results and null calibration. Explicit chunk sizes
+            bypass sizing; this is not a total-process memory limit.
 
         Returns
         -------
@@ -528,19 +509,25 @@ class DetectorGrid(Detector):
         For a different null method, use :func:`~sonic.spatial_q_test` with a
         cache from :func:`sonic.statistics.compute_null_params`.
         """
+        memory_budget_bytes = _parse_memory_budget(memory_budget_bytes)
         self._require_setup()
         raster_layer = self.sdata[self._img_key]
         features = self._filter_features(features, self._table_name)
 
+        auto_chunk = chunk_size == "auto"
         if isinstance(chunk_size, str):
-            if chunk_size != "auto":
+            if not auto_chunk:
                 raise ValueError(f"chunk_size must be 'auto' or int, got {chunk_size!r}.")
-            chunk_size = self._auto_chunk_size()
-
+            chunk_size = self._auto_chunk_size(budget_bytes=memory_budget_bytes)
+        if chunk_size < 1:
+            raise ValueError("chunk_size must be positive.")
+        n_batches = max(1, (len(features) + chunk_size - 1) // chunk_size)
+        n_jobs, workers = self._auto_schedule(n_batches, n_jobs, workers)
+        if auto_chunk:
+            chunk_size = self._auto_chunk_size(n_jobs=n_jobs, budget_bytes=memory_budget_bytes)
         feature_batches = [
             features[i : i + chunk_size] for i in range(0, len(features), chunk_size)
         ]
-        n_jobs, workers = self._auto_schedule(len(feature_batches), n_jobs, workers)
         # Let the FFT path pick up the balanced workers setting.
         self.kernel_.workers = workers
         # Z-scores require the same finite-sample moments even when p-values
@@ -633,6 +620,8 @@ class DetectorGrid(Detector):
         chunk_size: int | str = "auto",
         workers: int | str | None = "auto",
         show_progress: bool = True,
+        *,
+        memory_budget_bytes: int | str = _DEFAULT_CHUNK_BUDGET,
     ) -> pd.DataFrame:
         """
         Compute the bivariate spatial R-statistic across feature pairs.
@@ -652,14 +641,21 @@ class DetectorGrid(Detector):
             Whether to compute p-values + Benjamini–Hochberg–adjusted p-values.
         chunk_size : int or ``'auto'``, default ``'auto'``
             Y-features per batch (reuses the pre-computed ``K @ Y`` block).
-            ``'auto'`` targets ~256 MB per embedding batch via
+            ``'auto'`` uses ``memory_budget_bytes`` via
             :meth:`_auto_chunk_size`.
         workers : int, ``'auto'``, or None, default ``'auto'``
             Threads for scipy.fft inside the embedding pass. ``'auto'`` gives
-            every FFT all CPU cores (the R-test loop is sequential over X/Y
-            chunk pairs so there is no joblib contention).
+            each FFT up to four threads; the R-test loop is sequential over
+            X/Y chunk pairs. Explicit counts override the measured cap.
         show_progress : bool, default True
             Show a tqdm progress bar over X chunks.
+        memory_budget_bytes : int or str, default 2147483648 (2 GiB)
+            Bytes or a size string, e.g. ``"512 MB"`` or ``"2 GiB"``. Units are
+            case-insensitive: GB uses powers of 1000, GiB powers of 1024.
+            Positive estimated batch-workspace budget for ``chunk_size='auto'``.
+            The outer loop is sequential. Excludes stored inputs, kernels and
+            retained results; not a total-process memory limit. Explicit chunk
+            sizes bypass sizing.
 
         Returns
         -------
@@ -669,6 +665,7 @@ class DetectorGrid(Detector):
         """
         import gc  # Garbage collector
 
+        memory_budget_bytes = _parse_memory_budget(memory_budget_bytes)
         self._require_setup()
         raster_layer = self.sdata[self._img_key]
         table_name = self._table_name
@@ -677,13 +674,8 @@ class DetectorGrid(Detector):
         if isinstance(chunk_size, str):
             if chunk_size != "auto":
                 raise ValueError(f"chunk_size must be 'auto' or int, got {chunk_size!r}.")
-            chunk_size = self._auto_chunk_size()
-        # compute_rstat is sequential across X-chunks, so give every FFT the
-        # full CPU budget by default.
-        if workers == "auto":
-            import os
-
-            workers = os.cpu_count() or 1
+            chunk_size = self._auto_chunk_size(budget_bytes=memory_budget_bytes)
+        _, workers = self._auto_schedule(1, 1, workers)
         self.kernel_.workers = workers
 
         # 2. Resolve Features

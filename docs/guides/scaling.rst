@@ -310,6 +310,44 @@ Default recommendation
   The dense matrix path is the simplest.
 
 
+Memory budgets
+--------------
+
+Automatic feature chunks share a fixed 2 GiB estimated workspace budget across
+concurrent jobs. Set ``memory_budget_bytes`` on ``compute_qstat``,
+``compute_rstat``, ``compute_spectra``, or the standalone ``spatial_q_test`` /
+``spatial_r_test`` functions. Supply a positive integer number of bytes or a
+size string such as ``"512 MB"``, ``"2 GiB"``, or ``"16 Gb"``. Units are
+case-insensitive: KB/MB/GB/TB use powers of 1000, while KiB/MiB/GiB/TiB use powers
+of 1024. Fractional sizes such as ``"1.5 GiB"`` are accepted if they resolve to
+whole bytes. There is no adaptive ``"auto"`` memory budget:
+
+.. code-block:: python
+
+   q_results = detector.compute_qstat(
+       n_jobs=8,
+       chunk_size="auto",
+       memory_budget_bytes="4 GiB",  # across all jobs
+   )
+   comparison.compute_spectra(
+       n_jobs=8,
+       progress=False,
+       memory_budget_bytes="4 GiB",
+   )
+
+More jobs divide the budget rather than increase it automatically. For example,
+eight jobs share the default 2 GiB estimate at 256 MiB per job; a 4 GiB override
+allows 512 MiB per job. Raising the budget only increases chunks when the memory
+limit is binding; the backend chunk caps still apply. Each call defaults to
+2 GiB again if the override is omitted. Null-calibration workspace, process
+overhead and the NUFFT R-test's retained standardized X block are also outside
+the batch budget. Standalone bipartite NUFFT R-tests bypass chunk sizing.
+
+Explicit chunk sizes bypass automatic memory sizing. The batch budget excludes
+stored inputs, kernel matrices/factorizations and retained results; it is not a
+total-process memory limit.
+
+
 See also
 --------
 

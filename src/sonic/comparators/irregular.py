@@ -26,6 +26,7 @@ from sonic.comparators.features import (
     stream_polar_features,
     stream_radial_features,
 )
+from sonic.utils import _NUFFT_CHUNK_CAP
 
 __all__ = ["ComparatorIrregular"]
 
@@ -115,13 +116,14 @@ class ComparatorIrregular(_ComparatorBase):
         in a sample (feeds :attr:`presence_` and, transitively, the masked
         pattern test).
     nufft_chunk_size : int or 'auto', default 'auto'
-        Number of genes per batched NUFFT call. 32–128 balances finufft's
-        per-call overhead against the `(n_spots, chunk)` transient RAM.
+        Number of genes per batched NUFFT call. Automatic batches are capped
+        at 32 features and share the estimated workspace across sample jobs.
         ``'auto'`` sizes the chunk from the per-sample k-grid shapes via
-        :func:`sonic.statistics.resolve_chunk_size` — the NUFFT cache
-        sweet-spot cap (64) capped further by the live-memory budget.
-    workers : int, optional
-        Forwarded to per-sample FFTs used by :meth:`normalize_covariates`.
+        :func:`sonic.utils.resolve_chunk_size` — the NUFFT cache
+        cap (32) is reduced further by the live-memory budget.
+    workers : int, 'auto', or None, default 'auto'
+        FINUFFT threads per sample job. Automatic threads use spare CPUs,
+        capped at four; ``None`` selects one.
 
     Notes
     -----
@@ -131,8 +133,9 @@ class ComparatorIrregular(_ComparatorBase):
     serve any number of unrelated comparisons on the same spectra.
     """
 
-    # NUFFT cache sweet-spot cap for nufft_chunk_size='auto' (statistics.auto_chunk_size).
-    _auto_chunk_cap: int = 64
+    # NUFFT cache sweet-spot cap for nufft_chunk_size='auto' (utils.auto_chunk_size).
+    _auto_chunk_cap: int = _NUFFT_CHUNK_CAP
+    _spectrum_backend = "nufft"
 
     def __init__(  # noqa: C901 — flat per-arg config assembly + per-sample grid setup
         self,
@@ -152,7 +155,7 @@ class ComparatorIrregular(_ComparatorBase):
         eps: float = 1e-6,
         presence_threshold: float = 0.0,
         nufft_chunk_size: int | str = "auto",
-        workers: int | None = None,
+        workers: int | str | None = "auto",
     ) -> None:
         fft_solver = _validate_common(feature_mode, "fft2", presence_threshold)
         samples_list = list(samples)
@@ -174,12 +177,17 @@ class ComparatorIrregular(_ComparatorBase):
         self._n_radial_bins = int(n_radial_bins)
         self._n_theta_bins = self._normalize_n_theta_bins(n_theta_bins)
         self._fft_solver = fft_solver
-        self._workers = workers
+        self._workers_spec = workers
+        from sonic.utils import resolve_parallelism
+
+        self._workers = resolve_parallelism(1, workers, backend=self._spectrum_backend)[1]
         self._presence_threshold = float(presence_threshold)
-        # 'auto' resolved below once per-sample k-grids are known; int fixed now.
+        # Resolve 'auto' at execution, when both grids and outer jobs are known.
         self._nufft_chunk_size_spec = self._normalize_chunk_spec(nufft_chunk_size)
         self._nufft_chunk_size = (
-            64 if self._nufft_chunk_size_spec == "auto" else (self._nufft_chunk_size_spec)
+            self._auto_chunk_cap
+            if self._nufft_chunk_size_spec == "auto"
+            else (self._nufft_chunk_size_spec)
         )
         # NUFFT always produces full-2D layout (fft2), regardless of user's
         # ``fft_solver`` (which is moot here).
@@ -236,18 +244,7 @@ class ComparatorIrregular(_ComparatorBase):
         self._coords = coords_list
         self._grid_shapes = grids
         self._spacings = spacings
-        # Now that per-sample k-grids are known, resolve an 'auto' chunk size.
-        if self._nufft_chunk_size_spec == "auto":
-            self._nufft_chunk_size = self._resolve_chunk_size("auto", grids)
-            logger.info(
-                "auto nufft_chunk_size=%d (max k-grid %d px, cap %d, budget %.1f GiB).",
-                self._nufft_chunk_size,
-                max((ny * nx for (ny, nx) in grids), default=1),
-                self._auto_chunk_cap,
-                self._auto_chunk_budget_bytes / 1024**3,
-            )
 
-    # ------------------------------------------------------------------
     def _nufft_spectrum_chunker(self, i: int):
         """Build ``(spectrum_chunk_fn, dc, presence, n_genes, grid)`` for sample ``i``.
 
@@ -296,6 +293,7 @@ class ComparatorIrregular(_ComparatorBase):
                 spacing=spacing_i,
                 unit_scale=scale,
                 eps=self._nufft_eps,
+                nthreads=self._workers,
                 center_coords=True,
             )
             return np.moveaxis(p_chunk, -1, 0)  # (chunk, ny, nx)
@@ -308,6 +306,12 @@ class ComparatorIrregular(_ComparatorBase):
         progress: bool,
         landmark_genes: Sequence[str] | None = None,
     ) -> tuple[list[np.ndarray], np.ndarray, np.ndarray]:
+        if self._nufft_chunk_size_spec == "auto":
+            self._nufft_chunk_size = self._resolve_chunk_size(
+                "auto",
+                self._grid_shapes,
+                n_jobs=n_jobs,
+            )
         chunk_size = self._nufft_chunk_size
         n_samples_total = len(self.samples)
         self._resolve_freq_edges()
@@ -538,6 +542,7 @@ class ComparatorIrregular(_ComparatorBase):
                 spacing=self._spacings[i],
                 unit_scale=self._unit_scales[i],
                 eps=self._nufft_eps,
+                nthreads=self._workers,
                 center_coords=True,
             )
             # power_spectrum_2d_nufft returns (ny, nx, M) for multi-column values.

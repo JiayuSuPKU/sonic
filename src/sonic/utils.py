@@ -1,17 +1,27 @@
-"""General-purpose helpers: grid/coordinate generators, distance matrices, and Visium I/O."""
+"""Chunk/parallel scheduling, grid/coordinate helpers, and Visium I/O."""
 
 from __future__ import annotations
 
 import json
 import logging
+import os
+import re
 import warnings
+from fractions import Fraction
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 import numpy as np
 import pandas as pd
 import scipy.sparse as sp
 
+if TYPE_CHECKING:
+    from sonic.kernels import Kernel
+
 __all__ = [
+    "auto_chunk_size",
+    "resolve_chunk_size",
+    "resolve_parallelism",
     # Grid & coordinate helpers
     "get_rect_coords",
     "get_visium_coords",
@@ -25,6 +35,143 @@ __all__ = [
 ]
 
 logger = logging.getLogger(__name__)
+
+
+# Estimated transient workspace across all concurrent jobs; inputs, stored
+# kernels/factorizations and retained outputs are outside this budget.
+_DEFAULT_CHUNK_BUDGET = 2 * (1 << 30)
+_FFT_CHUNK_CAP = 32
+_NUFFT_CHUNK_CAP = 32
+
+
+def _parse_memory_budget(memory_budget_bytes: int | str) -> int:
+    """Parse positive bytes or a case-insensitive size such as '1.5 GiB'."""
+    message = "memory_budget_bytes must be positive whole bytes or a size such as '2 GiB'."
+    if isinstance(memory_budget_bytes, str):
+        match = re.fullmatch(r"\s*(\d+(?:\.\d+)?)\s*(B|[KMGT]I?B)?\s*", memory_budget_bytes, re.I)
+        if match is None:
+            raise ValueError(message)
+        value, unit = match.groups()
+        unit = (unit or "B").upper()
+        power = "BKMGT".index(unit[0])
+        amount = Fraction(value) * (1024 if "I" in unit else 1000) ** power
+        if amount.denominator != 1:
+            raise ValueError(message)
+        memory_budget_bytes = amount.numerator
+    if (
+        isinstance(memory_budget_bytes, (bool, np.bool_))
+        or not isinstance(memory_budget_bytes, (int, np.integer))
+        or memory_budget_bytes <= 0
+    ):
+        raise ValueError(message)
+    return int(memory_budget_bytes)
+
+
+def resolve_parallelism(
+    n_jobs: int | str = -1,
+    n_workers: int | str | None = "auto",
+    *,
+    backend: str = "fft",
+    n_tasks: int | None = None,
+) -> tuple[int, int]:
+    """Balance outer jobs and threads per transform within the CPU count.
+
+    ``n_jobs`` is an upper bound, with joblib's negative-count convention;
+    ``'auto'`` is equivalent to ``-1``. ``n_workers`` controls SciPy FFT
+    ``workers`` or FINUFFT ``nthreads``. ``None`` means one thread, while
+    ``'auto'`` uses the measured backend cap (FFT: 4, NUFFT: 4, matrix: 1).
+    Explicit thread counts may exceed that cap, but not available CPUs.
+    Prefer outer jobs when enough tasks are available, then spend spare CPUs
+    on transform threads up to the cap. ``n_tasks`` caps idle outer jobs.
+    See ``benchmarks/benchmark_scheduling.py`` for the reproducible sweep.
+    """
+    if backend not in ("fft", "nufft", "matrix"):
+        raise ValueError(f"Unknown parallel backend: {backend!r}.")
+    cpu = os.cpu_count() or 1
+    requested_jobs = -1 if n_jobs == "auto" else int(n_jobs)
+    if requested_jobs == 0:
+        raise ValueError("n_jobs cannot be zero.")
+    jobs = max(1, cpu + 1 + requested_jobs) if requested_jobs < 0 else requested_jobs
+    jobs = min(jobs, cpu, max(1, n_tasks) if n_tasks is not None else cpu)
+    if n_workers == "auto":
+        cap = 1 if backend == "matrix" else 4
+        workers = min(cap, max(1, cpu // jobs))
+    else:
+        workers = 1 if n_workers is None else int(n_workers)
+        if workers == 0:
+            raise ValueError("n_workers cannot be zero.")
+        workers = max(1, cpu + 1 + workers) if workers < 0 else min(workers, cpu)
+    return min(jobs, max(1, cpu // workers)), workers
+
+
+def auto_chunk_size(
+    kernel: Kernel,
+    n_jobs: int = 1,
+    budget_bytes: int | str = _DEFAULT_CHUNK_BUDGET,
+) -> int:
+    """Choose a measured backend chunk cap within an aggregate workspace budget.
+
+    Caps are FFT/NUFFT 32, explicit matrices 32, and precision solves 4.
+    Workspace estimates per feature are 64 bytes per FFT cell; 64 bytes per
+    NUFFT cell plus 64 per observation; and 32 bytes per matrix observation
+    (48 for precision solves). They allow for simultaneous real/complex
+    buffers and sparse-to-dense conversions, including paired R-test work.
+    The budget covers transient batches across ``n_jobs``, excluding retained
+    input/output arrays, kernel storage and cached factorizations. Native
+    library workspace is implementation-dependent; these are estimates.
+    ``budget_bytes`` accepts integer bytes or a size string such as ``'2 GiB'``.
+
+    ``n_jobs`` must describe actual concurrency after resolving transform
+    threads. Raises ``ValueError`` if even one feature per job cannot fit.
+    Explicit user chunk sizes bypass this policy. The caps are conservative
+    defaults from ``benchmarks/benchmark_scheduling.py``, not runtime autotuning.
+    """
+    from sonic.kernels.fft import FFTKernel
+    from sonic.kernels.nufft import NUFFTKernel
+
+    n = max(1, int(kernel.n))
+    if isinstance(kernel, FFTKernel):
+        per_feat, cap = 64 * n, _FFT_CHUNK_CAP
+    elif isinstance(kernel, NUFFTKernel):
+        per_feat = 64 * (int(np.prod(kernel.grid_shape)) + n)
+        cap = _NUFFT_CHUNK_CAP
+    else:
+        precision = bool(getattr(kernel, "stores_precision", False))
+        per_feat = (48 if precision else 32) * n
+        cap = 4 if precision else 32
+    return resolve_chunk_size(cap, per_feat, n_jobs=n_jobs, budget_bytes=budget_bytes)
+
+
+def resolve_chunk_size(
+    chunk_cap: int,
+    per_feat_bytes: int,
+    *,
+    n_jobs: int = 1,
+    budget_bytes: int | str = _DEFAULT_CHUNK_BUDGET,
+) -> int:
+    """Bound a chunk by its cap and the workspace shared across outer jobs.
+
+    ``per_feat_bytes`` estimates all simultaneously live buffers per feature,
+    not only the input. Transform threads within a job share that batch; do
+    not count them as extra jobs. Negative ``n_jobs`` follows joblib semantics.
+    ``budget_bytes`` accepts integer bytes or a case-insensitive size string:
+    KB/MB/GB/TB use powers of 1000; KiB/MiB/GiB/TiB use powers of 1024.
+    Raises ``ValueError`` when one feature per job exceeds ``budget_bytes``.
+    """
+    cap, per_feat, requested_jobs = int(chunk_cap), int(per_feat_bytes), int(n_jobs)
+    if cap < 1 or per_feat < 1 or requested_jobs == 0:
+        raise ValueError("chunk_cap and per_feat_bytes must be positive; n_jobs cannot be zero.")
+    jobs = (
+        max(1, (os.cpu_count() or 1) + 1 + requested_jobs) if requested_jobs < 0 else requested_jobs
+    )
+    mem_cap = _parse_memory_budget(budget_bytes) // jobs // per_feat
+    if mem_cap < 1:
+        raise ValueError(
+            f"budget_bytes={budget_bytes} cannot fit one feature per worker "
+            f"({per_feat} bytes each across {jobs} workers). "
+            "Increase budget_bytes or reduce n_jobs."
+        )
+    return min(mem_cap, cap)
 
 
 # ---------------------------------------------------------------------------

@@ -206,6 +206,7 @@ def power_spectrum_2d_nufft(
     unit_scale: float = 1.0,
     eps: float = 1e-6,
     center_coords: bool = True,
+    nthreads: int = 1,
 ) -> np.ndarray:
     """
     Compute the 2D power spectrum via type-1 NUFFT
@@ -248,6 +249,10 @@ def power_spectrum_2d_nufft(
         spectra are translation-invariant so recentering does not change the
         result.
 
+    nthreads : int, default 1
+        FINUFFT threads per call. Set explicitly when combining outer jobs;
+        the comparator resolves its ``workers`` setting into this parameter.
+
     Returns
     -------
     np.ndarray
@@ -270,6 +275,9 @@ def power_spectrum_2d_nufft(
     >>> P.shape
     (32, 32)
     """
+    if nthreads < 1 or int(nthreads) != nthreads:
+        raise ValueError("nthreads must be a positive integer.")
+    nthreads = int(nthreads)
     if coords.ndim != 2 or coords.shape[1] != 2:
         raise ValueError(f"coords must have shape (n, 2), got {coords.shape}.")
     if values.shape[0] != coords.shape[0]:
@@ -305,7 +313,16 @@ def power_spectrum_2d_nufft(
 
     # type-1 NUFFT: nonuniform points -> uniform k-space grid.
     # Native FFT ordering puts DC at [0, 0], avoiding a full-grid ifftshift copy.
-    f_hat = finufft.nufft2d1(y_scaled, x_scaled, c, n_modes=(ny, nx), eps=eps, isign=-1, modeord=1)
+    f_hat = finufft.nufft2d1(
+        y_scaled,
+        x_scaled,
+        c,
+        n_modes=(ny, nx),
+        eps=eps,
+        isign=-1,
+        modeord=1,
+        nthreads=nthreads,
+    )
 
     power = np.abs(f_hat)
     del f_hat
@@ -388,6 +405,8 @@ class NUFFTKernel(Kernel):
         kernels.
     eps : float, default 1e-6
         NUFFT tolerance forwarded to finufft.
+    nthreads : int, default 1
+        FINUFFT threads per transform, including null calibration.
     workers : int, optional
         Forwarded to :mod:`scipy.fft` (used by :meth:`Kx_grid`) and reserved
         for future finufft parallelism. ``None`` uses the SciPy default.
@@ -440,6 +459,7 @@ class NUFFTKernel(Kernel):
         eps: float = 1e-6,
         workers: int | None = None,
         *,
+        nthreads: int = 1,
         centering: bool = True,
         **kwargs,
     ) -> None:
@@ -466,6 +486,9 @@ class NUFFTKernel(Kernel):
             NUFFT tolerance.
         workers : int, optional
             scipy.fft worker count used by :meth:`Kx_grid`.
+        nthreads : int, default 1
+            FINUFFT threads for every type-1/type-2 transform, including null
+            calibration. Independent of ``workers``, which controls SciPy FFT.
         **kwargs
             Method-specific kernel hyperparameters. ``bandwidth`` / ``nu``
             for ``gaussian`` / ``matern``; ``rho`` for ``car``; and a
@@ -481,6 +504,9 @@ class NUFFTKernel(Kernel):
             If ``coords`` has the wrong shape, ``method`` is unknown, or
             ``grid_shape`` / ``spacing`` are invalid.
         """
+        if nthreads < 1 or int(nthreads) != nthreads:
+            raise ValueError("nthreads must be a positive integer.")
+        nthreads = int(nthreads)
         coords = np.asarray(coords, dtype=np.float64)
         if coords.ndim != 2 or coords.shape[1] != 2:
             raise ValueError(f"coords must be shape (n, 2), got {coords.shape}.")
@@ -520,6 +546,7 @@ class NUFFTKernel(Kernel):
         self._unit_scale: float = float(unit_scale)
         self._eps: float = float(eps)
         self.workers: int | None = workers
+        self.nthreads = nthreads
         self.stores_precision: bool = False
 
         # Graph-kernel ``k_neighbors`` semantic: on irregular coords the
@@ -628,6 +655,7 @@ class NUFFTKernel(Kernel):
             n_modes=(2 * ny + 1, 2 * nx + 1),
             eps=self._eps,
             isign=-1,
+            nthreads=self.nthreads,
         )
         # Odd mode counts pair every frequency with its actual negative.
         phi_hat_centered = 0.5 * (phi_hat_centered + phi_hat_centered[::-1, ::-1].conj())
@@ -832,6 +860,7 @@ class NUFFTKernel(Kernel):
             n_modes=(ny, nx),
             eps=self._eps,
             isign=-1,
+            nthreads=self.nthreads,
         )  # (M, ny, nx)
 
     def xtKx(self, x: np.ndarray) -> float | np.ndarray:
@@ -976,6 +1005,7 @@ class NUFFTKernel(Kernel):
             out_k,
             eps=self._eps,
             isign=+1,
+            nthreads=self.nthreads,
         )  # (M, n)
         Kz = np.real(Kz).T  # (n, M)
         if self.centering:

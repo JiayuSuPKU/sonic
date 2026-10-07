@@ -6,12 +6,16 @@ Tests coordinate generation and distance calculations.
 import unittest
 
 import numpy as np
+import pytest
 
+from sonic.kernels import MatrixKernel
 from sonic.utils import (
+    auto_chunk_size,
     compute_torus_distance_matrix,
     convert_visium_to_physical,
     get_rect_coords,
     get_visium_coords,
+    resolve_chunk_size,
 )
 
 
@@ -298,3 +302,105 @@ class TestComputeTorusDistanceMatrix(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+def test_small_chunks_respect_worker_budget(monkeypatch):
+    per_feature = 16 * 1024**2
+    assert resolve_chunk_size(32, per_feature, n_jobs=4, budget_bytes=128 * 1024**2) == 2
+    assert resolve_chunk_size(32, 100, n_jobs=4, budget_bytes=400) == 1
+    with pytest.raises(ValueError, match="cannot fit one feature per worker"):
+        resolve_chunk_size(32, 100, n_jobs=4, budget_bytes=399)
+    monkeypatch.setattr("sonic.utils.os.cpu_count", lambda: 8)
+    assert resolve_chunk_size(32, 100, n_jobs=-1, budget_bytes=1600) == 2
+    assert resolve_chunk_size(32, 100, n_jobs=-2, budget_bytes=1400) == 2
+
+
+def test_auto_chunk_size_respects_matrix_cap_and_worker_budget():
+    kernel = MatrixKernel.from_matrix(np.eye(5))
+    per_feat = 32 * kernel.n
+    assert auto_chunk_size(kernel, budget_bytes=per_feat * 100) == 32
+    assert auto_chunk_size(kernel, n_jobs=2, budget_bytes=per_feat * 16) == 8
+
+
+def test_resolve_chunk_size_respects_cap_and_worker_budget():
+    assert resolve_chunk_size(32, 100, budget_bytes=10_000) == 32
+    assert resolve_chunk_size(32, 100, n_jobs=4, budget_bytes=6_400) == 16
+    assert resolve_chunk_size(32, 100, n_jobs=4, budget_bytes="6.4 KB") == 16
+
+
+@pytest.mark.parametrize(
+    "value,expected",
+    [
+        (1024, 1024),
+        (np.int64(1024), 1024),
+        ("1024", 1024),
+        (" 512 B ", 512),
+        ("16 Gb", 16_000_000_000),
+        ("512 MB", 512_000_000),
+        ("2GiB", 2 * 1024**3),
+        ("1.5 gib", 3 * 1024**3 // 2),
+        ("0.5 KiB", 512),
+        ("2 MiB", 2 * 1024**2),
+        ("1 TB", 1000**4),
+        ("1 TiB", 1024**4),
+    ],
+)
+def test_parse_memory_budget_units(value, expected):
+    from sonic.utils import _parse_memory_budget
+
+    assert _parse_memory_budget(value) == expected
+
+
+@pytest.mark.parametrize(
+    "jobs,workers,tasks,backend,expected",
+    [
+        (-1, "auto", 100, "fft", (10, 1)),
+        (-1, "auto", 1, "fft", (1, 4)),
+        (-1, "auto", 3, "fft", (3, 3)),
+        (2, "auto", 100, "nufft", (2, 4)),
+        (-1, 4, 100, "nufft", (2, 4)),
+        (-2, "auto", 100, "fft", (9, 1)),
+        (20, 1, 100, "fft", (10, 1)),
+        (1, -1, 100, "fft", (1, 10)),
+        (-1, None, 100, "fft", (10, 1)),
+        (-1, "auto", 1, "matrix", (1, 1)),
+    ],
+)
+def test_parallelism_respects_cpu_and_task_budget(
+    monkeypatch, jobs, workers, tasks, backend, expected
+):
+    from sonic.utils import resolve_parallelism
+
+    monkeypatch.setattr("sonic.utils.os.cpu_count", lambda: 10)
+    assert resolve_parallelism(jobs, workers, n_tasks=tasks, backend=backend) == expected
+
+
+@pytest.mark.parametrize("kwargs", [{"n_jobs": 0}, {"n_workers": 0}, {"backend": "unknown"}])
+def test_parallelism_rejects_invalid_settings(kwargs):
+    from sonic.utils import resolve_parallelism
+
+    with pytest.raises(ValueError):
+        resolve_parallelism(**kwargs)
+
+
+@pytest.mark.parametrize("backend,cap", [("fft", 32), ("nufft", 32), ("precision", 4)])
+def test_auto_chunk_backend_workspace_budget(backend, cap):
+    from sonic.kernels import FFTKernel, NUFFTKernel
+
+    if backend == "fft":
+        kernel = FFTKernel((8, 8))
+        per_feat = 64 * kernel.n
+    elif backend == "nufft":
+        kernel = NUFFTKernel(
+            np.random.default_rng(0).uniform(0, 8, (20, 2)), grid_shape=(8, 8), spacing=(1.0, 1.0)
+        )
+        per_feat = 64 * (64 + kernel.n)
+    else:
+        from scipy.sparse import eye
+
+        kernel = MatrixKernel.from_matrix(eye(5001, format="csc"), is_precision=True)
+        per_feat = 48 * kernel.n
+    assert auto_chunk_size(kernel) == cap
+    assert auto_chunk_size(kernel, n_jobs=3, budget_bytes=per_feat * 6) == 2
+    with pytest.raises(ValueError, match="cannot fit one feature"):
+        auto_chunk_size(kernel, n_jobs=3, budget_bytes=per_feat * 3 - 1)

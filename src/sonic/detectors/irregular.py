@@ -21,6 +21,7 @@ from sonic.statistics import (
     compute_null_params,
     spatial_q_test,
 )
+from sonic.utils import _DEFAULT_CHUNK_BUDGET, _parse_memory_budget, resolve_parallelism
 
 __all__ = ["DetectorIrregular"]
 
@@ -106,11 +107,21 @@ def _qstat_worker(
                 ]
             if return_pval:
                 Q_batch, P_batch = spatial_q_test(
-                    Z_batch, kernel_obj, null_params, return_pval=True, is_standardized=True
+                    Z_batch,
+                    kernel_obj,
+                    null_params,
+                    return_pval=True,
+                    is_standardized=True,
+                    chunk_size=-1,
                 )
             else:
                 Q_batch = spatial_q_test(
-                    Z_batch, kernel_obj, null_params, return_pval=False, is_standardized=True
+                    Z_batch,
+                    kernel_obj,
+                    null_params,
+                    return_pval=False,
+                    is_standardized=True,
+                    chunk_size=-1,
                 )
                 P_batch = np.full(np.shape(Q_batch), np.nan)
             Q_batch = np.atleast_1d(Q_batch)
@@ -448,64 +459,9 @@ class DetectorIrregular(Detector):
     # ------------------------------------------------------------------
     # Auto-tuning helpers
     # ------------------------------------------------------------------
-    @staticmethod
-    def _resolve_n_jobs(n_jobs: int | str) -> int:
-        """Turn a joblib-style ``n_jobs`` (``-1``, ``'auto'``, positive int)
-        into a concrete worker count."""
-        import os
-
-        if isinstance(n_jobs, str):
-            if n_jobs != "auto":
-                raise ValueError(f"n_jobs must be 'auto', -1, or a positive int; got {n_jobs!r}.")
-            return os.cpu_count() or 1
-        n_jobs = int(n_jobs)
-        if n_jobs == -1:
-            return os.cpu_count() or 1
-        if n_jobs < 1:
-            raise ValueError(f"n_jobs must be >= 1 (or -1/'auto' for all cores); got {n_jobs}.")
-        return n_jobs
-
-    def _auto_chunk_size(
-        self,
-        n_jobs: int = 1,
-        budget_bytes: int = 2 * (1 << 30),
-    ) -> int:
-        """Thin wrapper around :func:`sonic.statistics.auto_chunk_size`.
-
-        Delegates to the shared helper so the chunk-size policy stays
-        in one place across :class:`DetectorIrregular`,
-        :class:`DetectorGrid`, and :func:`~sonic.spatial_q_test` /
-        :func:`~sonic.spatial_r_test`. See the helper's docstring for
-        the cache sweet-spot caps and per-feature memory model.
-
-        Parameters
-        ----------
-        n_jobs : int, default 1
-            Number of parallel workers the caller plans to use. Callers
-            should pre-resolve ``-1`` / ``'auto'`` via
-            :meth:`_resolve_n_jobs`.
-        budget_bytes : int, default 2 GiB
-            Aggregate live-memory cap across *all* workers.
-
-        Returns
-        -------
-        int
-            Batch size to use inside :func:`~sonic.spatial_q_test` /
-            :func:`~sonic.spatial_r_test`.
-        """
-        from sonic.statistics import auto_chunk_size
-
-        if self.kernel_ is None:
-            # Kernel not built yet — fall back to a conservative MatrixKernel
-            # default. Used only by very early setup paths; normal flows call
-            # this after ``setup_data``.
-            n = self.n or 1
-            per_feat = 16 * n
-            chunk_cap = 16
-            n_workers = max(1, int(n_jobs))
-            per_worker_budget = max(per_feat, budget_bytes // n_workers)
-            mem_cap = int(per_worker_budget // per_feat)
-            return int(np.clip(min(mem_cap, chunk_cap), 8, chunk_cap))
+    def _auto_chunk_size(self, n_jobs: int = 1, budget_bytes: int = _DEFAULT_CHUNK_BUDGET) -> int:
+        """Resolve a batch within the workspace shared by actual outer jobs."""
+        from sonic.utils import auto_chunk_size
 
         return auto_chunk_size(self.kernel_, n_jobs=n_jobs, budget_bytes=budget_bytes)
 
@@ -794,6 +750,9 @@ class DetectorIrregular(Detector):
         return_pval: bool = True,
         chunk_size: int | str = "auto",
         show_progress: bool = True,
+        workers: int | str | None = "auto",
+        *,
+        memory_budget_bytes: int | str = _DEFAULT_CHUNK_BUDGET,
     ) -> pd.DataFrame:
         """
         Compute univariate spatial Q-statistic for selected features.
@@ -816,11 +775,22 @@ class DetectorIrregular(Detector):
             If True, returns p-values and BH-corrected p-values. If False, returns Q only.
         chunk_size : int or ``'auto'``, default ``'auto'``
             Number of features each worker densifies at once (inner batch). ``'auto'``
-            targets ~256 MB per batch using :meth:`_auto_chunk_size`, yielding
-            ``chunk_size ≈ clip(16, 512, 256 MB / (4 · n · 8 B))``. Override with an
-            integer when memory is tight or you want deterministic batching.
+            shares ``memory_budget_bytes`` across actual outer jobs,
+            subject to the backend cap in :func:`sonic.utils.auto_chunk_size`.
         show_progress : bool, default True
             Show a tqdm progress bar over worker chunks.
+
+        workers : int, 'auto', or None, default 'auto'
+            FINUFFT threads per job on the NUFFT backend; ignored for matrices.
+            Automatic threads use spare CPUs, capped at four. ``None`` uses one.
+        memory_budget_bytes : int or str, default 2147483648 (2 GiB)
+            Bytes or a size string, e.g. ``"512 MB"`` or ``"2 GiB"``. Units are
+            case-insensitive: GB uses powers of 1000, GiB powers of 1024.
+            Positive estimated batch-workspace budget shared across actual jobs
+            for ``chunk_size='auto'``. More jobs divide this fixed budget; raise
+            it explicitly to allow larger batches. Excludes stored inputs,
+            kernels/factorizations, retained results and null calibration.
+            Explicit chunk sizes bypass sizing; not a total-process memory limit.
 
         Returns
         -------
@@ -861,16 +831,32 @@ class DetectorIrregular(Detector):
         """
 
         # 1. Ensure Kernel Exists
+        memory_budget_bytes = _parse_memory_budget(memory_budget_bytes)
         self._require_setup()
 
-        # Resolve n_jobs first so chunk_size='auto' can divide the live-
-        # memory budget across the actual worker count (see
-        # _auto_chunk_size).
-        n_jobs = self._resolve_n_jobs(n_jobs)
+        auto_chunk = chunk_size == "auto"
         if isinstance(chunk_size, str):
-            if chunk_size != "auto":
+            if not auto_chunk:
                 raise ValueError(f"chunk_size must be 'auto' or int, got {chunk_size!r}.")
-            chunk_size = self._auto_chunk_size(n_jobs=n_jobs)
+            chunk_size = self._auto_chunk_size(budget_bytes=memory_budget_bytes)
+        if chunk_size < 1:
+            raise ValueError("chunk_size must be positive.")
+        n_features = (
+            len(features)
+            if features is not None
+            else self.adata.n_vars if source == "var" else len(self.adata.obs.columns)
+        )
+        n_batches = max(1, (n_features + chunk_size - 1) // chunk_size)
+        n_jobs, n_workers = resolve_parallelism(
+            n_jobs,
+            workers if self.backend_ == "nufft" else 1,
+            backend="nufft" if self.backend_ == "nufft" else "matrix",
+            n_tasks=n_batches,
+        )
+        if self.backend_ == "nufft":
+            self.kernel_.nthreads = n_workers
+        if auto_chunk:
+            chunk_size = self._auto_chunk_size(n_jobs=n_jobs, budget_bytes=memory_budget_bytes)
 
         # NUFFT computes Q spectrally at the original observations.
         if self.backend_ == "nufft":
@@ -949,6 +935,9 @@ class DetectorIrregular(Detector):
         return_pval: bool = True,
         chunk_size: int | str = "auto",
         show_progress: bool = True,
+        workers: int | str | None = "auto",
+        *,
+        memory_budget_bytes: int | str = _DEFAULT_CHUNK_BUDGET,
     ) -> pd.DataFrame:
         """
         Compute bivariate spatial R-statistic (cross-spatial correlation) for feature pairs.
@@ -974,10 +963,24 @@ class DetectorIrregular(Detector):
             If True, returns p-values and BH-corrected p-values. If False, returns R only.
         chunk_size : int or ``'auto'``, default ``'auto'``
             Number of Y features to batch together when pre-computing ``K @ Y_chunk``.
-            ``'auto'`` uses :meth:`_auto_chunk_size` (~256 MB per batch target);
+            ``'auto'`` shares ``memory_budget_bytes`` across outer jobs;
             integer values override the heuristic.
         show_progress : bool, default True
             Show a tqdm progress bar over the Y-chunk loop.
+
+        workers : int, 'auto', or None, default 'auto'
+            FINUFFT threads per job on the NUFFT backend; ignored for matrices.
+            Automatic threads use spare CPUs, capped at four. ``None`` uses one.
+            NUFFT R comparisons have a sequential outer loop.
+        memory_budget_bytes : int or str, default 2147483648 (2 GiB)
+            Bytes or a size string, e.g. ``"512 MB"`` or ``"2 GiB"``. Units are
+            case-insensitive: GB uses powers of 1000, GiB powers of 1024.
+            Positive estimated batch-workspace budget shared across actual jobs
+            for ``chunk_size='auto'``. More jobs divide this fixed budget; raise
+            it explicitly to allow larger batches. Excludes stored inputs,
+            kernels/factorizations, retained results and null calibration,
+            including the full standardized X block on the NUFFT path.
+            Explicit chunk sizes bypass sizing; not a total-process memory limit.
 
         Returns
         -------
@@ -1024,13 +1027,30 @@ class DetectorIrregular(Detector):
         ...     n_jobs=-1
         ... )
         """
+        memory_budget_bytes = _parse_memory_budget(memory_budget_bytes)
         self._require_setup()
 
-        n_jobs = self._resolve_n_jobs(n_jobs)
+        auto_chunk = chunk_size == "auto"
         if isinstance(chunk_size, str):
-            if chunk_size != "auto":
+            if not auto_chunk:
                 raise ValueError(f"chunk_size must be 'auto' or int, got {chunk_size!r}.")
-            chunk_size = self._auto_chunk_size(n_jobs=n_jobs)
+            chunk_size = self._auto_chunk_size(budget_bytes=memory_budget_bytes)
+        if chunk_size < 1:
+            raise ValueError("chunk_size must be positive.")
+        targets = features_y if features_y is not None else features_x
+        n_targets = len(targets) if targets is not None else self.adata.n_vars
+        n_batches = max(1, (n_targets + chunk_size - 1) // chunk_size)
+        # The NUFFT R loop is sequential; only its transforms use threads.
+        n_jobs, n_workers = resolve_parallelism(
+            1 if self.backend_ == "nufft" else n_jobs,
+            workers if self.backend_ == "nufft" else 1,
+            backend="nufft" if self.backend_ == "nufft" else "matrix",
+            n_tasks=1 if self.backend_ == "nufft" else n_batches,
+        )
+        if self.backend_ == "nufft":
+            self.kernel_.nthreads = n_workers
+        if auto_chunk:
+            chunk_size = self._auto_chunk_size(n_jobs=n_jobs, budget_bytes=memory_budget_bytes)
 
         if self.backend_ == "nufft":
             return self._compute_rstat_nufft(
@@ -1224,11 +1244,13 @@ class DetectorIrregular(Detector):
             # the internal Fourier grid does not set the null sample size.
             block = np.asarray(X_kept[:, batch_idx].todense(), dtype=np.float64)
             if return_pval:
-                Q_arr, P_arr = spatial_q_test(block, kernel, null_params=null_params)
+                Q_arr, P_arr = spatial_q_test(block, kernel, null_params=null_params, chunk_size=-1)
                 Q_arr = np.atleast_1d(Q_arr)
                 P_arr = np.atleast_1d(P_arr)
             else:
-                Q_arr = np.atleast_1d(spatial_q_test(block, kernel, return_pval=False))
+                Q_arr = np.atleast_1d(
+                    spatial_q_test(block, kernel, return_pval=False, chunk_size=-1)
+                )
                 P_arr = np.full_like(Q_arr, np.nan)
             # Reference trace and trace²-based Z for reporting.
             if null_params is not None:

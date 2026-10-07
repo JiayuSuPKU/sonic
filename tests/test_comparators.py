@@ -1413,3 +1413,51 @@ def test_grid_subset_keeps_spacing_override_when_recomputed(monkeypatch, fitted)
     assert sub._spacings == reference._spacings
     np.testing.assert_allclose(sub.spectra_, reference.spectra_)
     assert comparator._spacing_override == spacing
+
+
+@pytest.mark.parametrize("backend", ["fft", "nufft"])
+def test_comparator_rebudgets_for_actual_sample_jobs(monkeypatch, backend):
+    monkeypatch.setattr("sonic.utils.os.cpu_count", lambda: 8)
+    rng = np.random.default_rng(87)
+    if backend == "fft":
+        samples = _install_grid_rasters(
+            monkeypatch,
+            [rng.normal(size=(8, 8, 8)) for _ in range(2)],
+            [f"g{i}" for i in range(8)],
+        )
+        comparator = ComparatorGrid(
+            samples,
+            bins="bins",
+            table_name="table",
+            col_key="col",
+            row_key="row",
+            n_radial_bins=3,
+        )
+        budget = 64 * 64 * 4
+    else:
+        samples = []
+        for _ in range(2):
+            sample = ad.AnnData(rng.uniform(size=(20, 8)))
+            sample.obsm["spatial"] = rng.uniform(0, 8, (20, 2))
+            samples.append(sample)
+        comparator = ComparatorIrregular(
+            samples, grid_shape=(8, 8), spacing=(1.0, 1.0), n_radial_bins=3
+        )
+        budget = 64 * (64 + 20) * 4
+    chunk_attr = f"_{backend}_chunk_size"
+    comparator.compute_spectra(
+        n_jobs=2, progress=False, memory_budget_bytes=f"{budget // 1024} KiB"
+    )
+    parallel = comparator.spectra_.copy()
+    assert getattr(comparator, chunk_attr) == 2
+    assert comparator._workers == 4
+    comparator.compute_spectra(n_jobs=2, progress=True, memory_budget_bytes=budget)
+    assert getattr(comparator, chunk_attr) == 4
+    assert comparator._workers == 4
+    np.testing.assert_allclose(comparator.spectra_, parallel, rtol=1e-10)
+    comparator.compute_spectra(n_jobs=2, progress=False, memory_budget_bytes=2 * budget)
+    assert getattr(comparator, chunk_attr) == 4
+    np.testing.assert_allclose(comparator.spectra_, parallel, rtol=1e-10)
+    comparator.compute_spectra(n_jobs=2, progress=False)
+    assert comparator._auto_chunk_budget_bytes == 2 * 1024**3
+    assert getattr(comparator, chunk_attr) == 32

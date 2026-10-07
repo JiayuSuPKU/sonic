@@ -15,14 +15,57 @@ from sonic.statistics import (
     _moment_sf,
     _prepare_moment_fit,
     apply_bh_correction,
-    auto_chunk_size,
     cauchy_combine,
     compute_null_params,
     liu_sf,
-    resolve_chunk_size,
     spatial_q_test,
     spatial_r_test,
 )
+
+
+@pytest.mark.parametrize("backend", ["matrix", "fft", "nufft"])
+@pytest.mark.parametrize("test", ["q", "r"])
+def test_memory_budget_controls_auto_chunks_without_changing_results(monkeypatch, backend, test):
+    import sonic.statistics as statistics
+
+    rng = np.random.default_rng(13)
+    coords = rng.uniform(0, 8, (20, 2))
+    if backend == "fft":
+        kernel = FFTKernel((8, 8))
+        shape, per_feature = (8, 8, 5), 64 * 64
+    elif backend == "nufft":
+        kernel = NUFFTKernel(coords, (8, 8), (1.0, 1.0))
+        shape, per_feature = (20, 5), 64 * (64 + 20)
+    else:
+        kernel = MatrixKernel.from_coordinates(coords, method="gaussian")
+        shape, per_feature = (20, 5), 32 * 20
+    x, y = rng.normal(size=shape), rng.normal(size=shape)
+    fn, args = (spatial_q_test, (x, kernel)) if test == "q" else (spatial_r_test, (x, y, kernel))
+    null = compute_null_params(kernel, method="welch")
+    # Explicit chunks retain precedence, even over a tiny positive budget.
+    expected = fn(*args, null_params=null, chunk_size=-1, memory_budget_bytes=1)
+    seen = []
+    original = statistics._chunk_last_axis
+
+    def record(array, start, end):
+        seen.append(end - start)
+        return original(array, start, end)
+
+    monkeypatch.setattr(statistics, "_chunk_last_axis", record)
+    actual = fn(*args, null_params=null, memory_budget_bytes=np.int64(2 * per_feature))
+    assert seen == ([2, 2, 1] if test == "q" else [2, 2, 2, 2, 1, 1])
+    np.testing.assert_allclose(actual, expected, rtol=2e-6, atol=1e-7)
+    with pytest.raises(ValueError, match="cannot fit one feature"):
+        fn(*args, null_params=null, memory_budget_bytes=per_feature - 1)
+
+
+@pytest.mark.parametrize("budget", [0, -1, 1.5, "auto", "0 GB", "1.1 B", "-2 GiB", None, True])
+def test_invalid_memory_budget_rejected_even_for_explicit_chunks(budget):
+    kernel = MatrixKernel.from_matrix(np.eye(4))
+    x = np.arange(4.0)
+    for fn, args in [(spatial_q_test, (x, kernel)), (spatial_r_test, (x, x, kernel))]:
+        with pytest.raises(ValueError, match="memory_budget_bytes must be positive"):
+            fn(*args, chunk_size=-1, memory_budget_bytes=budget)
 
 
 @pytest.mark.parametrize("backend", ["fft2", "rfft2", "nufft"])
@@ -338,15 +381,6 @@ class TestKernelPrimitivesAndNullParams(unittest.TestCase):
             self.assertIn("var_R", params)
             self.assertGreater(params["var_R"], 0.0)
 
-    def test_auto_chunk_size_respects_matrix_cap_and_worker_budget(self):
-        per_feat = (24 if getattr(self.kernel, "stores_precision", False) else 16) * self.n
-        self.assertEqual(auto_chunk_size(self.kernel, budget_bytes=per_feat * 100), 16)
-        self.assertEqual(auto_chunk_size(self.kernel, n_jobs=2, budget_bytes=per_feat * 16), 8)
-
-    def test_resolve_chunk_size_respects_cap_and_worker_budget(self):
-        self.assertEqual(resolve_chunk_size(32, 100, budget_bytes=10_000), 32)
-        self.assertEqual(resolve_chunk_size(32, 100, n_jobs=4, budget_bytes=6_400), 16)
-
     def test_spatial_r_test_consumes_var_R(self):
         """Supplying var_R via null_params should match the on-the-fly path exactly."""
         x = np.random.randn(self.n)
@@ -500,17 +534,6 @@ def test_sparse_moments_handle_duplicate_entries_without_mutating_input():
     np.testing.assert_array_equal(duplicate.data, before.data)
     np.testing.assert_array_equal(duplicate.indices, before.indices)
     np.testing.assert_array_equal(duplicate.indptr, before.indptr)
-
-
-def test_small_chunks_respect_worker_budget(monkeypatch):
-    per_feature = 16 * 1024**2
-    assert resolve_chunk_size(32, per_feature, n_jobs=4, budget_bytes=128 * 1024**2) == 2
-    assert resolve_chunk_size(32, 100, n_jobs=4, budget_bytes=400) == 1
-    with pytest.raises(ValueError, match="cannot fit one feature per worker"):
-        resolve_chunk_size(32, 100, n_jobs=4, budget_bytes=399)
-    monkeypatch.setattr("sonic.statistics.os.cpu_count", lambda: 8)
-    assert resolve_chunk_size(32, 100, n_jobs=-1, budget_bytes=1600) == 2
-    assert resolve_chunk_size(32, 100, n_jobs=-2, budget_bytes=1400) == 2
 
 
 if __name__ == "__main__":

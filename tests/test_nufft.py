@@ -976,3 +976,28 @@ class TestNUFFTEmpiricalNullMoments:
         _, pv = spatial_q_test(X, k, null_params=params)
         fpr = float((np.asarray(pv) < 0.05).mean())
         assert abs(fpr - 0.05) < 0.03, f"NUFFT-Moran clt FPR {fpr} off target"
+
+
+def test_nufft_threads_reach_all_transforms(monkeypatch):
+    import finufft
+
+    from sonic.kernels.nufft import power_spectrum_2d_nufft
+
+    seen = []
+    for name in ("nufft2d1", "nufft2d2"):
+        original = getattr(finufft, name)
+
+        def record(*args, _original=original, _name=name, **kwargs):
+            seen.append((_name, kwargs.get("nthreads")))
+            return _original(*args, **kwargs)
+
+        monkeypatch.setattr(finufft, name, record)
+    rng = np.random.default_rng(19)
+    coords = rng.uniform(0, 8, (20, 2))
+    values = rng.normal(size=(20, 3))
+    kernel = NUFFTKernel(coords, grid_shape=(8, 8), spacing=(1.0, 1.0), nthreads=2)
+    kernel.Kx(values)
+    kernel.square_trace()
+    power_spectrum_2d_nufft(coords, values, (8, 8), (1.0, 1.0), nthreads=2)
+    assert {name for name, _ in seen} == {"nufft2d1", "nufft2d2"}
+    assert all(threads == 2 for _, threads in seen)

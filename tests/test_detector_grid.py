@@ -646,3 +646,37 @@ def test_grid_detector_r_matches_standalone(shape, solver, method, monkeypatch):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+@pytest.mark.parametrize("test", ["q", "r"])
+def test_auto_chunk_uses_memory_override_and_resolved_jobs(monkeypatch, test):
+    import sonic.utils as utils
+
+    monkeypatch.setattr(utils.os, "cpu_count", lambda: 8)
+    monkeypatch.setattr("gc.collect", lambda: None)
+    seen = []
+    original = utils.auto_chunk_size
+    budget = 64 * 64 * 4
+
+    def chunk_size(kernel, n_jobs=1, **kwargs):
+        result = original(kernel, n_jobs=n_jobs, **kwargs)
+        seen.append((n_jobs, kwargs["budget_bytes"], result))
+        return result
+
+    monkeypatch.setattr(utils, "auto_chunk_size", chunk_size)
+    names = [f"gene_{i}" for i in range(20)]
+    raster = MockDataArray(np.random.default_rng(0).normal(size=(20, 8, 8)), names)
+    sdata = MockSpatialData("table", MockTable(np.ones((64, 20)), names))
+    detector = DetectorGrid(kernel_method="gaussian")
+    with patch("sonic._rasterize.rasterize_table", return_value=raster):
+        detector.setup_data(sdata, bins="bins", table_name="table", col_key="x", row_key="y")
+    kwargs = {"workers": 2, "show_progress": False, "memory_budget_bytes": budget}
+    if test == "q":
+        result = detector.compute_qstat(n_jobs=4, **kwargs)
+        assert len(result) == 20
+        assert seen == [(1, budget, 4), (4, budget, 1)]
+    else:
+        result = detector.compute_rstat(names[:4], **kwargs)
+        assert len(result) == 10
+        assert seen == [(1, budget, 4)]
+    assert detector.kernel_.workers == 2

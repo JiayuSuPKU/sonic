@@ -118,11 +118,14 @@ class ComparatorGrid(_ComparatorBase):
         Peak memory is ``O(chunk · ny · nx · 8 B)`` and the full ``(n_genes, ny,
         nx)`` raster / 2D spectra are *never* held in either mode.
         ``'auto'`` sizes the chunk from the (lazily-known) lattice shapes via
-        :func:`sonic.statistics.resolve_chunk_size` — the FFT cache sweet-spot
+        :func:`sonic.utils.resolve_chunk_size` — the FFT cache sweet-spot
         cap (32) capped further by the live-memory budget.
         In 2d mode the rotation is learned from a streamed cross-gene geometric-mean
         landmark by default, or from an explicit ``landmark_genes`` set passed
         to :meth:`compute_spectra`.
+    workers : int, 'auto', or None, default 'auto'
+        FFT threads per sample job. Automatic threads use spare CPUs, capped
+        at four; ``None`` selects one. Balanced against ``compute_spectra`` jobs.
     spacing : (dy, dx) or sequence of (dy, dx), optional
         Physical pitch of one rasterised bin. ``rasterize_bins`` emits one
         pixel per bin, so this maps the pixel lattice to physical frequency
@@ -154,9 +157,6 @@ class ComparatorGrid(_ComparatorBase):
     serve any number of unrelated comparisons on the same spectra.
     """
 
-    # FFT cache sweet-spot cap for fft_chunk_size='auto' (statistics.auto_chunk_size).
-    _auto_chunk_cap: int = 32
-
     def __init__(
         self,
         samples: Sequence[Any],
@@ -171,7 +171,7 @@ class ComparatorGrid(_ComparatorBase):
         n_radial_bins: int = 30,
         n_theta_bins: int = 36,
         fft_solver: str = "rfft2",
-        workers: int | None = None,
+        workers: int | str | None = "auto",
         spacing: tuple[float, float] | Sequence[tuple[float, float]] | None = None,
         freq_edges: np.ndarray | None = None,
         adaptive_freq_edges: bool = False,
@@ -200,13 +200,18 @@ class ComparatorGrid(_ComparatorBase):
         self._n_radial_bins = int(n_radial_bins)
         self._n_theta_bins = self._normalize_n_theta_bins(n_theta_bins)
         self._fft_solver = fft_solver
-        self._workers = workers
+        self._workers_spec = workers
+        from sonic.utils import resolve_parallelism
+
+        self._workers = resolve_parallelism(1, workers, backend=self._spectrum_backend)[1]
         self._presence_threshold = float(presence_threshold)
         # 'auto' is resolved lazily in compute_spectra once grid shapes are
         # known (rasterize_bins determines them per sample); an int is fixed now.
         self._fft_chunk_size_spec = self._normalize_chunk_spec(fft_chunk_size)
         self._fft_chunk_size = (
-            32 if self._fft_chunk_size_spec == "auto" else (self._fft_chunk_size_spec)
+            self._auto_chunk_cap
+            if self._fft_chunk_size_spec == "auto"
+            else (self._fft_chunk_size_spec)
         )
         self._spectrum_fft_solver = fft_solver
 

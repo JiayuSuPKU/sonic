@@ -41,6 +41,8 @@ import numpy as np
 from joblib import Parallel, delayed
 from tqdm.auto import tqdm
 
+from sonic.utils import _DEFAULT_CHUNK_BUDGET, _FFT_CHUNK_CAP, _parse_memory_budget
+
 # Suppress known deprecation warnings from SpatialData dependencies BEFORE importing them.
 warnings.filterwarnings("ignore", category=FutureWarning, message=".*legacy Dask DataFrame.*")
 warnings.filterwarnings("ignore", category=UserWarning, message=".*pkg_resources is deprecated.*")
@@ -220,6 +222,8 @@ class _ComparatorBase:
     _n_theta_bins: int
     _fft_solver: str
     _workers: int | None
+    _workers_spec: int | str | None
+    _spectrum_backend: str = "fft"
     _presence_threshold: float
     _spacings: list[tuple[float, float]] | None
     _spectrum_fft_solver: str
@@ -289,11 +293,11 @@ class _ComparatorBase:
         raise NotImplementedError
 
     # Backend cache sweet-spot cap for ``chunk_size='auto'`` — the empirically
-    # tuned caps from :func:`sonic.statistics.auto_chunk_size` (FFT → 32,
-    # NUFFT → 64). Subclasses override. The live-memory budget (across all
+    # tuned caps from :func:`sonic.utils.auto_chunk_size` (FFT → 32,
+    # NUFFT → 32). Subclasses override. The live-memory budget (across all
     # workers) is :attr:`_auto_chunk_budget_bytes`.
-    _auto_chunk_cap: int = 32
-    _auto_chunk_budget_bytes: int = 2 * 1024**3  # 2 GiB (statistics default)
+    _auto_chunk_cap: int = _FFT_CHUNK_CAP
+    _auto_chunk_budget_bytes: int = _DEFAULT_CHUNK_BUDGET
 
     @staticmethod
     def _normalize_chunk_spec(spec: int | str) -> int | str:
@@ -347,22 +351,25 @@ class _ComparatorBase:
     ) -> int:
         """Resolve a chunk-size spec (an int, or ``'auto'``) to an int.
 
-        ``'auto'`` reuses :func:`sonic.statistics.resolve_chunk_size` — the
+        ``'auto'`` reuses :func:`sonic.utils.resolve_chunk_size` — the
         same cache sweet-spot cap (:attr:`_auto_chunk_cap`) and live-memory
-        budget (:attr:`_auto_chunk_budget_bytes`) as the Q/R-test chunker — with
-        ``per_feat = max(ny·nx) · 8`` bytes (one dense lattice block per gene).
+        budget (:attr:`_auto_chunk_budget_bytes`) as the Q/R-test chunker.
+        Estimate 64 bytes per grid cell plus, for NUFFT, 64 per observation.
         An int is returned as-is (floored at 1).
         """
         if not isinstance(spec, str):
             return max(1, int(spec))
         if spec != "auto":
             raise ValueError(f"chunk_size must be a positive int or 'auto', got {spec!r}.")
-        from sonic.statistics import resolve_chunk_size
+        from sonic.utils import resolve_chunk_size
 
         max_lat = max((ny * nx for (ny, nx) in grid_shapes), default=1)
+        per_feat = 64 * max(max_lat, 1)
+        if self._spectrum_backend == "nufft":
+            per_feat += 64 * max(len(coords) for coords in self._coords)
         return resolve_chunk_size(
             self._auto_chunk_cap,
-            max(max_lat, 1) * 8,
+            per_feat,
             n_jobs=n_jobs,
             budget_bytes=self._auto_chunk_budget_bytes,
         )
@@ -561,6 +568,8 @@ class _ComparatorBase:
         n_jobs: int = -1,
         landmark_genes: Sequence[str] | None = None,
         progress: bool = True,
+        *,
+        memory_budget_bytes: int | str = _DEFAULT_CHUNK_BUDGET,
     ) -> _ComparatorBase:
         """
         Compute per-sample power spectra and (if ``feature_mode='2d'``) rotation-align.
@@ -570,8 +579,8 @@ class _ComparatorBase:
         n_jobs : int, default -1
             Parallelism over samples for the per-sample spectrum pass. When
             ``progress=True`` the outer loop is sequential (so the tqdm bar is
-            accurate); finufft / scipy.fft are multi-threaded internally via
-            OpenMP so this rarely loses in practice.
+            accurate). Transform threads use spare CPUs, capped at four by
+            default. The memory budget uses this actual outer concurrency.
         landmark_genes : sequence of str, optional
             Only used in ``feature_mode='2d'``. Names of genes (matched against
             :attr:`gene_names`) whose spectra define the rotation-alignment
@@ -581,11 +590,30 @@ class _ComparatorBase:
         progress : bool, default True
             Show tqdm progress bars over the three phases (spectrum compute,
             optional rotation alignment, radial binning).
+        memory_budget_bytes : int or str, default 2147483648 (2 GiB)
+            Bytes or a size string, e.g. ``"512 MB"`` or ``"2 GiB"``. Units are
+            case-insensitive: GB uses powers of 1000, GiB powers of 1024.
+            Positive estimated batch-workspace budget shared across actual
+            sample jobs when ``fft_chunk_size`` / ``nufft_chunk_size`` is
+            ``'auto'``. More jobs divide this fixed budget; increase it explicitly
+            to allow larger batches. Excludes stored inputs and retained outputs;
+            not a total-process memory limit. Explicit chunk sizes bypass sizing.
 
         Returns
         -------
         self
         """
+        from sonic.utils import resolve_parallelism
+
+        self._auto_chunk_budget_bytes = _parse_memory_budget(memory_budget_bytes)
+        # Progress currently serializes the sample loop; budget for that actual
+        # concurrency, and retain the requested worker setting across reruns.
+        n_jobs, self._workers = resolve_parallelism(
+            1 if progress else n_jobs,
+            self._workers_spec,
+            backend=self._spectrum_backend,
+            n_tasks=1 if progress else len(self.samples),
+        )
         logger.info(
             "Computing per-sample spectra (n_samples=%d, mean-centered)...",
             len(self.samples),

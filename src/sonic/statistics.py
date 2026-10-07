@@ -31,7 +31,6 @@ for higher traces; its reduced eigendecomposition requires an explicit opt-in.
 
 from __future__ import annotations
 
-import os
 from collections.abc import Sequence
 
 import numpy as np
@@ -42,6 +41,12 @@ from sklearn.utils.sparsefuncs import mean_variance_axis
 from tqdm import tqdm
 
 from sonic.kernels import Kernel
+from sonic.utils import (
+    _DEFAULT_CHUNK_BUDGET,
+    _parse_memory_budget,
+    auto_chunk_size,
+    resolve_chunk_size,
+)
 
 __all__ = [
     "apply_bh_correction",
@@ -60,12 +65,6 @@ _DELTA = 1e-10
 _TRACE_PROBE_BUDGET_BYTES = 256 * (1 << 20)
 # Full dense spectra are useful for small problems; larger nulls use probes.
 _DENSE_NULL_SPECTRUM_LIMIT = 2000
-
-
-# Default live-memory budget for :func:`auto_chunk_size` — 2 GiB. On an
-# 8-core host with joblib parallelism this keeps aggregate peak RAM
-# around 16 GiB (2 GiB × 8), comfortable on most modern laptops.
-_DEFAULT_CHUNK_BUDGET = 2 * (1 << 30)
 
 
 def apply_bh_correction(p_values: np.ndarray | pd.Series | Sequence[float]) -> np.ndarray:
@@ -144,152 +143,6 @@ def cauchy_combine(pvals: np.ndarray, axis: int = -1) -> np.ndarray:
     # loss for the ultra-small p-values produced by analytic Welch tests.
     T = np.mean(1.0 / np.tan(np.pi * clipped), axis=axis)
     return np.arctan2(1.0, T) / np.pi
-
-
-def auto_chunk_size(
-    kernel: Kernel,
-    n_jobs: int = 1,
-    budget_bytes: int = _DEFAULT_CHUNK_BUDGET,
-) -> int:
-    """Pick a per-backend-optimal ``chunk_size`` for the Q / R test.
-
-    The returned value is used by :func:`spatial_q_test` /
-    :func:`spatial_r_test` (and by :meth:`DetectorGrid.compute_qstat` /
-    :meth:`DetectorIrregular.compute_qstat`) to split a multi-feature
-    batch into chunks. It is the smaller of two caps:
-
-    1. **Cache sweet-spot cap** — empirical sweep of per-feature time
-       vs ``chunk`` at ``n ∈ {30k, 100k, 300k, 1M}``:
-
-       .. list-table::
-          :header-rows: 1
-          :widths: 50 50
-
-          * - Backend
-            - chunk cap
-          * - :class:`~sonic.FFTKernel`
-            - 32
-          * - :class:`~sonic.NUFFTKernel`
-            - 64
-          * - MatrixKernel (any sub-type)
-            - 16 (``n < 200k``); 8 (``n ≥ 200k``)
-
-       Matrix backends don't vectorise over RHS columns (scipy CSR SpMV,
-       SuperLU triangular solve), and the chunk size cap is determined empirically
-       for best per-feature speed under the given memory constraints.
-       FFT / NUFFT *do* benefit from BLAS / ``n_transf`` batching, but their
-       complex workspace spills L3 past the listed cap (15× slowdown
-       for FFT at chunk=512, 1.9× for NUFFT at chunk=256).
-
-    2. **Memory cap** — ``budget_bytes / n_jobs // per_feat``, where
-       ``per_feat`` is the backend-specific transient bytes per
-       feature:
-
-       - MatrixKernel dense / sparse: ``16 · n``
-       - MatrixKernel precision-stored CAR: ``24 · n``
-       - FFTKernel: ``24 · n``
-       - NUFFTKernel: ``16 · ny·nx + 8 · n``
-
-    Parameters
-    ----------
-    kernel : Kernel
-        The backend kernel the chunk will operate on.
-    n_jobs : int, default 1
-        Number of parallel workers the caller plans to use. The
-        ``budget_bytes`` is divided by ``n_jobs`` so aggregate live
-        memory stays bounded.
-    budget_bytes : int, default 2 GiB
-        Aggregate live-memory cap across *all* workers.
-
-    Returns
-    -------
-    int
-        A ``chunk_size`` in ``[1, chunk_cap]`` within the estimated memory budget.
-
-    Raises
-    ------
-    ValueError
-        If one feature per worker exceeds ``budget_bytes``.
-    """
-    # Lazy imports to avoid circular dependency with the FFT / NUFFT modules.
-    from sonic.kernels.fft import FFTKernel
-    from sonic.kernels.nufft import NUFFTKernel
-
-    if isinstance(kernel, FFTKernel):
-        n = kernel.n
-        per_feat = max(1, 24 * n)
-        chunk_cap = 32
-    elif isinstance(kernel, NUFFTKernel):
-        ny, nx = kernel.grid_shape
-        n = kernel.n
-        per_feat = max(1, 16 * ny * nx + 8 * n)
-        chunk_cap = 64
-    else:
-        # MatrixKernel family. Precision-stored kernels carry an extra
-        # LU-solve workspace on top of the RHS + output buffer.
-        n = int(getattr(kernel, "n", 0)) or 1
-        stores_precision = bool(getattr(kernel, "stores_precision", False))
-        per_feat = (24 if stores_precision else 16) * n
-        # Sparse sweet spot shifts from 16 → 8 once the CSR kernel or
-        # LU factor itself fills L3 (~200k for k≈4 nbrs, rho≈0.9).
-        chunk_cap = 16 if n < 200_000 else 8
-
-    return resolve_chunk_size(chunk_cap, per_feat, n_jobs=n_jobs, budget_bytes=budget_bytes)
-
-
-def resolve_chunk_size(
-    chunk_cap: int,
-    per_feat_bytes: int,
-    *,
-    n_jobs: int = 1,
-    budget_bytes: int = _DEFAULT_CHUNK_BUDGET,
-) -> int:
-    """Resolve a per-feature chunk size: ``min(cache-cap, memory-cap)``.
-
-    The kernel-free core of :func:`auto_chunk_size`, shared by the
-    :class:`~sonic.ComparatorGrid` / :class:`~sonic.ComparatorIrregular`
-    streaming spectrum loops so they reuse the same empirically-tuned cache
-    sweet-spot caps (FFT → 32, NUFFT → 64) and live-memory budget.
-
-    Parameters
-    ----------
-    chunk_cap : int
-        Backend cache sweet-spot cap (32 for FFT, 64 for NUFFT — the caps from
-        :func:`auto_chunk_size`'s empirical sweep).
-    per_feat_bytes : int
-        Transient bytes held per feature (gene) in the chunk loop.
-    n_jobs : int, default 1
-        Planned parallel workers; ``budget_bytes`` is divided by this.
-    budget_bytes : int, default 2 GiB
-        Aggregate live-memory cap across all workers.
-
-    Returns
-    -------
-    int
-        A chunk size in ``[1, chunk_cap]``.
-
-    Raises
-    ------
-    ValueError
-        If one feature per worker exceeds ``budget_bytes``.
-    """
-    cap = max(1, int(chunk_cap))
-    per_feat = max(1, int(per_feat_bytes))
-    requested_workers = int(n_jobs)
-    if requested_workers < 0:
-        # Match joblib's convention: -1 means all CPUs, -2 all but one, etc.
-        n_workers = max(1, (os.cpu_count() or 1) + 1 + requested_workers)
-    else:
-        n_workers = max(1, requested_workers)
-    per_worker_budget = int(budget_bytes) // n_workers
-    mem_cap = int(per_worker_budget // per_feat)
-    if mem_cap < 1:
-        raise ValueError(
-            f"budget_bytes={budget_bytes} cannot fit one feature per worker "
-            f"({per_feat} bytes each across {n_workers} workers). "
-            "Increase budget_bytes or reduce n_jobs."
-        )
-    return min(mem_cap, cap)
 
 
 def _fit_standardized_q(
@@ -1189,6 +1042,7 @@ def _resolve_chunk_size(
     kernel: Kernel,
     M: int,
     n_jobs: int = 1,
+    memory_budget_bytes: int | str = _DEFAULT_CHUNK_BUDGET,
 ) -> int:
     """Turn ``chunk_size='auto' | -1 | int`` into a concrete batch size.
 
@@ -1198,7 +1052,7 @@ def _resolve_chunk_size(
     if isinstance(chunk_size, str):
         if chunk_size != "auto":
             raise ValueError(f"chunk_size must be 'auto', -1, or int, got {chunk_size!r}.")
-        resolved = auto_chunk_size(kernel, n_jobs=n_jobs)
+        resolved = auto_chunk_size(kernel, n_jobs=n_jobs, budget_bytes=memory_budget_bytes)
     elif int(chunk_size) == -1:
         resolved = M
     else:
@@ -1214,6 +1068,8 @@ def spatial_q_test(  # noqa: C901
     is_standardized: bool = False,
     chunk_size: int | str = "auto",
     show_progress: bool = False,
+    *,
+    memory_budget_bytes: int | str = _DEFAULT_CHUNK_BUDGET,
 ) -> float | np.ndarray | tuple[float | np.ndarray, float | np.ndarray]:
     """
     Univariate spatial Q-test for detecting spatial variability.
@@ -1248,11 +1104,17 @@ def spatial_q_test(  # noqa: C901
     chunk_size : int or ``'auto'``, default ``'auto'``
         Number of features processed per per-chunk dispatch call.
         ``'auto'`` defers to :func:`auto_chunk_size` (backend-specific
-        cache sweet spot under a 2 GiB live-memory budget); ``-1``
+        cache cap under ``memory_budget_bytes``); ``-1``
         processes the full batch in a single call. For a cross-backend
         cost model see :doc:`/guides/scaling`.
     show_progress : bool, default False
         If True, displays a tqdm bar over chunks (only when ``M > chunk_size``).
+    memory_budget_bytes : int or str, default 2147483648 (2 GiB)
+        Bytes or a size string, e.g. ``"512 MB"`` or ``"2 GiB"``. Units are
+        case-insensitive: GB uses powers of 1000, GiB powers of 1024.
+        Positive estimated batch-workspace budget for ``chunk_size='auto'``.
+        Excludes inputs, retained outputs, kernel storage and null calibration;
+        not a total-process memory limit. Explicit chunk sizes bypass sizing.
 
     Returns
     -------
@@ -1286,6 +1148,7 @@ def spatial_q_test(  # noqa: C901
     from sonic.kernels.fft import FFTKernel, _q_test_fft
     from sonic.kernels.nufft import NUFFTKernel, _q_test_nufft
 
+    memory_budget_bytes = _parse_memory_budget(memory_budget_bytes)
     is_fft = isinstance(kernel, FFTKernel)
     is_nufft = isinstance(kernel, NUFFTKernel)
     # Prepare the null once for every backend before splitting features.
@@ -1295,7 +1158,9 @@ def spatial_q_test(  # noqa: C901
 
     # Determine M on the trailing axis.
     M = _feature_count(Xn, is_fft=is_fft)
-    resolved_chunk = _resolve_chunk_size(chunk_size, kernel, M)
+    resolved_chunk = _resolve_chunk_size(
+        chunk_size, kernel, M, memory_budget_bytes=memory_budget_bytes
+    )
 
     if is_fft:
 
@@ -1449,6 +1314,8 @@ def spatial_r_test(  # noqa: C901
     is_standardized: bool = False,
     chunk_size: int | str = "auto",
     show_progress: bool = False,
+    *,
+    memory_budget_bytes: int | str = _DEFAULT_CHUNK_BUDGET,
 ) -> float | np.ndarray | tuple[float | np.ndarray, float | np.ndarray]:
     """
     Bivariate spatial R-test for correlation between two spatial variables.
@@ -1488,6 +1355,13 @@ def spatial_r_test(  # noqa: C901
     show_progress : bool, default False
         If True, displays a tqdm bar over chunks (only when
         ``M > chunk_size``).
+    memory_budget_bytes : int or str, default 2147483648 (2 GiB)
+        Bytes or a size string, e.g. ``"512 MB"`` or ``"2 GiB"``. Units are
+        case-insensitive: GB uses powers of 1000, GiB powers of 1024.
+        Positive estimated batch-workspace budget for ``chunk_size='auto'``.
+        Excludes inputs, retained outputs, kernel storage and null calibration;
+        not a total-process memory limit. Explicit chunk sizes and bipartite
+        NUFFT inputs (``M_x != M_y``) bypass sizing.
 
     Returns
     -------
@@ -1517,6 +1391,7 @@ def spatial_r_test(  # noqa: C901
     from sonic.kernels.fft import FFTKernel, _r_test_fft
     from sonic.kernels.nufft import NUFFTKernel, _r_test_nufft
 
+    memory_budget_bytes = _parse_memory_budget(memory_budget_bytes)
     is_fft = isinstance(kernel, FFTKernel)
     is_nufft = isinstance(kernel, NUFFTKernel)
 
@@ -1571,7 +1446,9 @@ def spatial_r_test(  # noqa: C901
         return _dispatch(Xn, Yn)
 
     M = Mx
-    resolved_chunk = _resolve_chunk_size(chunk_size, kernel, M)
+    resolved_chunk = _resolve_chunk_size(
+        chunk_size, kernel, M, memory_budget_bytes=memory_budget_bytes
+    )
 
     # Single-batch shortcut.
     if resolved_chunk >= M:

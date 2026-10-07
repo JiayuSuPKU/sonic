@@ -658,3 +658,53 @@ def test_detector_preparation_preserves_small_variation_on_large_offsets(source)
 
 if __name__ == "__main__":
     unittest.main()
+
+
+@pytest.mark.parametrize("test", ["q", "r"])
+@pytest.mark.parametrize("backend", ["matrix", "nufft"])
+def test_detector_budget_and_worker_overrides_preserve_statistics(monkeypatch, test, backend):
+    import sonic.utils as utils
+
+    monkeypatch.setattr("sonic.utils.os.cpu_count", lambda: 8)
+    rng = np.random.default_rng(91)
+    adata = anndata.AnnData(rng.uniform(size=(32, 4)))
+    adata.var_names = ["a", "b", "c", "d"]
+    adata.obsm["spatial"] = rng.uniform(0, 8, (32, 2))
+    detector = DetectorIrregular(
+        backend=backend,
+        kernel_method="gaussian",
+        bandwidth=1.0,
+        **({"grid_shape": (8, 8), "spacing": (1.0, 1.0)} if backend == "nufft" else {}),
+    )
+    detector.setup_data(adata, min_cells=1)
+    budget = 2 * (64 * (64 + 32) if backend == "nufft" else 32 * 32)
+    original = utils.auto_chunk_size
+    seen = []
+
+    def record(kernel, n_jobs=1, **kwargs):
+        result = original(kernel, n_jobs=n_jobs, **kwargs)
+        seen.append((n_jobs, kwargs["budget_bytes"], result))
+        return result
+
+    monkeypatch.setattr(utils, "auto_chunk_size", record)
+    outputs = []
+    for workers in (1, 2):
+        seen.clear()
+        kwargs = {
+            "n_jobs": 4,
+            "workers": workers,
+            "memory_budget_bytes": budget,
+            "return_pval": False,
+            "show_progress": False,
+        }
+        if test == "q":
+            result = detector.compute_qstat(**kwargs).sort_values("Feature")
+            outputs.append(result["Q"].to_numpy())
+        else:
+            result = detector.compute_rstat(["a", "b"], ["c", "d"], **kwargs)
+            outputs.append(result.sort_values(["Feature_1", "Feature_2"])["R"].to_numpy())
+        expected_jobs = 2 if test == "q" else 1
+        assert seen == [(1, budget, 2), (expected_jobs, budget, 2 // expected_jobs)]
+        if backend == "nufft":
+            assert detector.kernel_.nthreads == workers
+    np.testing.assert_allclose(outputs[0], outputs[1], rtol=2e-6, atol=1e-7)

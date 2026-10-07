@@ -385,6 +385,63 @@ def test_scalar_glm_perfect_fit_preserves_nonzero_effects():
     np.testing.assert_array_equal(result["P_value"], [1, 0, 0, 0])
 
 
+@pytest.mark.parametrize(
+    "path", ["two_group", "two_group_masked", "two_group_scalar", "glm", "glm_masked", "glm_scalar"]
+)
+@pytest.mark.parametrize("n_a,n_b", [(6, 6), (10, 30)])
+def test_constant_responses_do_not_become_significant(path, n_a, n_b):
+    groups = np.repeat([0, 1], [n_a, n_b])
+    values = np.broadcast_to([0.1, 2.0, 10.0], (len(groups), 3))
+    spectra = np.broadcast_to(values[..., None] * [0.5, 1.0, 2.0], (len(groups), 3, 3))
+    presence = np.ones(values.shape, dtype=bool)
+    presence[0, 1] = presence[-1, 2] = False
+    design = pd.DataFrame({"group": groups})
+    if path == "glm_scalar":
+        result = compare_glm_scalar(values, design, "group")
+    elif path == "glm":
+        result = compare_glm(spectra, design, "group")
+    elif path == "glm_masked":
+        result = compare_glm_masked(spectra, design, "group", presence)
+    elif path == "two_group_scalar":
+        result = compare_two_groups_scalar(values, groups)
+    elif path == "two_group_masked":
+        result = compare_two_groups_masked(spectra, groups, presence)
+    else:
+        result = compare_two_groups(spectra, groups)
+    np.testing.assert_array_equal(result["Statistic"], 0.0)
+    np.testing.assert_array_equal(result[["P_value", "P_adj"]], 1.0)
+
+
+def test_glm_response_centering_preserves_intercepts_and_small_effects():
+    groups = np.repeat([0.0, 1.0], 6)
+    explicit = np.column_stack([np.ones(12), groups])
+    implicit = np.column_stack([1 - groups, groups])
+    values = np.ones((12, 1))
+    # A group-indicator design spans an intercept without a constant column.
+    result = compare_glm_scalar(values, implicit, np.array([-1.0, 1.0]))
+    assert result.P_value.iloc[0] == 1.0
+    # Tiny genuine intercept components must not be rounded out of a contrast.
+    result = compare_glm_scalar(values, explicit, np.array([1e-16, 1.0]))
+    assert result.Estimate.iloc[0] == 1e-16
+    assert result.P_value.iloc[0] == 0.0
+    # Without an intercept, a constant response still has a nonzero group coefficient.
+    result = compare_glm_scalar(values, groups[:, None], np.ones(1))
+    np.testing.assert_allclose(result.Estimate.iloc[0], 1.0)
+    assert result.P_value.iloc[0] < 0.05
+    # A constant column removed by the rank cutoff must not change that model.
+    truncated = np.column_stack([np.full(12, 1e-18), groups])
+    actual = compare_glm_scalar(values, truncated, np.array([0.0, 1.0]))
+    np.testing.assert_allclose(actual[["Estimate", "P_value"]], result[["Estimate", "P_value"]])
+    # A nearly constant covariate still does not span an exact intercept.
+    near_constant = (1 + 1e-10 * groups)[:, None]
+    actual = compare_glm_scalar(values, near_constant, np.ones(1))
+    assert np.isfinite(actual.Statistic.iloc[0])
+    values[groups == 1] += 1e-9
+    result = compare_glm_scalar(values, explicit, np.array([0.0, 1e-16]))
+    np.testing.assert_allclose(result.Estimate.iloc[0], (values[-1, 0] - 1) * 1e-16, rtol=1e-12)
+    assert result.P_value.iloc[0] < 1e-10
+
+
 @pytest.mark.parametrize("value", [np.nan, np.inf, -np.inf])
 @pytest.mark.parametrize("target", ["response", "design", "contrast"])
 def test_scalar_glm_rejects_nonfinite_inputs(value, target):

@@ -74,6 +74,10 @@ def compute_sample_spectrum(
     ``return_dc=True`` and are the natural target for a *classical differential
     expression* test complementary to the spectral pattern test.
 
+    Power is divided by ``(ny * nx)**2``: Fourier coefficients represent
+    averages over observations, so denser sampling of the same physical field
+    does not inflate its amplitude. DC expression means remain unscaled.
+
     Parameters
     ----------
     sample : np.ndarray
@@ -106,6 +110,7 @@ def compute_sample_spectrum(
     # Move feature axis to last so power_spectrum_2d treats it as M.
     moved = np.moveaxis(sample, 0, -1)
     p = power_spectrum_2d(moved, fft_solver=fft_solver, workers=workers, center=True)
+    p /= (sample.shape[1] * sample.shape[2]) ** 2
     spec = np.moveaxis(p, -1, 0)
 
     if return_dc:

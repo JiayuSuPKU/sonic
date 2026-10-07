@@ -296,6 +296,7 @@ class ComparatorIrregular(_ComparatorBase):
                 nthreads=self._workers,
                 center_coords=True,
             )
+            p_chunk /= n_spots**2
             return np.moveaxis(p_chunk, -1, 0)  # (chunk, ny, nx)
 
         return _spec_chunk, dc, presence, n_genes, grid_i
@@ -546,6 +547,7 @@ class ComparatorIrregular(_ComparatorBase):
                 nthreads=self._workers,
                 center_coords=True,
             )
+            p /= block.shape[0] ** 2
             # power_spectrum_2d_nufft returns (ny, nx, M) for multi-column values.
             cov_2d = np.moveaxis(p, -1, 0)  # (n_cov, ny, nx)
             ny, nx = self._grid_shapes[i]

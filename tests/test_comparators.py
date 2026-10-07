@@ -99,6 +99,64 @@ def _grid_samples_to_adata(samples, gene_names, spacings=None):
     ]
 
 
+@pytest.mark.parametrize("backend", ["fft2", "rfft2", "nufft"])
+def test_comparison_spectra_preserve_amplitude_across_sampling_densities(monkeypatch, backend):
+    amplitudes = np.tile([0.8, 1.0, 1.2, 1.4], 2)
+    groups = np.repeat([0, 1], 4)
+    sizes = np.repeat([16, 32], 4)
+    spacings = [(1 / n, 1 / n) for n in sizes]
+    rasters = []
+    for n, amplitude, group in zip(sizes, amplitudes, groups, strict=True):
+        _, x = np.indices((n, n)) / n
+        pattern = np.cos(2 * np.pi * 2 * x)
+        rasters.append(2 + np.stack([amplitude * pattern, amplitude * 2**group * pattern]))
+    names = ["unchanged", "changed"]
+    if backend == "nufft":
+        comparator = ComparatorIrregular(
+            _grid_samples_to_adata(rasters, names, spacings),
+            grid_shape=(16, 16),
+            spacing=(1 / 16, 1 / 16),
+            freq_edges=np.array([1.5, 2.5]),
+            workers=1,
+        )
+    else:
+        comparator = ComparatorGrid(
+            _install_grid_rasters(monkeypatch, rasters, names),
+            bins="bins",
+            table_name="table",
+            col_key="col",
+            row_key="row",
+            spacing=spacings,
+            freq_edges=np.array([1.5, 2.5]),
+            fft_solver=backend,
+            workers=1,
+        )
+    comparator.compute_spectra(n_jobs=1, progress=False)
+    # A unit cosine has two Fourier-average coefficients of magnitude 1/2;
+    # this radial annulus contains twelve modes at both sampling densities.
+    np.testing.assert_allclose(comparator.spectra_[:, 0, 0], amplitudes**2 / 24, rtol=1e-6)
+    np.testing.assert_allclose(
+        comparator.spectra_[:, 1, 0], amplitudes**2 * 4**groups / 24, rtol=1e-6
+    )
+    np.testing.assert_allclose(comparator.dc_, 2.0, atol=1e-12)
+    result = comparator.test_diff_freq(groups).set_index("Feature")
+    assert result.loc["unchanged", "P_value"] > 0.99
+    assert result.loc["changed", "P_value"] < 0.01
+
+
+@pytest.mark.parametrize("solver", ["fft2", "rfft2"])
+def test_grid_spectrum_normalizes_by_observed_bins(solver):
+    from sonic.comparators.grid import _grid_spectrum
+
+    _, x = np.indices((16, 16))
+    pattern = np.cos(2 * np.pi * 2 * x / 16)
+    block = 2 + np.stack([pattern, 2 * pattern])
+    block[:, 1::2, :] = np.nan
+    power, dc = _grid_spectrum(block, fft_solver=solver, workers=1, return_dc=True)
+    np.testing.assert_allclose(power[:, 0, 2], [0.25, 1.0], atol=1e-12)
+    np.testing.assert_allclose(dc, 2.0)
+
+
 def _comparator_from_spectra(
     spectra: np.ndarray,
     presence: np.ndarray | None = None,

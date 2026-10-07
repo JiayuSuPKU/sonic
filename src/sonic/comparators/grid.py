@@ -46,13 +46,18 @@ def _grid_spectrum(
     workers: int | None,
     return_dc: bool = False,
 ):
-    """Compute a grid spectrum after mean-filling structural ``NaN`` holes."""
-    return compute_sample_spectrum(
+    """Mean-fill structural holes and normalize power by observed bins squared."""
+    n_observed = (~np.isnan(block)).sum(axis=(1, 2))
+    spectrum, dc = compute_sample_spectrum(
         _mean_fill_missing(block, axis=(1, 2)),
         fft_solver=fft_solver,
         workers=workers,
-        return_dc=return_dc,
+        return_dc=True,
     )
+    # compute_sample_spectrum uses the whole grid; holes carry zero centered
+    # signal and must not count as observations in the Fourier average.
+    spectrum *= ((block.shape[1] * block.shape[2]) / np.maximum(n_observed, 1))[:, None, None] ** 2
+    return (spectrum, dc) if return_dc else spectrum
 
 
 def _observed_nonzero_fraction(block: np.ndarray) -> np.ndarray:

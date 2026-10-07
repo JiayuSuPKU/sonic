@@ -614,7 +614,7 @@ class DetectorIrregular(Detector):
             if method == "moran":
                 # Already symmetric and normalized
                 K = W_norm
-                self.kernel_ = MatrixKernel.from_matrix(K, is_precision=False)
+                self.kernel_ = MatrixKernel.from_matrix(K, is_precision=False, method=method)
                 self.kernel_params_ = {}
 
             elif method == "graph_laplacian":

@@ -690,6 +690,7 @@ def test_spectrum_centering_preserves_dc_and_input(solver, dtype, offset):
     centered = sample - sample.mean(axis=(1, 2), keepdims=True)
     transform = scipy.fft.fft2 if solver == "fft2" else scipy.fft.rfft2
     expected = np.abs(transform(centered, axes=(1, 2))) ** 2
+    expected /= (sample.shape[1] * sample.shape[2]) ** 2
     expected[:, 0, 0] = 0.0
     np.testing.assert_allclose(
         spectrum, expected, rtol=1e-6 if dtype == np.float32 else 1e-12, atol=1e-10

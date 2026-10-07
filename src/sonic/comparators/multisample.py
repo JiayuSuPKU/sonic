@@ -158,8 +158,10 @@ def _resolve_freq_weights(freq_weights: np.ndarray | None, n_bins: int) -> np.nd
     return w / total
 
 
-def _welch_test(group_a: np.ndarray, group_b: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
-    """Signed Welch t-statistic and analytic two-sided p-value along axis 0.
+def _welch_test(
+    group_a: np.ndarray, group_b: np.ndarray
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Signed Welch t-statistic, two-sided p-value, and mean difference along axis 0.
 
     Works for any trailing feature shape: ``(n_samples, n_features)`` gives a
     ``(n_features,)`` result for scalar DE, while ``(n_samples, n_genes, n_bins)``
@@ -171,16 +173,20 @@ def _welch_test(group_a: np.ndarray, group_b: np.ndarray) -> tuple[np.ndarray, n
         raise ValueError("Welch tests require at least two samples in each group.")
     if not np.all(np.isfinite(group_a)) or not np.all(np.isfinite(group_b)):
         raise ValueError("Welch tests require finite input values.")
-    mean_a = group_a.mean(axis=0)
-    mean_b = group_b.mean(axis=0)
+    # Anchor before reductions: repeated non-binary floats otherwise acquire
+    # rounding-dependent means and variances when group sizes differ.
+    offset = group_a[0] - group_b[0]
+    group_a = group_a - group_a[:1]
+    group_b = group_b - group_b[:1]
+    mean_diff = offset + (group_a.mean(axis=0) - group_b.mean(axis=0))
     var_a = group_a.var(axis=0, ddof=1)
     var_b = group_b.var(axis=0, ddof=1)
     se2_a = var_a / n_a
     se2_b = var_b / n_b
     se2 = se2_a + se2_b
     with np.errstate(divide="ignore", invalid="ignore"):
-        t_stat = (mean_a - mean_b) / np.sqrt(se2)
-    t_stat = np.where((se2 == 0) & (mean_a == mean_b), 0.0, t_stat)
+        t_stat = mean_diff / np.sqrt(se2)
+    t_stat = np.where((se2 == 0) & (mean_diff == 0), 0.0, t_stat)
     # Normalize variance contributions before squaring: no scale-dependent
     # epsilon, and no underflow/overflow from squaring the variances.
     fraction_a = np.divide(se2_a, se2, out=np.zeros_like(se2), where=se2 > 0)
@@ -189,7 +195,7 @@ def _welch_test(group_a: np.ndarray, group_b: np.ndarray) -> tuple[np.ndarray, n
     pvals = 2.0 * _t_dist.sf(np.abs(t_stat), df)
     # Clip the floor to the smallest representable positive float so
     # Cauchy's tan(pi(0.5 - p)) stays finite.
-    return t_stat, np.clip(pvals, np.finfo(float).tiny, 1.0)
+    return t_stat, np.clip(pvals, np.finfo(float).tiny, 1.0), mean_diff
 
 
 # ---------------------------------------------------------------------------
@@ -285,6 +291,7 @@ def _run_statistic_with_perm(
     a_val = uniq[0]
     log_spectra = np.maximum(spectra, 1e-12)
     np.log(log_spectra, out=log_spectra)
+    log_spectra -= log_spectra[:1].copy()
     weights = _resolve_freq_weights(freq_weights, spectra.shape[-1])
 
     def statistic(a: np.ndarray) -> np.ndarray:
@@ -328,7 +335,7 @@ def _run_welch_t_cauchy_analytic(
         ``(n_genes, n_bins)`` per-bin analytic Welch two-sided p-values.
     """
     a_mask = group_codes == 0
-    t_stat, per_bin_pvals = _welch_test(spectra[a_mask], spectra[~a_mask])
+    t_stat, per_bin_pvals, _ = _welch_test(spectra[a_mask], spectra[~a_mask])
     abs_t = np.abs(t_stat)
     # A bin constant across all samples has no information about the contrast.
     # Its p=1 would otherwise dominate the Cauchy sum and suppress other bins.
@@ -579,6 +586,45 @@ def _decompose_glm_design(
     return inverse, rank, bool(estimable)
 
 
+def _fit_glm_response(
+    response: np.ndarray,
+    design: np.ndarray,
+    inverse: np.ndarray,
+    contrast: np.ndarray,
+    rank: int,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Fit OLS after removing any representable constant response offset.
+
+    Compute residuals and contrasts before restoring the offset to beta, so
+    an intercept cannot leak roundoff into a zero group effect. Preserve
+    intercept contrasts and designs that do not span a constant response.
+    """
+    constant = np.flatnonzero(np.all(design == design[:1], axis=0) & (design[0] != 0))
+    offset_beta = np.zeros(design.shape[1])
+    if constant.size and rank == design.shape[1]:
+        j = constant[0]
+        offset_beta[j] = 1.0 / design[0, j]
+        offset_effect = contrast[j] / design[0, j]
+    else:
+        # Group indicators or aliased columns can span an intercept implicitly.
+        # Use the retained SVD subspace so rank truncation is respected.
+        offset_beta = inverse.sum(axis=1)
+        roundoff = np.finfo(float).eps * max(design.shape)
+        if not np.allclose(design @ offset_beta, 1.0, rtol=0.0, atol=roundoff):
+            offset_beta.fill(0.0)
+        offset_effect = float(contrast @ offset_beta)
+        tolerance = roundoff * np.max(np.abs(contrast)) * np.sum(np.abs(offset_beta))
+        if abs(offset_effect) <= tolerance:
+            offset_effect = 0.0
+    offset = response[0] if np.any(offset_beta) else np.zeros(response.shape[1])
+    residual = response - offset
+    beta = inverse @ residual
+    residual -= design @ beta
+    effect = contrast @ beta + offset_effect * offset
+    beta += offset_beta[:, None] * offset
+    return beta, residual, effect
+
+
 def _maybe_log_expression(
     values: np.ndarray,
     *,
@@ -638,7 +684,10 @@ def _estimate_two_group_null_covariance(
     # Compute the weighted log-L2 statistic.
     log_group_a = np.log(np.maximum(group_a, 1e-12))
     log_group_b = np.log(np.maximum(group_b, 1e-12))
-    mean_diff = log_group_a.mean(axis=0) - log_group_b.mean(axis=0)
+    offset = log_group_a[0] - log_group_b[0]
+    log_group_a -= log_group_a[:1].copy()
+    log_group_b -= log_group_b[:1].copy()
+    mean_diff = offset + (log_group_a.mean(axis=0) - log_group_b.mean(axis=0))
     observed = np.sqrt(np.sum(weights * mean_diff**2, axis=-1))
 
     # Pool within-group residuals across genes to compute the cross-bin covariance.
@@ -738,9 +787,12 @@ def _estimate_two_group_masked_null_covariance(  # noqa: C901
         # Compute the test statistic.
         log_a = log_spectra[idx_a, gene_idx, :]
         log_b = log_spectra[idx_b, gene_idx, :]
+        offset = log_a[0] - log_b[0]
+        log_a -= log_a[:1].copy()
+        log_b -= log_b[:1].copy()
         mean_a = log_a.mean(axis=0, keepdims=True)
         mean_b = log_b.mean(axis=0, keepdims=True)
-        mean_diff = mean_a.ravel() - mean_b.ravel()
+        mean_diff = offset + (mean_a.ravel() - mean_b.ravel())
         observed[gene_idx] = float(np.sqrt(np.sum(weights * mean_diff**2)))
         scale = (1.0 / n_obs_a[gene_idx]) + (1.0 / n_obs_b[gene_idx])
         contrast_scale[gene_idx] = scale
@@ -832,12 +884,13 @@ def _estimate_glm_null_covariance(
     # Compute the OLS fit for each gene.
     log_spectra = np.log(np.maximum(spectra, 1e-12))
     response = log_spectra.reshape(n_samples, n_genes * n_bins)
-    beta_flat = design_inverse @ response
+    beta_flat, residual_flat, theta_flat = _fit_glm_response(
+        response, design_matrix, design_inverse, contrast_vector, rank
+    )
     beta = beta_flat.reshape(n_terms, n_genes, n_bins)
-    theta = np.tensordot(contrast_vector, beta, axes=([0], [0]))
+    theta = theta_flat.reshape(n_genes, n_bins)
 
     # Compute the pooled residual covariance
-    residual_flat = response - design_matrix @ beta_flat
     residual_2d = residual_flat.reshape(n_samples * n_genes, n_bins)
     sigma_log = (residual_2d.T @ residual_2d) / (n_genes * df_resid)
     _maybe_warn_small_df_analytic(df_resid)
@@ -944,13 +997,13 @@ def _estimate_glm_masked_null_covariance(  # noqa: C901
 
         # Compute the OLS fit and the test statistic.
         gene_response = log_spectra[sample_mask, gene_idx, :]
-        gene_beta = design_inverse @ gene_response
-        theta = contrast_vector @ gene_beta
+        gene_beta, residuals, theta = _fit_glm_response(
+            gene_response, gene_design, design_inverse, contrast_vector, rank_gene
+        )
         observed[gene_idx] = float(np.sqrt(np.sum(weights * theta**2)))
         beta[:, gene_idx, :] = gene_beta
 
         # Compute the residuals and accumulate the pooled covariance.
-        residuals = gene_response - gene_design @ gene_beta
         sigma_acc += residuals.T @ residuals
         pooled_df += df_gene
         contrast_scale[gene_idx] = scale
@@ -1570,8 +1623,7 @@ def compare_two_groups_scalar(
     # Compute the Welch t-test.
     a_vals = values[group_codes == 0]
     b_vals = values[group_codes == 1]
-    mean_diff = a_vals.mean(axis=0) - b_vals.mean(axis=0)
-    t_stat, pvals = _welch_test(a_vals, b_vals)
+    t_stat, pvals, mean_diff = _welch_test(a_vals, b_vals)
     observed = np.abs(t_stat)
 
     if gene_names is None:
@@ -1659,16 +1711,15 @@ def compare_glm_scalar(
         )
 
     # Fit the OLS model
-    beta = design_inverse @ values  # (n_terms, n_genes)
-    fitted = design_matrix @ beta
-    resid = values - fitted
+    _, resid, estimate = _fit_glm_response(
+        values, design_matrix, design_inverse, contrast_vector, rank
+    )
     sigma2 = np.sum(resid**2, axis=0) / df_resid
     contrast_var = float(np.sum((contrast_vector @ design_inverse) ** 2))
     if contrast_var <= 0:
         raise ValueError("contrast has zero estimated variance under the supplied design.")
 
     # Compute the OLS contrast t statistic and p-value.
-    estimate = np.asarray(contrast_vector @ beta, dtype=float)
     se = np.sqrt(np.maximum(sigma2, 0.0) * contrast_var)
     with np.errstate(divide="ignore", invalid="ignore"):
         t_stat = estimate / se

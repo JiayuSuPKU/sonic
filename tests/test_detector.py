@@ -16,6 +16,26 @@ from sonic.detectors.irregular import DetectorIrregular
 from sonic.statistics import spatial_r_test
 
 
+@pytest.mark.parametrize("sparse", [False, True])
+def test_obsp_moran_uses_signed_null_calibration(sparse):
+    from scipy.stats import norm
+
+    clique = sp.csr_matrix(np.ones((16, 16)) - np.eye(16))
+    adjacency = sp.block_diag([clique] * 2, format="csr")
+    data = anndata.AnnData(np.repeat([0.0, 1.0], 16)[:, None])
+    data.obsp["graph"] = adjacency if sparse else adjacency.toarray()
+    detector = DetectorIrregular(kernel_method="moran").setup_data(data, obsp_key="graph")
+    result = detector.compute_qstat(n_jobs=1, show_progress=False).iloc[0]
+    h = np.eye(32) - np.ones((32, 32)) / 32
+    centered = h @ (adjacency.toarray() / 15) @ h
+    mean = np.trace(centered)
+    variance = 2 * (31 * np.sum(centered**2) - mean**2) / 33
+    expected = 2 * norm.sf(abs(result.Q - mean) / np.sqrt(variance))
+    assert detector.kernel_.method == "moran"
+    assert result.P_value < 1e-20
+    np.testing.assert_allclose(result.P_value, expected, rtol=1e-10, atol=0)
+
+
 class TestDetectorIrregular(unittest.TestCase):
     """Test cases for DetectorIrregular class."""
 

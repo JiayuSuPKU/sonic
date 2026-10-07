@@ -577,7 +577,7 @@ class TestFFTKernelNullParamsRoundTrip(unittest.TestCase):
 
         data = np.random.randn(self.ny, self.nx)
         Q_auto, p_auto = spatial_q_test(data, self.kernel)
-        params = compute_null_params(self.kernel, method="liu")
+        params = compute_null_params(self.kernel, method="moments")
         Q_given, p_given = spatial_q_test(data, self.kernel, null_params=params)
         self.assertAlmostEqual(Q_auto, Q_given, places=10)
         self.assertAlmostEqual(p_auto, p_given, places=10)
@@ -615,7 +615,7 @@ def test_rfft_full_spectrum_and_cached_null_match_fft(shape):
     data = np.random.default_rng(7).normal(size=shape + (3,))
     expected = spatial_q_test(data, full)
     np.testing.assert_allclose(spatial_q_test(data, half), expected)
-    cached = compute_null_params(half, method="liu")
+    cached = compute_null_params(half, method="moments")
     np.testing.assert_allclose(spatial_q_test(data, half, null_params=cached), expected)
 
 
@@ -753,11 +753,11 @@ class TestFFTWelchCltNull(unittest.TestCase):
         fpr = self._fpr(k, "clt")
         self.assertLess(abs(fpr - 0.05), 0.05, f"clt FPR {fpr}")
 
-    def test_liu_still_works(self):
+    def test_moments_still_works(self):
         """Liu default path unchanged for PSD kernels."""
         k = FFTKernel((self.ny, self.nx), method="matern", bandwidth=2.5, nu=1.5)
-        fpr = self._fpr(k, "liu")
-        self.assertLess(abs(fpr - 0.05), 0.05, f"liu FPR {fpr}")
+        fpr = self._fpr(k, "moments")
+        self.assertLess(abs(fpr - 0.05), 0.05, f"moments FPR {fpr}")
 
 
 if __name__ == "__main__":

@@ -323,7 +323,7 @@ class MatrixKernelBase(Kernel):
           ``HKH = K − 𝟏 r^T − c 𝟏^T + m · 𝟏𝟏^T``
           in closed form (``r`` / ``c`` = row / col means, ``m`` = grand
           mean) and call :func:`numpy.linalg.eigvalsh`. Same O(n³) cost
-          as the raw case, no extra memory.
+          as the raw case, with a dense centered copy.
         - **Sparse explicit ``K``** — wrap ``H K H · v`` as a
           :class:`scipy.sparse.linalg.LinearOperator` and call
           :func:`eigsh`. Preserves ``K``'s sparsity — we never densify.
@@ -338,14 +338,21 @@ class MatrixKernelBase(Kernel):
         ----------
         k : int, optional
             Number of largest-magnitude eigenvalues to return. If None,
-            returns all (dense) or ``max(6, n − 2)`` (sparse/implicit —
-            limited by what ``eigsh`` can extract).
+            returns all for dense matrices. Sparse/implicit matrices require
+            an explicit ``k < n``; a full spectrum raises ``NotImplementedError``
+            so null calibration can fall back to trace probes immediately.
 
         Returns
         -------
         np.ndarray
             Eigenvalues sorted in descending order.
         """
+        if k is not None:
+            if isinstance(k, (bool, np.bool_)) or not np.isfinite(k) or int(k) != k or k < 1:
+                raise ValueError("k must be a positive integer.")
+            k = int(k)
+            if k >= self.n and (self.stores_precision or sp.issparse(self._K)):
+                raise ValueError("Sparse/implicit eigenvalue requests require k < n.")
         # Per-mode cache (raw vs centered spectra differ).
         cache_key = "_spectrum_centered" if self.centering else "_spectrum_raw"
         cached = getattr(self, cache_key, None)
@@ -357,6 +364,10 @@ class MatrixKernelBase(Kernel):
 
         k_orig = k
         centered = self.centering
+        if k is None and (self.stores_precision or sp.issparse(self._K)):
+            raise NotImplementedError(
+                "Full sparse/implicit spectrum unavailable; use trace probes or explicit k < n."
+            )
 
         if self.stores_precision:
             # Implicit sparse precision ``M`` — solve systems instead of
@@ -365,7 +376,6 @@ class MatrixKernelBase(Kernel):
             # backed by the same sparse-LU solver.
             from scipy.sparse.linalg import LinearOperator, eigsh
 
-            k = k if k is not None else max(6, self.n - 2)
             if not centered:
                 vals, _ = eigsh(self._K, k=k, which="SM")
                 vals = np.real(1.0 / vals)
@@ -391,7 +401,6 @@ class MatrixKernelBase(Kernel):
             if sp.issparse(self._K):
                 from scipy.sparse.linalg import LinearOperator, eigsh
 
-                k = k if k is not None else max(6, self.n - 2)
                 if not centered:
                     vals, _ = eigsh(self._K, k=k, which="LM")
                 else:
@@ -415,8 +424,7 @@ class MatrixKernelBase(Kernel):
                 else:
                     # ``HKH = K − 𝟏rᵀ − c𝟏ᵀ + m·𝟏𝟏ᵀ`` where r = row-mean
                     # of K, c = col-mean of K, m = grand-mean. Same
-                    # asymptotic cost as eigvalsh(K); no dense HKH copy
-                    # beyond a few n×1 means.
+                    # asymptotic cost as eigvalsh(K), with a dense HKH copy.
                     K = self._K
                     row_mean = K.mean(axis=1, keepdims=True)  # (n, 1)
                     col_mean = K.mean(axis=0, keepdims=True)  # (1, n)
@@ -708,7 +716,8 @@ class MatrixKernelBase(Kernel):
         # the estimator is deterministic per-instance (matches NUFFTKernel's
         # convention) and does not perturb numpy's global RNG state — which
         # previously caused flaky order-dependent failures under pytest.
-        rvs = np.random.default_rng(0).choice([-1.0, 1.0], size=(self.n, n_vectors)).astype(float)
+        # Draw whole columns so the same probe stream also works in bounded blocks.
+        rvs = np.random.default_rng(0).choice([-1.0, 1.0], size=(n_vectors, self.n)).T.copy()
         # Batched Solve: Solve M * Y = rvs
         # spsolve can handle multiple RHS if passed as dense 2D array
         if sp.issparse(self._K):

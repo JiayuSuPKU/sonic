@@ -20,7 +20,7 @@ from tqdm import tqdm
 from sonic._rasterize import _mean_fill_missing
 from sonic.detectors.base import Detector
 from sonic.kernels.fft import FFTKernel
-from sonic.statistics import apply_bh_correction, spatial_q_test
+from sonic.statistics import apply_bh_correction, compute_null_params, spatial_q_test
 
 __all__ = ["DetectorGrid"]
 
@@ -28,7 +28,11 @@ logger = logging.getLogger(__name__)
 
 
 def _qstat_worker_fft(
-    raster_layer, feature_batch: list[str], kernel: FFTKernel, return_pval: bool
+    raster_layer,
+    feature_batch: list[str],
+    kernel: FFTKernel,
+    return_pval: bool,
+    null_params: dict | None = None,
 ) -> list[dict]:
     """
     Worker function for parallel Q-statistic computation with FFT kernels.
@@ -43,6 +47,8 @@ def _qstat_worker_fft(
         Pre-constructed FFT kernel object.
     return_pval : bool
         Whether to compute p-values.
+    null_params : dict, optional
+        Shared prepared Q calibration, also used for reporting Z-scores.
 
     Returns
     -------
@@ -59,9 +65,13 @@ def _qstat_worker_fft(
     # Transpose to (ny, nx, M) for kernel
     data_chunk_transposed = np.moveaxis(data_chunk, 0, -1)
 
+    if null_params is None:
+        null_params = compute_null_params(kernel)
     # Compute statistics
     if return_pval:
-        stats, pvals = spatial_q_test(data_chunk_transposed, kernel, return_pval=True)
+        stats, pvals = spatial_q_test(
+            data_chunk_transposed, kernel, null_params=null_params, return_pval=True
+        )
     else:
         stats = spatial_q_test(data_chunk_transposed, kernel, return_pval=False)
         pvals = None
@@ -74,9 +84,10 @@ def _qstat_worker_fft(
         pvals = np.array([None] * len(feature_batch), dtype=object)
 
     # Null parameters
-    mu = kernel.trace()
-    sigma = np.sqrt(2.0 * kernel.square_trace())
-    z_scores = (stats - mu) / sigma if sigma > 1e-12 else np.zeros_like(stats)
+    mu = null_params["mean_Q"]
+    sigma = np.sqrt(null_params["var_Q"])
+    z_scores = (stats - mu) / sigma if sigma > 0 else np.zeros_like(stats)
+    z_scores[np.ptp(data_chunk, axis=(1, 2)) == 0] = 0.0
 
     # Format batch results
     for j, gene in enumerate(feature_batch):
@@ -410,6 +421,16 @@ class DetectorGrid(Detector):
         pandas.DataFrame
             Indexed by feature. Columns: ``Q``, ``Z_score``, and (if
             ``return_pval=True``) ``P_value``, ``P_adj``. Sorted by ``Q`` desc.
+
+        Notes
+        -----
+        Gaussian, Matérn, CAR and graph-Laplacian kernels default to upper-tail
+        ``moments`` calibration. Moran and other signed Fourier spectra use
+        two-sided ``clt``. Finite-sample moments account for sample standardization;
+        one prepared null supplies both p-values and Z-scores for every batch.
+        Z-scores alone do not specify the non-normal moment-fit p-value.
+        For a different null method, use :func:`~sonic.spatial_q_test` with a
+        cache from :func:`sonic.statistics.compute_null_params`.
         """
         self._require_setup()
         raster_layer = self.sdata[self._img_key]
@@ -426,6 +447,9 @@ class DetectorGrid(Detector):
         n_jobs, workers = self._auto_schedule(len(feature_batches), n_jobs, workers)
         # Let the FFT path pick up the balanced workers setting.
         self.kernel_.workers = workers
+        # Z-scores require the same finite-sample moments even when p-values
+        # are not requested. Share the fit across all worker batches.
+        null_params = compute_null_params(self.kernel_)
 
         logger.info(
             "Q-test on %d features — %d batches, n_jobs=%d, workers=%s, chunk_size=%d",
@@ -444,7 +468,7 @@ class DetectorGrid(Detector):
                 bar_format="{l_bar}{bar:30}{r_bar}{bar:-30b}",
             )
         results_list = Parallel(n_jobs=n_jobs, prefer="threads")(
-            delayed(_qstat_worker_fft)(raster_layer, batch, self.kernel_, return_pval)
+            delayed(_qstat_worker_fft)(raster_layer, batch, self.kernel_, return_pval, null_params)
             for batch in batch_iter
         )
 

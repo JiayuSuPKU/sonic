@@ -107,7 +107,7 @@ class TestBatchedValues:
 
 
 from sonic.kernels.nufft import NUFFTKernel
-from sonic.statistics import liu_sf, spatial_q_test, spatial_r_test
+from sonic.statistics import _moment_sf, _prepare_moment_fit, spatial_q_test, spatial_r_test
 from sonic.utils import get_rect_coords
 
 
@@ -343,7 +343,9 @@ def test_nufft_spectrum_and_moments_match_real_operator(shape, centering):
             np.testing.assert_allclose(kernel.eigenvalues(), eigenvalues, atol=1e-9)
             if centering:
                 q, p = spatial_q_test(rng.normal(size=(kernel.n, 10)), kernel)
-                expected = liu_sf(q, eigenvalues[eigenvalues > 1e-9], n=kernel.n)
+                expected = _moment_sf(
+                    q, _prepare_moment_fit(eigenvalues[eigenvalues > 1e-09], n=kernel.n)
+                )
                 np.testing.assert_allclose(p, expected, rtol=1e-8, atol=1e-10)
 
 
@@ -369,13 +371,13 @@ def test_nufft_projected_kernel_matches_its_null_spectrum(method):
     np.testing.assert_allclose(kernel.square_trace(), np.sum(dense**2))
     data = rng.normal(size=(kernel.n, 4))
     q, p = spatial_q_test(data, kernel)
-    expected = liu_sf(q, values[values > 1e-9], n=kernel.n)
+    expected = _moment_sf(q, _prepare_moment_fit(values[values > 1e-09], n=kernel.n))
     np.testing.assert_allclose(p, expected, rtol=1e-8)
-    params = compute_null_params(kernel, method="liu")
+    params = compute_null_params(kernel, method="moments")
     np.testing.assert_allclose(spatial_q_test(data, kernel, null_params=params), [q, p])
 
 
-def test_nufft_indefinite_spectrum_uses_clt():
+def test_nufft_indefinite_spectrum_defaults_to_clt_and_allows_moments():
     from sonic.statistics import compute_null_params
 
     kernel = NUFFTKernel(
@@ -392,12 +394,17 @@ def test_nufft_indefinite_spectrum_uses_clt():
     np.testing.assert_allclose(
         spatial_q_test(data, kernel), spatial_q_test(data, kernel, null_params=params)
     )
-    for method in ("welch", "liu"):
-        with pytest.raises(ValueError, match="require a PSD kernel"):
-            compute_null_params(kernel, method=method)
+    with pytest.raises(ValueError, match="require a PSD kernel"):
+        compute_null_params(kernel, method="welch")
+    moments = compute_null_params(kernel, method="moments")
+    assert moments["source"] == "probes"
+    np.testing.assert_allclose(
+        spatial_q_test(data, kernel, null_params=moments),
+        spatial_q_test(data, kernel, null_params={"method": "moments"}),
+    )
 
 
-def test_nufft_broad_psd_support_still_uses_liu_probes():
+def test_nufft_broad_psd_support_uses_moment_probes():
     from unittest.mock import patch
 
     from sonic import statistics
@@ -410,10 +417,10 @@ def test_nufft_broad_psd_support_still_uses_liu_probes():
     )
     kernel._TOEPLITZ_R_THRESHOLD = 0  # Force the supported broad-PSD fallback cheaply.
     with patch.object(
-        statistics, "_hutchinson_cumulants", wraps=statistics._hutchinson_cumulants
+        statistics, "_estimate_kernel_traces", wraps=statistics._estimate_kernel_traces
     ) as probe:
-        params = statistics.compute_null_params(kernel, method="liu")
-        probe.assert_called_once_with(kernel, n_probes=60)
+        params = statistics.compute_null_params(kernel, method="moments")
+        probe.assert_called_once_with(kernel, n_probes=60, centered=True)
     data = np.arange(kernel.n, dtype=float)
     np.testing.assert_allclose(
         spatial_q_test(data, kernel), spatial_q_test(data, kernel, null_params=params)
@@ -659,18 +666,15 @@ class TestNUFFTKernelNullParamsRoundTrip:
         k = NUFFTKernel(coords, (ny, nx), (1.0, 1.0), method="matern", bandwidth=2.0, nu=1.5)
         z = rng.standard_normal(ny * nx)
         Q_auto, p_auto = spatial_q_test(z, k)
-        # Pre-build the Liu null_params dict exactly as compute_null_params
+        # Pre-build the moment null_params dict exactly as compute_null_params
         # produces it; passing it back in should round-trip the p-value.
-        null_params = compute_null_params(k, method="liu")
+        null_params = compute_null_params(k, method="moments")
         Q_given, p_given = spatial_q_test(z, k, null_params=null_params)
         assert abs(Q_auto - Q_given) < 1e-10
         assert abs(p_auto - p_given) < 1e-10
 
-    def test_qtest_liu_requires_liu_coef_or_cumulants(self):
-        """Passing ``method='liu'`` with an unrelated / deprecated key
-        (e.g. the legacy ``'eigenvalues'``) must raise a clear error —
-        callers should use ``compute_null_params`` or supply
-        ``liu_coef`` / ``cumulants`` directly."""
+    def test_qtest_moments_requires_prepared_fit(self):
+        """A deprecated eigenvalue cache must be rejected with a clear error."""
         from sonic.kernels.nufft import NUFFTKernel
         from sonic.statistics import spatial_q_test
 
@@ -679,11 +683,11 @@ class TestNUFFTKernelNullParamsRoundTrip:
         coords = rng.uniform(0, 15, size=(ny * nx, 2))
         k = NUFFTKernel(coords, (ny, nx), (1.0, 1.0), method="matern", bandwidth=2.0, nu=1.5)
         z = rng.standard_normal(ny * nx)
-        with pytest.raises(ValueError, match="liu_coef"):
+        with pytest.raises(ValueError, match="q_fit"):
             spatial_q_test(
                 z,
                 k,
-                null_params={"method": "liu", "eigenvalues": np.ones(ny * nx)},
+                null_params={"method": "moments", "eigenvalues": np.ones(ny * nx)},
             )
 
     def test_rtest_nufft_null_params_round_trip(self):

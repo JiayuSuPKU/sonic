@@ -53,7 +53,7 @@ import finufft
 import numpy as np
 import scipy.fft
 import scipy.sparse as sp
-from scipy.stats import chi2, norm
+from scipy.stats import norm
 
 from sonic.kernels.base import Kernel
 from sonic.kernels.fft import FFTKernel
@@ -343,12 +343,16 @@ class NUFFTKernel(Kernel):
     ``xᵀ K x = (1/n') Σ_k λ(k) |x̂(k)|²`` with ``x̂ = Uᴴ x`` (a single type-1 NUFFT).
     The matrix-vector primitive :meth:`Kx` uses the companion two-shot NUFFT
     ``K z = (1/n') · U · (λ ⊙ Uᴴ z)`` and backs the Hutchinson-based
-    cumulant estimator (:func:`sonic.statistics._hutchinson_cumulants`)
+    trace estimator (:func:`sonic.statistics._estimate_kernel_traces`)
     and the bipartite R-test cross matrix.
 
     Gaussian and Matérn use the PSD-projected spectrum supplied by
     :class:`FFTKernel`; the projection applies to both the operator and its null
-    moments. Moran retains its signed spectrum and uses the CLT Q-test null.
+    moments. Q-tests default to upper-tail ``moments`` calibration for Gaussian,
+    Matérn, CAR and graph-Laplacian kernels. Moran and other signed Fourier
+    spectra default to two-sided CLT; finite-sample moment matching is available
+    explicitly. Null moments use the ``n`` observed points, not the internal
+    Fourier-grid size. See :func:`sonic.statistics.compute_null_params`.
 
     :func:`sonic.spatial_q_test` always uses the k-space Parseval path
     (:meth:`xtKx`); :func:`sonic.spatial_r_test` dispatches on shape —
@@ -656,8 +660,8 @@ class NUFFTKernel(Kernel):
           signed square root makes ``M`` non-Hermitian.
         - Broad spectrum with ``r > _TOEPLITZ_R_THRESHOLD`` — dense
           ``r × r`` eigvalsh becomes the bottleneck; callers should
-          route through cumulant-based Liu
-          (:func:`compute_null_params(..., liu_n_probes=...)`) instead
+          route through probe-based moment matching
+          (:func:`compute_null_params(..., n_probes=...)`) instead
           of asking for the full spectrum.
 
         Returns
@@ -737,11 +741,12 @@ class NUFFTKernel(Kernel):
         Full-spectrum requests that fall outside Toeplitz-M's reach
         (indefinite ``Λ`` like Moran, or broad-support kernels like CAR
         at strong coupling) raise ``NotImplementedError`` rather than
-        falling back to an approximate density reconstruction. For Liu's
-        method on broad-support PSD kernels, use
-        :func:`compute_null_params(..., method='liu', liu_n_probes=...)`
-        to get cumulant-based Liu directly from :math:`2m` matvecs.
-        Indefinite kernels use ``method='clt'`` instead.
+        falling back to an approximate density reconstruction. For moment matching
+        on indefinite or broad-support kernels, use
+        :func:`compute_null_params(..., method='moments', n_probes=...)`
+        to estimate traces with two batched kernel applications.
+        Indefinite kernels default to ``method='clt'``; explicit moment fits
+        require the finite-sample correction.
 
         Parameters
         ----------
@@ -785,9 +790,9 @@ class NUFFTKernel(Kernel):
                 "Full NUFFT spectrum unavailable for this configuration "
                 "(indefinite spectrum or broad spectral support: r > "
                 f"{self._TOEPLITZ_R_THRESHOLD}). Use "
-                "`method='clt'` for indefinite kernels, or "
-                "`compute_null_params(..., method='liu', liu_n_probes=60)` "
-                "for broad-support PSD kernels. `eigenvalues(k=...)` "
+                "`method='clt'` or "
+                "`compute_null_params(..., method='moments', n_probes=60)` "
+                "for trace-based finite-sample calibration. `eigenvalues(k=...)` "
                 "provides a Lanczos top-k."
             )
         pad = max(0, n - len(toep))
@@ -940,7 +945,7 @@ class NUFFTKernel(Kernel):
         evaluated as type-1 NUFFT → elementwise multiply by ``λ(k) / n'`` →
         type-2 NUFFT. Output length ``n``, same shape as ``z``. Base primitive
         for :meth:`xtKx_matmul`, :meth:`xtKy_matmul`, the Hutchinson
-        cumulant estimator used by Liu's null approximation, and the
+        trace estimator used by moment calibration, and the
         bipartite R-test in :class:`DetectorIrregular`.
 
         Parameters
@@ -1183,10 +1188,10 @@ def _q_test_nufft(  # noqa: C901
     NUFFT precision and is exposed for callers that prefer the direct
     round-trip; :func:`spatial_q_test` always uses the spectral path.
 
-    Null moments route through :func:`sonic.statistics.compute_null_params`,
-    which on graph kernels defaults to the empirical moment estimator over
-    ``HKH``-centered probes (see :meth:`NUFFTKernel.trace` /
-    :meth:`NUFFTKernel.square_trace`).
+    Null preparation and tail evaluation are shared with the other backends;
+    see :func:`sonic.statistics.compute_null_params`. PSD kernels default to
+    upper-tail moment matching, and signed kernels to two-sided CLT.
+    Signed kernels also allow an explicit finite-sample moment fit (upper tail).
 
     Standardization at the ``n`` irregular points is applied internally
     unless ``is_standardized=True``.
@@ -1197,12 +1202,8 @@ def _q_test_nufft(  # noqa: C901
         ``(n,)`` or ``(n, M)``.
     kernel : NUFFTKernel
     null_params : dict, optional
-        Pre-built moments (see :func:`sonic.compute_null_params`). Read
-        keys depend on the null approximation selected via
-        ``null_params['method']``: ``'mean_Q'`` / ``'var_Q'`` for CLT,
-        ``'scale_g'`` / ``'df_h'`` (or ``'mean_Q'`` / ``'var_Q'`` as
-        fallback) for Welch, and ``'liu_coef'`` (preferred) or
-        ``'cumulants'`` for Liu. Pass ``None`` to auto-build.
+        Prepared cache from :func:`sonic.statistics.compute_null_params`.
+        :func:`sonic.statistics.spatial_q_test` shares the prepared fit across chunks. ``None`` prepares a default fit.
     return_pval : bool, default True
     is_standardized : bool, default False
 
@@ -1227,89 +1228,13 @@ def _q_test_nufft(  # noqa: C901
     if not return_pval:
         return Q_arr if batched else float(Q_arr[0])
 
-    # Dispatch on the user-selected null approximation. This mirrors the
-    # MatrixKernel path in `spatial_q_test`: the caller picks one of
-    # {'clt', 'welch', 'liu'} via ``null_params['method']``; defaults keep
-    # CLT for signed spectra and Liu for PSD kernels.
-    from sonic.statistics import _resolve_q_null_method
+    # Apply the shared calibration; spatial_q_test normally prepares it once.
+    from sonic.statistics import _prepare_q_null, _q_pvalues
 
-    null_approx = _resolve_q_null_method(
-        kernel, None if null_params is None else null_params.get("method"), default="liu"
-    )
-
-    def _get_mean_var() -> tuple[float, float]:
-        """Mean/var of Q under H0 — from user-supplied params or recompute."""
-        if null_params is not None and "mean_Q" in null_params and "var_Q" in null_params:
-            return float(null_params["mean_Q"]), float(null_params["var_Q"])
-        # Route through compute_null_params to pick up the H-centering +
-        # finite-n ratio correction; for NUFFT graph kernels the
-        # ``'empirical'`` default on trace()/square_trace() ensures the
-        # corrections capture the spreading-kernel smoothing too.
-        from sonic.statistics import compute_null_params
-
-        p = compute_null_params(kernel, method="clt")
-        return float(p["mean_Q"]), float(p["var_Q"])
-
-    if null_approx == "clt":
-        mean_Q, var_Q = _get_mean_var()
-        sigma = float(np.sqrt(var_Q))
-        if sigma <= 1e-12:
-            pvals = np.ones_like(Q_arr)
-        else:
-            z_scores = (Q_arr - mean_Q) / sigma
-            pvals = chi2.sf(z_scores**2, df=1)
-
-    elif null_approx == "welch":
-        from sonic.statistics import _welch_apply
-
-        if null_params is not None and "scale_g" in null_params and "df_h" in null_params:
-            pvals = _welch_apply(Q_arr, null_params)
-        else:
-            mean_Q, var_Q = _get_mean_var()
-            pvals = _welch_apply(Q_arr, {"mean_Q": mean_Q, "var_Q": var_Q})
-
-    elif null_approx == "liu":
-        from sonic.statistics import (
-            _hutchinson_cumulants,
-            _liu_apply,
-            _liu_prepare,
-            _liu_prepare_from_cumulants,
-        )
-
-        # Prefer cached Liu coefficients from compute_null_params; derive
-        # from caller-supplied ``cumulants`` otherwise. ``n`` is passed
-        # for the Dirichlet(1/2) variance correction — essential on
-        # broad-spectrum PSD kernels (CAR / graph_laplacian) where
-        # c_1² ≈ m·c_2 would otherwise inflate sigma_Q by O(10×).
-        n_kernel = int(kernel.n)
-        coef = None if null_params is None else null_params.get("liu_coef")
-        if coef is None and null_params is not None and "cumulants" in null_params:
-            coef = _liu_prepare_from_cumulants(null_params["cumulants"], n=n_kernel)
-        if coef is None:
-            # ``null_params`` empty or just ``{"method": "liu"}`` — build
-            # the coef from the kernel directly. Any other caller-supplied
-            # keys without ``liu_coef`` / ``cumulants`` is considered
-            # malformed and raises.
-            if null_params is not None and null_params.keys() - {"method"}:
-                raise ValueError(
-                    "null_params with method='liu' must contain either "
-                    "'liu_coef' (preferred) or 'cumulants'. Build via "
-                    "compute_null_params(kernel, method='liu')."
-                )
-            # Try the exact Toeplitz-M eigendecomposition; if that's
-            # unavailable for a broad-support PSD kernel, fall back to
-            # Hutchinson-estimated cumulants. Signed kernels were rejected above.
-            try:
-                evals = kernel.eigenvalues(return_full_layout=True)
-                sig_evals = evals[evals > 1e-9]
-                coef = _liu_prepare(sig_evals, n=n_kernel)
-            except NotImplementedError:
-                c = _hutchinson_cumulants(kernel, n_probes=60)
-                coef = _liu_prepare_from_cumulants(c, n=n_kernel)
-        pvals = np.atleast_1d(_liu_apply(Q_arr, coef))
-
-    else:
-        raise ValueError(f"Unknown null approximation method: {null_approx!r}")
+    if null_params is None:
+        null_params = _prepare_q_null(kernel)
+    pvals = _q_pvalues(Q_arr, null_params)
+    pvals = np.where(np.any(z, axis=0), pvals, 1.0)
 
     if batched:
         return Q_arr, pvals

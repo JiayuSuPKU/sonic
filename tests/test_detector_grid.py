@@ -144,6 +144,32 @@ class TestDetectorGrid(unittest.TestCase):
         self.assertIn("f1", df.index)
         self.assertIn("f3", df.index)
 
+    def test_q_batches_share_calibration_and_report_its_corrected_variance(self):
+        from sonic import statistics
+        from sonic.detectors import grid
+
+        with patch("sonic._rasterize.rasterize_table", return_value=self.mock_da):
+            detector = DetectorGrid(kernel_method="car", rho=0.1)
+            self._setup(detector)
+        for return_pval in (True, False):
+            with patch.object(
+                grid, "compute_null_params", wraps=statistics.compute_null_params
+            ) as prepare:
+                result = detector.compute_qstat(
+                    n_jobs=1, chunk_size=1, return_pval=return_pval, show_progress=False
+                )
+                prepare.assert_called_once_with(detector.kernel_)
+            params = statistics.compute_null_params(detector.kernel_)
+            values = np.moveaxis(self.raster_data, 0, -1)
+            q, p = statistics.spatial_q_test(values, detector.kernel_, null_params=params)
+            result = result.loc[self.features]
+            np.testing.assert_allclose(result["Q"], q)
+            np.testing.assert_allclose(
+                result["Z_score"], (q - params["mean_Q"]) / np.sqrt(params["var_Q"])
+            )
+            if return_pval:
+                np.testing.assert_allclose(result["P_value"], p)
+
     def test_kernel_reuse_same_shape(self):
         """Kernel is kept across successive compute_qstat calls once setup is done."""
         with patch("sonic._rasterize.rasterize_table", return_value=self.mock_da):

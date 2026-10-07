@@ -12,6 +12,8 @@ from scipy.sparse import csc_matrix, csr_matrix
 from sonic import Detector
 from sonic.kernels import FFTKernel, MatrixKernel, NUFFTKernel
 from sonic.statistics import (
+    _moment_sf,
+    _prepare_moment_fit,
     apply_bh_correction,
     auto_chunk_size,
     cauchy_combine,
@@ -24,7 +26,7 @@ from sonic.statistics import (
 
 
 @pytest.mark.parametrize("backend", ["fft2", "rfft2", "nufft"])
-def test_null_routing_rejects_signed_spectra_even_with_a_psd_name(backend):
+def test_null_routing_on_signed_spectra_even_with_a_psd_name(backend):
     shape = (8, 8)
     rng = np.random.default_rng(0)
     if backend == "nufft":
@@ -40,7 +42,10 @@ def test_null_routing_rejects_signed_spectra_even_with_a_psd_name(backend):
         kernel = FFTKernel(shape, method="gaussian", fft_solver=backend)
         fourier_kernel = kernel
         data = rng.normal(size=shape)
-    cached = {method: compute_null_params(kernel, method=method) for method in ("welch", "liu")}
+    cached = {
+        "welch": compute_null_params(kernel, method="welch"),
+        "moments": compute_null_params(kernel, method="moments", dirichlet_correction=False),
+    }
     # Model a legacy/custom spectrum: the family name alone does not certify PSD.
     fourier_kernel.spectrum = FFTKernel(
         shape, method="moran", fft_solver=fourier_kernel.fft_solver
@@ -49,13 +54,14 @@ def test_null_routing_rejects_signed_spectra_even_with_a_psd_name(backend):
     np.testing.assert_allclose(
         spatial_q_test(data, kernel), spatial_q_test(data, kernel, null_params=explicit)
     )
-    for method in ("welch", "liu"):
+    for method in ("welch", "moments"):
         with pytest.raises(ValueError, match="require a PSD kernel"):
-            compute_null_params(kernel, method=method)
+            compute_null_params(kernel, method=method, dirichlet_correction=False)
         with pytest.raises(ValueError, match="require a PSD kernel"):
             spatial_q_test(data, kernel, null_params=cached[method])
-    with pytest.raises(ValueError, match="require a PSD kernel"):
-        compute_null_params(kernel, method="liu", liu_n_probes=4)
+    params = compute_null_params(kernel, method="moments", n_probes=4)
+    assert params["model"] == "standardized_q"
+    assert np.isfinite(spatial_q_test(data, kernel, null_params=params)[1])
 
 
 class TestMultipleTestingHelpers(unittest.TestCase):
@@ -132,9 +138,9 @@ class TestStatisticalFunctions(unittest.TestCase):
         self.assertGreaterEqual(pval, 0)
         self.assertLessEqual(pval, 1)
 
-    def test_spatial_q_test_liu(self):
+    def test_spatial_q_test_moments(self):
         """Test spatial Q-test with Liu approximation."""
-        Q, pval = spatial_q_test(self.data, self.kernel, null_params={"method": "liu"})
+        Q, pval = spatial_q_test(self.data, self.kernel, null_params={"method": "moments"})
 
         # Q should be a positive number
         self.assertIsInstance(Q, (float, np.floating))
@@ -272,27 +278,16 @@ class TestStatisticalFunctions(unittest.TestCase):
         self.assertIn("mean_Q", params)
         self.assertIn("var_Q", params)
 
-    def test_compute_null_params_liu(self):
-        """Liu always yields cached cumulants + liu_coef.
-
-        The full-spectrum path is internal — ``compute_null_params``
-        only exposes the four spectral cumulants ``c_1..c_4`` and the
-        derived shifted-χ² fit ``liu_coef`` (consumed by
-        :func:`spatial_q_test`).
-        """
-        params = compute_null_params(self.kernel, method="liu", k_eigen=5)
-        self.assertEqual(params["method"], "liu")
-        # Cumulants: {1,2,3,4} → float.
-        self.assertIn("cumulants", params)
-        self.assertEqual(set(params["cumulants"].keys()), {1, 2, 3, 4})
-        # Liu coefficients: shifted-χ² fit.
-        self.assertIn("liu_coef", params)
+    def test_compute_null_params_moments(self):
+        """The cache contains the fitted distribution, without intermediate traces."""
+        params = compute_null_params(self.kernel, method="moments", k_eigen=5)
+        self.assertEqual(params["method"], "moments")
         self.assertEqual(
-            set(params["liu_coef"].keys()),
-            {"mu_Q", "sigma_Q", "mu_x", "sigma_x", "dof_x", "delta_x"},
+            set(params), {"method", "model", "tail", "source", "q_fit", "mean_Q", "var_Q", "var_R"}
         )
-        # Raw spectrum is NO LONGER exposed.
-        self.assertNotIn("eigenvalues", params)
+        self.assertIn(params["q_fit"]["family"], {"ncx2", "beta", "normal"})
+        self.assertEqual(params["q_fit"]["mu_Q"], params["mean_Q"])
+        self.assertEqual(params["q_fit"]["sigma_Q"] ** 2, params["var_Q"])
 
     def test_spatial_q_test_kernel_matrix_requires_params(self):
         """Kernel matrices without params should raise when null_params is None."""
@@ -338,7 +333,7 @@ class TestKernelPrimitivesAndNullParams(unittest.TestCase):
 
     def test_compute_null_params_populates_var_R(self):
         """compute_null_params should always populate var_R alongside Q-test moments."""
-        for method in ("clt", "welch", "liu"):
+        for method in ("clt", "welch", "moments"):
             params = compute_null_params(self.kernel, method=method)
             self.assertIn("var_R", params)
             self.assertGreater(params["var_R"], 0.0)
@@ -420,7 +415,7 @@ def test_identity_kernel_q_is_uninformative():
     np.testing.assert_array_equal(p, [1, 1])
     result = detector.compute_qstat(n_jobs=1, show_progress=False)
     np.testing.assert_array_equal(result.P_value, [1, 1])
-    np.testing.assert_array_equal(liu_sf(q, np.ones(79), n=80), [1, 1])
+    np.testing.assert_array_equal(_moment_sf(q, _prepare_moment_fit(np.ones(79), n=80)), [1, 1])
 
 
 @pytest.mark.parametrize("backend", ["fft2", "rfft2", "nufft"])
@@ -466,3 +461,60 @@ def test_small_chunks_respect_worker_budget(monkeypatch):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+@pytest.mark.parametrize("method", ["liu", "unknown"])
+def test_invalid_null_methods_raise_before_calibration(method):
+    kernel = MatrixKernel.from_matrix(np.eye(4))
+    with pytest.raises(ValueError, match="choose 'clt', 'welch', or 'moments'"):
+        compute_null_params(kernel, method=method)
+    with pytest.raises(ValueError, match="choose 'clt', 'welch', or 'moments'"):
+        spatial_q_test(np.arange(4), kernel, null_params={"method": method})
+
+
+@pytest.mark.parametrize("backend", ["matrix", "fft2", "rfft2", "nufft"])
+@pytest.mark.parametrize("method", ["clt", "welch"])
+@pytest.mark.parametrize("correction", [False, True])
+def test_null_moments_project_raw_kernel_traces(backend, method, correction):
+    # Features are centered by the test, independent of the kernel's trace view.
+    rng = np.random.default_rng(37)
+    coords = rng.uniform(0, 8, (40, 2))
+    kernels = []
+    for centered in (True, False):
+        if backend == "matrix":
+            kernel = MatrixKernel.from_coordinates(coords, method="gaussian", centering=centered)
+        elif backend == "nufft":
+            kernel = NUFFTKernel(coords, (8, 8), (1, 1), method="gaussian", centering=centered)
+        else:
+            kernel = FFTKernel((8, 8), method="gaussian", fft_solver=backend, centering=centered)
+        kernels.append(kernel)
+    data = rng.normal(size=(8, 8, 3) if backend in ("fft2", "rfft2") else (40, 3))
+    expected = compute_null_params(kernels[0], method=method, dirichlet_correction=correction)
+    actual = compute_null_params(kernels[1], method=method, dirichlet_correction=correction)
+    for key in ("mean_Q", "var_Q"):
+        np.testing.assert_allclose(actual[key], expected[key], rtol=1e-10)
+    np.testing.assert_allclose(
+        spatial_q_test(data, kernels[1], null_params=actual),
+        spatial_q_test(data, kernels[0], null_params=expected),
+        rtol=1e-10,
+    )
+    assert actual["var_R"] == kernels[1].square_trace()
+    assert kernels[1].centering is False
+
+
+@pytest.mark.parametrize("backend", ["fft2", "rfft2", "nufft"])
+def test_clt_tail_is_invariant_to_small_kernel_scale(backend):
+    rng = np.random.default_rng(24)
+    coords = rng.uniform(0, 8, (40, 2))
+    data = rng.normal(size=(40, 3) if backend == "nufft" else (8, 8, 3))
+    pvalues = []
+    for scale in (1.0, 1e-15):
+        if backend == "nufft":
+            kernel = NUFFTKernel(coords, (8, 8), (1, 1), method="gaussian")
+            kernel._fft_kernel.spectrum *= scale
+        else:
+            kernel = FFTKernel((8, 8), method="gaussian", fft_solver=backend)
+            kernel.spectrum *= scale
+        params = compute_null_params(kernel, method="clt")
+        pvalues.append(spatial_q_test(data, kernel, null_params=params)[1])
+    np.testing.assert_allclose(pvalues[0], pvalues[1], rtol=1e-10)

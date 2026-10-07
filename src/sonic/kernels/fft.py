@@ -7,7 +7,7 @@ import numpy as np
 import scipy.fft
 import scipy.sparse as sp
 from scipy.special import gamma, kv
-from scipy.stats import chi2, norm
+from scipy.stats import norm
 
 from sonic.kernels.base import Kernel
 
@@ -89,6 +89,11 @@ class FFTKernel(Kernel):
     Gaussian and Matérn kernels are projected onto the PSD cone by zeroing
     negative Fourier weights. This regularizes the periodic approximation;
     kernel applications, statistics, and null moments all use that spectrum.
+
+    Q-tests default to upper-tail ``moments`` calibration for Gaussian,
+    Matérn, CAR and graph-Laplacian kernels. Moran and other signed Fourier
+    spectra use two-sided CLT. Both ``fft2`` and ``rfft2`` use the full set
+    of modes for calibration. See :func:`sonic.statistics.compute_null_params`.
 
     Attributes
     ----------
@@ -697,13 +702,8 @@ def _q_test_fft(  # noqa: C901
     kernel : FFTKernel
         Pre-constructed FFT kernel object for grid data.
     null_params : dict, optional
-        Pre-computed null distribution parameters from
-        :func:`sonic.statistics.compute_null_params`. When supplied, the
-        cached ``eigenvalues`` / ``mean_Q`` / ``var_Q`` entries are reused
-        in the p-value stage to avoid recomputing the spectrum on every
-        call — useful when running the same kernel against many features
-        (e.g., in :class:`sonic.DetectorGrid`). If None, the
-        spectrum and moments are computed on the fly.
+        Prepared cache from :func:`sonic.statistics.compute_null_params`.
+        :func:`sonic.statistics.spatial_q_test` shares the prepared fit across chunks. ``None`` prepares a default fit.
     return_pval : bool, default True
         If True, returns (Q, pval) tuple; if False, returns Q only.
     is_standardized : bool, default False
@@ -716,7 +716,8 @@ def _q_test_fft(  # noqa: C901
         Test statistic. Scalar if input was 2D; array of shape (M,) if 3D.
     pval : float or np.ndarray, optional
         Tail probability under null hypothesis. Only returned if return_pval=True.
-        Uses Liu's method for most kernels; Normal approximation for Moran's I.
+        Defaults to moment matching for PSD kernels and two-sided CLT for signed
+        kernels. Signed kernels also allow explicit upper-tail moment matching.
 
     Raises
     ------
@@ -732,8 +733,9 @@ def _q_test_fft(  # noqa: C901
     Uses FFT via Parseval's theorem to compute :math:`Q = \\sum_{i,j} \\lambda_{i,j} Z^2_{i,j}`
     in O(n' log n') time instead of O(n'³) dense methods.
 
-    For Moran's I kernel (which has negative eigenvalues), uses Normal approximation
-    based on asymptotic theory. For other kernels, uses Liu's chi-squared mixture approximation.
+    Null preparation and tail evaluation are shared with the other backends.
+    Signed kernels default to two-sided CLT; PSD kernels default to the
+    upper-tail moment matching family. See :func:`sonic.statistics.compute_null_params`.
 
     Examples
     --------
@@ -755,6 +757,7 @@ def _q_test_fft(  # noqa: C901
     # 1. Standardization (Z-score across spatial dimensions)
     if is_standardized:
         z = Xn
+        valid = np.any(z, axis=(0, 1))
     else:
         # Mean/Std per feature slice
         means = np.mean(Xn, axis=(0, 1), keepdims=True)
@@ -777,77 +780,14 @@ def _q_test_fft(  # noqa: C901
     if not return_pval:
         return Q
 
-    # 3. P-value approximation. Dispatch on the user-selected null method
-    # (``null_params['method']``) mirroring the MatrixKernel path in
-    # :func:`sonic.statistics.spatial_q_test`: any of 'clt' / 'welch' / 'liu'.
-    # Default: CLT for signed spectra, Liu for PSD spectra.
-    # When `null_params` is supplied the caller's
-    # cached moments are reused so we don't retraverse the spectrum per feature.
+    # 3. Apply the shared calibration; spatial_q_test normally prepares it once.
+    from sonic.statistics import _prepare_q_null, _q_pvalues
+
+    if null_params is None:
+        null_params = _prepare_q_null(kernel)
     Q_arr = np.atleast_1d(Q).astype(float).ravel()
-
-    from sonic.statistics import _resolve_q_null_method
-
-    null_approx = _resolve_q_null_method(
-        kernel, None if null_params is None else null_params.get("method"), default="liu"
-    )
-
-    def _get_mean_var() -> tuple[float, float]:
-        if null_params is not None and "mean_Q" in null_params and "var_Q" in null_params:
-            return float(null_params["mean_Q"]), float(null_params["var_Q"])
-        # Fall back to compute_null_params so we get H-centered moments
-        # with the finite-n ratio correction — raw trace(K), 2·trace(K²)
-        # would inflate the null variance (see compute_null_params docstring).
-        from sonic.statistics import compute_null_params
-
-        p = compute_null_params(kernel, method="clt")
-        return float(p["mean_Q"]), float(p["var_Q"])
-
-    if null_approx == "clt":
-        mean_Q, var_Q = _get_mean_var()
-        sigma = float(np.sqrt(var_Q))
-        if sigma <= 1e-12:
-            pvals = np.ones_like(Q_arr)
-        else:
-            z_scores = (Q_arr - mean_Q) / sigma
-            pvals = chi2.sf(z_scores**2, df=1)
-
-    elif null_approx == "welch":
-        from sonic.statistics import _welch_apply
-
-        if null_params is not None and "scale_g" in null_params and "df_h" in null_params:
-            pvals = _welch_apply(Q_arr, null_params)
-        else:
-            mean_Q, var_Q = _get_mean_var()
-            pvals = _welch_apply(Q_arr, {"mean_Q": mean_Q, "var_Q": var_Q})
-
-    elif null_approx == "liu":
-        from sonic.statistics import _liu_apply, _liu_prepare, _liu_prepare_from_cumulants
-
-        # Dirichlet(1/2) variance correction: pass ``n`` so ``sigma_Q``
-        # uses ``2·(m·c_2 − c_1²)/(m+2)`` rather than the large-n limit
-        # ``2·c_2``. Matters on broad-spectrum PSD kernels where
-        # ``c_1² ≈ m·c_2`` (e.g. CAR on a dense regular grid).
-        n_kernel = int(kernel.n)
-        coef = None if null_params is None else null_params.get("liu_coef")
-        if coef is None and null_params is not None and "cumulants" in null_params:
-            coef = _liu_prepare_from_cumulants(null_params["cumulants"], n=n_kernel)
-        if coef is None:
-            # No cached coef and no user-supplied cumulants — auto-build
-            # from the kernel's own full spectrum (cheap for FFT: O(n)).
-            if null_params is not None and null_params.keys() - {"method"}:
-                raise ValueError(
-                    "null_params with method='liu' must contain either "
-                    "'liu_coef' (preferred) or 'cumulants'. Build via "
-                    "compute_null_params(kernel, method='liu')."
-                )
-            evals = kernel.eigenvalues(return_full_layout=True)
-            # Keep the same signed cumulants as compute_null_params.
-            sig_evals = evals[np.abs(evals) > 1e-9]
-            coef = _liu_prepare(sig_evals, n=n_kernel)
-        pvals = np.atleast_1d(_liu_apply(Q_arr, coef))
-
-    else:
-        raise ValueError(f"Unknown null approximation method: {null_approx!r}")
+    pvals = _q_pvalues(Q_arr, null_params)
+    pvals = np.where(np.asarray(valid).ravel(), pvals, 1.0)
 
     # Unwrap to scalar if the caller passed a 2D grid for a single feature.
     if np.ndim(Q) == 0:

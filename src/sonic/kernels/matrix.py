@@ -37,6 +37,12 @@ class MatrixKernel(MatrixKernelBase):
     cross-modality covariance, a learnt operator) subclass
     :class:`MatrixKernelBase` directly and implement :meth:`_build_kernel`.
 
+    Q-tests default to upper-tail Welch calibration for Gaussian, Matérn,
+    CAR and graph-Laplacian kernels, and two-sided CLT for ``method="moran"``.
+    Precomputed matrices otherwise default to Welch under a PSD assumption;
+    select CLT or finite-sample ``moments`` explicitly for other signed matrices.
+    See :func:`sonic.statistics.compute_null_params` for overrides and moments.
+
     See Also
     --------
     MatrixKernel.from_coordinates

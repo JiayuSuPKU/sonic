@@ -14,6 +14,7 @@ from sonic.detectors.base import Detector
 from sonic.kernels import Kernel, MatrixKernel
 from sonic.kernels.nufft import NUFFTKernel, _standardize_features
 from sonic.statistics import (
+    _q_pvalues,
     _resolve_q_null_method,
     apply_bh_correction,
     compute_null_params,
@@ -94,9 +95,7 @@ def _qstat_worker(
             Q_batch = np.atleast_1d(kernel_obj.xtKx_standardized(X_batch_sp, b_means, b_stds))
             # xtKx_standardized already returns 0.0 for std<=0 columns.
             P_batch = (
-                _pvals_from_null(Q_batch, null_params)
-                if return_pval
-                else np.full(Q_batch.shape, np.nan)
+                _q_pvalues(Q_batch, null_params) if return_pval else np.full(Q_batch.shape, np.nan)
             )
         else:
             # Fallback (e.g. raw-matrix "kernel"): densify and z-score explicitly.
@@ -135,48 +134,6 @@ def _qstat_worker(
     return results
 
 
-def _pvals_from_null(Q: np.ndarray, null_params: dict) -> np.ndarray:
-    """Apply the configured null approximation to a pre-computed Q vector.
-
-    Used by the sparse fast path in :func:`_qstat_worker`, where the quadratic
-    form has already been computed via
-    :meth:`~sonic.kernels.MatrixKernel.xtKx_standardized` and only the p-value
-    stage remains. Mirrors the dispatch logic in
-    :func:`sonic.statistics.spatial_q_test`.
-    """
-    from scipy.stats import chi2 as _chi2
-
-    method = null_params.get("method", "welch")
-    if method == "welch":
-        from sonic.statistics import _welch_apply
-
-        return _welch_apply(Q, null_params)
-    if method == "clt":
-        mu = null_params["mean_Q"]
-        var = null_params["var_Q"]
-        if var <= 0:
-            return np.ones_like(Q, dtype=float)
-        z = (Q - mu) / np.sqrt(var)
-        return _chi2.sf(z**2, df=1)
-    if method == "liu":
-        from sonic.statistics import (
-            _liu_apply,
-            _liu_prepare_from_cumulants,
-        )
-
-        coef = null_params.get("liu_coef")
-        if coef is None:
-            if "cumulants" not in null_params:
-                raise ValueError(
-                    "null_params with method='liu' must contain either "
-                    "'liu_coef' (preferred) or 'cumulants'. Build via "
-                    "compute_null_params(kernel, method='liu')."
-                )
-            coef = _liu_prepare_from_cumulants(null_params["cumulants"])
-        return np.atleast_1d(_liu_apply(np.asarray(Q, dtype=float), coef))
-    return np.ones_like(Q, dtype=float)
-
-
 # optimized R-stat worker with pre-computed K@Y
 def _rstat_worker_chunked(
     X_csc: sp.csc_matrix,
@@ -206,8 +163,7 @@ def _rstat_worker_chunked(
     kernel_obj : Kernel
         Pre-constructed kernel object.
     null_params : dict
-        Pre-computed null parameters: ``'var_R'`` (``trace(K²)``). ``'mean_R'``
-        is implicitly 0.
+        Pre-computed null variance ``'var_R'`` (``trace(K²)``). The null mean is zero.
     means : np.ndarray
         Feature means for standardization.
     stds : np.ndarray
@@ -899,11 +855,13 @@ class DetectorIrregular(Detector):
 
         Zero-variance features are assigned Q=0, P_value=1.0.
 
-        The null-distribution approximation is auto-selected from
-        ``self.kernel_method_`` (``'clt'`` for Moran's I, ``'welch'`` for all other
-        kernels) and cannot be overridden through this method. For full control
-        over the null method (including ``'liu'``), call
-        :func:`sonic.statistics.spatial_q_test` directly.
+        The null approximation depends on both method and backend. Gaussian,
+        Matérn, CAR and graph-Laplacian kernels use upper-tail ``welch`` on the
+        matrix backend and upper-tail ``moments`` on NUFFT. Moran and other
+        recognized signed spectra use two-sided ``clt``. All defaults correct
+        for sample standardization. This method does not expose a null override;
+        use :func:`sonic.statistics.spatial_q_test` with a prepared cache from
+        :func:`sonic.statistics.compute_null_params` to select another calibration.
 
         Examples
         --------
@@ -924,8 +882,7 @@ class DetectorIrregular(Detector):
                 raise ValueError(f"chunk_size must be 'auto' or int, got {chunk_size!r}.")
             chunk_size = self._auto_chunk_size(n_jobs=n_jobs)
 
-        # NUFFT backend takes a different code path (no dense K, different
-        # null rescaling). Dispatch early and delegate.
+        # NUFFT computes Q spectrally at the original observations.
         if self.backend_ == "nufft":
             return self._compute_qstat_nufft(
                 source=source,
@@ -1102,7 +1059,6 @@ class DetectorIrregular(Detector):
         logger.info("Computing null distribution for R statistic...")
         q_null = compute_null_params(self.kernel_, method="clt")
         null_params = {
-            "mean_R": 0.0,
             "var_R": q_null["var_R"],
         }
 
@@ -1264,9 +1220,9 @@ class DetectorIrregular(Detector):
         null_params: dict[str, float | np.ndarray] | None = None
         if return_pval:
             # Delegate to compute_null_params — it auto-falls back to
-            # Hutchinson-cumulant Liu when the NUFFT spectrum is
+            # probe-based moment matching when the NUFFT spectrum is
             # unavailable for broad PSD support. Signed spectra use CLT.
-            nm = _resolve_q_null_method(kernel, default="liu")
+            nm = _resolve_q_null_method(kernel)
             null_params = compute_null_params(kernel, method=nm)
 
         logger.info("Preparing %s features (layer=%s)...", source, layer)
@@ -1280,10 +1236,8 @@ class DetectorIrregular(Detector):
 
         def _batch(batch_idx: np.ndarray) -> list[dict[str, Any]]:
             # Densify one small block at a time; never materialize full X.
-            # Do NOT pre-standardize at irregular points — the NUFFT Q-test
-            # is now defined on the *grid* representation, so grid-space
-            # standardization (done inside _q_test_fft via the NUFFT dispatch)
-            # is what matches the FFT-kernel null distribution.
+            # Let spatial_q_test standardize at the n irregular observations;
+            # the internal Fourier grid does not set the null sample size.
             block = np.asarray(X_kept[:, batch_idx].todense(), dtype=np.float64)
             if return_pval:
                 Q_arr, P_arr = spatial_q_test(block, kernel, null_params=null_params)
@@ -1294,20 +1248,9 @@ class DetectorIrregular(Detector):
                 P_arr = np.full_like(Q_arr, np.nan)
             # Reference trace and trace²-based Z for reporting.
             if null_params is not None:
-                # Compute Z-score from the cached moments — prefer the
-                # explicit ``mean_Q/var_Q`` (CLT/Welch path), else
-                # ``cumulants`` (Liu path, ``c_1``/``c_2`` = trace/sq).
-                # Any other config yields Z_score=nan (no reference
-                # moments available).
-                if "mean_Q" in null_params and "var_Q" in null_params:
-                    trK = float(null_params["mean_Q"])
-                    varQ = float(null_params["var_Q"])
-                elif "cumulants" in null_params:
-                    c = null_params["cumulants"]
-                    trK = float(c[1])
-                    varQ = 2.0 * float(c[2])
-                else:
-                    trK, varQ = 0.0, 0.0
+                # All Q calibration methods report the same mean/variance fields.
+                trK = float(null_params["mean_Q"])
+                varQ = float(null_params["var_Q"])
                 sigma = float(np.sqrt(varQ)) if varQ > 0 else 0.0
                 Z_arr = (Q_arr - trK) / sigma if sigma > 0 else np.zeros_like(Q_arr)
             else:

@@ -1,3 +1,32 @@
+"""Spatial statistics and null calibration.
+
+Q calibration has four steps: collect kernel traces, compute null moments,
+fit a distribution, and evaluate its tail. ``compute_null_params`` prepares
+the fit; ``_prepare_q_null`` resolves defaults and validates supplied fits;
+``_q_pvalues`` evaluates the prepared fit for every backend.
+
+The null paths are deliberately distinct:
+
+* Sample-standardized Q: finite-sample ratio moments. ``moments`` selects a
+  four-moment Liu or beta fit, a central chi-square fit, or a normal fallback.
+  Symmetric indefinite kernels, including Moran, can use this path explicitly.
+* Gaussian quadratic forms: ``liu_sf(...)`` retains the original
+  eigenvalue-mixture approximation used by comparison.
+* Welch Q: mean/variance chi-square fit, upper tail.
+* CLT Q: normal approximation, two-sided. A normal fallback within moment matching
+  still uses the upper tail; it is not the CLT test.
+* R: zero-mean normal approximation, two-sided, using ``var_R``.
+
+Finite-sample fitting computes centered/scaled traces directly for numerical
+stability. Zero-variance nulls return p=1.
+
+Automatic Q defaults (also used by detectors) are Welch for MatrixKernel and
+moment matching for FFTKernel/NUFFTKernel with Gaussian, Matérn, CAR or graph
+Laplacian kernels. Moran, and any detected signed Fourier spectrum, use CLT.
+Custom precomputed matrices otherwise default to Welch under the caller's PSD
+assumption; their signs are not inferred by an extra eigendecomposition.
+"""
+
 from __future__ import annotations
 
 import os
@@ -6,7 +35,7 @@ from collections.abc import Sequence
 import numpy as np
 import pandas as pd
 import scipy.sparse as sp
-from scipy.stats import chi2, ncx2, norm
+from scipy.stats import beta, chi2, ncx2, norm
 from tqdm import tqdm
 
 from sonic.kernels import Kernel
@@ -23,6 +52,11 @@ __all__ = [
 ]
 
 _DELTA = 1e-10
+
+# Bound new probe workspace, allowing for eight live float64 blocks.
+_TRACE_PROBE_BUDGET_BYTES = 256 * (1 << 20)
+# Full dense spectra are useful for small problems; larger nulls use probes.
+_DENSE_NULL_SPECTRUM_LIMIT = 2000
 
 
 # Default live-memory budget for :func:`auto_chunk_size` — 2 GiB. On an
@@ -255,68 +289,156 @@ def resolve_chunk_size(
     return min(mem_cap, cap)
 
 
-def _liu_prepare_from_cumulants(
-    c: dict[int, float],
-    kurtosis: bool = False,
-    n: int | None = None,
-) -> dict[str, float]:
-    r"""Pure-math core: Liu shifted-chi² fit from cumulants ``c_1..c_4``.
+def _fit_standardized_q(
+    mean: float, b: dict[int, float], scale: float, n: int, kurtosis: bool = False
+) -> dict:
+    r"""Fit the sample-standardized Q from traces of ``B / scale``.
 
-    Called by both :func:`_liu_prepare` (from an explicit eigenvalue
-    spectrum) and :func:`_hutchinson_cumulants` (from probe estimates),
-    so the shifted-chi² algebra lives in one place. The input ``c`` is a
-    mapping ``{1: c_1, 2: c_2, 3: c_3, 4: c_4}`` with
-    ``c_p = trace(K^p)`` (any contributions from non-unit ``dofs`` /
-    non-zero ``deltas`` must already be folded into these sums).
+    With ``m = n-1``, ``B = HKH - tr(HKH) H/m`` and ``b_j = tr(B^j)``,
+    the Gaussian-null cumulants are
 
-    Parameters
-    ----------
-    c : dict[int, float]
-        Spectral cumulants ``{1: c_1, 2: c_2, 3: c_3, 4: c_4}``.
-    kurtosis : bool, default False
-        Use the kurtosis-based edge-case approximation when Liu's
-        discriminant ``s_1² − s_2`` is non-positive.
-    n : int, optional
-        Sample size. When provided, ``sigma_Q`` is set from the
-        finite-:math:`n` Dirichlet(1/2) variance
-        ``Var[Q] = 2·(m·c_2 − c_1²)/(m+2)`` with ``m = n-1`` — matching
-        the ``dirichlet_correction=True`` branch of
-        :func:`compute_null_params`. Without ``n`` (default) the
-        large-:math:`n` limit ``sigma_Q = sqrt(2·c_2)`` is used, which
-        overestimates ``Var[Q]`` when the spectrum is broad
-        (:math:`c_1^2 \approx m \cdot c_2`) — e.g. CAR on a dense grid —
-        and collapses Liu's tail probability to zero. Passing
-        ``n = kernel.n`` recovers the Welch variance.
+    .. math::
 
-    Returns
-    --------
-    dict[str, float]
-        Liu coefficients for the shifted-chi² approximation, with keys:
+        \kappa_2 &= 2m b_2/(m+2), \\
+        \kappa_3 &= 8m^2 b_3/((m+2)(m+4)), \\
+        \kappa_4 &= \frac{48m^3}{(m+2)(m+4)(m+6)}
+          \left[b_4-\frac{2(m+3)b_2^2}{m(m+2)}\right].
 
-        - ``'mu_Q'`` : float — the mean of the original Q statistic.
-        - ``'sigma_Q'`` : float — the standard deviation of the original Q
-          statistic (with optional finite-``n`` Dirichlet(1/2) correction).
-        - ``'mu_x'`` : float — the mean of the fitted shifted-χ² variable X.
-        - ``'sigma_x'`` : float — the standard deviation of X.
-        - ``'dof_x'`` : float — the degrees of freedom of X.
-        - ``'delta_x'`` : float — the non-centrality parameter of X.
-
-    Consumers (e.g. :func:`spatial_q_test`) read only these coefficients
-    for the final p-value calculation; the input cumulants are not
-    needed beyond this point.
+    Positive skew uses Liu when admissible, otherwise its three-moment
+    central-chi-square fallback. Shapes with insufficient kurtosis for Liu
+    (including negative excess kurtosis) use a four-moment beta fit when
+    possible. Remaining symmetric/left-skewed shapes use a normal fallback.
+    These formulas require symmetry, not positive semidefiniteness. All fits
+    are moment approximations, not exact tail probabilities.
     """
-    # ponytail: TODO estimate centered/scaled traces of B = HKH - tr(HKH)/m * H
-    # directly, and correct the third/fourth moments for sample standardization.
-    # The current Liu fit corrects only variance; validate its shape/admissibility
-    # and null calibration before replacing this raw-cumulant approximation.
-    s1 = c[3] / (np.sqrt(c[2]) ** 3 + _DELTA)
-    s2 = c[4] / (c[2] ** 2 + _DELTA)
+    # 1. Convert scaled B traces to the moments of sample-standardized Q.
+    m = n - 1
+    coef = {
+        "model": "standardized_q",
+        "family": "normal",
+        "fit": "degenerate",
+        "mu_Q": float(mean),
+        "sigma_Q": 0.0,
+    }
+    if b[2] <= 0 or scale == 0:
+        return coef
+    coef["sigma_Q"] = float(scale * np.sqrt(2 * m * b[2] / (m + 2)))
+    s1 = np.sqrt(m * (m + 2)) / (m + 4) * b[3] / b[2] ** 1.5
+    s2 = (m * (m + 2) * b[4] / b[2] ** 2 - 2 * (m + 3)) / ((m + 4) * (m + 6))
+    if not np.isfinite(s1) or not np.isfinite(s2):
+        raise ValueError("Non-finite standardized Q moments.")
 
+    coef["fit"] = "normal_fallback"
+
+    # 2. Match all four moments with Liu only when its parameters are valid.
+    # Noncentral chi-square requires 1 <= s1^2/s2 < 9/8 and positive skew.
+    if s1 > 1e-7 and s2 > 0 and s2 <= s1 * s1 < 1.125 * s2:
+        fit = "liu4"
+        a = 1 / (s1 - np.sqrt(max(s1 * s1 - s2, 0.0)))
+        delta = max(s1 * a**3 - a**2, 0.0)
+        dof = a**2 - 2 * delta
+    else:
+        skew, excess = np.sqrt(8) * s1, 12 * s2
+        # 3. Try a bounded four-moment beta fit for shapes Liu cannot represent.
+        # Solve its equations for a+b and (b-a)/(a+b).
+        denominator = 3 * skew**2 - 2 * excess
+        if denominator > 1e-12:
+            total = 6 * (2 + excess - skew**2) / denominator
+            if total > 0:
+                ratio = skew * (total + 2) / np.sqrt(skew**2 * (total + 2) ** 2 + 16 * (total + 1))
+                alpha, beta_shape = total * (1 - ratio) / 2, total * (1 + ratio) / 2
+                if min(alpha, beta_shape) > 0:
+                    coef.update(
+                        family="beta",
+                        fit="beta4",
+                        alpha=float(alpha),
+                        beta=float(beta_shape),
+                        mu_x=float(alpha / total),
+                        sigma_x=float(np.sqrt(alpha * beta_shape / (total + 1)) / total),
+                    )
+                    return coef
+        # 4. Preserve the existing fallback policy: normal for remaining
+        # symmetric/left-skewed shapes, central chi-square for positive skew.
+        if s1 <= 1e-7:
+            return coef
+        dof = 1 / (s2 if kurtosis and s2 > 0 else s1 * s1)
+        fit = "chi2_kurtosis" if kurtosis and s2 > 0 else "chi2_skewness"
+        delta = 0.0
+    if dof <= 0 or not np.isfinite(dof + delta):
+        return coef
+    coef.update(
+        family="ncx2",
+        fit=fit,
+        mu_x=float(dof + delta),
+        sigma_x=float(np.sqrt(2 * (dof + 2 * delta))),
+        dof_x=float(dof),
+        delta_x=float(delta),
+    )
+    return coef
+
+
+def _spectrum_traces(lambs: np.ndarray, n: int, dofs: np.ndarray | None = None) -> dict:
+    """Collect the Q mean and scaled B traces from a centered spectrum.
+
+    Return ``mean``, ``powers``, ``scale`` and ``source`` in the same format
+    as :func:`_estimate_kernel_traces`. Include omitted zero modes up to the
+    n-1 centered dimensions; remove only the structural constant mode.
+    """
+    if n < 2:
+        raise ValueError("Sample-standardized Q requires n >= 2.")
+    lam = np.asarray(lambs, dtype=float).ravel()
+    weights = np.ones_like(lam) if dofs is None else np.broadcast_to(dofs, lam.shape).copy()
+    if not np.all(np.isfinite(lam)) or not np.all(np.isfinite(weights)) or np.any(weights < 0):
+        raise ValueError("Kernel eigenvalues and non-negative degrees of freedom must be finite.")
+    m = n - 1
+    missing = m - float(weights.sum())
+    if missing < 0 and lam.size:
+        # A full HKH spectrum includes the removed constant direction once.
+        dc = int(np.argmin(np.abs(lam)))
+        tolerance = 64 * np.finfo(float).eps * np.max(np.abs(lam))
+        if missing == -1 and abs(lam[dc]) <= tolerance and weights[dc] >= 1:
+            weights[dc] -= 1
+            missing = 0.0
+    if missing < 0:
+        raise ValueError("The kernel spectrum exceeds the n-1 centered dimensions.")
+    keep = weights > 0
+    lam, weights = lam[keep], weights[keep]
+    mean = float(np.sum(weights * lam))
+    offset = mean / m
+    shifted = lam - offset
+    scale = max(float(np.max(np.abs(shifted), initial=0)), abs(offset) if missing else 0.0)
+    if scale <= 64 * np.finfo(float).eps * np.max(np.abs(lam), initial=0):
+        return {
+            "mean": mean,
+            "powers": dict.fromkeys((2, 3, 4), 0.0),
+            "scale": 0.0,
+            "source": "spectrum",
+        }
+    shifted /= scale
+    b = {
+        p: float(np.sum(weights * shifted**p) + missing * (-offset / scale) ** p) for p in (2, 3, 4)
+    }
+    return {"mean": mean, "powers": b, "scale": scale, "source": "spectrum"}
+
+
+def _fit_gaussian_quadratic(mean: float, powers: dict[int, float], kurtosis: bool = False) -> dict:
+    r"""Fit the unstandardized Gaussian quadratic form with Liu's approximation.
+
+    ``powers[p]`` is the spectral power sum (including degrees of freedom and
+    noncentrality weights); the statistical cumulant is
+    ``2**(p-1) * (p-1)! * powers[p]``. No sample-standardization correction belongs
+    here. Preserve this calculation for ``liu_sf(...)`` and comparison.
+    """
+    s1 = powers[3] / (np.sqrt(powers[2]) ** 3 + _DELTA)
+    s2 = powers[4] / (powers[2] ** 2 + _DELTA)
+
+    fit = "liu4"
     s12 = s1**2
     if s12 > s2:
         denom = s1 - np.sqrt(s12 - s2)
         if abs(denom) < _DELTA:
             # Catastrophic cancellation — fall back to the kurtosis path.
+            fit = "chi2_kurtosis"
             delta_x = 0.0
             dof_x = 1.0 / (s2 + _DELTA)
         else:
@@ -324,6 +446,7 @@ def _liu_prepare_from_cumulants(
             delta_x = s1 * a**3 - a**2
             dof_x = a**2 - 2.0 * delta_x
     else:
+        fit = "chi2_kurtosis" if kurtosis else "chi2_skewness"
         delta_x = 0.0
         if kurtosis:
             dof_x = 1.0 / (s2 + _DELTA)
@@ -332,17 +455,13 @@ def _liu_prepare_from_cumulants(
     dof_x = max(dof_x, _DELTA)
     delta_x = max(delta_x, 0.0)
 
-    # sigma_Q: Dirichlet(1/2)-corrected for the z-scored ratio Q when n
-    # is provided. See :func:`compute_null_params` Notes for the full
-    # derivation of ``Var[Q] = 2·(m·c_2 − c_1²)/(m+2)``.
-    if n is not None and n >= 2:
-        m = n - 1
-        var_Q = 2.0 * max(m * c[2] - c[1] ** 2, 0.0) / (m + 2)
-    else:
-        var_Q = 2.0 * c[2]
+    var_Q = 2.0 * powers[2]
 
     return {
-        "mu_Q": float(c[1]),
+        "model": "gaussian_quadratic",
+        "family": "ncx2",
+        "fit": fit if var_Q > 0 else "degenerate",
+        "mu_Q": float(mean),
         "sigma_Q": float(np.sqrt(max(var_Q, 0.0))),
         "mu_x": float(dof_x + delta_x),
         "sigma_x": float(np.sqrt(2 * (dof_x + 2 * delta_x))),
@@ -351,17 +470,19 @@ def _liu_prepare_from_cumulants(
     }
 
 
-def _liu_prepare(
+def _prepare_moment_fit(
     lambs: np.ndarray,
     dofs: np.ndarray | None = None,
     deltas: np.ndarray | None = None,
     kurtosis: bool = False,
     n: int | None = None,
-) -> dict[str, float]:
-    """Precompute Liu coefficients from the kernel eigenvalue spectrum.
+) -> dict:
+    """Prepare a moment fit from the kernel eigenvalue spectrum.
 
-    Thin wrapper — builds ``c_1..c_4`` from the weighted eigenvalues and
-    calls :func:`_liu_prepare_from_cumulants`.
+    With ``n``, accumulate centered/scaled powers directly. Omitted zero
+    eigenvalues are included up to the ``n-1`` centered dimensions; a full
+    ``HKH`` spectrum may include its one extra zero constant mode. Without
+    ``n``, preserve the unstandardized Gaussian-mixture fit.
 
     Parameters
     ----------
@@ -373,10 +494,15 @@ def _liu_prepare(
     kurtosis : bool, default False
         Use the kurtosis-based edge-case approximation.
     n : int, optional
-        Sample size for the Dirichlet(1/2) variance correction. See
-        :func:`_liu_prepare_from_cumulants` for details.
+        Sample size for finite-sample moment correction. Noncentral variables
+        are unsupported in this mode; ``dofs`` must fit in ``n-1`` dimensions.
     """
     lambs = np.asarray(lambs, dtype=float)
+    if n is not None:
+        if deltas is not None and np.any(np.asarray(deltas) != 0):
+            raise ValueError("Sample-standardized Q requires central variables (deltas=0).")
+        traces = _spectrum_traces(lambs, n, dofs)
+        return _fit_standardized_q(traces["mean"], traces["powers"], traces["scale"], n, kurtosis)
     if dofs is None:
         dofs = np.ones_like(lambs)
     else:
@@ -385,184 +511,288 @@ def _liu_prepare(
         deltas = np.zeros_like(lambs)
     else:
         deltas = np.asarray(deltas, dtype=float)
-    lambs_pow = {i: lambs**i for i in range(1, 5)}
-    c = {
-        i: float(np.sum(lambs_pow[i] * dofs) + i * np.sum(lambs_pow[i] * deltas))
-        for i in range(1, 5)
-    }
-    return _liu_prepare_from_cumulants(c, kurtosis=kurtosis, n=n)
+    mean = float(np.sum(lambs * (dofs + deltas)))
+    powers = {p: float(np.sum(lambs**p * (dofs + p * deltas))) for p in (2, 3, 4)}
+    return _fit_gaussian_quadratic(mean, powers, kurtosis=kurtosis)
 
 
-def _hutchinson_cumulants(
+def _estimate_kernel_traces(  # noqa: C901
     kernel: Kernel,
     n_probes: int = 60,
     rng_seed: int = 0,
-    use_analytic_c12: bool = True,
-) -> dict[int, float]:
-    r"""Estimate ``c_p = tr(K^p)``, ``p = 1..4`` using random probes.
+    use_analytic_traces: bool = True,
+    *,
+    centered: bool = False,
+    max_order: int = 4,
+) -> dict:
+    r"""Collect Q traces and the R variance with one shared probe budget.
 
-    General probe form. For iid ``v`` with ``E[vvᵀ] = I``:
-    :math:`c_p = \mathbb{E}[\mathbf{v}^\top \mathbf{K}^p \mathbf{v}]`.
-    Two matvecs per probe yield
-    :math:`\mathbf{u}_s = \mathbf{K}\mathbf{v}_s` and
-    :math:`\mathbf{w}_s = \mathbf{K}^2 \mathbf{v}_s`, from which
-    all four cumulants fall out as inner products:
+    ``max_order=2`` returns the mean and second trace of A=HKH for Welch/CLT.
+    Order four additionally estimates powers of A, or of the scaled contrast
+    B=A-tr(A)H/(n-1) when ``centered=True``. These are spectral power sums,
+    not statistical cumulants. ``var_R`` retains the kernel's centered/raw view.
 
-    .. math::
-
-        \hat c_1 &= \tfrac{1}{m}\textstyle\sum_s \mathbf{v}_s^\top \mathbf{u}_s,
-        &\hat c_2 &= \tfrac{1}{m}\textstyle\sum_s \|\mathbf{u}_s\|^2, \\
-        \hat c_3 &= \tfrac{1}{m}\textstyle\sum_s \mathbf{u}_s^\top \mathbf{w}_s,
-        &\hat c_4 &= \tfrac{1}{m}\textstyle\sum_s \|\mathbf{w}_s\|^2.
-
-    Here we use **iid Rademacher** probes (``±1`` with equal probability),
-    which has strictly smaller variance on :math:`v^\top A v` than
-    :math:`\mathcal{N}(0, I)` probes at fixed probe count:
-
-    .. math::
-
-        \mathrm{Var}_{\text{Rad}}[v^\top A v] &= 2 \sum_{i \neq j} A_{ij}^2
-        = 2\bigl(\|A\|_F^2 - \|\mathrm{diag}(A)\|^2\bigr), \\
-        \mathrm{Var}_{\mathcal{N}}[v^\top A v] &= 2 \|A\|_F^2.
-
-    ``K`` centering is inherited from :meth:`~sonic.kernels.Kernel.Kx`
-    (which applies ``H`` on both sides whenever ``centering=True``).
-    Analytic substitutions listed below all read from backend-specific
-    :meth:`trace` / :meth:`square_trace` methods that already embed the
-    centering correction (``-s₁/n`` for ``c_1``; ``-2·s₂/n + s₁²/n²`` for ``c_2``).
-
-    Backend-specific fast paths
-    ---------------------------
-
-    *FFTKernel* — **full spectrum always, all four cumulants analytic**
-        ``c_p = Σ_k λ̃(k)^p`` is computed analytically using the ``n`` Fourier
-        modes (``O(n)``) cached from :meth:`~sonic.kernels.fft.FFTKernel.eigenvalues`.
-
-    *MatrixKernel / NUFFTKernel — ``use_analytic_c12=True``* (default)
-        ``c_1`` from :meth:`trace`, ``c_2`` from :meth:`square_trace`
-        (both exact: diagonal-sum / Frobenius² on ``MatrixKernel``,
-        coord-invariant ``(n/n')·Σλ`` / doubled-grid linear-conv
-        ``λᵀΨλ`` on ``NUFFTKernel``). ``c_3``, ``c_4`` always come from
-        the Rademacher probe estimator (closed-form formula are often
-        too expensive).
-
-    *MatrixKernel with ``stores_precision=True``* (CAR, Graph Laplacian)
-        The stored object is the precision :math:`K^{-1}`, and the
-        kernel's :meth:`trace` / :meth:`square_trace` are themselves
-        Hutchinson estimators (``±1`` Rademacher probes through an LU
-        solve on the precision). We forward the current ``n_probes`` so
-        the precision-side Hutchinson budget tracks this caller's
-        budget; ``c_3`` / ``c_4`` use our Rademacher probes as usual.
-
-    *``use_analytic_c12=False``*
-        All four cumulants from the same Rademacher probes — useful for
-        diagnostics or when the analytic paths are known to be
-        unreliable.
-
-    Parameters
-    ----------
-    kernel : Kernel
-        Must expose ``Kx(v)``. ``FFTKernel`` takes the fast path above.
-    n_probes : int, default 60
-        Probe count for the ``c_3`` / ``c_4`` estimator — also forwarded
-        to :meth:`trace` / :meth:`square_trace` on precision-stored
-        ``MatrixKernel``. ``m=60`` lands Liu p-values within ``~5%`` of
-        the eigenvalue-exact baseline; ``m=120`` within ``~0.2%``. Cost
-        scales as ``2·n_probes`` kernel matvecs (plus the same count of
-        LU solves when precision-stored).
-    rng_seed : int, default 0
-        Seed for reproducible probe draws.
-    use_analytic_c12 : bool, default True
-        If ``True`` (default), substitute analytic ``c_1`` / ``c_2`` on
-        ``MatrixKernel`` / ``NUFFTKernel`` as described above; on
-        ``FFTKernel`` the full-spectrum fast path runs regardless.
-        Set ``False`` to force the pure-probe estimator (still skips
-        ``FFTKernel``'s fast path).
-
-    Returns
-    -------
-    dict[int, float]
-        ``{1: c_1, 2: c_2, 3: c_3, 4: c_4}`` of the input kernel ``K``.
+    Explicit kernels retain analytic lower traces where available. Precision
+    kernels reuse cached raw probes and solves, then project them to HKH.
+    Higher powers use a second application to the same probes. Large probe
+    sets are processed in bounded blocks; when the global mean is estimated,
+    replaying the first application costs a third pass instead of storing all
+    solutions. Every block uses the same offset. Draws are independent of
+    block size. FFT kernels always use their inexpensive full spectrum.
     """
-    # ------------------------------------------------------------------
-    # FFTKernel fast path — full spectrum is O(n) and exact for all c_p.
-    # ------------------------------------------------------------------
-    from sonic.kernels.fft import FFTKernel  # lazy to avoid circular import
+    from sonic.kernels.fft import FFTKernel
 
+    if (
+        isinstance(n_probes, (bool, np.bool_))
+        or not np.isfinite(n_probes)
+        or n_probes < 1
+        or int(n_probes) != n_probes
+    ):
+        raise ValueError("n_probes must be a positive integer.")
+    if max_order not in (2, 4):
+        raise ValueError("max_order must be 2 or 4.")
+    n_probes = int(n_probes)
+    n, m = int(kernel.n), int(kernel.n) - 1
+    if m < 1:
+        raise ValueError("Spatial null calibration requires n >= 2.")
     if isinstance(kernel, FFTKernel):
-        # ``return_full_layout=True`` unpacks the rfft2 half-spectrum to
-        # the full ``ny·nx`` layout and zeroes the DC bin when
-        # ``centering=True`` (see FFTKernel.eigenvalues docstring).
-        lam = np.asarray(kernel.eigenvalues(return_full_layout=True), dtype=float)
-        sig = lam[np.abs(lam) > _DELTA]
-        return {p: float(np.sum(sig**p)) for p in (1, 2, 3, 4)}
+        lam = np.asarray(kernel.eigenvalues(return_full_layout=True), dtype=float).copy()
+        var_R = float(np.sum(lam**2))
+        lam[0] = 0.0  # Q always projects out the constant mode.
+        if centered and max_order == 4:
+            return {**_spectrum_traces(lam, n), "var_R": var_R}
+        return {
+            "mean": float(lam.sum()),
+            "powers": {p: float(np.sum(lam**p)) for p in range(2, max_order + 1)},
+            "scale": 1.0,
+            "source": "spectrum",
+            "var_R": var_R,
+        }
 
-    # ------------------------------------------------------------------
-    # General path — probe c_3, c_4; analytic / Hutchinson-via-trace
-    # for c_1, c_2 depending on the backend.
-    # ------------------------------------------------------------------
-    rng = np.random.default_rng(rng_seed)
-    V_flat = rng.choice(np.array([-1.0, 1.0]), size=(int(kernel.n), int(n_probes)))
-
-    def _apply(x_flat: np.ndarray) -> np.ndarray:
-        return np.asarray(kernel.Kx(x_flat))
-
-    U = _apply(V_flat)
-    W = _apply(U)
-    c1_probe = float(np.mean(np.sum(V_flat * U, axis=0)))
-    c2_probe = float(np.mean(np.sum(U * U, axis=0)))
-    c3 = float(np.mean(np.sum(U * W, axis=0)))
-    c4 = float(np.mean(np.sum(W * W, axis=0)))
-
-    c1, c2 = c1_probe, c2_probe
-    if use_analytic_c12 and hasattr(kernel, "trace") and hasattr(kernel, "square_trace"):
-        is_precision_stored = bool(getattr(kernel, "stores_precision", False))
+    precision = bool(getattr(kernel, "stores_precision", False))
+    kernel_centered = getattr(kernel, "centering", True)
+    c1 = c2 = var_R = None
+    analytic = False
+    # The constant-vector solve also converts cached KV into HKHV, without
+    # repeating the first batch of precision solves or changing kernel state.
+    K1 = None
+    if precision:
+        K1 = np.asarray(kernel._apply_K_dense(np.ones((n, 1)))).ravel()
+    elif not kernel_centered:
+        K1 = np.asarray(kernel.Kx(np.ones(n))).ravel()
+    if use_analytic_traces and not precision:
         try:
-            if is_precision_stored:
-                # MatrixKernel with stored precision: ``trace`` /
-                # ``square_trace`` are themselves Hutchinson estimators
-                # through an LU solve. Forward ``n_probes`` so the
-                # internal cache uses our probe budget.
-                c1 = float(kernel.trace(n_probes=n_probes))
-                c2 = float(kernel.square_trace(n_probes=n_probes))
-            else:
-                # Analytic paths. All three backends (MatrixKernel
-                # non-precision, FFTKernel, NUFFTKernel) return
-                # deterministic analytic cumulants from a no-arg call.
-                c1 = float(kernel.trace())
-                c2 = float(kernel.square_trace())
+            c1, c2 = float(kernel.trace()), float(kernel.square_trace())
+            var_R = c2
+            if not kernel_centered:
+                dc = float(K1.sum() / n)
+                c1 -= dc
+                c2 = max(c2 - 2 * float(K1 @ K1) / n + dc**2, 0.0)
+            analytic = True
         except (ValueError, NotImplementedError):
-            # Any analytic path that refuses (e.g. indefinite-Λ
-            # cancellation) silently falls back to probe estimates.
-            c1, c2 = c1_probe, c2_probe
+            c1 = c2 = var_R = None
 
-    return {1: c1, 2: c2, 3: c3, 4: c4}
+    block_size = min(n_probes, max(1, _TRACE_PROBE_BUDGET_BYTES // (8 * n * 8)))
+    cached = getattr(kernel, "_trace_rvs_cache", None) if precision and rng_seed == 0 else None
+    if cached is not None and cached["n_vectors"] != n_probes:
+        cached = None
+    if precision and rng_seed == 0 and cached is None and block_size == n_probes:
+        cached = kernel._get_rvs_trace_cache(n_probes)
+
+    def probe_blocks():
+        # This iterator is replayed only when the global offset is not known
+        # and the first-pass solutions do not fit the workspace budget.
+        rng = np.random.default_rng(rng_seed)
+        for start in range(0, n_probes, block_size):
+            count = min(block_size, n_probes - start)
+            if cached is not None:
+                V = cached["rvs"][:, start : start + count]
+                Y = cached["Y"][:, start : start + count]
+            else:
+                V = rng.choice([-1.0, 1.0], size=(count, n)).T
+                Y = np.asarray(kernel._apply_K_dense(V) if precision else kernel.Kx(V))
+            raw_second = float(np.sum(Y * Y))
+            means = V.mean(axis=0)
+            U = Y if K1 is None else Y - K1[:, None] * means
+            U = U - U.mean(axis=0)
+            yield V - means, U, raw_second
+
+    # One extra pass is needed only to learn the global B offset. For small
+    # jobs retain its single block; large jobs replay identical probe draws.
+    mean_pass = centered and max_order == 4 and not analytic
+    saved = None
+    sums = np.zeros(4)  # <V,AV>, ||AV||², ||V||², raw R second trace
+    powers = dict.fromkeys(range(2, max_order + 1), 0.0)
+    scale = 0.0 if centered and max_order == 4 else 1.0
+    largest_action = 0.0
+    for phase in range(2 if mean_pass else 1):
+        blocks = [saved] if phase == 1 and saved is not None else probe_blocks()
+        for V, U, raw_second in blocks:
+            if phase == 0:
+                sums += [np.sum(V * U), np.sum(U * U), np.sum(V * V), raw_second]
+                largest_action = max(largest_action, float(np.max(np.abs(U))))
+            if mean_pass and phase == 0:
+                if block_size == n_probes:
+                    saved = (V, U, raw_second)
+                continue
+            if max_order == 2:
+                continue
+            if centered:
+                offset = c1 / m
+                U = U - offset * V
+                block_scale = float(np.max(np.abs(U)))
+                if block_scale <= 64 * np.finfo(float).eps * max(largest_action, abs(offset)):
+                    continue
+                # Rescale accumulated sums when a later block has a larger
+                # contrast, avoiding fourth-power overflow/underflow.
+                new_scale = max(scale, block_scale)
+                for p in powers:
+                    powers[p] *= (scale / new_scale) ** p
+                scale = new_scale
+                U /= scale
+                W = np.asarray(kernel.Kx(U))
+                W -= W.mean(axis=0)
+                W -= offset * U
+                W /= scale
+            else:
+                W = np.asarray(kernel.Kx(U))
+                W -= W.mean(axis=0)
+            powers[2] += float(np.sum(U * U))
+            powers[3] += float(np.sum(U * W))
+            powers[4] += float(np.sum(W * W))
+        if phase == 0:
+            if centered and sums[2] == 0:
+                raise ValueError("All centered probes were constant; increase n_probes.")
+            weight = m / sums[2] if centered else 1.0 / n_probes
+            if not analytic:
+                c1, c2 = float(weight * sums[0]), float(weight * sums[1])
+                var_R = c2 if kernel_centered else float(sums[3] / n_probes)
+
+    powers = {p: float(weight * value) for p, value in powers.items()}
+    if max_order == 2 or not centered:
+        powers[2] = c2
+    elif scale > 0:
+        b2_exact = c2 - c1**2 / m
+        if analytic and b2_exact > np.sqrt(np.finfo(float).eps) * c2:
+            powers[2] = b2_exact / scale**2
+    return {"mean": c1, "powers": powers, "scale": scale, "source": "probes", "var_R": var_R}
 
 
-def _liu_apply(t: float | np.ndarray, coef: dict[str, float]) -> np.ndarray:
-    """Evaluate ``Pr(Q > t)`` from cached Liu coefficients.
+def _moment_sf(t: float | np.ndarray, coef: dict) -> np.ndarray:
+    """Evaluate ``Pr(Q > t)`` from a prepared moment fit.
 
-    ``coef`` is the dict returned by :func:`_liu_prepare`. Broadcasts
-    across array ``t`` in a single :func:`scipy.stats.ncx2.sf` call.
+    ``coef`` is the dict returned by :func:`_prepare_moment_fit`. Broadcasts across
+    ``t`` using the fitted chi-square, beta, or normal survival function.
     """
     t = np.asarray(t, dtype=float)
     if coef["sigma_Q"] <= 0:
         return np.ones_like(t)
+    if coef["model"] == "standardized_q":
+        z = (t - coef["mu_Q"]) / coef["sigma_Q"]
+        if coef["family"] == "normal":
+            return norm.sf(z)
+        x = z * coef["sigma_x"] + coef["mu_x"]
+        if coef["family"] == "beta":
+            return beta.sf(x, coef["alpha"], coef["beta"])
+        return ncx2.sf(x, coef["dof_x"], coef["delta_x"])
+    # Preserve the unstandardized Gaussian-mixture calculation (n=None).
     t_star = (t - coef["mu_Q"]) / (coef["sigma_Q"] + _DELTA)
     tfinal = t_star * coef["sigma_x"] + coef["mu_x"]
     return ncx2.sf(tfinal, coef["dof_x"], max(coef["delta_x"], 1e-9))
 
 
+def _prepare_q_null(kernel: Kernel, null_params: dict | None = None) -> dict:  # noqa: C901
+    """Resolve defaults or validate a prepared Q cache before feature chunking.
+
+    Matrix kernels default to Welch; Fourier kernels default to moments;
+    recognized signed kernels default to CLT. Supply either a method-only
+    request or the cache returned by ``compute_null_params``. Partial caches
+    are rejected instead of silently rebuilding a different null model.
+    """
+    # Check the method even for cached fits, so signed-kernel checks apply.
+    requested = None if null_params is None else null_params.get("method")
+    fit = None if null_params is None else null_params.get("q_fit")
+    fit_model = fit.get("model") if isinstance(fit, dict) else None
+    model = None if null_params is None else null_params.get("model", fit_model)
+    method = _resolve_q_null_method(
+        kernel,
+        requested,
+        dirichlet_correction=model != "gaussian_quadratic",
+    )
+    if null_params is None or null_params.keys() <= {"method"}:
+        if not hasattr(kernel, "square_trace"):
+            raise ValueError(
+                "A raw kernel matrix requires null_params; wrap it in MatrixKernel "
+                "or pass a prepared null from compute_null_params."
+            )
+        return compute_null_params(kernel, method=method)
+
+    # Reuse fitted parameters without modifying the caller's dictionary.
+    required = {"method", "mean_Q", "var_Q"}
+    if method == "moments":
+        required.add("q_fit")
+    elif method == "welch":
+        required.update(("scale_g", "df_h"))
+    missing = sorted(key for key in required if null_params.get(key) is None)
+    if missing:
+        raise ValueError(
+            f"Incomplete null_params for method={method!r}: missing {', '.join(missing)}. "
+            "Build the cache with compute_null_params."
+        )
+    if model is not None and model not in {"standardized_q", "gaussian_quadratic"}:
+        raise ValueError("Invalid null_params model; rebuild with compute_null_params.")
+    expected_tail = "two-sided" if method == "clt" else "upper"
+    if null_params.get("tail", expected_tail) != expected_tail:
+        raise ValueError(
+            "null_params tail does not match its method; rebuild with compute_null_params."
+        )
+    if method == "moments":
+        if not isinstance(fit, dict) or fit.get("family") not in {"normal", "beta", "ncx2"}:
+            raise ValueError(
+                "Incomplete or invalid q_fit family; rebuild with compute_null_params."
+            )
+        required_fit = {"model", "mu_Q", "sigma_Q"}
+        if fit["family"] != "normal":
+            required_fit.update(("mu_x", "sigma_x"))
+            required_fit.update(
+                ("alpha", "beta") if fit["family"] == "beta" else ("dof_x", "delta_x")
+            )
+        if any(fit.get(key) is None for key in required_fit):
+            raise ValueError("Incomplete q_fit; rebuild with compute_null_params.")
+        if fit_model != model or (fit_model == "gaussian_quadratic" and fit["family"] != "ncx2"):
+            raise ValueError(
+                "q_fit model does not match null_params; rebuild with compute_null_params."
+            )
+    return null_params
+
+
+def _q_pvalues(Q: float | np.ndarray, params: dict) -> np.ndarray:
+    """Evaluate a prepared Q null without estimating traces or fitting again.
+
+    Welch and moment fits use the upper tail. CLT is two-sided. A zero
+    variance returns p=1; positive variances use the same rule on all backends.
+    """
+    Q = np.asarray(Q, dtype=float)
+    method = params["method"]
+    if method == "moments":
+        return _moment_sf(Q, params["q_fit"])
+    if method == "welch":
+        return _welch_apply(Q, params)
+    if method == "clt":
+        sigma = np.sqrt(max(params["var_Q"], 0.0))
+        if sigma <= 0:
+            return np.ones_like(Q)
+        z = (Q - params["mean_Q"]) / sigma
+        return chi2.sf(z * z, df=1)  # Two-sided normal tail; moment fits always use the upper tail.
+    raise ValueError(f"Unknown null approximation method: {method!r}")
+
+
 def _welch_apply(t: float | np.ndarray, params: dict) -> np.ndarray:
     """Apply the Welch null, treating a deterministic Q as uninformative."""
     t = np.asarray(t, dtype=float)
-    if params.get("var_Q", 1.0) <= 0 or params.get("mean_Q", 1.0) <= 0:
+    if params["var_Q"] <= 0 or params["mean_Q"] <= 0:
         return np.ones_like(t)
-    if "scale_g" in params and "df_h" in params:
-        g, h = params["scale_g"], params["df_h"]
-    else:
-        g = params["var_Q"] / (2.0 * params["mean_Q"])
-        h = 2.0 * params["mean_Q"] ** 2 / params["var_Q"]
+    g, h = params["scale_g"], params["df_h"]
     if g <= 0 or h <= 0:
         return np.ones_like(t)
     return chi2.sf(t / g, df=h)
@@ -574,55 +804,34 @@ def liu_sf(
     dofs: np.ndarray | None = None,
     deltas: np.ndarray | None = None,
     kurtosis: bool = False,
-    n: int | None = None,
 ) -> float | np.ndarray:
+    """Approximate the upper tail of a Gaussian quadratic form using Liu's fit.
+
+    ``lambs`` are eigenvalue weights, ``dofs`` are degrees of freedom
+    (default ones), and ``deltas`` are noncentralities (default zeros).
+    ``kurtosis=True`` selects the kurtosis-based central chi-square fallback.
+    The returned probability has the same shape as ``t``.
+
+    This is the unstandardized eigenvalue-mixture model used by comparison.
+    For sample-standardized spatial Q, use ``compute_null_params`` with
+    ``method="moments"`` and pass that cache to ``spatial_q_test``.
     """
-    Liu approximation to a linear combination of non-central chi-squared variables.
-
-    One-shot convenience wrapper equivalent to
-    ``_liu_apply(t, _liu_prepare(lambs, ...))``. For multi-feature
-    workloads, prefer the split form: call :func:`_liu_prepare` once on
-    the spectrum and :func:`_liu_apply` for each Q-batch
-    (:func:`compute_null_params` already caches the coefficients under
-    ``null_params['liu_coef']``, so :func:`spatial_q_test` does this
-    automatically).
-
-    Parameters
-    ----------
-    t : float or np.ndarray
-        Test statistic value(s). Array input is broadcast efficiently
-        through a single :func:`scipy.stats.ncx2.sf` call.
-    lambs : np.ndarray
-        Eigenvalues of the kernel matrix, shape ``(n_evals,)``.
-    dofs : np.ndarray, optional
-        Per-eigenvalue degrees of freedom. Default: ones (chi-squared).
-    deltas : np.ndarray, optional
-        Non-centrality parameters. Default: zeros (central).
-    kurtosis : bool, default False
-        If True, use the kurtosis-based edge-case approximation.
-    n : int, optional
-        Sample size. When provided, applies the Dirichlet(1/2) variance
-        correction ``Var[Q] = 2·(m·c_2 - c_1²)/(m+2)`` with ``m = n-1``
-        for the z-scored ratio ``Q = XᵀK̃X/σ̂²``. Essential for
-        broad-spectrum PSD kernels (CAR, graph_laplacian) on dense
-        grids, where the large-:math:`n` limit ``2·c_2`` overestimates
-        ``Var[Q]`` and collapses the tail to zero. Default ``None``
-        keeps the original large-:math:`n` behavior for back-compat
-        with callers supplying a raw eigenvalue mixture.
-
-    Returns
-    -------
-    float or np.ndarray
-        Tail probability ``Pr(Q > t)`` with the same shape as ``t``.
-    """
-    coef = _liu_prepare(lambs, dofs=dofs, deltas=deltas, kurtosis=kurtosis, n=n)
-    return _liu_apply(t, coef)
+    coef = _prepare_moment_fit(lambs, dofs=dofs, deltas=deltas, kurtosis=kurtosis)
+    return _moment_sf(t, coef)
 
 
 def _resolve_q_null_method(
-    kernel: Kernel, method: str | None = None, *, default: str = "welch"
+    kernel: Kernel,
+    method: str | None = None,
+    *,
+    dirichlet_correction: bool = True,
 ) -> str:
-    """Use CLT for Moran/signed Fourier kernels; reject explicit PSD-only fits."""
+    """Resolve the same automatic Q method for direct calls and detectors."""
+    from sonic.kernels.fft import FFTKernel
+    from sonic.kernels.nufft import NUFFTKernel
+
+    if method is not None and method not in {"clt", "welch", "moments"}:
+        raise ValueError(f"Unknown null method {method!r}; choose 'clt', 'welch', or 'moments'.")
     indefinite = getattr(kernel, "method", None) == "moran"
     # NUFFT uses this same Fourier spectrum to apply the irregular-point kernel.
     fourier_kernel = getattr(kernel, "_fft_kernel", kernel)
@@ -631,220 +840,218 @@ def _resolve_q_null_method(
         tolerance = 64 * np.finfo(float).eps * float(np.max(np.abs(spectrum)))
         indefinite |= bool(np.min(spectrum) < -tolerance)
     if method is None:
-        return "clt" if indefinite else default
-    if indefinite and method != "clt":
+        if indefinite:
+            return "clt"
+        return "moments" if isinstance(kernel, (FFTKernel, NUFFTKernel)) else "welch"
+    # Finite-sample moments depend on centered eigenvalue contrasts, not their signs.
+    # Welch and the unstandardized Gaussian-mixture fit still require PSD kernels.
+    if indefinite and (method == "welch" or (method == "moments" and not dirichlet_correction)):
         raise ValueError(
-            "Indefinite kernels support only null_method='clt' for the Q-test; "
-            f"Welch and Liu require a PSD kernel. Got method={method!r}."
+            "Welch and unstandardized moment fits require a PSD kernel. "
+            "For indefinite kernels, use method='clt' or method='moments' "
+            "with dirichlet_correction=True."
         )
     return method
 
 
-def compute_null_params(
+def compute_null_params(  # noqa: C901
     kernel: Kernel,
-    method: str = "welch",
+    method: str | None = None,
     k_eigen: int | None = None,
     dirichlet_correction: bool = True,
-    liu_n_probes: int | None = None,
-) -> dict[str, float | np.ndarray]:
-    r"""
-    Pre-compute null distribution parameters for spatial tests.
+    n_probes: int | None = None,
+) -> dict:
+    r"""Prepare and cache the Q null, plus the variance needed by the R-test.
 
-    Call this ONCE before running parallel tests on thousands of features.
-    Caches the expensive computations (traces, cumulants, shifted-χ² fit)
-    for reuse across both Q-tests and R-tests.
+    Calibration proceeds once per kernel: collect traces, compute moments,
+    then fit the requested distribution. All Q backends share the resulting
+    cache and p-value evaluator. See the module docstring for the path table.
 
     Parameters
     ----------
     kernel : Kernel
-        The spatial kernel object (MatrixKernel, FFTKernel, NUFFTKernel, or compatible).
-    method : {'clt', 'welch', 'liu'}, default 'welch'
-        Null approximation method for the **Q-test**. The R-test entry
-        ``var_R = trace(K̃²)`` is always populated alongside, regardless of
-        ``method`` — R-tests use a Normal approximation and only need this
-        one moment.
-
-        - 'clt': Central Limit Theorem (Z-score normal approximation)
-        - 'welch': Welch-Satterthwaite moment matching (fast, uses traces)
-        - 'liu': Liu eigenvalue-based approximation (accurate tail, slower)
-
-        Welch and Liu require PSD kernels. Moran and Fourier kernels with
-        negative weights beyond roundoff require an explicit ``method='clt'``.
+        Matrix, FFT, NUFFT, or a compatible kernel object.
+    method : {'clt', 'welch', 'moments'} or None, default None
+        Automatic selection matches ``spatial_q_test``: Welch for matrix
+        kernels, moments for Fourier kernels, and CLT for recognized signed kernels.
+        ``clt`` uses a two-sided normal approximation; ``welch`` uses an
+        upper-tail chi-square fit to mean/variance; ``moments`` uses the first
+        four moments to select Liu, beta, central chi-square, or normal fits.
+        All moment fits use the upper tail. Symmetric indefinite kernels,
+        including Moran, support ``moments`` with ``dirichlet_correction=True``.
+        Their automatic default remains two-sided CLT; Welch requires PSD.
     k_eigen : int, optional
-        Number of top eigenvalues to compute if method='liu' and kernel is sparse.
-        If None, computes all available eigenvalues. Ignored when
-        ``liu_n_probes`` is set (eigenvalues are bypassed entirely).
-    liu_n_probes : int, optional
-        If set, bypass the eigendecomposition for ``method='liu'`` and
-        estimate the four spectral cumulants ``c_p = trace(K̃^p)``,
-        ``p = 1..4``, directly from the kernel via Hutchinson probing
-        (:func:`_hutchinson_cumulants`). Cost drops from
-        :math:`O(n^3)` (dense eigensolve) or :math:`O(r^3)` (reduced
-        Toeplitz-M) to :math:`2 \cdot n_\mathrm{probes}` kernel
-        matvecs, at the cost of :math:`O(n_\mathrm{probes}^{-1/2})`
-        Monte-Carlo error in each cumulant. Rule of thumb:
-        ``n_probes = 60`` gives Liu p-values within ``~5\%`` of the
-        eigenvalue-exact baseline; ``n_probes = 120`` within
-        ``~0.2\%``. When ``None`` (default), the eigenvalue path is
-        used.
+        Use a truncated eigenvalue spectrum for moment matching. This is approximate:
+        omitted modes are treated as zero. Automatic spectra are limited to
+        FFT, the bounded NUFFT route, and dense matrices with at most 2000
+        samples (or a cached full spectrum). Other cases use probes.
+        Ignored when ``n_probes`` is specified.
     dirichlet_correction : bool, default True
-        When ``True``: use the finite-``n`` Dirichlet(1/2) ratio
-        ``Var[Q] = 2 · (m · trace((HKH)²) - trace(HKH)²) / (m+2)`` with
-        ``m = n-1``. When ``False``: drop the ``mean²`` term to the
-        large-``n`` limit ``Var[Q] = 2 · trace((HKH)²)``, a monotonic
-        upper bound that slightly overestimates ``Var[Q]`` at finite
-        ``n``. See **Notes** for the derivation.
+        Use moments of sample-standardized Q (a ratio of quadratic forms).
+        Correct variance for every method, and skewness/kurtosis for moment matching.
+        ``False`` retains the unstandardized Gaussian quadratic-form model;
+        recognized indefinite kernels reject this option with ``moments``.
+    n_probes : int, optional
+        Probe budget: defaults to 60 for moments and 15 for precision-backed
+        Welch/CLT. Explicit Welch/CLT traces remain exact. For moments, supplying
+        this skips eigenvalues except for FFT, which always uses its full spectrum.
+        Precision solves are shared across trace orders. Probe workspace is
+        blocked above 256 MiB (excluding existing kernel/cache storage, and with
+        at least one probe). A global-offset pass may require replaying solves.
+        Probe error decreases as the inverse square root of the count;
+        no fixed count guarantees relative p-value accuracy.
 
     Returns
     -------
-    dict[str, float or np.ndarray]
-        Always populated (regardless of ``method``):
+    dict
+        ``method``, ``model`` and ``tail`` identify the calibration path.
+        ``mean_Q`` and ``var_Q`` describe its Q moments; ``var_R`` is the
+        kernel square trace used by the separate, two-sided normal R-test.
 
-        - ``'method'`` : str — the Q-test approximation selected.
-        - ``'var_R'`` : float — ``trace(K̃²)``, the null variance of ``R``
-          (used by :func:`spatial_r_test`).
+        Welch also stores ``scale_g`` and ``df_h``. Moment matching stores ``q_fit``:
+        its ``family`` names the distribution, while ``fit`` distinguishes
+        ``liu4``, ``beta4``, ``chi2_skewness``, ``chi2_kurtosis``,
+        ``normal_fallback`` and ``degenerate`` fits. ``source`` records
+        whether the traces came from the spectrum or probes.
 
-        Method-specific additions:
-
-        - ``method='liu'`` (default for FFT / NUFFT kernels):
-
-          * ``'cumulants'`` : ``dict {1: c_1, 2: c_2, 3: c_3, 4: c_4}``
-            with ``c_p = trace(K̃^p)``. Computed from the full
-            eigendecomposition when available (``liu_n_probes is
-            None``) or from :math:`2m` Hutchinson probes otherwise.
-          * ``'liu_coef'`` : ``dict`` with cached Liu coefficients
-            ``{'mu_Q', 'sigma_Q', 'mu_x', 'sigma_x', 'dof_x',
-            'delta_x'}`` derived from ``cumulants`` once; consumed by
-            :func:`spatial_q_test` so per-feature p-values reduce to a
-            pure :math:`t`-broadcast.
-
-        - ``method='welch'`` (default for MatrixKernel Q-tests):
-
-          * ``'mean_Q'`` : ``trace(K)``
-          * ``'var_Q'`` : ``2 · trace(K²)``
-          * ``'scale_g'`` : Welch scale parameter ``var_Q / (2 · mean_Q)``
-          * ``'df_h'`` : Welch df ``2 · mean_Q² / var_Q``
-
-        - ``method='clt'``: ``'mean_Q'``, ``'var_Q'`` only.
-
-    Consumers (``spatial_q_test`` / ``spatial_r_test``) read only the keys
-    their approximation needs; the dict is safe to reuse across calls.
-
-    Raises
-    ------
-    AssertionError
-        If method is not one of 'clt', 'welch', 'liu'.
-
-    Examples
-    --------
-    >>> kernel = MatrixKernel.from_coordinates(coords, method='gaussian')
-    >>> params = compute_null_params(kernel, method='welch')
-    >>> Q, pval = spatial_q_test(data, kernel, null_params=params)
-    >>> R, r_pval = spatial_r_test(x, y, kernel, null_params=params)
+        Intermediate trace estimates are not returned. Recompute this cache
+        when changing the kernel or calibration settings; partial caches
+        are not rebuilt automatically.
 
     Notes
     -----
-    :func:`spatial_q_test` standardizes its input as
-    :math:`Z = (X - \bar{X}\,\mathbf{1}) / \sigma`, so the realized
-    quadratic form is
+    Defaults for Gaussian, Matérn, CAR and graph-Laplacian kernels are Welch
+    on MatrixKernel and moment matching on FFTKernel/NUFFTKernel. Moran and
+    detected signed Fourier spectra use CLT. Precomputed matrix kernels
+    default to Welch unless labeled ``method="moran"``; the caller must
+    select CLT or finite-sample moments for other symmetric indefinite
+    matrices. No extra eigendecomposition is done just to choose the default.
+
+    For ``H = I - 11'/n``, ``A = HKH`` and ``m = n-1``, standardization
+    gives ``Q = m X'AX / (X'HX)``. Under the iid central Gaussian null,
 
     .. math::
 
-        Q \;=\; Z^{\top} K Z \;=\; X^{\top}\, H K H\, X / \sigma^{2},
-        \qquad H = I - \mathbf{1}\mathbf{1}^{\top} / n.
+        E[Q] = \operatorname{tr}(A), \qquad
+        \operatorname{Var}(Q) =
+        \frac{2[m\operatorname{tr}(A^2)-\operatorname{tr}(A)^2]}{m+2}.
 
-    Null moments are therefore for the double-centered operator
-    :math:`\tilde{K} = H K H`, not raw :math:`K`. :math:`Q` is
-    additionally a *ratio* of quadratic forms — the denominator
-    :math:`\sigma^{2} = X^{\top} H X / (n-1)` is a random variable
-    correlated with the numerator. ``dirichlet_correction=True`` applies
-    the finite-:math:`n` correction derived from the Dirichlet(1/2)
-    distribution of :math:`Y_i = X_i^{2} / \sum_j X_j^{2}`:
+    Finite-sample higher moments use ``B = A - tr(A) H/m``; their formulas and
+    fallback order live together in :func:`_fit_standardized_q`.
+    Without the correction, variance is ``2 tr(A^2)``. These moment fits
+    remain approximations, particularly in extreme tails.
 
-    .. math::
-
-        \mathrm{Var}[Q] \;=\; \frac{2 \bigl[\, m \cdot \mathrm{tr}(\tilde K^{2})
-            - \mathrm{tr}(\tilde K)^{2} \,\bigr]}{m + 2},
-            \qquad m = n - 1.
-
-    With ``dirichlet_correction=False`` the finite term drops
-    out and :math:`\mathrm{Var}[Q] = 2\,\mathrm{tr}(\tilde K^{2})` (large-:math:`n` limit).
+    Examples
+    --------
+    >>> params = compute_null_params(kernel, method="moments")
+    >>> Q, pval = spatial_q_test(data, kernel, null_params=params)
     """
-    params = {"method": method}
+    from sonic.kernels.base import MatrixKernelBase
+    from sonic.kernels.fft import FFTKernel
 
-    assert method in ["clt", "welch", "liu"], "Method must be 'clt', 'welch', or 'liu'."
-
-    _resolve_q_null_method(kernel, method)
-
-    # Centered traces can be computed cheaply from two additional numbers:
-    #   s1 = 𝟏ᵀ K 𝟏,   s2 = ‖K·𝟏‖² = 𝟏ᵀ K² 𝟏
-    # via a single K·𝟏 application (see `Kernel._ones_stats`), giving
-    #   trace(HKH)   = trace(K)  − s1/n
-    #   trace((HKH)²) = trace(K²) − 2·s2/n + s1²/n²
+    # 1. Resolve policy and validate budgets before doing any kernel work.
+    method = _resolve_q_null_method(kernel, method, dirichlet_correction=dirichlet_correction)
     n = int(kernel.n)
-    tr_HKH = float(kernel.trace())
-    tr_HKH_sq = float(kernel.square_trace())
-    params["var_R"] = tr_HKH_sq
+    if n < 2:
+        raise ValueError("Spatial null calibration requires n >= 2.")
+    if n_probes is not None and (
+        isinstance(n_probes, (bool, np.bool_))
+        or not np.isfinite(n_probes)
+        or n_probes < 1
+        or int(n_probes) != n_probes
+    ):
+        raise ValueError("n_probes must be a positive integer.")
+    probe_count = int(n_probes) if n_probes is not None else (60 if method == "moments" else 15)
+    precision = bool(getattr(kernel, "stores_precision", False))
+    params = {
+        "method": method,
+        "model": "standardized_q" if dirichlet_correction else "gaussian_quadratic",
+        "tail": "two-sided" if method == "clt" else "upper",
+    }
 
-    if method == "liu":
-        # Liu's method is entirely determined by the four spectral
-        # cumulants c_1..c_4. We ALWAYS store them under ``cumulants``
-        # and the derived shifted-χ² fit under ``liu_coef``; callers
-        # consuming Liu p-values read only ``liu_coef``.
-        #
-        # Two paths produce the cumulants:
-        #   - ``liu_n_probes is not None``: Hutchinson — 2·m matvecs.
-        #   - ``liu_n_probes is None``: try the kernel's full
-        #     eigendecomposition first, fall back to Hutchinson if the
-        #     PSD kernel can't produce a full spectrum (NUFFT with broad
-        #     support → ``NotImplementedError``). Signed kernels were rejected above.
-        if liu_n_probes is not None:
-            c = _hutchinson_cumulants(kernel, n_probes=int(liu_n_probes))
-        else:
-            try:
-                from sonic.kernels.fft import FFTKernel
-
-                if isinstance(kernel, FFTKernel):
-                    vals = kernel.eigenvalues(k=k_eigen, return_full_layout=True)
-                else:
-                    vals = kernel.eigenvalues(k=k_eigen)
+    # 2. Choose the source before collecting traces. A failed spectrum attempt
+    # must be cheap; sparse/implicit full-spectrum requests fail immediately.
+    if method == "moments":
+        try:
+            if n_probes is not None or not getattr(kernel, "centering", True):
+                raise NotImplementedError("Use trace probes for this request.")
+            if isinstance(kernel, MatrixKernelBase) and k_eigen is None:
+                cached = getattr(kernel, "_spectrum_centered", None)
+                if n > _DENSE_NULL_SPECTRUM_LIMIT and (cached is None or len(cached) != n):
+                    raise NotImplementedError("Large matrix nulls use trace probes.")
+            if isinstance(kernel, FFTKernel):
+                vals = kernel.eigenvalues(k=k_eigen, return_full_layout=True)
+            else:
+                vals = kernel.eigenvalues(k=k_eigen)
+            if dirichlet_correction and k_eigen is None and len(vals) < n - 1:
+                raise NotImplementedError("Incomplete centered spectrum; use probes.")
+            # Keep the full second trace for R even when Q explicitly uses a
+            # truncated spectrum. Do not use centered B powers as an R variance.
+            if len(vals) == n and (precision or isinstance(kernel, FFTKernel)):
+                params["var_R"] = float(np.sum(vals**2))
+            elif precision:
+                params["var_R"] = float(kernel.square_trace(n_probes=probe_count))
+            else:
+                # In particular, NUFFT's reduced spectrum may be truncated;
+                # keep its separate analytic R variance authoritative.
+                params["var_R"] = float(kernel.square_trace())
+            if dirichlet_correction:
+                if len(vals) == n:
+                    vals = np.delete(vals, np.argmin(np.abs(vals)))
+                traces = _spectrum_traces(vals, n)
+            else:
                 sig = vals[np.abs(vals) > 1e-9]
-                c = {p: float(np.sum(sig**p)) for p in (1, 2, 3, 4)}
-            except NotImplementedError:
-                c = _hutchinson_cumulants(kernel, n_probes=60)
-        params["cumulants"] = c
-        # Pass ``n`` for the Dirichlet(1/2) variance correction — matches
-        # the Welch branch below when ``dirichlet_correction=True``.
-        # Broad-spectrum PSD kernels (CAR, graph_laplacian) have
-        # ``c_1² ≈ m · c_2``; the large-n limit ``2·c_2`` then
-        # overestimates ``Var[Q]`` by up to an order of magnitude,
-        # collapsing Liu's tail probability to zero.
-        liu_n = n if dirichlet_correction else None
-        params["liu_coef"] = _liu_prepare_from_cumulants(c, n=liu_n)
-    else:
-        # Q-test CLT / Welch moments.
-        mean_Q = tr_HKH
+                traces = {
+                    "mean": float(np.sum(sig)),
+                    "powers": {p: float(np.sum(sig**p)) for p in (2, 3, 4)},
+                    "scale": 1.0,
+                    "source": "spectrum",
+                }
+        except NotImplementedError:
+            traces = _estimate_kernel_traces(
+                kernel, n_probes=probe_count, centered=dirichlet_correction
+            )
+            params["var_R"] = traces["var_R"]
+        # 3. Fit once; every feature consumes this small prepared cache.
+        params["source"] = traces["source"]
         if dirichlet_correction:
-            m = max(n - 1, 1)
-            var_Q = 2.0 * (m * tr_HKH_sq - tr_HKH**2) / (m + 2)
+            params["q_fit"] = _fit_standardized_q(
+                traces["mean"], traces["powers"], traces["scale"], n
+            )
         else:
-            # Large-n limit — drops the (m·sq − mean²) cancellation that
-            # amplifies ``sq``-errors for broad-spectrum PSD kernels.
-            var_Q = 2.0 * tr_HKH_sq
-        var_Q = max(var_Q, 0.0)  # numerical safety
+            params["q_fit"] = _fit_gaussian_quadratic(traces["mean"], traces["powers"])
+        params["mean_Q"] = params["q_fit"]["mu_Q"]
+        params["var_Q"] = params["q_fit"]["sigma_Q"] ** 2
+    else:
+        # Welch/CLT need only two traces. Explicit kernels calculate these
+        # exactly; precision kernels share one (possibly blocked) probe solve.
+        if precision:
+            traces = _estimate_kernel_traces(
+                kernel, n_probes=probe_count, centered=dirichlet_correction, max_order=2
+            )
+            mean_Q, second = traces["mean"], traces["powers"][2]
+            params["var_R"] = traces["var_R"]
+        else:
+            mean_Q, second = float(kernel.trace()), float(kernel.square_trace())
+            params["var_R"] = second
+            if not getattr(kernel, "centering", True):
+                ones = np.ones((kernel.ny, kernel.nx) if isinstance(kernel, FFTKernel) else n)
+                K1 = np.asarray(kernel.Kx(ones)).ravel()
+                dc = float(K1.sum() / n)
+                mean_Q -= dc
+                second = max(second - 2 * float(K1 @ K1) / n + dc**2, 0.0)
+        m = n - 1
+        var_Q = 2.0 * (m * second - mean_Q**2) / (m + 2) if dirichlet_correction else 2.0 * second
+        var_Q = max(var_Q, 0.0)
         params["mean_Q"] = float(mean_Q)
         params["var_Q"] = float(var_Q)
-
         if method == "welch":
-            # Pre-calculate Welch-Satterthwaite parameters.
             if var_Q > 0 and mean_Q > 0:
                 params["scale_g"] = var_Q / (2.0 * mean_Q)
                 params["df_h"] = (2.0 * mean_Q**2) / var_Q
             else:
-                # Zero scale denotes the degenerate null; _welch_apply returns 1.
                 params["scale_g"] = 0.0
                 params["df_h"] = 1.0
-
     return params
 
 
@@ -885,10 +1092,14 @@ def _q_test_matrix(  # noqa: C901
         var = (sq_sum - n * means**2) / max(n - 1, 1)
         var[var < 0] = 0.0
         stds = np.sqrt(var)
+        valid_mask = stds > 0
         Q = kernel.xtKx_standardized(Xn, means, stds)
     else:
         if is_standardized:
             z = Xn
+            valid_mask = (
+                np.asarray((z != 0).sum(axis=0)).ravel() > 0 if is_sparse else np.any(z, axis=0)
+            )
         else:
             if is_sparse:
                 Xn = Xn.toarray()
@@ -912,35 +1123,13 @@ def _q_test_matrix(  # noqa: C901
     if not return_pval:
         return Q
 
-    # P-value from cached null_params (pre-resolved by spatial_q_test).
-    null_approx_method = _resolve_q_null_method(
-        kernel, null_params.get("method", "welch") if null_params else "welch"
-    )
-
-    if null_approx_method == "clt":
-        mu_Q = null_params["mean_Q"]
-        var_Q = null_params["var_Q"]
-        if var_Q > 0:
-            z_score = (np.atleast_1d(Q) - mu_Q) / np.sqrt(var_Q)
-            pval = chi2.sf(z_score**2, df=1)
-        else:
-            pval = np.ones(max(np.atleast_1d(Q).size, 1), dtype=float)
-    elif null_approx_method == "welch":
-        pval = _welch_apply(np.atleast_1d(Q), null_params)
-    elif null_approx_method == "liu":
-        coef = null_params.get("liu_coef")
-        if coef is None:
-            if "cumulants" not in null_params:
-                raise ValueError(
-                    "null_params with method='liu' must contain either "
-                    "'liu_coef' (preferred) or 'cumulants'. Build via "
-                    "compute_null_params(kernel, method='liu')."
-                )
-            n_kernel = int(getattr(kernel, "n", 0)) or None
-            coef = _liu_prepare_from_cumulants(null_params["cumulants"], n=n_kernel)
-        pval = _liu_apply(np.atleast_1d(Q), coef)
-    else:
-        pval = np.ones(max(np.atleast_1d(Q).size, 1), dtype=float)
+    # Calibration is shared with both Fourier backends; this helper only computes Q.
+    if null_params is None:
+        null_params = _prepare_q_null(kernel)
+    pval = _q_pvalues(np.atleast_1d(Q), null_params)
+    # A constant feature has no sample-standardized null realization. In
+    # particular, Q=0 can lie in a significant tail when the kernel is signed.
+    pval = np.where(valid_mask, pval, 1.0)
 
     pval = np.atleast_1d(pval)
     if M == 1 and pval.size == 1:
@@ -1045,15 +1234,16 @@ def spatial_q_test(  # noqa: C901
         Test statistic value(s). Shape ``(M,)`` for 2-D / 3-D inputs,
         scalar for 1-D.
     pval : float or np.ndarray, optional
-        Tail probability under null hypothesis; returned only if
-        ``return_pval=True``. Same shape as Q.
+        Null p-value, returned only if ``return_pval=True``. Welch and moments
+        use the upper tail; CLT uses a two-sided normal tail. Same shape as Q.
 
     Notes
     -----
-    Under H₀: data is spatially independent. Under H₁: mean shift
-    present. The test statistic ``Q = xᵀ K x`` approximates a
-    chi-squared mixture under the null; see :doc:`/guides/theory` and
-    :doc:`/guides/scaling`.
+    Inputs are centered and scaled by their sample standard deviation.
+    Under the iid Gaussian null, Q is a ratio of quadratic forms; the chosen
+    null fit approximates its tail. PSD matrix kernels default to Welch,
+    PSD Fourier kernels to moment matching, and recognized signed kernels to CLT.
+    See :func:`compute_null_params` and :doc:`/guides/theory`.
 
     Examples
     --------
@@ -1072,29 +1262,10 @@ def spatial_q_test(  # noqa: C901
 
     is_fft = isinstance(kernel, FFTKernel)
     is_nufft = isinstance(kernel, NUFFTKernel)
-    is_matrix_path = not (is_fft or is_nufft)
-
-    # Resolve null_params once (cached across chunks).
-    if (
-        return_pval
-        and null_params is not None
-        and "method" in null_params
-        and len(null_params) == 1
-    ):
-        # User passed only {'method': ...} — flesh out the full param set.
-        null_params = {**null_params, **compute_null_params(kernel, method=null_params["method"])}
-    elif return_pval and null_params is None and is_matrix_path:
-        if not hasattr(kernel, "square_trace"):
-            # A raw dense / sparse kernel matrix can't produce null moments
-            # on its own — the caller must supply ``null_params`` or wrap
-            # the matrix in a :class:`~sonic.MatrixKernel`.
-            raise ValueError(
-                "spatial_q_test received a raw kernel matrix without "
-                "null_params; pass a Kernel object or provide "
-                "null_params=compute_null_params(kernel)."
-            )
-        default_method = _resolve_q_null_method(kernel)
-        null_params = compute_null_params(kernel, method=default_method)
+    # Prepare the null once for every backend before splitting features.
+    # Score-only calls never estimate traces or fit a distribution.
+    if return_pval:
+        null_params = _prepare_q_null(kernel, null_params)
 
     # Determine M on the trailing axis.
     M = _feature_count(Xn, is_fft=is_fft)

@@ -66,7 +66,7 @@ class TestTutorialBasicQTest(unittest.TestCase):
         kernel = MatrixKernel.from_coordinates(self.coords, method="car", k_neighbors=15, rho=0.9)
 
         # Test with different null approximations
-        methods = ["welch", "liu"]
+        methods = ["welch", "moments"]
 
         for method in methods:
             null_params = compute_null_params(kernel, method=method)

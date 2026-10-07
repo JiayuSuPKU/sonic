@@ -636,5 +636,25 @@ def test_prepare_var_view_respects_layer_order_and_preserves_inputs(sparse, keys
     np.testing.assert_array_equal(counts, values)
 
 
+@pytest.mark.parametrize("source", ["var", "obs"])
+def test_detector_preparation_preserves_small_variation_on_large_offsets(source):
+    rng = np.random.default_rng(51)
+    values = 1e8 + rng.normal(size=(64, 2))
+    data = anndata.AnnData(sp.csc_matrix(values))
+    data.var_names = ["x", "y"]
+    data.obs[["x", "y"]] = values
+    data.obsm["spatial"] = rng.normal(size=(64, 2))
+    detector = DetectorIrregular(kernel_method="gaussian").setup_data(data)
+    matrix, names, means, stds = detector._prepare_data(source, ["x", "y"], 1)
+    assert names == ["x", "y"]
+    np.testing.assert_array_equal(matrix.toarray(), values)
+    np.testing.assert_allclose(means, values.mean(0))
+    np.testing.assert_allclose(stds, values.std(0, ddof=1), rtol=1e-10)
+    _, names, _, stds = detector._prepare_features_nufft(source, ["x", "y"], None)
+    assert names == ["x", "y"]
+    np.testing.assert_allclose(stds, values.std(0), rtol=1e-10)
+    np.testing.assert_array_equal(data.X.toarray(), values)
+
+
 if __name__ == "__main__":
     unittest.main()

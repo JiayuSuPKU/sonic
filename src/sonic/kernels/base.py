@@ -615,7 +615,7 @@ class MatrixKernelBase(Kernel):
         return self._xtKy_from_Ky(x_2d, Kx, 1 if squeeze else n_cols)
 
     # ------------------------------------------------------------------
-    # Sparsity-preserving standardized quadratic form
+    # Standardized quadratic form
     # ------------------------------------------------------------------
     def _K_column_sums(self) -> tuple[np.ndarray, float]:
         """Return (``K @ 1_N``, ``1_N^T K 1_N``), computed once and cached.
@@ -639,16 +639,12 @@ class MatrixKernelBase(Kernel):
         stds: np.ndarray,
     ) -> np.ndarray:
         """
-        Compute ``z^T K z`` where ``z = (x - means) / stds`` *without* densifying
-        sparse ``x``.
+        Compute ``z^T K z`` where ``z = (x - means) / stds``.
 
-        Sparse-aware expansion using the raw-``K`` primitives::
-
-            z^T K z = (x^T K x - 2·μ·(K·𝟏)^T·x + μ²·(𝟏^T K 𝟏)) / σ²
-
-        and the cached row sums of ``K``. This is the fast path for
-        standardizing large sparse feature matrices (e.g. scRNA-seq counts)
-        before a Q-test.
+        Sparse inputs and explicit sparse kernels use sparse products at any
+        density, with a directly centered dense fallback for strong cancellation.
+        Dense kernels and precision solves also use a centered dense workspace.
+        Callers chunk features to bound this workspace; the input is never modified.
 
         Parameters
         ----------
@@ -674,27 +670,38 @@ class MatrixKernelBase(Kernel):
                 f"inconsistent with x columns ({n_cols})."
             )
 
-        K_sum, K_total = self._K_column_sums()  # K_sum: (n,), K_total: scalar
-
-        # Term 1: RAW ``x^T K x``. Apply K via the dense primitive directly
-        # (skips the public :meth:`xtKx` centering wrapper), then contract
-        # through :meth:`_xtKy_from_Ky` which preserves x's sparsity.
-        x_dense = x_2d.toarray() if sp.issparse(x_2d) else x_2d
-        Kx_dense = self._apply_K_dense(x_dense)
-        q_raw = np.atleast_1d(np.asarray(self._xtKy_from_Ky(x_2d, Kx_dense, n_cols))).astype(float)
-
-        # Term 2: (K·1)^T x → (M,). x^T @ K_sum, preserving x's sparsity.
-        if sp.issparse(x_2d):
-            ksum_x = np.asarray(x_2d.T @ K_sum).ravel()
-        else:
-            ksum_x = x_2d.T @ K_sum
-
-        # Standardized quadratic form
-        q_centered = q_raw - 2.0 * means * ksum_x + (means**2) * K_total
         valid = stds > 1e-12
-        out = np.zeros(n_cols, dtype=float)
-        out[valid] = q_centered[valid] / (stds[valid] ** 2)
-        return out
+        if not self.stores_precision and sp.issparse(self._K) and sp.issparse(x_2d):
+            x_sparse = x_2d.astype(float, copy=False)
+            Kx = self._K @ x_sparse
+            products = x_sparse.multiply(Kx)
+            raw = np.asarray(products.sum(axis=0)).ravel()
+            K_ones, K_total = self._K_column_sums()
+            ones_Kx = np.asarray(Kx.sum(axis=0)).ravel()
+            x_Kones = np.asarray(x_sparse.T @ K_ones).ravel()
+            offset = means**2 * K_total
+            q = raw - means * (ones_Kx + x_Kones) + offset
+            magnitude = (
+                np.asarray(abs(products).sum(axis=0)).ravel()
+                + np.abs(means) * (np.abs(ones_Kx) + np.abs(x_Kones))
+                + np.abs(offset)
+            )
+            # Recenter directly if cancellation loses four or more digits.
+            # Keep both cross terms: precomputed K need not be symmetric.
+            if np.all(np.isfinite(q)) and np.all(np.abs(q[valid]) >= 1e-4 * magnitude[valid]):
+                return np.divide(q, stds**2, out=np.zeros(n_cols), where=valid)
+            del Kx, products, x_sparse
+
+        z = (
+            x_2d.astype(float, copy=False).toarray(order="F" if self.stores_precision else "C")
+            if sp.issparse(x_2d)
+            else np.array(x_2d, dtype=float, copy=True)
+        )
+        z -= means
+        z[:, ~valid] = 0.0
+        q = np.einsum("ij,ij->j", z, self._apply_K_dense(z))
+        np.divide(q, stds**2, out=q, where=valid)
+        return q
 
     def _get_rvs_trace_cache(self, n_vectors=15):
         """Generate random vectors for trace estimation caching."""

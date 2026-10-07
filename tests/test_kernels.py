@@ -497,6 +497,95 @@ class TestXtKxStandardized(unittest.TestCase):
         self.assertGreater(q[1], 0.0)
 
 
+@pytest.mark.parametrize("sparse_type", [sp.csr_matrix, sp.csc_matrix])
+@pytest.mark.parametrize("centering", [False, True])
+@pytest.mark.parametrize("kind", ["positive", "signed", "asymmetric"])
+def test_sparse_standardized_q_avoids_dense_feature_workspace(sparse_type, centering, kind):
+    rng = np.random.default_rng(42)
+    n = 512
+    values = np.zeros((n, 4), dtype=np.int16)
+    for column in range(3):
+        values[rng.choice(n, 8, replace=False), column] = rng.integers(1, 5, size=8)
+    matrix = sp.diags(
+        [
+            np.full(n - 1, 0.2),
+            np.full(n, 0.0 if kind == "signed" else 1.0),
+            np.full(n - 1, 0.4 if kind == "asymmetric" else 0.2),
+        ],
+        [-1, 0, 1],
+        format="csc",
+    )
+    kernel = MatrixKernel.from_matrix(matrix, centering=centering)
+    means = values.mean(axis=0)
+    stds = values.std(axis=0, ddof=1)
+    z = np.divide(values - means, stds, out=np.zeros_like(values, dtype=float), where=stds > 0)
+    expected = kernel.xtKx(z)
+    sparse = sparse_type(values)
+    before = sparse.copy()
+
+    # Only the cached K @ 1 may use a dense RHS; no feature block may densify.
+    apply = kernel._apply_K_dense
+
+    def checked_apply(block):
+        assert block.shape == (n, 1)
+        return apply(block)
+
+    with patch.object(kernel, "_apply_K_dense", side_effect=checked_apply):
+        actual = kernel.xtKx_standardized(sparse, means, stds)
+    np.testing.assert_allclose(actual, expected, rtol=1e-10, atol=1e-12)
+    np.testing.assert_array_equal(sparse.data, before.data)
+    np.testing.assert_array_equal(sparse.indices, before.indices)
+    np.testing.assert_array_equal(sparse.indptr, before.indptr)
+    assert actual[-1] == 0.0
+
+
+@pytest.mark.parametrize(
+    "case", ["dense_kernel", "precision", "dense_features", "offset", "hub", "cancellation"]
+)
+def test_sparse_standardized_q_product_and_cancellation_fallback(case):
+    rng = np.random.default_rng(51)
+    n = 256
+    values = np.zeros((n, 4))
+    values[[0, 7, 29, 100], :] = rng.uniform(1, 2, size=(4, 4))
+    matrix = sp.diags(
+        [np.full(n - 1, 0.2), np.ones(n), np.full(n - 1, 0.2)], [-1, 0, 1], format="csr"
+    )
+    if case == "dense_features":
+        # Full density and means larger than stds must still use sparse products.
+        values = rng.uniform(1, 2, size=values.shape)
+    elif case == "offset":
+        # Large offsets must trigger direct centering after the sparse product.
+        values = np.zeros((n, 64))
+        values[:, 0] = 1e8 + rng.normal(size=n)
+    elif case == "hub":
+        edges = sp.coo_matrix(
+            (np.full(n - 1, 0.01), (np.arange(1, n), np.zeros(n - 1, dtype=int))), shape=(n, n)
+        ).tocsr()
+        matrix = sp.eye(n, format="csr") + edges + edges.T
+        values[:] = 0
+        values[0, :] = 1
+    elif case == "cancellation":
+        # Sparse rank-one K with a nonconstant feature in its centered nullspace.
+        v = sp.csc_matrix(([1.0, n - 1.0], ([0, 1], [0, 0])), shape=(n, 1))
+        matrix = (v @ v.T).tocsr()
+        values[:] = 0
+        values[0, 0] = 1
+        values[7, 1:] = 2
+    kernel = MatrixKernel.from_matrix(
+        matrix.toarray() if case == "dense_kernel" else matrix,
+        is_precision=case == "precision",
+    )
+    means = values.mean(axis=0)
+    stds = values.std(axis=0, ddof=1)
+    z = np.divide(values - means, stds, out=np.zeros_like(values), where=stds > 0)
+    expected = kernel.xtKx(z)
+    with patch.object(kernel, "_apply_K_dense", wraps=kernel._apply_K_dense) as apply:
+        actual = kernel.xtKx_standardized(sp.csc_matrix(values), means, stds)
+    used_dense_features = any(call.args[0].shape == values.shape for call in apply.call_args_list)
+    assert used_dense_features == (case in {"dense_kernel", "precision", "offset", "cancellation"})
+    np.testing.assert_allclose(actual, expected, rtol=1e-10, atol=1e-9)
+
+
 def test_standardized_precision_lu_survives_pickle():
     # Cross the production threshold for implicit inversion, without a dense matrix.
     n = 5001

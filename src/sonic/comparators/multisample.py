@@ -526,12 +526,23 @@ def _resolve_contrast(
     raise TypeError(f"Contrast must be a str, dict, or ndarray; got {type(contrast).__name__}.")
 
 
-def _contrast_is_estimable(design_matrix: np.ndarray, contrast_vector: np.ndarray) -> bool:
-    """Whether ``contrast_vector`` lies in the row space of ``design_matrix``."""
-    row_projector = np.linalg.pinv(design_matrix) @ design_matrix
-    return bool(
-        np.allclose(row_projector @ contrast_vector, contrast_vector, rtol=1e-7, atol=1e-10)
+def _decompose_glm_design(
+    design_matrix: np.ndarray, contrast_vector: np.ndarray
+) -> tuple[np.ndarray, int, bool]:
+    """Use one SVD for the OLS inverse, rank, and contrast estimability.
+
+    Forming X'X squares the condition number. Check the contrast against
+    the orthonormal row basis directly, without multiplying X's inverse by X.
+    """
+    u, singular, vt = np.linalg.svd(design_matrix, full_matrices=False)
+    cutoff = np.finfo(float).eps * max(design_matrix.shape) * singular[0]
+    rank = int(np.count_nonzero(singular > cutoff))
+    rows = vt[:rank]
+    inverse = (rows.T / singular[:rank]) @ u[:, :rank].T
+    estimable = np.allclose(
+        rows.T @ (rows @ contrast_vector), contrast_vector, rtol=1e-7, atol=1e-10
     )
+    return inverse, rank, bool(estimable)
 
 
 def _maybe_log_expression(
@@ -773,13 +784,13 @@ def _estimate_glm_null_covariance(
     n_terms = design_matrix.shape[1]
     if contrast_vector.shape != (n_terms,):
         raise ValueError(f"contrast length {contrast_vector.shape} != design cols ({n_terms},).")
-    rank = int(np.linalg.matrix_rank(design_matrix))
+    design_inverse, rank, estimable = _decompose_glm_design(design_matrix, contrast_vector)
     df_resid = n_samples - rank
     if df_resid <= 0:
         raise ValueError(
             f"design has no residual degrees of freedom: n_samples={n_samples}, rank={rank}."
         )
-    if not _contrast_is_estimable(design_matrix, contrast_vector):
+    if not estimable:
         raise ValueError(
             "contrast is not estimable from the supplied design matrix "
             f"(rank={rank}, n_terms={n_terms})."
@@ -788,8 +799,7 @@ def _estimate_glm_null_covariance(
     # Compute the OLS fit for each gene.
     log_spectra = np.log(np.maximum(spectra, 1e-12))
     response = log_spectra.reshape(n_samples, n_genes * n_bins)
-    xtx_inv = np.linalg.pinv(design_matrix.T @ design_matrix)
-    beta_flat = xtx_inv @ (design_matrix.T @ response)
+    beta_flat = design_inverse @ response
     beta = beta_flat.reshape(n_terms, n_genes, n_bins)
     theta = np.tensordot(contrast_vector, beta, axes=([0], [0]))
 
@@ -800,7 +810,7 @@ def _estimate_glm_null_covariance(
     _maybe_warn_small_df_analytic(df_resid)
 
     # Compute the weighted log-L2 statistic, contrast scale, and eigenvalues.
-    contrast_scale = float(contrast_vector @ xtx_inv @ contrast_vector)
+    contrast_scale = float(np.sum((contrast_vector @ design_inverse) ** 2))
     weights = _resolve_freq_weights(freq_weights, n_bins)
     observed = np.sqrt(np.sum(weights * theta**2, axis=-1))
     sqrt_weights = np.sqrt(weights)
@@ -887,22 +897,21 @@ def _estimate_glm_masked_null_covariance(  # noqa: C901
             continue
 
         gene_design = design_matrix[sample_mask]
-        rank_gene = int(np.linalg.matrix_rank(gene_design))
+        design_inverse, rank_gene, estimable = _decompose_glm_design(gene_design, contrast_vector)
         df_gene = n_obs[gene_idx] - rank_gene
         df_resid[gene_idx] = df_gene
         if df_gene < int(min_resid_df):
             continue
-        if not _contrast_is_estimable(gene_design, contrast_vector):
+        if not estimable:
             continue
 
-        xtx_inv = np.linalg.pinv(gene_design.T @ gene_design)
-        scale = float(contrast_vector @ xtx_inv @ contrast_vector)
+        scale = float(np.sum((contrast_vector @ design_inverse) ** 2))
         if not np.isfinite(scale) or scale <= 0.0:
             continue
 
         # Compute the OLS fit and the test statistic.
         gene_response = log_spectra[sample_mask, gene_idx, :]
-        gene_beta = xtx_inv @ (gene_design.T @ gene_response)
+        gene_beta = design_inverse @ gene_response
         theta = contrast_vector @ gene_beta
         observed[gene_idx] = float(np.sqrt(np.sum(weights * theta**2)))
         beta[:, gene_idx, :] = gene_beta
@@ -1596,25 +1605,24 @@ def compare_glm_scalar(
 
     design_matrix, design_columns = _build_design_matrix(design, n_samples)
     contrast_vector = _resolve_contrast(contrast, design_columns)
-    rank = int(np.linalg.matrix_rank(design_matrix))
+    design_inverse, rank, estimable = _decompose_glm_design(design_matrix, contrast_vector)
     df_resid = n_samples - rank
     if df_resid <= 0:
         raise ValueError(
             f"design has no residual degrees of freedom: n_samples={n_samples}, rank={rank}."
         )
-    if not _contrast_is_estimable(design_matrix, contrast_vector):
+    if not estimable:
         raise ValueError(
             "contrast is not estimable from the supplied design matrix "
             f"(rank={rank}, n_terms={design_matrix.shape[1]})."
         )
 
     # Fit the OLS model
-    xtx_inv = np.linalg.pinv(design_matrix.T @ design_matrix)
-    beta = xtx_inv @ design_matrix.T @ values  # (n_terms, n_genes)
+    beta = design_inverse @ values  # (n_terms, n_genes)
     fitted = design_matrix @ beta
     resid = values - fitted
     sigma2 = np.sum(resid**2, axis=0) / df_resid
-    contrast_var = float(contrast_vector @ xtx_inv @ contrast_vector)
+    contrast_var = float(np.sum((contrast_vector @ design_inverse) ** 2))
     if contrast_var <= 0:
         raise ValueError("contrast has zero estimated variance under the supplied design.")
 

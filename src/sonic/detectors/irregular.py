@@ -16,6 +16,7 @@ from sonic.kernels.nufft import NUFFTKernel, _standardize_features
 from sonic.statistics import (
     _q_pvalues,
     _resolve_q_null_method,
+    _sparse_mean_std,
     apply_bh_correction,
     compute_null_params,
     spatial_q_test,
@@ -76,9 +77,7 @@ def _qstat_worker(
     n_features = len(feature_indices)
     mu = null_params["mean_Q"]
     sigma = np.sqrt(null_params["var_Q"])
-    # Fast path: pass sparse X_batch + (means, stds) straight into the kernel's
-    # sparsity-preserving standardized quadratic form. Avoids the (n, batch) dense
-    # copy that the old path allocated just to subtract the per-column mean.
+    # Reuse moments; the kernel selects sparse products or a centered dense RHS.
     use_sparse_fastpath = hasattr(kernel_obj, "xtKx_standardized")
 
     for start in range(0, n_features, chunk_size):
@@ -737,14 +736,14 @@ class DetectorIrregular(Detector):
                 dummies = pd.get_dummies(adata_tmp)
 
                 names = dummies.columns.tolist()
-                X_dense = dummies.values.astype(np.float32)
+                X_dense = dummies.values.astype(np.float64)
                 means = X_dense.mean(axis=0)
                 stds = X_dense.std(axis=0, ddof=1)
                 X_csc = sp.csc_matrix(X_dense)
             else:
                 # All numeric - no encoding needed
                 names = adata_tmp.columns.tolist()
-                X_dense = adata_tmp.values.astype(np.float32)
+                X_dense = adata_tmp.values.astype(np.float64)
                 means = X_dense.mean(axis=0)
                 stds = X_dense.std(axis=0, ddof=1)
                 X_csc = sp.csc_matrix(X_dense)
@@ -766,19 +765,9 @@ class DetectorIrregular(Detector):
             names = adata_tmp.var_names.tolist()
 
             # compute means and stds (ddof=1 for sample std, consistent with statistics.py)
-            n_obs = X.shape[0]
             if sp.issparse(X):
                 X = X.astype(np.float64, copy=False)
-                means = np.array(X.mean(axis=0)).flatten()
-                X2 = X.copy()
-                X2.data **= 2
-                means2 = np.array(X2.mean(axis=0)).flatten()
-                var = means2 - (means**2)
-                var[var < 0] = 0
-                # Bessel correction: population var -> sample var
-                if n_obs > 1:
-                    var = var * n_obs / (n_obs - 1)
-                stds = np.sqrt(var)
+                means, stds = _sparse_mean_std(X)
                 X_csc = X.tocsc()
             else:
                 means = np.mean(X, axis=0)
@@ -1186,11 +1175,7 @@ class DetectorIrregular(Detector):
         # Integer count products can overflow before the variance is computed.
         X_csc = X_csc.astype(np.float64, copy=False)
         nnz_per = np.asarray((X_csc != 0).sum(axis=0)).ravel()
-        means = np.asarray(X_csc.mean(axis=0)).ravel()
-        sq = X_csc.multiply(X_csc)
-        sq_mean = np.asarray(sq.mean(axis=0)).ravel()
-        var = np.maximum(sq_mean - means**2, 0.0)
-        stds = np.sqrt(var)
+        means, stds = _sparse_mean_std(X_csc, ddof=0)
         keep = (stds > 0) & (nnz_per >= self.min_cells)
 
         X_kept = X_csc[:, keep]

@@ -7,7 +7,7 @@ import unittest
 import anndata as ad
 import numpy as np
 import pytest
-from scipy.sparse import csc_matrix, csr_matrix
+from scipy.sparse import csc_matrix, csr_matrix, diags
 
 from sonic import Detector
 from sonic.kernels import FFTKernel, MatrixKernel, NUFFTKernel
@@ -446,6 +446,60 @@ def test_sparse_integer_q_matches_float(dtype, scale, sparse_type):
     np.testing.assert_allclose(spatial_q_test(counts, kernel, chunk_size=1), expected)
     assert counts.dtype == dtype
     assert (counts != before).nnz == 0
+
+
+@pytest.mark.parametrize("sparse_type", [csr_matrix, csc_matrix])
+@pytest.mark.parametrize("kernel_kind", ["dense", "sparse", "precision"])
+def test_sparse_q_large_offsets_match_dense_without_mutation(sparse_type, kernel_kind):
+    rng = np.random.default_rng(85)
+    n = 100
+    values = rng.normal(size=(n, 3)) + np.array([0.0, 1e6, 1e8])
+    values = np.column_stack([values, np.full(n, 1e8)])
+    matrix = diags([np.full(n - 1, 0.2), np.ones(n), np.full(n - 1, 0.2)], [-1, 0, 1])
+    kernel = MatrixKernel.from_matrix(
+        matrix.toarray() if kernel_kind == "dense" else matrix.tocsr(),
+        is_precision=kernel_kind == "precision",
+    )
+    sparse = sparse_type(values)
+    before = sparse.copy()
+    expected = spatial_q_test(values, kernel)
+    actual = spatial_q_test(sparse, kernel, chunk_size=2)
+    np.testing.assert_allclose(actual, expected, rtol=2e-7, atol=1e-9)
+    direct = kernel.xtKx_standardized(sparse, values.mean(0), values.std(0, ddof=1))
+    np.testing.assert_allclose(direct, expected[0], rtol=2e-7, atol=1e-9)
+    np.testing.assert_allclose(
+        spatial_r_test(sparse, sparse, kernel),
+        spatial_r_test(values, values, kernel),
+        rtol=2e-7,
+        atol=1e-9,
+    )
+    np.testing.assert_array_equal(sparse.data, before.data)
+    np.testing.assert_array_equal(sparse.indices, before.indices)
+    np.testing.assert_array_equal(sparse.indptr, before.indptr)
+    assert actual[0][-1] == 0.0
+    assert actual[1][-1] == 1.0
+
+
+def test_sparse_moments_handle_duplicate_entries_without_mutating_input():
+    rng = np.random.default_rng(61)
+    values = 1e8 + rng.normal(size=(32, 3))
+    duplicate = csr_matrix(
+        (
+            np.repeat(values.ravel() / 2, 2),
+            np.tile(np.repeat(np.arange(3), 2), 32),
+            np.arange(33) * 6,
+        ),
+        shape=values.shape,
+    )
+    before = duplicate.copy()
+    kernel = MatrixKernel.from_matrix(np.diag(np.linspace(0.5, 1.5, 32)))
+    np.testing.assert_allclose(
+        spatial_q_test(duplicate, kernel), spatial_q_test(values, kernel), rtol=2e-7
+    )
+    assert not duplicate.has_canonical_format
+    np.testing.assert_array_equal(duplicate.data, before.data)
+    np.testing.assert_array_equal(duplicate.indices, before.indices)
+    np.testing.assert_array_equal(duplicate.indptr, before.indptr)
 
 
 def test_small_chunks_respect_worker_budget(monkeypatch):

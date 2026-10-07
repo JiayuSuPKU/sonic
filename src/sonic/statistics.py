@@ -36,6 +36,7 @@ import numpy as np
 import pandas as pd
 import scipy.sparse as sp
 from scipy.stats import beta, chi2, ncx2, norm
+from sklearn.utils.sparsefuncs import mean_variance_axis
 from tqdm import tqdm
 
 from sonic.kernels import Kernel
@@ -1055,6 +1056,19 @@ def compute_null_params(  # noqa: C901
     return params
 
 
+def _sparse_mean_std(X: sp.spmatrix, ddof: int = 1) -> tuple[np.ndarray, np.ndarray]:
+    """Stable column moments without densification or input mutation."""
+    X = X.astype(np.float64, copy=False)
+    if X.format not in ("csr", "csc"):
+        X = X.tocsc()
+    if not X.has_canonical_format:
+        X = X.copy()
+        X.sum_duplicates()
+    means, var = mean_variance_axis(X, axis=0)
+    var *= X.shape[0] / max(X.shape[0] - ddof, 1)
+    return means, np.sqrt(var)
+
+
 def _q_test_matrix(  # noqa: C901
     Xn: np.ndarray | sp.spmatrix,
     kernel: Kernel,
@@ -1083,15 +1097,10 @@ def _q_test_matrix(  # noqa: C901
             Xn = Xn.reshape(-1, 1)
         n, M = Xn.shape
 
-    # Fast path: sparse Xn + unstandardized + kernel exposes xtKx_standardized.
-    # Uses the (K·1, 1ᵀK1) expansion so sparse Xn never needs densification.
+    # Sparse moments stay sparse; the kernel selects a sparse product or a
+    # directly centered dense workspace according to numerical safety and kernel type.
     if is_sparse and not is_standardized and hasattr(kernel, "xtKx_standardized"):
-        col_sum = np.asarray(Xn.sum(axis=0)).ravel()
-        means = col_sum / n
-        sq_sum = np.asarray(Xn.multiply(Xn).sum(axis=0)).ravel()
-        var = (sq_sum - n * means**2) / max(n - 1, 1)
-        var[var < 0] = 0.0
-        stds = np.sqrt(var)
+        means, stds = _sparse_mean_std(Xn)
         valid_mask = stds > 0
         Q = kernel.xtKx_standardized(Xn, means, stds)
     else:
@@ -1371,12 +1380,7 @@ def _r_test_matrix(  # noqa: C901
     def _standardize(A):
         """Z-score A (sparse or dense) column-wise with ddof=1. Returns dense."""
         if sp.issparse(A):
-            col_sum = np.asarray(A.sum(axis=0)).ravel()
-            means = col_sum / n
-            sq_sum = np.asarray(A.multiply(A).sum(axis=0)).ravel()
-            var = (sq_sum - n * means**2) / max(n - 1, 1)
-            var[var < 0] = 0.0
-            stds = np.sqrt(var)
+            means, stds = _sparse_mean_std(A)
             Z = A.toarray() - means
         else:
             means = np.mean(A, axis=0)

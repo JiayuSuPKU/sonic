@@ -279,6 +279,34 @@ class TestLogL2AnalyticNull:
         assert df["P_value"].between(0, 1).all()
 
 
+@pytest.mark.parametrize("path", ["spectral", "masked", "scalar"])
+@pytest.mark.parametrize("offset,scale", [(1e4, 1.0), (0.0, 1e8)])
+def test_glm_nuisance_offset_and_units_preserve_contrast(path, offset, scale):
+    rng = np.random.default_rng(673)
+    n, n_genes, n_bins = 24, 8, 6
+    group = np.repeat([0.0, 1.0], n // 2)
+    covariate = rng.normal(size=n)
+    design = np.column_stack([np.ones(n), group, covariate])
+    shifted = design.copy()
+    shifted[:, 2] = (covariate + offset) * scale
+    contrast = np.array([0.0, 1.0, 0.0])
+    values = 1.0 + 0.5 * group[:, None] + 0.2 * covariate[:, None] + rng.normal(size=(n, n_genes))
+    spectra = np.exp(values[:, :, None] + rng.normal(size=(n, n_genes, n_bins)))
+    presence = rng.random((n, n_genes)) > 0.15
+
+    def compare(x):
+        if path == "scalar":
+            frame = compare_glm_scalar(values, x, contrast)
+        elif path == "masked":
+            frame = compare_glm_masked(spectra, x, contrast, presence)
+        else:
+            frame = compare_glm(spectra, x, contrast)
+        return frame.sort_values("Feature").drop(columns="Feature").to_numpy()
+
+    np.testing.assert_allclose(compare(shifted), compare(design), rtol=2e-6, atol=1e-10)
+    np.testing.assert_array_equal(design[:, 2], covariate)
+
+
 class TestCompareGLM:
     """GLM analytic comparisons for DataFrame, dict, and ndarray designs."""
 

@@ -505,6 +505,116 @@ class TestDetectorGridStatistic(unittest.TestCase):
 
 @pytest.mark.parametrize("shape", [(8, 8), (7, 9)])
 @pytest.mark.parametrize("solver", ["fft2", "rfft2"])
+@pytest.mark.parametrize("method", ["gaussian", "matern", "car", "graph_laplacian", "moran"])
+def test_masked_grid_q_matches_observed_cell_operator(shape, solver, method):
+    from sonic.detectors import grid
+    from sonic.kernels import MatrixKernel
+    from sonic.statistics import compute_null_params, spatial_q_test
+
+    rng = np.random.default_rng(81)
+    observed = rng.random(shape) > 0.55
+    data = rng.normal(size=(4, *shape))
+    data[0, observed] = 3.0  # Constant features remain non-significant.
+    data[:, ~observed] = np.nan
+    original = data.copy()
+    names = ["constant", "x", "y", "z"]
+    raster = MockDataArray(data, names)
+    sdata = MockSpatialData("cells", MockTable(np.ones((observed.sum(), 4)), names))
+    with patch("sonic._rasterize.rasterize_table", return_value=raster):
+        detector = DetectorGrid(kernel_method=method, fft_solver=solver).setup_data(
+            sdata, bins="bins", table_name="cells", col_key="col", row_key="row"
+        )
+
+    # Independent dense oracle: apply the grid operator to each basis vector,
+    # then restrict it to observations and retain the existing grid-Q scale.
+    n = int(np.prod(shape))
+    matrix = detector.kernel_.Kx(np.eye(n).reshape(*shape, n)).reshape(n, n)
+    idx = np.flatnonzero(observed)
+    scale = (n - 1) / (len(idx) - 1)
+    reference = MatrixKernel.from_matrix(scale * matrix[np.ix_(idx, idx)])
+    params = compute_null_params(
+        reference, method="clt" if method == "moran" else "moments", n_probes=60
+    )
+    q, p = spatial_q_test(data[:, observed].T, reference, null_params=params)
+    z = (q - params["mean_Q"]) / np.sqrt(params["var_Q"])
+    z[0] = 0.0
+
+    for n_jobs, return_pval in [(1, True), (2, True), (1, False)]:
+        with patch.object(grid, "compute_null_params", wraps=compute_null_params) as prepare:
+            result = detector.compute_qstat(
+                n_jobs=n_jobs,
+                workers=1,
+                chunk_size=1,
+                return_pval=return_pval,
+                show_progress=False,
+            ).loc[names]
+            assert prepare.call_count == 1
+        np.testing.assert_allclose(result["Q"], q, rtol=1e-10, atol=1e-10)
+        np.testing.assert_allclose(result["Z_score"], z, rtol=1e-10, atol=1e-10)
+        if return_pval:
+            np.testing.assert_allclose(result["P_value"], p, rtol=1e-9, atol=1e-10)
+    np.testing.assert_array_equal(data, original)
+
+
+def test_masked_grid_null_always_uses_bounded_probes(monkeypatch):
+    from sonic.detectors import grid
+    from sonic.kernels import FFTKernel, MatrixKernel
+    from sonic.statistics import compute_null_params
+
+    rng = np.random.default_rng(11)
+    observed = rng.random((8, 9)) > 0.4
+    kernel = FFTKernel(observed.shape, method="gaussian", bandwidth=1.0, fft_solver="rfft2")
+    restricted = grid._OccupiedGridKernel(kernel, observed)
+    matrix = restricted.Kx(np.eye(restricted.n))
+    exact = compute_null_params(MatrixKernel.from_matrix(matrix), method="moments")
+    # Exercise both the matrix-free fit and multiple embedded FFT chunks.
+    monkeypatch.setattr(grid, "_TRACE_PROBE_BUDGET_BYTES", 64 * kernel.n * 2)
+    vectors = rng.normal(size=(restricted.n, 5))
+    np.testing.assert_allclose(restricted.Kx(vectors), matrix @ vectors, atol=1e-12)
+    with patch("numpy.linalg.eigvalsh", side_effect=AssertionError("Unexpected dense spectrum")):
+        probed = grid._grid_q_null(kernel, observed)
+    assert probed["source"] == "probes"
+    np.testing.assert_allclose(
+        [probed["mean_Q"], probed["var_Q"]],
+        [exact["mean_Q"], exact["var_Q"]],
+        rtol=1e-10,
+    )
+
+
+def test_masked_grid_q_white_noise_false_positive_rate():
+    from sonic.detectors.grid import _qstat_worker_fft
+    from sonic.kernels import FFTKernel
+
+    rng = np.random.default_rng(213)
+    yy, xx = np.indices((32, 32))
+    observed = abs(yy - xx) < 5
+    n_trials = 5000
+    data = np.full((n_trials, 32, 32), np.nan)
+    data[:, observed] = rng.normal(size=(n_trials, observed.sum()))
+    names = [str(i) for i in range(n_trials)]
+    result = _qstat_worker_fft(
+        MockDataArray(data, names),
+        names,
+        FFTKernel((32, 32), method="gaussian", bandwidth=2.0, workers=1),
+        True,
+    )
+    rejection_rate = np.mean([row["P_value"] < 0.05 for row in result])
+    # The old full-grid null rejects roughly 11%, despite iid Gaussian data.
+    assert 0.035 < rejection_rate < 0.065
+
+
+def test_masked_grid_q_rejects_mismatched_feature_masks():
+    from sonic.detectors.grid import _qstat_worker_fft
+    from sonic.kernels import FFTKernel
+
+    data = np.ones((2, 4, 4))
+    data[0, 0, 0] = np.nan
+    with pytest.raises(ValueError, match="same observed-cell mask"):
+        _qstat_worker_fft(MockDataArray(data, ["x", "y"]), ["x", "y"], FFTKernel((4, 4)), True)
+
+
+@pytest.mark.parametrize("shape", [(8, 8), (7, 9)])
+@pytest.mark.parametrize("solver", ["fft2", "rfft2"])
 @pytest.mark.parametrize("method", ["car", "moran"])
 def test_grid_detector_r_matches_standalone(shape, solver, method, monkeypatch):
     # This checks numerical parity, not the production memory-cleanup policy.

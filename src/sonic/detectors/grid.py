@@ -20,11 +20,95 @@ from tqdm import tqdm
 from sonic._rasterize import _mean_fill_missing
 from sonic.detectors.base import Detector
 from sonic.kernels.fft import FFTKernel
-from sonic.statistics import apply_bh_correction, compute_null_params, spatial_q_test
+from sonic.statistics import (
+    _TRACE_PROBE_BUDGET_BYTES,
+    _resolve_q_null_method,
+    apply_bh_correction,
+    compute_null_params,
+    spatial_q_test,
+)
 
 __all__ = ["DetectorGrid"]
 
 logger = logging.getLogger(__name__)
+
+
+class _OccupiedGridKernel:
+    """Null operator on observed cells, scaled to the reported full-grid Q.
+
+    For m observed cells in an N-cell raster, mean filling followed by grid
+    standardization gives Q_grid = (N-1)/(m-1) * Q_observed. Restrict the
+    kernel to those m cells and center there before fitting the existing null.
+    """
+
+    centering = True
+
+    def __init__(self, kernel: FFTKernel, observed: np.ndarray):
+        self._fft_kernel = kernel
+        self.observed = observed
+        self.n = int(observed.sum())
+        if self.n < 2:
+            raise ValueError("Grid Q calibration requires at least two observed cells.")
+        self.scale = (kernel.n - 1) / (self.n - 1)
+        self.method = kernel.method
+        shape = observed.shape
+        fft = scipy.fft.fft2 if kernel.fft_solver == "fft2" else scipy.fft.rfft2
+        ifft = scipy.fft.ifft2 if kernel.fft_solver == "fft2" else scipy.fft.irfft2
+        spectrum = kernel.eigenvalues().reshape(kernel.ny, -1)
+        column = ifft(spectrum, s=shape, workers=kernel.workers).real
+        mask_fft = fft(observed, workers=kernel.workers)
+        row_sums = ifft(spectrum * mask_fft, s=shape, workers=kernel.workers).real[observed]
+        total = float(row_sums.sum())
+        # Convolving the squared kernel column counts only observed pairs.
+        second = (
+            ifft(
+                fft(column**2, workers=kernel.workers) * mask_fft,
+                s=shape,
+                workers=kernel.workers,
+            )
+            .real[observed]
+            .sum()
+        )
+        self._trace = self.scale * (self.n * column[0, 0] - total / self.n)
+        self._square_trace = self.scale**2 * max(
+            float(second - 2 * (row_sums @ row_sums) / self.n + (total / self.n) ** 2), 0.0
+        )
+
+    def trace(self):
+        return self._trace
+
+    def square_trace(self):
+        return self._square_trace
+
+    def Kx(self, x):
+        kernel = self._fft_kernel
+        squeeze = x.ndim == 1
+        x = x[:, None] if squeeze else x
+        result = np.empty_like(x, dtype=float)
+        # Bound the embedded FFT workspace as well as the observed-cell probes.
+        chunk = max(1, _TRACE_PROBE_BUDGET_BYTES // (64 * kernel.n))
+        for start in range(0, x.shape[1], chunk):
+            block = x[:, start : start + chunk]
+            grid = np.zeros((*self.observed.shape, block.shape[1]))
+            grid[self.observed] = block - block.mean(axis=0)
+            applied = kernel.Kx(grid)[self.observed]
+            result[:, start : start + chunk] = self.scale * (applied - applied.mean(axis=0))
+        return result[:, 0] if squeeze else result
+
+    def eigenvalues(self, k=None):
+        raise NotImplementedError("Occupied grids always use bounded trace probes.")
+
+
+def _grid_q_null(kernel: FFTKernel, observed: np.ndarray) -> dict:
+    """Prepare one occupancy-aware null for all feature batches."""
+    if observed.all():
+        params = compute_null_params(kernel)
+    else:
+        params = compute_null_params(
+            _OccupiedGridKernel(kernel, observed), method=_resolve_q_null_method(kernel)
+        )
+    params["_grid_observed"] = observed
+    return params
 
 
 def _qstat_worker_fft(
@@ -59,14 +143,19 @@ def _qstat_worker_fft(
 
     # Load data to memory for batch: shape (M, ny, nx)
     data_chunk = raster_layer.sel(c=feature_batch).values
+    observed = ~np.isnan(data_chunk[0])
+    if np.any(np.isnan(data_chunk) != ~observed):
+        raise ValueError("Grid Q-test features must share the same observed-cell mask.")
+    if null_params is None or (not observed.all() and "_grid_observed" not in null_params):
+        null_params = _grid_q_null(kernel, observed)
+    elif not np.array_equal(null_params.get("_grid_observed", observed), observed):
+        raise ValueError("Grid Q-test features must share the calibration's observed-cell mask.")
     # Structural holes are NaN after rasterization. Mean-fill them so the
     # Q-test's subsequent centering maps missing bins to zero residuals.
     data_chunk = _mean_fill_missing(data_chunk, axis=(1, 2))
     # Transpose to (ny, nx, M) for kernel
     data_chunk_transposed = np.moveaxis(data_chunk, 0, -1)
 
-    if null_params is None:
-        null_params = compute_null_params(kernel)
     # Compute statistics
     if return_pval:
         stats, pvals = spatial_q_test(
@@ -428,6 +517,13 @@ class DetectorGrid(Detector):
         ``moments`` calibration. Moran and other signed Fourier spectra use
         two-sided ``clt``. Finite-sample moments account for sample standardization;
         one prepared null supplies both p-values and Z-scores for every batch.
+        Structural NaN holes are excluded from null calibration: it uses the
+        kernel restricted to observed cells and their sample size. Reported Q
+        retains its full-grid scale, with the null scaled to match. Moment
+        calibration on masked grids always uses exact first/second traces and
+        60 fixed-seed probes in bounded batches for higher moments, regardless
+        of mask size.
+        All tested features must share the same observed-cell mask.
         Z-scores alone do not specify the non-normal moment-fit p-value.
         For a different null method, use :func:`~sonic.spatial_q_test` with a
         cache from :func:`sonic.statistics.compute_null_params`.
@@ -449,7 +545,8 @@ class DetectorGrid(Detector):
         self.kernel_.workers = workers
         # Z-scores require the same finite-sample moments even when p-values
         # are not requested. Share the fit across all worker batches.
-        null_params = compute_null_params(self.kernel_)
+        observed = ~np.isnan(raster_layer.sel(c=features[:1]).values[0])
+        null_params = _grid_q_null(self.kernel_, observed)
 
         logger.info(
             "Q-test on %d features — %d batches, n_jobs=%d, workers=%s, chunk_size=%d",

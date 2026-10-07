@@ -1465,3 +1465,11 @@ def test_comparator_rebudgets_for_actual_sample_jobs(monkeypatch, backend):
     comparator.compute_spectra(n_jobs=2, progress=False)
     assert comparator._auto_chunk_budget_bytes == 2 * 1024**3
     assert getattr(comparator, chunk_attr) == 32
+
+    # Only one sample job fits; spare CPUs become transform threads.
+    comparator.compute_spectra(n_jobs=-1, progress=False, memory_budget_bytes=budget // 4)
+    assert getattr(comparator, chunk_attr) == 1
+    assert comparator._workers == 4
+    np.testing.assert_allclose(comparator.spectra_, parallel, rtol=1e-10)
+    with pytest.raises(ValueError, match="cannot fit one feature"):
+        comparator.compute_spectra(n_jobs=2, progress=False, memory_budget_bytes=budget // 4)

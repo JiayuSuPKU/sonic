@@ -686,7 +686,8 @@ if __name__ == "__main__":
 
 
 @pytest.mark.parametrize("test", ["q", "r"])
-def test_auto_chunk_uses_memory_override_and_resolved_jobs(monkeypatch, test):
+@pytest.mark.parametrize("n_jobs", [4, "auto", -1])
+def test_auto_chunk_uses_memory_override_and_resolved_jobs(monkeypatch, test, n_jobs):
     import sonic.utils as utils
 
     monkeypatch.setattr(utils.os, "cpu_count", lambda: 8)
@@ -707,9 +708,13 @@ def test_auto_chunk_uses_memory_override_and_resolved_jobs(monkeypatch, test):
     detector = DetectorGrid(kernel_method="gaussian")
     with patch("sonic._rasterize.rasterize_table", return_value=raster):
         detector.setup_data(sdata, bins="bins", table_name="table", col_key="x", row_key="y")
-    kwargs = {"workers": 2, "show_progress": False, "memory_budget_bytes": budget}
+    kwargs = {
+        "workers": "auto" if test == "q" else 2,
+        "show_progress": False,
+        "memory_budget_bytes": budget,
+    }
     if test == "q":
-        result = detector.compute_qstat(n_jobs=4, **kwargs)
+        result = detector.compute_qstat(n_jobs=n_jobs, **kwargs)
         assert len(result) == 20
         assert seen == [(1, budget, 4), (4, budget, 1)]
     else:

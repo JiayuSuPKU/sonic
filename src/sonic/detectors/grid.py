@@ -27,7 +27,7 @@ from sonic.statistics import (
     compute_null_params,
     spatial_q_test,
 )
-from sonic.utils import _DEFAULT_CHUNK_BUDGET, _parse_memory_budget
+from sonic.utils import _DEFAULT_CHUNK_BUDGET, _chunk_parameters, _parse_memory_budget
 
 __all__ = ["DetectorGrid"]
 
@@ -433,12 +433,24 @@ class DetectorGrid(Detector):
         return auto_chunk_size(self.kernel_, n_jobs=n_jobs, budget_bytes=budget_bytes)
 
     def _auto_schedule(
-        self, n_batches: int, n_jobs: int | str, workers: int | str | None
+        self,
+        n_batches: int,
+        n_jobs: int | str,
+        workers: int | str | None,
+        *,
+        budget_bytes: int | None = None,
     ) -> tuple[int, int]:
         """Balance outer batches and transform threads using the shared policy."""
         from sonic.utils import resolve_parallelism
 
-        return resolve_parallelism(n_jobs, workers, backend="fft", n_tasks=n_batches)
+        return resolve_parallelism(
+            n_jobs,
+            workers,
+            backend="fft",
+            n_tasks=n_batches,
+            per_feat_bytes=_chunk_parameters(self.kernel_)[1] if budget_bytes is not None else None,
+            budget_bytes=budget_bytes if budget_bytes is not None else _DEFAULT_CHUNK_BUDGET,
+        )
 
     def compute_qstat(
         self,
@@ -464,9 +476,10 @@ class DetectorGrid(Detector):
             Feature names to analyze. ``None`` uses all features that pass
             the ``min_count`` filter from :meth:`setup_data`.
         n_jobs : int or ``'auto'``, default ``'auto'``
-            Joblib workers over feature batches. ``'auto'`` balances against
-            ``workers`` — see :meth:`_auto_schedule`. ``-1`` is also accepted
-            and behaves like ``'auto'``.
+            Joblib workers over feature batches. With automatic chunks, ``'auto'``
+            limits jobs to fit at least one feature each in the workspace budget,
+            then balances against ``workers`` — see :meth:`_auto_schedule`.
+            ``-1`` is also accepted and behaves like ``'auto'``.
         workers : int, ``'auto'``, or None, default ``'auto'``
             Threads for scipy.fft inside each worker. ``'auto'`` co-balances with
             ``n_jobs`` and caps automatic threads at four; ``None`` uses one.
@@ -522,7 +535,9 @@ class DetectorGrid(Detector):
         if chunk_size < 1:
             raise ValueError("chunk_size must be positive.")
         n_batches = max(1, (len(features) + chunk_size - 1) // chunk_size)
-        n_jobs, workers = self._auto_schedule(n_batches, n_jobs, workers)
+        n_jobs, workers = self._auto_schedule(
+            n_batches, n_jobs, workers, budget_bytes=memory_budget_bytes if auto_chunk else None
+        )
         if auto_chunk:
             chunk_size = self._auto_chunk_size(n_jobs=n_jobs, budget_bytes=memory_budget_bytes)
         feature_batches = [

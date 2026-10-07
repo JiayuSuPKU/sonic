@@ -329,8 +329,10 @@ class ComparatorGrid(_ComparatorBase):
         # Resolve 'auto' chunk size. The lazy rasters carry their (ny, nx) as
         # cheap dask metadata, so we can scan shapes without materialising any
         # pixels, then size the chunk to bound the per-chunk dense footprint.
+        n_jobs, self._fft_chunk_size = self._resolve_spectrum_schedule(
+            self._fft_chunk_size_spec, shapes, n_jobs=n_jobs
+        )
         if self._fft_chunk_size_spec == "auto":
-            self._fft_chunk_size = self._resolve_chunk_size("auto", shapes, n_jobs=n_jobs)
             logger.info(
                 "auto fft_chunk_size=%d (max lattice %d px, cap %d, budget %.1f GiB).",
                 self._fft_chunk_size,

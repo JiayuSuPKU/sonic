@@ -306,12 +306,9 @@ class ComparatorIrregular(_ComparatorBase):
         progress: bool,
         landmark_genes: Sequence[str] | None = None,
     ) -> tuple[list[np.ndarray], np.ndarray, np.ndarray]:
-        if self._nufft_chunk_size_spec == "auto":
-            self._nufft_chunk_size = self._resolve_chunk_size(
-                "auto",
-                self._grid_shapes,
-                n_jobs=n_jobs,
-            )
+        n_jobs, self._nufft_chunk_size = self._resolve_spectrum_schedule(
+            self._nufft_chunk_size_spec, self._grid_shapes, n_jobs=n_jobs
+        )
         chunk_size = self._nufft_chunk_size
         n_samples_total = len(self.samples)
         self._resolve_freq_edges()

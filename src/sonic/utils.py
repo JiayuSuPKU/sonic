@@ -73,6 +73,8 @@ def resolve_parallelism(
     *,
     backend: str = "fft",
     n_tasks: int | None = None,
+    per_feat_bytes: int | None = None,
+    budget_bytes: int | str = _DEFAULT_CHUNK_BUDGET,
 ) -> tuple[int, int]:
     """Balance outer jobs and threads per transform within the CPU count.
 
@@ -83,6 +85,11 @@ def resolve_parallelism(
     Explicit thread counts may exceed that cap, but not available CPUs.
     Prefer outer jobs when enough tasks are available, then spend spare CPUs
     on transform threads up to the cap. ``n_tasks`` caps idle outer jobs.
+    When automatic chunks supply ``per_feat_bytes``, automatic/negative job
+    counts also leave room for at least one feature per job in ``budget_bytes``.
+    This limit is applied before assigning spare CPUs to transform threads.
+    Explicit positive job counts retain their requested CPU/task limit; chunk
+    sizing raises if their workspace cannot fit. Explicit chunks omit this limit.
     See ``benchmarks/benchmark_scheduling.py`` for the reproducible sweep.
     """
     if backend not in ("fft", "nufft", "matrix"):
@@ -93,6 +100,8 @@ def resolve_parallelism(
         raise ValueError("n_jobs cannot be zero.")
     jobs = max(1, cpu + 1 + requested_jobs) if requested_jobs < 0 else requested_jobs
     jobs = min(jobs, cpu, max(1, n_tasks) if n_tasks is not None else cpu)
+    if per_feat_bytes is not None and requested_jobs < 0:
+        jobs = min(jobs, resolve_chunk_size(cpu, per_feat_bytes, budget_bytes=budget_bytes))
     if n_workers == "auto":
         cap = 1 if backend == "matrix" else 4
         workers = min(cap, max(1, cpu // jobs))
@@ -126,20 +135,22 @@ def auto_chunk_size(
     Explicit user chunk sizes bypass this policy. The caps are conservative
     defaults from ``benchmarks/benchmark_scheduling.py``, not runtime autotuning.
     """
+    cap, per_feat = _chunk_parameters(kernel)
+    return resolve_chunk_size(cap, per_feat, n_jobs=n_jobs, budget_bytes=budget_bytes)
+
+
+def _chunk_parameters(kernel: Kernel) -> tuple[int, int]:
+    """Shared chunk cap and per-feature workspace for scheduling and sizing."""
     from sonic.kernels.fft import FFTKernel
     from sonic.kernels.nufft import NUFFTKernel
 
     n = max(1, int(kernel.n))
     if isinstance(kernel, FFTKernel):
-        per_feat, cap = 64 * n, _FFT_CHUNK_CAP
-    elif isinstance(kernel, NUFFTKernel):
-        per_feat = 64 * (int(np.prod(kernel.grid_shape)) + n)
-        cap = _NUFFT_CHUNK_CAP
-    else:
-        precision = bool(getattr(kernel, "stores_precision", False))
-        per_feat = (48 if precision else 32) * n
-        cap = 4 if precision else 32
-    return resolve_chunk_size(cap, per_feat, n_jobs=n_jobs, budget_bytes=budget_bytes)
+        return _FFT_CHUNK_CAP, 64 * n
+    if isinstance(kernel, NUFFTKernel):
+        return _NUFFT_CHUNK_CAP, 64 * (int(np.prod(kernel.grid_shape)) + n)
+    precision = bool(getattr(kernel, "stores_precision", False))
+    return (4, 48 * n) if precision else (32, 32 * n)
 
 
 def resolve_chunk_size(

@@ -21,7 +21,12 @@ from sonic.statistics import (
     compute_null_params,
     spatial_q_test,
 )
-from sonic.utils import _DEFAULT_CHUNK_BUDGET, _parse_memory_budget, resolve_parallelism
+from sonic.utils import (
+    _DEFAULT_CHUNK_BUDGET,
+    _chunk_parameters,
+    _parse_memory_budget,
+    resolve_parallelism,
+)
 
 __all__ = ["DetectorIrregular"]
 
@@ -776,7 +781,8 @@ class DetectorIrregular(Detector):
         features : Optional[List[str]]
             Feature names to test. If None, tests all features in source.
         n_jobs : int, default -1
-            Number of parallel jobs. -1 uses all available cores; 1 for sequential.
+            Maximum parallel jobs. Negative counts also limit jobs to the automatic
+            chunk workspace budget; -1 requests all cores. Use 1 for sequential.
         layer : Optional[str]
             If source='var', which layer to use (e.g., 'raw', 'log1p'). If None, uses .X.
         return_pval : bool, default True
@@ -861,6 +867,8 @@ class DetectorIrregular(Detector):
             workers if self.backend_ == "nufft" else 1,
             backend="nufft" if self.backend_ == "nufft" else "matrix",
             n_tasks=n_batches,
+            per_feat_bytes=_chunk_parameters(self.kernel_)[1] if auto_chunk else None,
+            budget_bytes=memory_budget_bytes,
         )
         if self.backend_ == "nufft":
             self.kernel_.nthreads = n_workers
@@ -968,7 +976,9 @@ class DetectorIrregular(Detector):
         source : str, default 'var'
             Feature source: 'var' (genes) or 'obs' (metadata columns).
         n_jobs : int, default -1
-            Number of parallel jobs. -1 uses all available cores; 1 for sequential.
+            Maximum parallel jobs for matrices. Negative counts also limit jobs to
+            the automatic chunk workspace budget; -1 requests all cores. NUFFT
+            R-tests use one outer job and parallelize only their transforms.
         layer : Optional[str]
             If source='var', which layer to use (e.g., 'raw', 'log1p'). If None, uses .X.
         return_pval : bool, default True
@@ -1059,6 +1069,8 @@ class DetectorIrregular(Detector):
             workers if self.backend_ == "nufft" else 1,
             backend="nufft" if self.backend_ == "nufft" else "matrix",
             n_tasks=1 if self.backend_ == "nufft" else n_batches,
+            per_feat_bytes=_chunk_parameters(self.kernel_)[1] if auto_chunk else None,
+            budget_bytes=memory_budget_bytes,
         )
         if self.backend_ == "nufft":
             self.kernel_.nthreads = n_workers

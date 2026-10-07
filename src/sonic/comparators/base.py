@@ -346,33 +346,42 @@ class _ComparatorBase:
         )
 
     # ------------------------------------------------------------------
-    def _resolve_chunk_size(
+    def _resolve_spectrum_schedule(
         self, spec: int | str, grid_shapes: list[tuple[int, int]], *, n_jobs: int = 1
-    ) -> int:
-        """Resolve a chunk-size spec (an int, or ``'auto'``) to an int.
+    ) -> tuple[int, int]:
+        """Resolve sample jobs, transform threads and chunks from the same budget.
 
-        ``'auto'`` reuses :func:`sonic.utils.resolve_chunk_size` — the
-        same cache sweet-spot cap (:attr:`_auto_chunk_cap`) and live-memory
-        budget (:attr:`_auto_chunk_budget_bytes`) as the Q/R-test chunker.
         Estimate 64 bytes per grid cell plus, for NUFFT, 64 per observation.
-        An int is returned as-is (floored at 1).
+        Automatic jobs can shrink to fit one feature per sample job; explicit
+        positive jobs retain their limit. Explicit chunks bypass memory sizing.
         """
-        if not isinstance(spec, str):
-            return max(1, int(spec))
-        if spec != "auto":
+        if isinstance(spec, str) and spec != "auto":
             raise ValueError(f"chunk_size must be a positive int or 'auto', got {spec!r}.")
-        from sonic.utils import resolve_chunk_size
+        from sonic.utils import resolve_chunk_size, resolve_parallelism
 
         max_lat = max((ny * nx for (ny, nx) in grid_shapes), default=1)
         per_feat = 64 * max(max_lat, 1)
         if self._spectrum_backend == "nufft":
             per_feat += 64 * max(len(coords) for coords in self._coords)
-        return resolve_chunk_size(
-            self._auto_chunk_cap,
-            per_feat,
-            n_jobs=n_jobs,
+        n_jobs, self._workers = resolve_parallelism(
+            n_jobs,
+            self._workers_spec,
+            backend=self._spectrum_backend,
+            n_tasks=len(self.samples),
+            per_feat_bytes=per_feat if spec == "auto" else None,
             budget_bytes=self._auto_chunk_budget_bytes,
         )
+        chunk = (
+            resolve_chunk_size(
+                self._auto_chunk_cap,
+                per_feat,
+                n_jobs=n_jobs,
+                budget_bytes=self._auto_chunk_budget_bytes,
+            )
+            if spec == "auto"
+            else max(1, int(spec))
+        )
+        return n_jobs, chunk
 
     # Rotation-landmark cache budget (bytes). An explicit ``landmark_genes``
     # set in 2d mode needs its full ``(n_landmarks, ny, n_kx)`` spectra cached
@@ -580,7 +589,8 @@ class _ComparatorBase:
             Parallelism over samples for the per-sample spectrum pass. When
             ``progress=True`` the outer loop is sequential (so the tqdm bar is
             accurate). Transform threads use spare CPUs, capped at four by
-            default. The memory budget uses this actual outer concurrency.
+            default. With automatic chunks, negative job counts are also capped
+            by the workspace needed for one feature per concurrent sample.
         landmark_genes : sequence of str, optional
             Only used in ``feature_mode='2d'``. Names of genes (matched against
             :attr:`gene_names`) whose spectra define the rotation-alignment
@@ -603,17 +613,7 @@ class _ComparatorBase:
         -------
         self
         """
-        from sonic.utils import resolve_parallelism
-
         self._auto_chunk_budget_bytes = _parse_memory_budget(memory_budget_bytes)
-        # Progress currently serializes the sample loop; budget for that actual
-        # concurrency, and retain the requested worker setting across reruns.
-        n_jobs, self._workers = resolve_parallelism(
-            1 if progress else n_jobs,
-            self._workers_spec,
-            backend=self._spectrum_backend,
-            n_tasks=1 if progress else len(self.samples),
-        )
         logger.info(
             "Computing per-sample spectra (n_samples=%d, mean-centered)...",
             len(self.samples),
@@ -626,7 +626,10 @@ class _ComparatorBase:
         # ``self.rotation_angles_`` by the backend.
         self._raw_2d_spectra = None
         per_sample, self.dc_, self.presence_ = self._compute_spectra(
-            n_jobs=n_jobs, progress=progress, landmark_genes=landmark_genes
+            # Backends resolve jobs/chunks once their grid shapes are known.
+            n_jobs=1 if progress else n_jobs,
+            progress=progress,
+            landmark_genes=landmark_genes,
         )
 
         # The feature grid may be adaptively merged; diagnostics also preserve

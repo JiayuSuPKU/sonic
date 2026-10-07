@@ -813,3 +813,17 @@ def test_detector_budget_and_worker_overrides_preserve_statistics(monkeypatch, t
         if backend == "nufft":
             assert detector.kernel_.nthreads == workers
     np.testing.assert_allclose(outputs[0], outputs[1], rtol=2e-6, atol=1e-7)
+
+    # A one-feature workspace must serialize automatic jobs rather than fail.
+    kwargs.update(n_jobs=-1, workers="auto", memory_budget_bytes=budget // 2)
+    seen.clear()
+    if test == "q":
+        result = detector.compute_qstat(**kwargs).sort_values("Feature")
+        actual = result["Q"].to_numpy()
+    else:
+        result = detector.compute_rstat(["a", "b"], ["c", "d"], **kwargs)
+        actual = result.sort_values(["Feature_1", "Feature_2"])["R"].to_numpy()
+    assert seen == [(1, budget // 2, 1), (1, budget // 2, 1)]
+    if backend == "nufft":
+        assert detector.kernel_.nthreads == 4
+    np.testing.assert_allclose(actual, outputs[0], rtol=2e-6, atol=1e-7)

@@ -404,3 +404,47 @@ def test_auto_chunk_backend_workspace_budget(backend, cap):
     assert auto_chunk_size(kernel, n_jobs=3, budget_bytes=per_feat * 6) == 2
     with pytest.raises(ValueError, match="cannot fit one feature"):
         auto_chunk_size(kernel, n_jobs=3, budget_bytes=per_feat * 3 - 1)
+
+
+@pytest.mark.parametrize(
+    "jobs,workers,tasks,backend,per_feature,expected",
+    [
+        ("auto", "auto", 100, "fft", 64 * 6_000_000, (5, 2)),
+        (-1, "auto", 100, "nufft", 128 * 6_000_000, (2, 4)),
+        (-2, "auto", 100, "fft", 64 * 6_000_000, (5, 2)),
+        (-1, "auto", 1, "fft", 64 * 6_000_000, (1, 4)),
+        (-1, 3, 100, "fft", 64 * 6_000_000, (3, 3)),
+        (-1, None, 100, "fft", 64 * 6_000_000, (5, 1)),
+        (-1, "auto", 100, "matrix", 32 * 20_000_000, (3, 1)),
+    ],
+)
+def test_memory_limited_jobs_leave_room_for_chunks(
+    monkeypatch, jobs, workers, tasks, backend, per_feature, expected
+):
+    from sonic.utils import resolve_parallelism
+
+    monkeypatch.setattr("sonic.utils.os.cpu_count", lambda: 10)
+    actual = resolve_parallelism(
+        jobs,
+        workers,
+        backend=backend,
+        n_tasks=tasks,
+        per_feat_bytes=per_feature,
+        budget_bytes="2 GiB",
+    )
+    assert actual == expected
+    chunk = resolve_chunk_size(32, per_feature, n_jobs=actual[0], budget_bytes="2 GiB")
+    assert actual[0] * chunk * per_feature <= 2 * 1024**3
+
+
+def test_memory_job_limit_preserves_explicit_settings_and_rejects_impossible_budget(monkeypatch):
+    from sonic.utils import resolve_parallelism
+
+    monkeypatch.setattr("sonic.utils.os.cpu_count", lambda: 10)
+    jobs, workers = resolve_parallelism(8, per_feat_bytes=100, budget_bytes=200)
+    assert (jobs, workers) == (8, 1)
+    with pytest.raises(ValueError, match="cannot fit one feature"):
+        resolve_chunk_size(32, 100, n_jobs=jobs, budget_bytes=200)
+    with pytest.raises(ValueError, match="cannot fit one feature"):
+        resolve_parallelism(-1, per_feat_bytes=100, budget_bytes=99)
+    assert resolve_parallelism(-1, budget_bytes=1) == (10, 1)  # Explicit chunks omit estimates.

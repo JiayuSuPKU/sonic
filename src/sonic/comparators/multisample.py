@@ -387,6 +387,8 @@ def _log_l2_pvalues_from_state(state: _AnalyticNullState) -> np.ndarray:
     ``_estimate_*_null_covariance`` helpers. Unmasked states carry one
     eigenvalue vector reused for every gene; masked states carry a per-gene
     eigenvalue matrix and an ``eligible`` mask so skipped genes remain ``NaN``.
+    Genes with the same contrast scale share one Liu fit. Retaining the scale
+    in the fit preserves its absolute numerical safeguards and eigenvalue floor.
     """
     observed = np.asarray(state["observed"], dtype=float)
     eigenvalues = np.asarray(state["eigenvalues"], dtype=float)
@@ -394,10 +396,13 @@ def _log_l2_pvalues_from_state(state: _AnalyticNullState) -> np.ndarray:
         return _log_l2_analytic_pvalues(observed, eigenvalues)
 
     pvals = np.full(observed.shape, np.nan, dtype=float)
-    for gene_idx in np.where(state["eligible"])[0]:
-        pvals[gene_idx] = float(
-            liu_sf(np.array([observed[gene_idx] * observed[gene_idx]]), eigenvalues[gene_idx])[0]
-        )
+    indices = np.flatnonzero(state["eligible"])
+    if indices.size:
+        scales = np.asarray(state["contrast_scale"])[indices]
+        order = np.argsort(scales)
+        boundaries = np.flatnonzero(np.diff(scales[order])) + 1
+        for group in np.split(indices[order], boundaries):
+            pvals[group] = liu_sf(observed[group] ** 2, eigenvalues[group[0]])
     return pvals
 
 

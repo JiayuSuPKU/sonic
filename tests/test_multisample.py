@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import itertools
+from unittest.mock import patch
 
 import numpy as np
 import pandas as pd
@@ -11,6 +12,9 @@ from scipy.stats import kstest
 
 from sonic.comparators.multisample import (
     _AnalyticNullState,
+    _estimate_glm_masked_null_covariance,
+    _estimate_two_group_masked_null_covariance,
+    _log_l2_pvalues_from_state,
     compare_glm,
     compare_glm_masked,
     compare_glm_scalar,
@@ -19,6 +23,7 @@ from sonic.comparators.multisample import (
     compare_two_groups_scalar,
 )
 from sonic.comparators.normalization import normalize_shape
+from sonic.statistics import liu_sf
 
 
 def test_analytic_null_metadata_stays_optional_on_python_310():
@@ -950,3 +955,29 @@ def test_streamed_permutations_match_materialized_weighted_null(masked, exact, d
     result = result.set_index("Feature").loc[[str(i) for i in range(4)]]
     np.testing.assert_allclose(result[["Statistic", "P_value"]], expected, equal_nan=True)
     np.testing.assert_array_equal(spectra, original)
+
+
+@pytest.mark.parametrize("mode", ["two_group", "glm"])
+@pytest.mark.parametrize("amplitude", [1.0, 1e-5, 0.0])
+def test_masked_liu_reuses_fits_without_changing_tails(mode, amplitude):
+    rng = np.random.default_rng(32)
+    spectra = np.exp(amplitude * rng.normal(size=(12, 12, 5)))
+    groups = np.repeat([0, 1], 6)
+    presence = np.ones((12, 12), dtype=bool)
+    presence[0, :4] = False
+    presence[6, 4:8] = False
+    presence[:, -1] = False
+    if mode == "two_group":
+        state = _estimate_two_group_masked_null_covariance(spectra, groups, presence)
+    else:
+        design = np.column_stack([np.ones(12), groups, rng.normal(size=12)])
+        state = _estimate_glm_masked_null_covariance(
+            spectra, design, np.array([0.0, 1.0, 0.0]), presence
+        )
+    expected = np.full(12, np.nan)
+    for j in np.flatnonzero(state["eligible"]):
+        expected[j] = liu_sf(state["observed"][j] ** 2, state["eigenvalues"][j])
+    with patch("sonic.comparators.multisample.liu_sf", wraps=liu_sf) as fitted:
+        actual = _log_l2_pvalues_from_state(state)
+        assert fitted.call_count == np.unique(state["contrast_scale"][state["eligible"]]).size
+    np.testing.assert_array_equal(actual, expected)

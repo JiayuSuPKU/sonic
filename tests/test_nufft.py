@@ -14,6 +14,48 @@ from sonic.kernels.nufft import power_spectrum_2d_nufft
 
 
 class TestNufftMatchesFft:
+    @pytest.mark.parametrize("shape", [(8, 10), (7, 9), (8, 9)])
+    @pytest.mark.parametrize("n_features", [None, 1, 3])
+    @pytest.mark.parametrize("center_coords", [False, True])
+    def test_native_fft_order_matches_direct_transform(self, shape, n_features, center_coords):
+        """Check mode ordering, shapes, strided inputs, and input immutability."""
+        rng = np.random.default_rng(83)
+        coords = rng.uniform(-3, 3, size=(23, 2))
+        values = rng.normal(size=(23, 6))[:, ::2]
+        values[:, 1] = 0.0
+        if n_features is None:
+            values = values[:, 0]
+        else:
+            values = values[:, :n_features]
+        original_coords, original_values = coords.copy(), values.copy()
+        coords.flags.writeable = values.flags.writeable = False
+        spacing, unit_scale = (0.7, 1.2), 1.7
+        actual = power_spectrum_2d_nufft(
+            coords,
+            values,
+            shape,
+            spacing,
+            unit_scale=unit_scale,
+            center_coords=center_coords,
+            eps=1e-12,
+        )
+
+        points = coords * unit_scale
+        if center_coords:
+            points -= points.mean(axis=0)
+        ky, kx = np.meshgrid(
+            np.fft.fftfreq(shape[0], d=spacing[0]),
+            np.fft.fftfreq(shape[1], d=spacing[1]),
+            indexing="ij",
+        )
+        phase = ky[..., None] * points[:, 0] + kx[..., None] * points[:, 1]
+        expected = np.abs(np.exp(-2j * np.pi * phase) @ values) ** 2
+        assert actual.shape == expected.shape
+        assert actual.dtype == np.float64
+        np.testing.assert_allclose(actual, expected, rtol=1e-9, atol=1e-9)
+        np.testing.assert_array_equal(coords, original_coords)
+        np.testing.assert_array_equal(values, original_values)
+
     def test_regular_grid_agrees_with_fft(self):
         """When spots sit on a regular grid, NUFFT should reproduce the FFT spectrum."""
         rng = np.random.default_rng(0)
@@ -47,7 +89,7 @@ class TestNufftMatchesFft:
             center_coords=False,
         )
         total = vals.sum()
-        # DC at [0, 0] after ifftshift.
+        # DC is returned directly at [0, 0].
         assert P[0, 0] == pytest.approx(total**2, rel=1e-6)
 
 
@@ -323,6 +365,8 @@ class TestNUFFTKernelTrace:
 @pytest.mark.parametrize("shape", [(8, 8), (8, 9), (9, 8), (9, 9)])
 @pytest.mark.parametrize("centering", [False, True])
 def test_nufft_spectrum_and_moments_match_real_operator(shape, centering):
+    from sonic.statistics import compute_null_params
+
     rng = np.random.default_rng(7)
     coords = rng.uniform(0, 8, (40, 2))
     for method in ("car", "moran", "gaussian"):
@@ -342,7 +386,9 @@ def test_nufft_spectrum_and_moments_match_real_operator(shape, centering):
             eigenvalues = np.linalg.eigvalsh(dense)[::-1]
             np.testing.assert_allclose(kernel.eigenvalues(), eigenvalues, atol=1e-9)
             if centering:
-                q, p = spatial_q_test(rng.normal(size=(kernel.n, 10)), kernel)
+                params = compute_null_params(kernel, nufft_spectrum=True)
+                assert params["source"] == "spectrum"
+                q, p = spatial_q_test(rng.normal(size=(kernel.n, 10)), kernel, null_params=params)
                 expected = _moment_sf(
                     q, _prepare_moment_fit(eigenvalues[eigenvalues > 1e-09], n=kernel.n)
                 )
@@ -370,11 +416,59 @@ def test_nufft_projected_kernel_matches_its_null_spectrum(method):
     np.testing.assert_allclose(kernel.trace(), np.trace(dense))
     np.testing.assert_allclose(kernel.square_trace(), np.sum(dense**2))
     data = rng.normal(size=(kernel.n, 4))
-    q, p = spatial_q_test(data, kernel)
+    params = compute_null_params(kernel, method="moments", nufft_spectrum=True)
+    assert params["source"] == "spectrum"
+    q, p = spatial_q_test(data, kernel, null_params=params)
     expected = _moment_sf(q, _prepare_moment_fit(values[values > 1e-09], n=kernel.n))
     np.testing.assert_allclose(p, expected, rtol=1e-8)
-    params = compute_null_params(kernel, method="moments")
-    np.testing.assert_allclose(spatial_q_test(data, kernel, null_params=params), [q, p])
+
+
+@pytest.mark.parametrize("method", ["gaussian", "matern", "car", "graph_laplacian"])
+@pytest.mark.parametrize("cached_spectrum", [False, True])
+def test_nufft_default_moments_skip_eigenvalues(method, cached_spectrum):
+    from unittest.mock import patch
+
+    from sonic import statistics
+
+    rng = np.random.default_rng(2)
+    kernel = NUFFTKernel(rng.uniform(0, 8, (40, 2)), (8, 8), (1, 1), method=method)
+    if cached_spectrum:
+        kernel.eigenvalues()
+    with (
+        patch.object(kernel, "eigenvalues", side_effect=AssertionError("Unexpected eigensolve")),
+        patch.object(
+            statistics, "_estimate_kernel_traces", wraps=statistics._estimate_kernel_traces
+        ) as probe,
+    ):
+        params = statistics.compute_null_params(kernel)
+        probe.assert_called_once_with(kernel, n_probes=60, centered=True)
+        assert params["source"] == "probes"
+        c1, c2, m = kernel.trace(), kernel.square_trace(), kernel.n - 1
+        np.testing.assert_allclose(
+            [params["mean_Q"], params["var_Q"], params["var_R"]],
+            [c1, 2 * (m * c2 - c1**2) / (m + 2), c2],
+        )
+        data = rng.normal(size=(kernel.n, 3))
+        np.testing.assert_allclose(
+            spatial_q_test(data, kernel), spatial_q_test(data, kernel, null_params=params)
+        )
+
+
+@pytest.mark.parametrize("n_probes", [None, 7])
+def test_nufft_explicit_spectrum_controls(n_probes):
+    from unittest.mock import patch
+
+    from sonic.statistics import compute_null_params
+
+    kernel = NUFFTKernel(np.random.default_rng(2).uniform(0, 8, (40, 2)), (8, 8), (1, 1))
+    with patch.object(kernel, "eigenvalues", wraps=kernel.eigenvalues) as eigenvalues:
+        params = compute_null_params(kernel, k_eigen=5, nufft_spectrum=True, n_probes=n_probes)
+        if n_probes is None:
+            eigenvalues.assert_called_once_with(k=5)
+            assert params["source"] == "spectrum"
+        else:
+            eigenvalues.assert_not_called()
+            assert params["source"] == "probes"
 
 
 def test_nufft_indefinite_spectrum_defaults_to_clt_and_allows_moments():
@@ -419,7 +513,7 @@ def test_nufft_broad_psd_support_uses_moment_probes():
     with patch.object(
         statistics, "_estimate_kernel_traces", wraps=statistics._estimate_kernel_traces
     ) as probe:
-        params = statistics.compute_null_params(kernel, method="moments")
+        params = statistics.compute_null_params(kernel, method="moments", nufft_spectrum=True)
         probe.assert_called_once_with(kernel, n_probes=60, centered=True)
     data = np.arange(kernel.n, dtype=float)
     np.testing.assert_allclose(
@@ -533,8 +627,9 @@ class TestSpatialQTestNUFFT:
         assert Q.shape == (5,) and p.shape == (5,)
 
     def test_matches_fft_on_regular_grid(self):
-        """On a uniform N=ny*nx grid the NUFFT Q-test equals spatial_q_test (FFT kernel)."""
+        """Explicit spectral calibration agrees with FFT on a uniform grid."""
         from sonic.kernels.fft import FFTKernel
+        from sonic.statistics import compute_null_params
 
         ny, nx = 16, 20
         yy, xx = np.meshgrid(np.arange(ny), np.arange(nx), indexing="ij")
@@ -553,7 +648,8 @@ class TestSpatialQTestNUFFT:
         k_fft = FFTKernel(
             (ny, nx), spacing=(1.0, 1.0), method="matern", bandwidth=2.0, nu=1.5, fft_solver="fft2"
         )
-        Q_n, p_n = spatial_q_test(x, k_nufft)
+        params = compute_null_params(k_nufft, nufft_spectrum=True)
+        Q_n, p_n = spatial_q_test(x, k_nufft, null_params=params)
         Q_f, p_f = spatial_q_test(x.reshape(ny, nx), k_fft)
         assert abs(Q_n - float(Q_f)) / abs(float(Q_f)) < 1e-6
         assert abs(p_n - float(p_f)) < 1e-3
@@ -608,6 +704,8 @@ class TestDetectorNUFFTBackend:
         return adata
 
     def test_build_and_qstat(self):
+        from unittest.mock import patch
+
         from sonic import DetectorIrregular
 
         adata = self._mk_adata(n_spots=400, n_genes=8, with_signal=True)
@@ -616,7 +714,10 @@ class TestDetectorNUFFTBackend:
         assert det.kernel_ is not None
         assert det.kernel_method_ == "matern"
         assert det.backend_ == "nufft"
-        df = det.compute_qstat(n_jobs=1)
+        with patch.object(
+            det.kernel_, "eigenvalues", side_effect=AssertionError("Unexpected eigensolve")
+        ):
+            df = det.compute_qstat(n_jobs=1)
         assert df.shape[0] == 8
         assert {"Feature", "Q", "Z_score", "P_value", "P_adj"} <= set(df.columns)
         assert df["Feature"].iloc[0] == "g0"

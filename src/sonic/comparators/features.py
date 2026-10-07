@@ -66,7 +66,7 @@ def compute_sample_spectrum(
     """
     Compute the 2D power spectrum of every gene in a single sample.
 
-    The spatial signal is **mean-centered per gene** before the FFT so that the
+    The spatial signal is **mean-centered per gene** in Fourier space so that the
     resulting power spectrum carries only the *AC* component of the pattern —
     i.e. the ``k=0`` (DC) bin is exactly zero and low-``k`` leakage from per-
     sample mean shifts is eliminated. The separated DC scalars (the per-sample
@@ -102,11 +102,10 @@ def compute_sample_spectrum(
 
     # DC scalars always come from the *uncentered* grid.
     dc = sample.mean(axis=(1, 2))
-    work = sample - dc[:, None, None]
 
     # Move feature axis to last so power_spectrum_2d treats it as M.
-    moved = np.moveaxis(work, 0, -1)
-    p = power_spectrum_2d(moved, fft_solver=fft_solver, workers=workers)
+    moved = np.moveaxis(sample, 0, -1)
+    p = power_spectrum_2d(moved, fft_solver=fft_solver, workers=workers, center=True)
     spec = np.moveaxis(p, -1, 0)
 
     if return_dc:

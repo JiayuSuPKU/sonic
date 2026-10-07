@@ -18,6 +18,8 @@ def power_spectrum_2d(
     x: np.ndarray,
     fft_solver: str = "fft2",
     workers: int | None = None,
+    *,
+    center: bool = False,
 ) -> np.ndarray:
     """
     Compute the 2D power spectrum :math:`|\\hat{x}(k)|^2` of one or more grid signals.
@@ -39,6 +41,9 @@ def power_spectrum_2d(
     workers : int, optional
         Number of parallel workers forwarded to :mod:`scipy.fft`. ``None`` uses the
         SciPy default.
+    center : bool, default False
+        Remove the per-feature mean by zeroing DC. For a dominant DC component,
+        subtract the mean before transforming to avoid loss of precision.
 
     Returns
     -------
@@ -67,12 +72,22 @@ def power_spectrum_2d(
     if squeeze:
         x = x[..., np.newaxis]
 
-    if fft_solver == "fft2":
-        x_hat = scipy.fft.fft2(x, axes=(0, 1), workers=workers)
-    else:
-        x_hat = scipy.fft.rfft2(x, axes=(0, 1), workers=workers)
-
-    power = np.abs(x_hat) ** 2
+    transform = scipy.fft.fft2 if fft_solver == "fft2" else scipy.fft.rfft2
+    x_hat = transform(x, axes=(0, 1), workers=workers)
+    power = np.abs(x_hat)
+    del x_hat
+    if center:
+        dc = power[0, 0].copy()
+        power[0, 0] = 0.0
+        # Avoid a full centered input copy unless the DC magnitude threatens
+        # the accuracy of the nonconstant modes (especially for float32).
+        if np.any(dc * np.finfo(power.dtype).eps ** 0.25 > power.max(axis=(0, 1))):
+            del power
+            x_hat = transform(x - x.mean(axis=(0, 1), keepdims=True), axes=(0, 1), workers=workers)
+            power = np.abs(x_hat)
+            del x_hat
+            power[0, 0] = 0.0
+    np.square(power, out=power)
 
     if squeeze:
         power = power[..., 0]
@@ -483,43 +498,21 @@ class FFTKernel(Kernel):
                 f"Data shape ({ny}, {nx}) does not match kernel ({self.ny}, {self.nx})"
             )
 
-        # HKH quadratic form on z-scored input equals raw K on the centered
-        # input; subtracting per-feature mean is cheap on the grid.
-        if self.centering:
-            x = x - x.mean(axis=(0, 1), keepdims=True)
-
-        # Transform using selected FFT solver via the shared power-spectrum helper.
-        x_power = power_spectrum_2d(x, fft_solver=self.fft_solver, workers=self.workers)
-
-        if self.fft_solver == "fft2":
-            # Reshape spectrum for full fft2: (ny, nx, 1)
-            lam = self.spectrum.reshape(self.ny, self.nx, 1)
-
-            # Weighted Sum (Parseval's Theorem)
-            weighted_power = np.sum(x_power * lam, axis=(0, 1))
-
-        else:
-            # Reshape spectrum for rfft2: (ny, nx//2+1, 1)
-            lam = self.spectrum.reshape(self.ny, self.nx // 2 + 1, 1)
-
-            # Weighted Sum (Parseval's Theorem) with correction for rfft2
-            weighted = x_power * lam
-            weighted_power = 2.0 * np.sum(weighted, axis=(0, 1))
-
-            # Correction: Subtract the first column (fx=0) once
-            # because we added it twice in the line above, but it only exists once.
-            weighted_power -= np.sum(weighted[:, 0, :], axis=0)
-
-            # Correction: If width is even, the last column is Nyquist (fx=N/2).
-            # It is also unique (real-valued in full spectrum), so subtract it once.
-            if nx % 2 == 0:
-                weighted_power -= np.sum(weighted[:, -1, :], axis=0)
-
-        # FFT is unnormalized: Parseval requires 1/n normalization
-        Q = weighted_power / (ny * nx)
-
-        # Unwrap if M=1
+        x_power = power_spectrum_2d(
+            x, fft_solver=self.fft_solver, workers=self.workers, center=self.centering
+        )
+        Q = self._quadratic_from_power(x_power)
         return Q.item() if M == 1 else Q.ravel()
+
+    def _quadratic_from_power(self, power: np.ndarray) -> np.ndarray:
+        """Reduce batched power without allocating a weighted-power tensor."""
+        lam = self.spectrum.reshape(power.shape[:2])
+        if self.fft_solver == "rfft2":
+            lam = lam.copy()
+            # Only interior columns have omitted conjugates; odd widths have
+            # no unique Nyquist column.
+            lam[:, 1 : (self.nx + 1) // 2] *= 2.0
+        return np.einsum("ij,ijm->m", lam, power) / self.n_grid
 
     def _ones_stats(self) -> tuple[float, float]:
         """Return ``(s1, s2) = (𝟏ᵀ K 𝟏, ‖K·𝟏‖²)`` analytically from the DC mode.
@@ -744,7 +737,7 @@ def _q_test_fft(  # noqa: C901
     >>> data = np.random.randn(ny, nx)
     >>> Q, pval = spatial_q_test(data, kernel)
     """
-    Xn = np.asarray(Xn).astype(float)
+    Xn = np.asarray(Xn, dtype=float)
     if Xn.ndim == 2:
         Xn = Xn[..., np.newaxis]
 
@@ -754,28 +747,34 @@ def _q_test_fft(  # noqa: C901
             f"Data shape ({ny}, {nx}) does not match kernel ({kernel.ny}, {kernel.nx})"
         )
 
-    # 1. Standardization (Z-score across spatial dimensions)
+    # Center in Fourier space, then apply sample-variance scaling to Q.
+    # This avoids allocating a standardized copy of the entire feature batch.
     if is_standardized:
-        z = Xn
-        valid = np.any(z, axis=(0, 1))
+        valid = np.any(Xn, axis=(0, 1))
     else:
-        # Mean/Std per feature slice
-        means = np.mean(Xn, axis=(0, 1), keepdims=True)
-        stds = np.std(Xn, axis=(0, 1), keepdims=True, ddof=1)
-
-        # Handle constant features (std=0)
-        # Create result array
-        z = np.zeros_like(Xn)
-
-        # Mask where std > 0 (shape 1,1,M broadcastable)
-        valid = stds > 1e-12
-
-        # Safe division
-        np.divide(Xn - means, stds, out=z, where=valid)
-
-    # 2. Compute Q statistic: z^T K z
-    # Helper returns (M,) array or scalar if input was 2D
-    Q = kernel.xtKx(z)
+        variance = np.var(Xn, axis=(0, 1), ddof=1)
+        valid = variance > 1e-24
+        # Extreme magnitudes can overflow raw Fourier power before the final
+        # variance division. Standardize those batches before transforming.
+        max_weight = max(1.0, float(kernel.spectrum.max()), -float(kernel.spectrum.min()))
+        variance_limit = np.finfo(float).max / kernel.n_grid**2 / max_weight
+        if np.any(variance > variance_limit):
+            Xn = Xn - Xn.mean(axis=(0, 1), keepdims=True)
+            np.divide(Xn, np.sqrt(variance), out=Xn, where=valid)
+            Xn[..., ~valid] = 0.0
+            variance = np.ones_like(variance)
+    power = power_spectrum_2d(
+        Xn,
+        fft_solver=kernel.fft_solver,
+        workers=kernel.workers,
+        center=kernel.centering or not is_standardized,
+    )
+    Q = kernel._quadratic_from_power(power)
+    if not is_standardized:
+        np.divide(Q, variance, out=Q, where=valid)
+        Q[~valid] = 0.0
+    if M == 1:
+        Q = Q.item()
 
     if not return_pval:
         return Q

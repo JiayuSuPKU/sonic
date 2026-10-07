@@ -300,21 +300,16 @@ def power_spectrum_2d_nufft(
 
     # Batched transforms: finufft accepts shape (n_tr, M) for c.
     squeeze = values.ndim == 1
-    if squeeze:
-        c = values.astype(np.complex128, copy=False)
-    else:
-        # finufft expects (n_tr, N_points).
-        c = np.ascontiguousarray(values.T.astype(np.complex128, copy=False))
+    # Convert dtype and layout in one allocation; batched strengths are (M, n).
+    c = np.asarray(values if squeeze else values.T, dtype=np.complex128, order="C")
 
     # type-1 NUFFT: nonuniform points -> uniform k-space grid.
-    # Output shape: (ny, nx) or (n_tr, ny, nx). DC at CENTRE ([ny//2, nx//2]).
-    f_hat = finufft.nufft2d1(y_scaled, x_scaled, c, n_modes=(ny, nx), eps=eps, isign=-1)
+    # Native FFT ordering puts DC at [0, 0], avoiding a full-grid ifftshift copy.
+    f_hat = finufft.nufft2d1(y_scaled, x_scaled, c, n_modes=(ny, nx), eps=eps, isign=-1, modeord=1)
 
-    # Power spectrum.
-    power = (f_hat.real**2 + f_hat.imag**2).astype(np.float64)
-
-    # Move DC from the centre to [0, 0] so the layout matches scipy.fft.fft2.
-    power = np.fft.ifftshift(power, axes=(-2, -1))
+    power = np.abs(f_hat)
+    del f_hat
+    np.square(power, out=power)
 
     if squeeze:
         return power
@@ -349,10 +344,12 @@ class NUFFTKernel(Kernel):
     Gaussian and Matérn use the PSD-projected spectrum supplied by
     :class:`FFTKernel`; the projection applies to both the operator and its null
     moments. Q-tests default to upper-tail ``moments`` calibration for Gaussian,
-    Matérn, CAR and graph-Laplacian kernels. Moran and other signed Fourier
-    spectra default to two-sided CLT; finite-sample moment matching is available
-    explicitly. Null moments use the ``n`` observed points, not the internal
-    Fourier-grid size. See :func:`sonic.statistics.compute_null_params`.
+    Matérn, CAR and graph-Laplacian kernels, using analytic lower traces and
+    60 probes for higher traces. Reduced eigendecomposition is opt-in via
+    ``compute_null_params(..., nufft_spectrum=True)``. Moran and other signed
+    Fourier spectra default to two-sided CLT; finite-sample moment matching is
+    available explicitly. Null moments use the ``n`` observed points, not the
+    internal Fourier-grid size. See :func:`sonic.statistics.compute_null_params`.
 
     :func:`sonic.spatial_q_test` always uses the k-space Parseval path
     (:meth:`xtKx`); :func:`sonic.spatial_r_test` dispatches on shape —

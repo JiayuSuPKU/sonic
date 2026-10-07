@@ -25,6 +25,8 @@ moment matching for FFTKernel/NUFFTKernel with Gaussian, Matérn, CAR or graph
 Laplacian kernels. Moran, and any detected signed Fourier spectrum, use CLT.
 Custom precomputed matrices otherwise default to Welch under the caller's PSD
 assumption; their signs are not inferred by an extra eigendecomposition.
+NUFFT moment calibration defaults to analytic lower traces and 60 probes
+for higher traces; its reduced eigendecomposition requires an explicit opt-in.
 """
 
 from __future__ import annotations
@@ -861,6 +863,8 @@ def compute_null_params(  # noqa: C901
     k_eigen: int | None = None,
     dirichlet_correction: bool = True,
     n_probes: int | None = None,
+    *,
+    nufft_spectrum: bool = False,
 ) -> dict:
     r"""Prepare and cache the Q null, plus the variance needed by the R-test.
 
@@ -884,8 +888,9 @@ def compute_null_params(  # noqa: C901
     k_eigen : int, optional
         Use a truncated eigenvalue spectrum for moment matching. This is approximate:
         omitted modes are treated as zero. Automatic spectra are limited to
-        FFT, the bounded NUFFT route, and dense matrices with at most 2000
-        samples (or a cached full spectrum). Other cases use probes.
+        FFT and dense matrices with at most 2000 samples (or a cached full
+        spectrum). An explicit integer selects top-k Lanczos for NUFFT;
+        otherwise NUFFT uses probes unless ``nufft_spectrum=True``.
         Ignored when ``n_probes`` is specified.
     dirichlet_correction : bool, default True
         Use moments of sample-standardized Q (a ratio of quadratic forms).
@@ -901,6 +906,15 @@ def compute_null_params(  # noqa: C901
         at least one probe). A global-offset pass may require replaying solves.
         Probe error decreases as the inverse square root of the count;
         no fixed count guarantees relative p-value accuracy.
+    nufft_spectrum : bool, default False
+        Opt into the reduced eigendecomposition for centered NUFFT moment
+        calibration. By default, NUFFT uses analytic lower traces and 60 probes
+        for higher traces, even when eigenvalues are cached. ``True`` requests
+        the bounded PSD spectrum (at most 2000 retained Fourier modes), falling
+        back to probes if unavailable. Spectral truncation and NUFFT accuracy
+        limit this approximation. ``n_probes`` overrides this flag;
+        ``k_eigen`` selects top-k Lanczos instead. Other backends and Welch/CLT
+        ignore this flag.
 
     Returns
     -------
@@ -949,6 +963,7 @@ def compute_null_params(  # noqa: C901
     """
     from sonic.kernels.base import MatrixKernelBase
     from sonic.kernels.fft import FFTKernel
+    from sonic.kernels.nufft import NUFFTKernel
 
     # 1. Resolve policy and validate budgets before doing any kernel work.
     method = _resolve_q_null_method(kernel, method, dirichlet_correction=dirichlet_correction)
@@ -976,6 +991,8 @@ def compute_null_params(  # noqa: C901
         try:
             if n_probes is not None or not getattr(kernel, "centering", True):
                 raise NotImplementedError("Use trace probes for this request.")
+            if isinstance(kernel, NUFFTKernel) and k_eigen is None and not nufft_spectrum:
+                raise NotImplementedError("NUFFT moments default to analytic traces and probes.")
             if isinstance(kernel, MatrixKernelBase) and k_eigen is None:
                 cached = getattr(kernel, "_spectrum_centered", None)
                 if n > _DENSE_NULL_SPECTRUM_LIMIT and (cached is None or len(cached) != n):

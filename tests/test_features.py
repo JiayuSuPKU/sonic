@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import numpy as np
 import pytest
+import scipy.fft
 
 from sonic.comparators.features import (
     adapt_frequency_edges,
@@ -676,3 +677,22 @@ class TestStreamingFeatureHelpers:
         )
         assert one_chunk.shape == (4, 4 * 12)
         np.testing.assert_allclose(many_chunks, one_chunk, rtol=1e-12, atol=1e-12)
+
+
+@pytest.mark.parametrize("solver", ["fft2", "rfft2"])
+@pytest.mark.parametrize("dtype,offset", [(np.float64, 3.0), (np.float64, 1e12), (np.float32, 1e5)])
+def test_spectrum_centering_preserves_dc_and_input(solver, dtype, offset):
+    sample = (np.random.default_rng(3).normal(size=(3, 7, 9)) + offset).astype(dtype)
+    sample[1] = offset
+    original = sample.copy()
+    sample.flags.writeable = False
+    spectrum, dc = compute_sample_spectrum(sample, fft_solver=solver, return_dc=True)
+    centered = sample - sample.mean(axis=(1, 2), keepdims=True)
+    transform = scipy.fft.fft2 if solver == "fft2" else scipy.fft.rfft2
+    expected = np.abs(transform(centered, axes=(1, 2))) ** 2
+    expected[:, 0, 0] = 0.0
+    np.testing.assert_allclose(
+        spectrum, expected, rtol=1e-6 if dtype == np.float32 else 1e-12, atol=1e-10
+    )
+    np.testing.assert_array_equal(dc, sample.mean(axis=(1, 2)))
+    np.testing.assert_array_equal(sample, original)

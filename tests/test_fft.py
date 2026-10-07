@@ -7,10 +7,11 @@ import unittest
 
 import numpy as np
 import pytest
+import scipy.fft
 
 from sonic.kernels import MatrixKernel
 from sonic.kernels.fft import FFTKernel
-from sonic.statistics import compute_null_params, spatial_q_test, spatial_r_test
+from sonic.statistics import _q_pvalues, compute_null_params, spatial_q_test, spatial_r_test
 from sonic.statistics import spatial_q_test as spatial_q_test_standard
 from sonic.statistics import spatial_r_test as spatial_r_test_standard
 from sonic.utils import compute_torus_distance_matrix
@@ -758,6 +759,62 @@ class TestFFTWelchCltNull(unittest.TestCase):
         k = FFTKernel((self.ny, self.nx), method="matern", bandwidth=2.5, nu=1.5)
         fpr = self._fpr(k, "moments")
         self.assertLess(abs(fpr - 0.05), 0.05, f"moments FPR {fpr}")
+
+
+def test_fft_q_scaling_does_not_overflow_before_normalization():
+    x = np.random.default_rng(99).normal(size=(9, 9, 2))
+    x[..., 1] = 0.0
+    kernel = FFTKernel((9, 9), fft_solver="rfft2")
+    with np.errstate(over="raise", invalid="raise"):
+        expected = spatial_q_test(x, kernel, return_pval=False)
+        actual = spatial_q_test(x * 1e153, kernel, return_pval=False)
+    np.testing.assert_allclose(actual, expected, rtol=1e-12)
+
+
+@pytest.mark.parametrize("solver", ["fft2", "rfft2"])
+@pytest.mark.parametrize("shape", [(8, 10), (7, 9)])
+@pytest.mark.parametrize("method", ["gaussian", "moran"])
+def test_fft_q_matches_centered_dense_operator(solver, shape, method):
+    rng = np.random.default_rng(73)
+    x = rng.normal(size=(*shape, 4))
+    x[..., 0] += 3.0
+    x[..., 1] = 7.0
+    x[..., 2] += 1e12
+    x[..., 3] *= 1e-14
+    original = x.copy()
+    x.flags.writeable = False
+    kernel = FFTKernel(shape, method=method, fft_solver=solver)
+    null = compute_null_params(kernel)
+    q, p = spatial_q_test(x, kernel, null_params=null, chunk_size=2)
+
+    # Construct the circulant matrix independently of the power reduction.
+    raw = scipy.fft.ifft2(kernel.eigenvalues(return_full_layout=True).reshape(shape)).real
+    y, xx = (a.ravel() for a in np.indices(shape))
+    matrix = raw[(y[:, None] - y) % shape[0], (xx[:, None] - xx) % shape[1]]
+    flat = x.reshape(-1, 4)
+    sd = flat.std(axis=0, ddof=1)
+    valid = sd > 1e-12
+    z = np.zeros_like(flat)
+    np.divide(flat - flat.mean(axis=0), sd, out=z, where=valid)
+    z -= z.mean(axis=0)
+    expected = np.sum(z * (matrix @ z), axis=0)
+    expected_p = np.where(valid, _q_pvalues(expected, null), 1.0)
+    np.testing.assert_allclose(q, expected, rtol=1e-10, atol=1e-10)
+    np.testing.assert_allclose(p, expected_p, rtol=1e-10, atol=1e-10)
+    np.testing.assert_array_equal(x, original)
+    np.testing.assert_allclose(
+        spatial_q_test(z.reshape(x.shape), kernel, is_standardized=True, return_pval=False),
+        expected,
+        rtol=1e-10,
+        atol=1e-10,
+    )
+    # The raw primitive must retain DC when kernel centering is disabled.
+    kernel.centering = False
+    raw = scipy.fft.ifft2(kernel.eigenvalues(return_full_layout=True).reshape(shape)).real
+    matrix = raw[(y[:, None] - y) % shape[0], (xx[:, None] - xx) % shape[1]]
+    np.testing.assert_allclose(
+        kernel.xtKx(x[..., :2]), np.sum(flat[:, :2] * (matrix @ flat[:, :2]), axis=0)
+    )
 
 
 if __name__ == "__main__":

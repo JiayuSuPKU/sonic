@@ -848,8 +848,9 @@ class DetectorIrregular(Detector):
         Matérn, CAR and graph-Laplacian kernels use upper-tail ``welch`` on the
         matrix backend and upper-tail ``moments`` on NUFFT. Moran and other
         recognized signed spectra use two-sided ``clt``. All defaults correct
-        for sample standardization. This method does not expose a null override;
-        use :func:`sonic.statistics.spatial_q_test` with a prepared cache from
+        for sample standardization. NUFFT moments use analytic lower traces
+        and 60 probes for higher traces. This method does not expose a null
+        override; use :func:`sonic.statistics.spatial_q_test` with a prepared cache from
         :func:`sonic.statistics.compute_null_params` to select another calibration.
 
         Examples
@@ -1196,17 +1197,15 @@ class DetectorIrregular(Detector):
         (n-point-scaled) and delegates per-feature work to
         :func:`sonic.spatial_q_test` on Path A (spectral).
 
-        The NUFFT Q-test targets the n-point operator ``K``; moments come from
-        :meth:`NUFFTKernel.trace` / :meth:`~NUFFTKernel.square_trace` /
-        :meth:`~NUFFTKernel.eigenvalues` (all already n-point-scaled by the
-        kernel). No ``n / (ny · nx)`` rescaling at the caller.
+        The NUFFT Q-test targets the n-point operator ``K``, using analytic
+        lower traces from :meth:`NUFFTKernel.trace` and
+        :meth:`~NUFFTKernel.square_trace`, plus probes for higher traces.
+        All are already n-point-scaled; no ``n / (ny · nx)`` rescaling is needed.
         """
         kernel = self.kernel_
         null_params: dict[str, float | np.ndarray] | None = None
         if return_pval:
-            # Delegate to compute_null_params — it auto-falls back to
-            # probe-based moment matching when the NUFFT spectrum is
-            # unavailable for broad PSD support. Signed spectra use CLT.
+            # Analytic lower traces plus probes; signed spectra use CLT.
             nm = _resolve_q_null_method(kernel)
             null_params = compute_null_params(kernel, method=nm)
 

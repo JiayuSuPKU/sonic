@@ -37,6 +37,24 @@ __all__ = [
 logger = logging.getLogger(__name__)
 
 
+def _require_finite(values, name: str = "Data") -> None:
+    """Reject invalid observations without a full-size validation workspace."""
+    if sp.issparse(values):
+        if values.format in {"dok", "lil"}:
+            values = values.tocsr()
+        values = values.data
+    else:
+        values = np.asarray(values)
+    for block in np.nditer(
+        values,
+        flags=["external_loop", "buffered", "zerosize_ok"],
+        op_flags=["readonly"],
+        buffersize=1 << 20,
+    ):
+        if not np.isfinite(block).all():
+            raise ValueError(f"{name} must contain only finite values.")
+
+
 # Estimated transient workspace across all concurrent jobs; inputs, stored
 # kernels/factorizations and retained outputs are outside this budget.
 _DEFAULT_CHUNK_BUDGET = 2 * (1 << 30)

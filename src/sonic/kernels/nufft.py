@@ -48,6 +48,7 @@ Vectors and matrices:
 from __future__ import annotations
 
 import logging
+from copy import copy
 
 import finufft
 import numpy as np
@@ -207,6 +208,7 @@ def power_spectrum_2d_nufft(
     eps: float = 1e-6,
     center_coords: bool = True,
     nthreads: int = 1,
+    frequency_padding: int = 0,
 ) -> np.ndarray:
     """
     Compute the 2D power spectrum via type-1 NUFFT
@@ -252,12 +254,18 @@ def power_spectrum_2d_nufft(
     nthreads : int, default 1
         FINUFFT threads per call. Set explicitly when combining outer jobs;
         the comparator resolves its ``workers`` setting into this parameter.
+    frequency_padding : int, default 0
+        Extra Fourier modes on each side of each axis, evaluated at the same
+        frequency spacing and physical domain extent. A one-cell border
+        supports polar interpolation at the original Nyquist boundary without
+        assuming that off-grid Fourier coefficients are periodic in frequency.
 
     Returns
     -------
     np.ndarray
         Power spectrum. Shape ``(ny, nx)`` for 1D ``values`` or
         ``(ny, nx, M)`` for 2D ``values``, with DC at index ``[0, 0]``.
+        Each spatial axis grows by ``2 * frequency_padding`` when requested.
 
     Raises
     ------
@@ -278,6 +286,9 @@ def power_spectrum_2d_nufft(
     if nthreads < 1 or int(nthreads) != nthreads:
         raise ValueError("nthreads must be a positive integer.")
     nthreads = int(nthreads)
+    if frequency_padding < 0 or int(frequency_padding) != frequency_padding:
+        raise ValueError("frequency_padding must be a non-negative integer.")
+    frequency_padding = int(frequency_padding)
     if coords.ndim != 2 or coords.shape[1] != 2:
         raise ValueError(f"coords must have shape (n, 2), got {coords.shape}.")
     if values.shape[0] != coords.shape[0]:
@@ -317,7 +328,7 @@ def power_spectrum_2d_nufft(
         y_scaled,
         x_scaled,
         c,
-        n_modes=(ny, nx),
+        n_modes=(ny + 2 * frequency_padding, nx + 2 * frequency_padding),
         eps=eps,
         isign=-1,
         modeord=1,
@@ -898,6 +909,8 @@ class NUFFTKernel(Kernel):
             else:
                 x = x - x.mean(axis=0, keepdims=True)
         x_hat_centered = self._nufft_type1(x)  # (M, ny, nx)
+        if self.centering:
+            x_hat_centered[:, ny // 2, nx // 2] = 0.0
         power = x_hat_centered.real**2 + x_hat_centered.imag**2  # (M, ny, nx)
         # Spectrum is stored in scipy FFT layout (DC at [0,0]); fftshift → centered
         # to match the NUFFT output before multiplying.
@@ -949,6 +962,9 @@ class NUFFTKernel(Kernel):
                 y = y - y.mean(axis=0, keepdims=True)
         x_hat = self._nufft_type1(x)  # (M, ny, nx) complex
         y_hat = self._nufft_type1(y)
+        if self.centering:
+            x_hat[:, ny // 2, nx // 2] = 0.0
+            y_hat[:, ny // 2, nx // 2] = 0.0
         lam = np.fft.fftshift(self._fft_kernel.spectrum.reshape(ny, nx))
         cross = np.real(np.conj(x_hat) * y_hat) * lam[None, :, :]
         R = np.sum(cross, axis=(1, 2)) / (ny * nx)
@@ -996,6 +1012,8 @@ class NUFFTKernel(Kernel):
             else:
                 z = z - z.mean(axis=0, keepdims=True)
         z_hat = self._nufft_type1(z)  # (M, ny, nx) complex, DC centred
+        if self.centering:
+            z_hat[:, ny // 2, nx // 2] = 0.0
         out_k = np.ascontiguousarray(
             (lam_centred[None, :, :] * z_hat / (ny * nx)).astype(np.complex128)
         )
@@ -1128,6 +1146,14 @@ class NUFFTKernel(Kernel):
     # Null-moment estimators — doubled-grid linear-convolution analytic
     # (default) and Rademacher Hutchinson probe (opt-in second opinion).
     # ------------------------------------------------------------------
+    def _ac_ones_stats(self) -> tuple[float, float]:
+        """Raw ones moments after removing the DC operator annihilated by H."""
+        view = copy(self)
+        view._fft_kernel = copy(self._fft_kernel)
+        view._fft_kernel.spectrum = self._fft_kernel.spectrum.copy()
+        view._fft_kernel.spectrum[0] = 0.0
+        return view._ones_stats()
+
     def trace(self) -> float:
         """``trace(K)`` (raw) or ``trace(HKH)`` (centered).
 
@@ -1136,13 +1162,17 @@ class NUFFTKernel(Kernel):
         ``trace(K_n) = (n/n') · trace(K_grid)`` is independent of the
         coord layout. Adjusts by ``-s₁/n`` when ``centering=True``
         (``s₁ = 𝟏ᵀ K 𝟏`` via a single ``K·𝟏`` apply in
-        :meth:`Kernel._ones_stats`).
+        :meth:`Kernel._ones_stats`). Centered traces first remove the DC
+        operator, which H annihilates, to avoid cancellation for broad kernels.
         """
         ny, nx = self.grid_shape
-        raw = float(self._fft_kernel.trace() * self.n / (ny * nx))
+        spectrum = self._fft_kernel.spectrum
+        # HKH is unchanged by removing the constant DC operator first. Avoid
+        # subtracting its dominant trace from a nearly constant kernel.
+        raw = float(np.sum(spectrum[1:] if self.centering else spectrum) * self.n / (ny * nx))
         if not self.centering:
             return raw
-        s1, _ = self._ones_stats()
+        s1, _ = self._ac_ones_stats()
         return raw - s1 / self.n
 
     def square_trace(self) -> float:
@@ -1156,6 +1186,8 @@ class NUFFTKernel(Kernel):
         ny, nx = self.grid_shape
         nprime = ny * nx
         lam = self._real_spectrum()
+        if self.centering:
+            lam[lam.shape[0] // 2, lam.shape[1] // 2] = 0.0
         phi2_d = np.abs(self._coord_phi()) ** 2
         lam_pad_centered = np.zeros_like(phi2_d)
         sy = phi2_d.shape[0] // 2 - lam.shape[0] // 2
@@ -1174,7 +1206,7 @@ class NUFFTKernel(Kernel):
         raw = max(raw, 0.0)
         if not self.centering:
             return raw
-        s1, s2 = self._ones_stats()
+        s1, s2 = self._ac_ones_stats()
         return max(raw - 2.0 * s2 / self.n + s1**2 / (self.n**2), 0.0)
 
 

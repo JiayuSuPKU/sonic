@@ -838,6 +838,7 @@ def _physical_polar_coords(
     n_theta: int,
     *,
     angle_deg: float = 0.0,
+    frequency_padding: int = 0,
 ) -> tuple[np.ndarray, int]:
     """Pixel sample coords for a **physical-frequency** polar grid.
 
@@ -850,19 +851,25 @@ def _physical_polar_coords(
     ``spacing=(dy, dx)`` and ``(ny, nx)`` (``offset_y = f·sin θ·ny·dy``),
     samples with **different lattices map the same physical frequency to the
     same radius bin** — the 2-D analogue of the radial path's shared bin grid.
+    Bin centres must fit inside both sampling Nyquist limits; interpolation
+    within that band wraps across the periodic FFT array boundary.
 
     Returns ``(coords, n_radius)`` with ``coords`` of shape
     ``(2, n_radius·n_theta)`` in ``(radius, theta)`` row-major order.
     """
+    if frequency_padding < 0 or int(frequency_padding) != frequency_padding:
+        raise ValueError("frequency_padding must be a non-negative integer.")
     ny, nx = grid_shape
     dy, dx = spacing if spacing is not None else (1.0 / ny, 1.0 / nx)
     edges = np.asarray(freq_edges, dtype=float)
     radii = 0.5 * (edges[:-1] + edges[1:])  # (n_radius,) cycles/unit
+    if np.any(radii > min(0.5 / dy, 0.5 / dx) * (1 + 1e-12)):
+        raise ValueError("2D frequency-bin centres must lie within both sampling Nyquist limits.")
     # Sample the original spectrum at the inverse rotation. Applying the
     # angle here preserves physical directions on anisotropic FFT grids.
     thetas = np.linspace(0.0, np.pi, n_theta, endpoint=False) - np.deg2rad(angle_deg)
     rr, tt = np.meshgrid(radii, thetas, indexing="ij")  # (n_radius, n_theta)
-    cy, cx = ny // 2, nx // 2  # fftshift puts DC at floor(n/2)
+    cy, cx = ny // 2 + frequency_padding, nx // 2 + frequency_padding
     yy = cy + rr * np.sin(tt) * ny * dy
     xx = cx + rr * np.cos(tt) * nx * dx
     return np.stack([yy.ravel(), xx.ravel()], axis=0), len(radii)
@@ -880,6 +887,7 @@ def stream_polar_features(
     n_theta: int,
     fft_solver: str,
     pbar: Any = None,
+    frequency_padding: int = 0,
 ) -> np.ndarray:
     """Stream rotate → **physical-frequency polar resample** per gene-chunk.
 
@@ -897,21 +905,33 @@ def stream_polar_features(
     polar coordinates → flatten, discarding the dense 2D block. The
     full ``(n_genes, ny, n_kx)`` aligned stack is never held. Returns
     ``(n_genes, n_radius·n_theta)``.
+
+    ``frequency_padding`` describes an evaluated Fourier-mode border around
+    the original grid, as returned by ``power_spectrum_2d_nufft``. Padded
+    spectra use that border instead of FFT-periodic boundary interpolation.
     """
     coords, n_radius = _physical_polar_coords(
-        grid_shape, spacing, freq_edges, n_theta, angle_deg=angle_deg
+        grid_shape,
+        spacing,
+        freq_edges,
+        n_theta,
+        angle_deg=angle_deg,
+        frequency_padding=frequency_padding,
     )
     feat_len = n_radius * n_theta
     out = np.empty((n_genes, feat_len), dtype=np.float64)
     for start in range(0, n_genes, chunk_size):
         stop = min(start + chunk_size, n_genes)
         spec_chunk = spectrum_chunk_fn(start, stop)
-        full = _to_full_2d(spec_chunk, grid_shape, fft_solver)  # (m, ny, nx)
+        full = _to_full_2d(spec_chunk, grid_shape, fft_solver, frequency_padding)
         shifted = np.fft.fftshift(full, axes=(-2, -1))
         m = shifted.shape[0]
         for j in range(m):
             out[start + j] = scipy.ndimage.map_coordinates(
-                shifted[j], coords, order=1, mode="constant", cval=0.0
+                shifted[j],
+                coords,
+                order=1,
+                mode="nearest" if frequency_padding else "grid-wrap",
             )
         del spec_chunk, full, shifted
         if pbar is not None:
@@ -924,13 +944,25 @@ def stream_polar_features(
 # ---------------------------------------------------------------------------
 
 
-def _to_full_2d(power: np.ndarray, grid_shape: tuple[int, int], fft_solver: str) -> np.ndarray:
+def _to_full_2d(
+    power: np.ndarray,
+    grid_shape: tuple[int, int],
+    fft_solver: str,
+    frequency_padding: int = 0,
+) -> np.ndarray:
     """Mirror an ``rfft2`` half-spectrum into a full ``(ny, nx)`` spectrum.
 
     Uses the Hermitian symmetry of the FFT of a real signal: ``|X[ky, kx]|² ==
     |X[(ny - ky) % ny, (nx - kx) % nx]|²``. For ``fft2`` input, returns ``power``
     unchanged.
     """
+    if frequency_padding and (
+        fft_solver != "fft2"
+        or power.shape[-2:] != tuple(n + 2 * frequency_padding for n in grid_shape)
+    ):
+        raise ValueError(
+            "Padded polar spectra require fft2 layout and the evaluated frequency border."
+        )
     if fft_solver == "fft2":
         return power
     ny, nx = grid_shape
@@ -961,6 +993,7 @@ def _build_landmark_polar_stack(
     n_theta: int,
     freq_edges: np.ndarray,
     spacing: tuple[float, float],
+    frequency_padding: int = 0,
 ) -> np.ndarray:
     """Build a ``(n_landmarks, n_theta, n_radius)`` polar stack for one sample.
 
@@ -968,13 +1001,20 @@ def _build_landmark_polar_stack(
     the polar grid, and zero-meaned along theta so the DC angular component
     doesn't dominate the cross-correlation.
     """
-    full = _to_full_2d(spectra, grid_shape, fft_solver)  # (n_landmarks, ny, nx)
+    full = _to_full_2d(spectra, grid_shape, fft_solver, frequency_padding)
     shifted = np.fft.fftshift(full, axes=(-2, -1))
-    coords, n_radius = _physical_polar_coords(grid_shape, spacing, freq_edges, n_theta)
+    coords, n_radius = _physical_polar_coords(
+        grid_shape, spacing, freq_edges, n_theta, frequency_padding=frequency_padding
+    )
     out = np.empty((shifted.shape[0], n_theta, n_radius), dtype=float)
     for j in range(shifted.shape[0]):
         polar = (
-            scipy.ndimage.map_coordinates(shifted[j], coords, order=1, mode="constant", cval=0.0)
+            scipy.ndimage.map_coordinates(
+                shifted[j],
+                coords,
+                order=1,
+                mode="nearest" if frequency_padding else "grid-wrap",
+            )
             .reshape(n_radius, n_theta)
             .T
         )
@@ -992,6 +1032,7 @@ def estimate_rotations_from_landmarks(
     n_radius: int = 64,
     spacings: Sequence[tuple[float, float]] | None = None,
     progress: bool = False,
+    frequency_padding: int = 0,
 ) -> np.ndarray:
     """
     Estimate the per-sample rotation that best aligns every landmark
@@ -1031,6 +1072,10 @@ def estimate_rotations_from_landmarks(
         Landmarks share physical radii up to the smallest sampling Nyquist.
     progress : bool, default False
         If True, show a tqdm bar over non-reference samples.
+    frequency_padding : int, default 0
+        Evaluated Fourier-mode border per axis, as in
+        :func:`stream_polar_features`. Grid shapes and spacings describe the
+        original unpadded grid so alignment retains its physical frequency band.
 
     Returns
     -------
@@ -1072,6 +1117,7 @@ def estimate_rotations_from_landmarks(
         n_theta,
         freq_edges,
         spacings[reference_index],
+        frequency_padding,
     )
     ref_hat = np.fft.fft(ref_polar, axis=1)  # (n_landmarks, n_theta, n_radius)
 
@@ -1083,7 +1129,13 @@ def estimate_rotations_from_landmarks(
         if i == reference_index:
             continue
         cur_polar = _build_landmark_polar_stack(
-            landmark_spectra[i], grid_shapes[i], fft_solver, n_theta, freq_edges, spacings[i]
+            landmark_spectra[i],
+            grid_shapes[i],
+            fft_solver,
+            n_theta,
+            freq_edges,
+            spacings[i],
+            frequency_padding,
         )
         cur_hat = np.fft.fft(cur_polar, axis=1)
         # Per-landmark circular cross-correlation along theta; sum across
@@ -1172,8 +1224,16 @@ def apply_rotations_to_spectra(
         matrix[1:, 1:] = [[c, -s * extent_y / extent_x], [s * extent_x / extent_y, c]]
         center = np.array([0, shape[0] // 2, shape[1] // 2])
         rot = scipy.ndimage.affine_transform(
-            full_shift, matrix, offset=center - matrix @ center, order=1, mode="constant", cval=0.0
+            full_shift, matrix, offset=center - matrix @ center, order=1, mode="grid-wrap"
         )
+        # Interpolate periodically across the last sampled frequency, but do
+        # not alias rotated corners from outside the physical Nyquist band.
+        yy = (np.arange(shape[0]) - center[1])[:, None]
+        xx = (np.arange(shape[1]) - center[2])[None, :]
+        outside = (np.abs(matrix[1, 1] * yy + matrix[1, 2] * xx) > shape[0] / 2) | (
+            np.abs(matrix[2, 1] * yy + matrix[2, 2] * xx) > shape[1] / 2
+        )
+        rot[:, outside] = 0.0
         rot = np.fft.ifftshift(rot, axes=(-2, -1))
         if fft_solver == "rfft2":
             ny, nx = shape

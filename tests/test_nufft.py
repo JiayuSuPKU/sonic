@@ -8,6 +8,27 @@ import pytest
 from sonic.kernels.fft import power_spectrum_2d
 from sonic.kernels.nufft import power_spectrum_2d_nufft
 
+
+@pytest.mark.parametrize("bandwidth", [100.0, 1e5])
+def test_broad_centered_kernel_traces_keep_small_ac_signal(bandwidth):
+    from sonic.kernels import NUFFTKernel
+    from sonic.statistics import spatial_r_test
+
+    rng = np.random.default_rng(166)
+    coords = rng.uniform(0, 1, (32, 2))
+    kernel = NUFFTKernel(coords, (8, 8), (1.0, 1.0), bandwidth=bandwidth)
+    fy, fx = np.meshgrid(np.fft.fftfreq(8), np.fft.fftfreq(8), indexing="ij")
+    basis = np.exp(2j * np.pi * coords @ np.stack([fy.ravel(), fx.ravel()]))
+    basis -= basis.mean(axis=0)
+    expected = ((basis * kernel._fft_kernel.spectrum) @ basis.conj().T).real / 64
+    assert kernel.trace() == pytest.approx(np.trace(expected), rel=1e-5)
+    assert kernel.square_trace() == pytest.approx(np.sum(expected**2), rel=1e-5, abs=0)
+    values = np.linalg.eigh(expected)[1][:, -1]
+    np.testing.assert_allclose(kernel.Kx(values), expected @ values, rtol=2e-4, atol=1e-20)
+    assert spatial_r_test(values, values, kernel)[1] < 0.05
+    assert kernel.centering
+
+
 # ---------------------------------------------------------------------------
 # Primitive: power_spectrum_2d_nufft
 # ---------------------------------------------------------------------------

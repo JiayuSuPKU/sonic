@@ -23,6 +23,52 @@ from sonic.statistics import (
 )
 
 
+@pytest.mark.parametrize("backend", ["matrix", "csc", "dok", "lil", "fft", "nufft"])
+@pytest.mark.parametrize("bad", [np.nan, np.inf])
+def test_detection_rejects_nonfinite_observations(backend, bad):
+    rng = np.random.default_rng(72)
+    coords = rng.uniform(0, 8, (20, 2))
+    if backend == "fft":
+        kernel = FFTKernel((8, 8))
+        values = rng.normal(size=(8, 8, 2))
+    elif backend == "nufft":
+        kernel = NUFFTKernel(coords, (8, 8), (1.0, 1.0))
+        values = rng.normal(size=(20, 2))
+    else:
+        kernel = MatrixKernel.from_coordinates(coords, method="gaussian")
+        values = rng.normal(size=(20, 2))
+    good = values.copy()
+    values.flat[0] = bad
+    if backend in {"csc", "dok", "lil"}:
+        good = csc_matrix(good).asformat(backend)
+        values = csc_matrix(values).asformat(backend)
+    for return_pval in (False, True):
+        for standardized in (False, True):
+            for fn, args in (
+                (spatial_q_test, (values, kernel)),
+                (spatial_r_test, (values, good, kernel)),
+                (spatial_r_test, (good, values, kernel)),
+            ):
+                with pytest.raises(ValueError, match="only finite values"):
+                    fn(*args, return_pval=return_pval, is_standardized=standardized)
+
+
+@pytest.mark.parametrize("sparse", [False, True])
+@pytest.mark.parametrize("perturbation", [1e-3, 1e-7, 1e-9])
+def test_near_identity_welch_variance_avoids_trace_cancellation(sparse, perturbation):
+    n = 64
+    v = np.linspace(-1, 1, n)
+    v /= np.linalg.norm(v)
+    matrix = np.eye(n) + perturbation * np.outer(v, v)
+    kernel = MatrixKernel.from_matrix(csr_matrix(matrix) if sparse else matrix)
+    before = kernel.trace(), kernel.square_trace()
+    params = compute_null_params(kernel, method="welch")
+    expected = 2 * (n - 2) * perturbation**2 / (n + 1)
+    assert params["var_Q"] == pytest.approx(expected, rel=1e-5)
+    assert spatial_q_test(v, kernel, null_params=params)[1] < 0.05
+    assert (kernel.trace(), kernel.square_trace()) == before
+
+
 @pytest.mark.parametrize("backend", ["matrix", "fft", "nufft"])
 @pytest.mark.parametrize("test", ["q", "r"])
 def test_memory_budget_controls_auto_chunks_without_changing_results(monkeypatch, backend, test):

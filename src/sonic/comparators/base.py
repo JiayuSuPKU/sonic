@@ -391,7 +391,7 @@ class _ComparatorBase:
     _landmark_cache_warn_bytes: int = 8 * 1024**3  # 8 GiB
 
     # ------------------------------------------------------------------
-    def _landmark_cache_fits(self, n_landmarks: int) -> bool:
+    def _landmark_cache_fits(self, n_landmarks: int, *, frequency_padding: int = 0) -> bool:
         """Whether caching ``n_landmarks`` full-2D spectra per sample fits budget.
 
         The explicit-``landmark_genes`` path (2d mode) holds each sample's
@@ -406,6 +406,7 @@ class _ComparatorBase:
             return True
         worst = 0
         for ny, nx in self._grid_shapes:
+            ny, nx = ny + 2 * frequency_padding, nx + 2 * frequency_padding
             n_kx = nx if self._spectrum_fft_solver == "fft2" else nx // 2 + 1
             worst = max(worst, n_landmarks * ny * n_kx * 8)
         if worst > self._landmark_cache_warn_bytes:
@@ -649,6 +650,23 @@ class _ComparatorBase:
         n_feature_bins = min(f.shape[-1] for f in feats)
         feats = [f[..., :n_feature_bins] for f in feats]
         self.spectra_ = np.stack(feats, axis=0)
+        if hasattr(self, "_nufft_eps") and len(self.samples) > 1:
+            # Diagnostic only: eps is a transform target, not a statistical
+            # variance floor. Keep small real effects and p-values unchanged.
+            spread = np.ptp(self.spectra_, axis=0).max(axis=-1)
+            scale = self.spectra_.max(axis=(0, 2))
+            unresolved = (spread > 0) & (spread <= 2 * self._nufft_eps * scale)
+            if self.presence_ is not None:
+                unresolved &= self.presence_.all(axis=0)
+            if unresolved.any():
+                warnings.warn(
+                    f"{unresolved.sum()} feature(s) have between-sample spectral differences "
+                    "below the requested NUFFT accuracy. With negligible replicate variance, "
+                    "analytic p-values may reflect transform error. Recompute with a smaller "
+                    "eps and check effect-size stability before interpreting significance.",
+                    UserWarning,
+                    stacklevel=2,
+                )
         return self
 
     # ------------------------------------------------------------------
@@ -708,6 +726,7 @@ class _ComparatorBase:
         """
         if self.spectra_ is None:
             raise RuntimeError("Call .compute_spectra() before .normalize_background().")
+        self.spectra_ = np.asarray(self.spectra_, dtype=np.float64)
         for i in range(self.spectra_.shape[0]):
             observed = slice(None) if self.presence_ is None else self.presence_[i]
             if self.presence_ is None or observed.any():
@@ -803,9 +822,11 @@ class _ComparatorBase:
             cov_feat = cov_feat[..., : self.spectra_.shape[-1]]
             self._validate_covariate_features(cov_feat, sample_index=i, mode=covariate_mode)
             cov_features_per_sample[i] = cov_feat
-        # Validate every sample before modifying any spectra.
+        # Keep the original spectra intact if a later sample has a saturated design.
+        normalized = np.empty(self.spectra_.shape, dtype=np.float64)
         for i, cov_feat in enumerate(cov_features_per_sample):
-            self.spectra_[i] = _normalize_covariates(self.spectra_[i], cov_feat)
+            normalized[i] = _normalize_covariates(self.spectra_[i], cov_feat)
+        self.spectra_ = normalized
         return self
 
     def _validate_covariate_features(

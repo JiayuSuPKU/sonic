@@ -657,6 +657,7 @@ def _estimate_two_group_null_covariance(
     Liu eigenvalues used by both :func:`compare_two_groups` and
     :meth:`sonic.comparators.base._ComparatorBase.estimate_null_covariance`.
     """
+    spectra = np.asarray(spectra, dtype=np.float64)
     if spectra.ndim != 3:
         raise ValueError(f"spectra must be 3D (n_samples, n_genes, n_bins), got {spectra.shape}.")
     n_samples, n_genes, n_bins = spectra.shape
@@ -740,6 +741,7 @@ def _estimate_two_group_masked_null_covariance(  # noqa: C901
     """
     if int(min_samples_per_group) < 2:
         raise ValueError(f"min_samples_per_group must be >= 2, got {min_samples_per_group}.")
+    spectra = np.asarray(spectra, dtype=np.float64)
     if spectra.ndim != 3:
         raise ValueError(f"spectra must be 3D, got {spectra.shape}.")
     n_samples, n_genes, n_bins = spectra.shape
@@ -855,6 +857,7 @@ def _estimate_glm_null_covariance(
     covariance across genes, and the single contrast variance scale
     ``c'(X'X)^+c`` applied to the Liu eigenvalues.
     """
+    spectra = np.asarray(spectra, dtype=np.float64)
     if spectra.ndim != 3:
         raise ValueError(f"spectra must be 3D (n_samples, n_genes, n_bins), got {spectra.shape}.")
     n_samples, n_genes, n_bins = spectra.shape
@@ -942,6 +945,7 @@ def _estimate_glm_masked_null_covariance(  # noqa: C901
     """
     if int(min_resid_df) < 1:
         raise ValueError(f"min_resid_df must be >= 1, got {min_resid_df}.")
+    spectra = np.asarray(spectra, dtype=np.float64)
     if spectra.ndim != 3:
         raise ValueError(f"spectra must be 3D (n_samples, n_genes, n_bins), got {spectra.shape}.")
     n_samples, n_genes, n_bins = spectra.shape
@@ -1159,6 +1163,7 @@ def compare_two_groups(  # noqa: C901
         )
     if null not in _NULL_OPTIONS:
         raise ValueError(f"Unknown null='{null}'. Options: {list(_NULL_OPTIONS)}.")
+    spectra = np.asarray(spectra, dtype=np.float64)
     if spectra.ndim != 3:
         raise ValueError(f"spectra must be 3D (n_samples, n_genes, n_bins), got {spectra.shape}.")
     n_samples, n_genes, _ = spectra.shape
@@ -1313,6 +1318,7 @@ def compare_two_groups_masked(  # noqa: C901
         )
     if null not in _NULL_OPTIONS:
         raise ValueError(f"Unknown null='{null}'. Options: {list(_NULL_OPTIONS)}.")
+    spectra = np.asarray(spectra, dtype=np.float64)
     if spectra.ndim != 3:
         raise ValueError(f"spectra must be 3D, got {spectra.shape}.")
     n_samples, n_genes, _ = spectra.shape

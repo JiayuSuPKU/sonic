@@ -157,6 +157,42 @@ def test_grid_spectrum_normalizes_by_observed_bins(solver):
     np.testing.assert_allclose(dc, 2.0)
 
 
+def test_noiseless_nufft_sampling_difference_warns_about_transform_accuracy():
+    rasters = []
+    sizes = [16] * 4 + [32] * 4
+    for n in sizes:
+        _, x = np.indices((n, n)) / n
+        rasters.append((2 + np.cos(4 * np.pi * x))[None])
+    comparator = ComparatorIrregular(
+        _grid_samples_to_adata(rasters, ["cosine"], [(1 / n, 1 / n) for n in sizes]),
+        grid_shape=(16, 16),
+        spacing=(1 / 16, 1 / 16),
+        freq_edges=np.array([1.5, 2.5]),
+        workers=1,
+    )
+    with pytest.warns(UserWarning, match="below the requested NUFFT accuracy"):
+        comparator.compute_spectra(progress=False, n_jobs=1)
+    np.testing.assert_allclose(comparator.spectra_, 1 / 24, rtol=1e-6)
+
+
+def test_sparse_float32_nufft_centering_matches_float64():
+    from scipy.sparse import csc_matrix
+
+    rng = np.random.default_rng(166)
+    values = (1e8 + 8 * rng.integers(-2, 3, size=(256, 3))).astype(np.float32)
+    coords = rng.uniform(0, 8, (256, 2))
+    outputs = []
+    for matrix in (csc_matrix(values), values.astype(float)):
+        data = ad.AnnData(matrix)
+        data.obsm["spatial"] = coords
+        comparator = ComparatorIrregular(
+            [data], grid_shape=(8, 8), spacing=(1.0, 1.0), workers=1
+        ).compute_spectra(progress=False, n_jobs=1)
+        outputs.append((comparator.spectra_, comparator.dc_))
+    for index in (0, 1):
+        np.testing.assert_allclose(outputs[0][index], outputs[1][index], rtol=1e-8, atol=1e-8)
+
+
 def _comparator_from_spectra(
     spectra: np.ndarray,
     presence: np.ndarray | None = None,
@@ -1587,3 +1623,55 @@ def test_2d_alignment_respects_physical_spacing(backend, monkeypatch):
     cosine = features[0] @ features[1] / np.linalg.norm(features[0]) / np.linalg.norm(features[1])
     assert cosine > 0.94
     np.testing.assert_array_equal(np.argmax(features, axis=1), 45)
+
+
+@pytest.mark.parametrize("landmarks", [None, ["g0"]])
+def test_nufft_2d_genes_and_covariates_use_evaluated_frequency_border(landmarks):
+    from scipy.ndimage import map_coordinates
+
+    rng = np.random.default_rng(37)
+    coords = rng.uniform(0, 8, (41, 2))
+    values = rng.lognormal(size=(41, 2))
+    sample = ad.AnnData(values)
+    sample.var_names = ["g0", "g1"]
+    sample.obsm["spatial"] = coords
+    sample.obs["cov"] = values[:, 0]
+    edges = np.linspace(0, 0.5, 4)
+    cmp = ComparatorIrregular(
+        [sample],
+        feature_mode="2d",
+        grid_shape=(8, 8),
+        spacing=(1.0, 1.0),
+        freq_edges=edges,
+        n_theta_bins=36,
+        nufft_chunk_size=1,
+        eps=1e-12,
+        workers=1,
+    ).compute_spectra(landmark_genes=landmarks, progress=False)
+    modes = np.arange(-5, 5) / 8
+    fy, fx = np.meshgrid(modes, modes, indexing="ij")
+    transform = np.exp(-2j * np.pi * (fy[..., None] * coords[:, 0] + fx[..., None] * coords[:, 1]))
+    exact = abs(transform @ (values - values.mean(axis=0))) ** 2 / len(coords) ** 2
+    radii = (edges[1:] + edges[:-1]) / 2
+    angles = np.linspace(0, np.pi, 36, endpoint=False)
+    points = np.array(
+        [5 + radii[:, None] * np.sin(angles) * 8, 5 + radii[:, None] * np.cos(angles) * 8]
+    )
+    expected = np.stack([map_coordinates(exact[..., i], points, order=1).ravel() for i in range(2)])
+    np.testing.assert_allclose(cmp.spectra_[0], expected, rtol=1e-9, atol=1e-12)
+    covariates = cmp._covariate_features_from_keys(["cov"])
+    np.testing.assert_allclose(covariates[0][0], expected[0], rtol=1e-9, atol=1e-12)
+
+
+def test_covariate_normalization_failure_preserves_all_samples(monkeypatch):
+    rng = np.random.default_rng(24)
+    samples = TestComparatorIrregularNormalizeCovariates._build_samples(n_samples=2)
+    cmp = ComparatorIrregular(samples)
+    cmp.spectra_ = rng.lognormal(size=(2, 4, 8)).astype(np.float32)
+    original = cmp.spectra_.copy()
+    covariates = [np.ones((10, 8)), rng.lognormal(size=(10, 8))]
+    monkeypatch.setattr(cmp, "_covariate_features_from_keys", lambda keys: covariates)
+    with pytest.raises(ValueError, match="no residual dimensions"):
+        cmp.normalize_covariates(["cov_a"])
+    np.testing.assert_array_equal(cmp.spectra_, original)
+    assert cmp.spectra_.dtype == np.float32

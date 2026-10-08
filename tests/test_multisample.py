@@ -26,6 +26,46 @@ from sonic.comparators.normalization import normalize_shape
 from sonic.statistics import liu_sf
 
 
+@pytest.mark.parametrize(
+    "mode", ["binary", "masked", "glm", "masked_glm", "permutation", "masked_permutation"]
+)
+@pytest.mark.parametrize("shape_only", [False, True])
+def test_float32_comparisons_match_the_same_values_promoted_to_float64(mode, shape_only):
+    rng = np.random.default_rng(921)
+    spectra = (1e-4 * (1 + 2e-7 * rng.normal(size=(8, 40, 3)))).astype(np.float32)
+    original = spectra.copy()
+    groups = np.repeat([0, 1], 4)
+    presence = np.ones(spectra.shape[:2], dtype=bool)
+    presence[0, :10] = False
+    presence[4, 10:20] = False
+    design = pd.DataFrame({"group": groups})
+
+    def run(values):
+        kwargs = {"normalize_shape": shape_only}
+        if mode == "glm":
+            result = compare_glm(values, design, "group", **kwargs)
+        elif mode == "masked_glm":
+            result = compare_glm_masked(values, design, "group", presence, **kwargs)
+        else:
+            kwargs["null"] = "permutation" if "permutation" in mode else "analytic"
+            if mode.startswith("masked"):
+                result = compare_two_groups_masked(values, groups, presence, **kwargs)
+            else:
+                result = compare_two_groups(values, groups, **kwargs)
+        return result.set_index("Feature").sort_index()[["Statistic", "P_value", "P_adj"]]
+
+    np.testing.assert_array_equal(run(spectra), run(spectra.astype(np.float64)))
+    np.testing.assert_array_equal(spectra, original)
+
+
+def test_shape_only_comparison_ignores_low_power_amplitude_changes():
+    spectra = np.tile(np.array([1.0, 2.0, 4.0]) * 1e-16, (8, 1, 1))
+    spectra[4:] *= 10
+    result = compare_two_groups(spectra, np.repeat([0, 1], 4), normalize_shape=True)
+    np.testing.assert_array_equal(result["Statistic"], 0.0)
+    np.testing.assert_array_equal(result["P_value"], 1.0)
+
+
 def test_analytic_null_metadata_stays_optional_on_python_310():
     assert _AnalyticNullState.__optional_keys__ == {
         "n_obs_A",

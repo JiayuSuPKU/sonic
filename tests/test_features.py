@@ -24,6 +24,67 @@ from sonic.comparators.features import (
 from sonic.kernels.fft import power_spectrum_2d
 
 
+@pytest.mark.parametrize(
+    "grid,spacing", [((8, 8), (1.0, 1.0)), ((9, 7), (1.0, 1.5)), ((8, 11), (1.5, 1.0))]
+)
+@pytest.mark.parametrize("angle", [0.0, 73.0])
+def test_padded_nufft_polar_features_match_direct_fourier_modes(grid, spacing, angle):
+    from scipy.ndimage import map_coordinates
+
+    from sonic.comparators.features import _build_landmark_polar_stack
+    from sonic.kernels.nufft import power_spectrum_2d_nufft
+
+    rng = np.random.default_rng(32)
+    domain = np.asarray(grid) * spacing
+    coords = rng.uniform(size=(37, 2)) * domain
+    values = rng.normal(size=37)
+    values -= values.mean()
+    power = power_spectrum_2d_nufft(coords, values, grid, spacing, eps=1e-12, frequency_padding=1)[
+        None
+    ]
+    # Direct Fourier evaluation, including the otherwise missing positive edge.
+    frequencies = [
+        (np.arange(n + 2) - (n + 2) // 2) / length for n, length in zip(grid, domain, strict=True)
+    ]
+    fy, fx = np.meshgrid(*frequencies, indexing="ij")
+    exact = (
+        abs(
+            np.exp(-2j * np.pi * (fy[..., None] * coords[:, 0] + fx[..., None] * coords[:, 1]))
+            @ values
+        )
+        ** 2
+    )
+    np.testing.assert_allclose(np.fft.fftshift(power[0]), exact, rtol=1e-9, atol=1e-9)
+    edges = np.linspace(0, 0.5 / max(spacing), 31)
+    radii = (edges[1:] + edges[:-1]) / 2
+
+    def reference(rotation):
+        theta = np.linspace(0, np.pi, 36, endpoint=False) - np.deg2rad(rotation)
+        yy = (grid[0] + 2) // 2 + radii[:, None] * np.sin(theta) * domain[0]
+        xx = (grid[1] + 2) // 2 + radii[:, None] * np.cos(theta) * domain[1]
+        return map_coordinates(exact, np.array([yy, xx]), order=1, mode="constant")
+
+    actual = stream_polar_features(
+        lambda start, stop: power[start:stop],
+        1,
+        grid,
+        angle,
+        chunk_size=1,
+        freq_edges=edges,
+        spacing=spacing,
+        n_theta=36,
+        fft_solver="fft2",
+        frequency_padding=1,
+    )
+    np.testing.assert_allclose(actual[0], reference(angle).ravel(), rtol=1e-9, atol=1e-9)
+    landmark = _build_landmark_polar_stack(
+        power, grid, "fft2", 36, edges, spacing, frequency_padding=1
+    )
+    expected = reference(0).T
+    expected -= expected.mean(axis=0, keepdims=True)
+    np.testing.assert_allclose(landmark[0], expected, rtol=1e-9, atol=1e-9)
+
+
 def _axis_angle_error(observed: float, expected: float) -> float:
     """Smallest axial-angle error in degrees."""
     return abs((observed - expected + 90.0) % 180.0 - 90.0)
@@ -252,6 +313,37 @@ def test_radial_bins_discard_out_of_band_modes(shape, solver, exclude_dc):
     kwargs = {"fft_solver": solver, "edges": edges, "exclude_dc": exclude_dc}
     np.testing.assert_allclose(radial_bin_counts(shape, **kwargs), counts)
     np.testing.assert_allclose(radial_bin_spectrum(power, shape, **kwargs), sums / counts)
+
+
+@pytest.mark.parametrize("n", [8, 9, 16])
+@pytest.mark.parametrize("angle", [0.0, 17.0])
+def test_polar_interpolation_wraps_inside_nyquist_band(n, angle):
+    power = np.ones((1, n, n))
+    power[:, 0, 0] = 0
+    result = stream_polar_features(
+        lambda start, stop: power[start:stop],
+        1,
+        (n, n),
+        angle,
+        chunk_size=1,
+        freq_edges=np.array([0.4, 0.5]),
+        spacing=(1.0, 1.0),
+        n_theta=36,
+        fft_solver="fft2",
+    )
+    np.testing.assert_allclose(result, 1.0)
+    with pytest.raises(ValueError, match="Nyquist limits"):
+        stream_polar_features(
+            lambda start, stop: power[start:stop],
+            1,
+            (n, n),
+            angle,
+            chunk_size=1,
+            freq_edges=np.array([0.5, 0.6]),
+            spacing=(1.0, 1.0),
+            n_theta=36,
+            fft_solver="fft2",
+        )
 
 
 class TestRotationAlignment:

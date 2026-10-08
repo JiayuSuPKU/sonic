@@ -21,8 +21,8 @@ def test_covariate_normalization_matches_projection_and_preserves_inputs(dtype, 
     covariates[1] = covariates[0]  # Rank-deficient designs still use the pseudoinverse.
     original = spectra.copy()
     original_covariates = covariates.copy()
-    log_spec = np.log(spectra + 1e-12)
-    design = np.log(covariates + 1e-12).T
+    log_spec = np.log(spectra.astype(np.float64) + 1e-12)
+    design = np.log(covariates.astype(np.float64) + 1e-12).T
     if fit_intercept:
         design = np.column_stack([np.ones(20), design])
     expected = np.exp(log_spec - (design @ np.linalg.pinv(design) @ log_spec.T).T)
@@ -31,6 +31,47 @@ def test_covariate_normalization_matches_projection_and_preserves_inputs(dtype, 
     np.testing.assert_allclose(actual, expected, rtol=1e-6 if dtype == np.float32 else 1e-12)
     np.testing.assert_array_equal(spectra, original)
     np.testing.assert_array_equal(covariates, original_covariates)
+
+
+@pytest.mark.parametrize("fit_intercept", [False, True])
+def test_covariate_normalization_rejects_saturated_design(fit_intercept):
+    rng = np.random.default_rng(3)
+    spectra = rng.lognormal(size=(20, 8))
+    covariates = rng.lognormal(size=(10, 8))
+    with pytest.raises(ValueError, match="no residual dimensions"):
+        normalize_covariates(spectra, covariates, fit_intercept=fit_intercept)
+    # Many duplicate covariates still leave residual dimensions and are valid.
+    covariates[:] = covariates[:1]
+    assert np.isfinite(normalize_covariates(spectra, covariates)).all()
+
+
+def test_shape_normalization_preserves_tiny_and_huge_shapes_and_zero_spectra():
+    shape = np.array([1.0, 2.0, 4.0])
+    spectra = np.array([0.0, 1e-310, 1e-16, 1.0, 4e307])[:, None] * shape
+    original = spectra.copy()
+    with np.errstate(over="raise", divide="raise", invalid="raise"):
+        normalized = normalize_shape(spectra)
+    np.testing.assert_allclose(normalized[1:], np.tile(shape / shape.sum(), (4, 1)))
+    np.testing.assert_array_equal(normalized[0], 0.0)
+    np.testing.assert_array_equal(spectra, original)
+    np.testing.assert_array_equal(normalize_shape(spectra.T, axis=0).T, normalized)
+
+
+@pytest.mark.parametrize(
+    "normalizer", [normalize_background, normalize_covariates, normalize_shape]
+)
+def test_float32_normalization_matches_promoted_input(normalizer):
+    rng = np.random.default_rng(12)
+    spectra = (1e-4 * (1 + 2e-7 * rng.normal(size=(12, 8)))).astype(np.float32)
+    args = (
+        (rng.lognormal(size=(2, 8)).astype(np.float32),)
+        if normalizer is normalize_covariates
+        else ()
+    )
+    actual = normalizer(spectra, *args)
+    expected = normalizer(spectra.astype(np.float64), *[a.astype(np.float64) for a in args])
+    assert actual.dtype == np.float64
+    np.testing.assert_array_equal(actual, expected)
 
 
 class TestNormalizationPrimitives:

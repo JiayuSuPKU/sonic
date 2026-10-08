@@ -26,6 +26,7 @@ from sonic.utils import (
     _DEFAULT_CHUNK_BUDGET,
     _chunk_parameters,
     _parse_memory_budget,
+    _require_finite,
     resolve_parallelism,
 )
 
@@ -556,11 +557,25 @@ class DetectorIrregular(Detector):
 
         # --- Distance Based Transformations ---
         if is_distance:
+            if sp.issparse(matrix):
+                # An omitted sparse entry cannot distinguish a missing edge
+                # from a genuinely zero distance. Require every off-diagonal
+                # distance to be explicitly stored (explicit zeros are allowed).
+                distances = matrix.tocsr(copy=True)
+                distances.sum_duplicates()
+                distances.setdiag(0.0)
+                if distances.nnz != self.n**2:
+                    raise ValueError(
+                        "Sparse distance matrices must explicitly store every off-diagonal "
+                        "distance; incomplete neighbor-distance graphs are unsupported. "
+                        "Use spatial coordinates or a complete pairwise distance matrix."
+                    )
+                matrix = distances.toarray()
+            matrix = np.asarray(matrix, dtype=np.float64)
+            _require_finite(matrix, "Distances")
             if method == "gaussian":
                 bw = kernel_params_["bandwidth"]
                 # K = exp(-d^2 / 2bw^2)
-                if sp.issparse(matrix):
-                    matrix = matrix.toarray()  # Gaussian usually requires dense
                 K = np.exp(-(matrix**2) / (2 * bw**2))
                 self.kernel_ = MatrixKernel.from_matrix(K, is_precision=False)
                 self.kernel_params_ = {"bandwidth": bw}
@@ -569,9 +584,6 @@ class DetectorIrregular(Detector):
 
                 bw = kernel_params_["bandwidth"]
                 nu = kernel_params_["nu"]
-                if sp.issparse(matrix):
-                    matrix = matrix.toarray()
-
                 dists = matrix.copy()
                 dists[dists == 0] = 1e-15
                 factor = (np.sqrt(2 * nu) * dists) / bw
@@ -588,6 +600,9 @@ class DetectorIrregular(Detector):
             W = matrix
             if not sp.issparse(W):
                 W = sp.csr_matrix(W)
+            W = W.astype(float)
+            _require_finite(W, "Connectivity")
+            W = 0.5 * (W + W.T)
 
             # Remove isolated cells (zero-degree nodes)
             row_sums_raw = np.array(W.sum(axis=1)).flatten()
@@ -603,13 +618,11 @@ class DetectorIrregular(Detector):
                 self.n = W.shape[0]
                 self.min_cells = min(self.min_cells, self.n)
 
-            # Symmetrize and symmetric normalization
-            W = W.astype(float)
-            W_sym = 0.5 * (W + W.T)
-            row_sums = np.array(W_sym.sum(axis=1)).flatten()
+            # Symmetric normalization after removing truly isolated nodes.
+            row_sums = np.array(W.sum(axis=1)).flatten()
             row_sums[row_sums == 0] = 1.0
             inv_D_sqrt = sp.diags(1.0 / np.sqrt(row_sums))
-            W_norm = inv_D_sqrt @ W_sym @ inv_D_sqrt
+            W_norm = inv_D_sqrt @ W @ inv_D_sqrt
 
             if method == "moran":
                 # Already symmetric and normalized
@@ -697,26 +710,24 @@ class DetectorIrregular(Detector):
             else:
                 raise ValueError("Keys must be provided when feature source is 'obs'.")
 
-            # check if .obs[keys] are char/categorical
-            if any(adata_tmp.dtypes == "object") or any(adata_tmp.dtypes == "category"):
-                logger.info(
-                    "Categorical features detected in .obs[keys]; performing one-hot encoding..."
+            if adata_tmp.isna().any().any():
+                raise ValueError(
+                    "Metadata observations must contain only finite, nonmissing values."
                 )
-                # one-hot encode categorical variables while keeping others unchanged
-                dummies = pd.get_dummies(adata_tmp)
-
-                names = dummies.columns.tolist()
-                X_dense = dummies.values.astype(np.float64)
-                means = X_dense.mean(axis=0)
-                stds = X_dense.std(axis=0, ddof=1)
-                X_csc = sp.csc_matrix(X_dense)
-            else:
-                # All numeric - no encoding needed
-                names = adata_tmp.columns.tolist()
-                X_dense = adata_tmp.values.astype(np.float64)
-                means = X_dense.mean(axis=0)
-                stds = X_dense.std(axis=0, ddof=1)
-                X_csc = sp.csc_matrix(X_dense)
+            parts = [pd.get_dummies(adata_tmp[[key]]) for key in adata_tmp.columns]
+            self._obs_feature_names = {
+                key: part.columns.tolist()
+                for key, part in zip(adata_tmp.columns, parts, strict=True)
+            }
+            encoded = pd.concat(parts, axis=1)
+            if not encoded.columns.is_unique:
+                raise ValueError("Metadata feature names collide after categorical encoding.")
+            names = encoded.columns.tolist()
+            X_dense = encoded.to_numpy(dtype=np.float64)
+            _require_finite(X_dense, "Metadata observations")
+            means = X_dense.mean(axis=0)
+            stds = X_dense.std(axis=0, ddof=1)
+            X_csc = sp.csc_matrix(X_dense)
 
         elif source == "var":
             # check if keys are in var
@@ -740,6 +751,8 @@ class DetectorIrregular(Detector):
                 means, stds = _sparse_mean_std(X)
                 X_csc = X.tocsc()
             else:
+                X = np.asarray(X, dtype=np.float64)
+                _require_finite(X, "Expression observations")
                 means = np.mean(X, axis=0)
                 stds = np.std(X, axis=0, ddof=1)
                 X_csc = sp.csc_matrix(X)
@@ -1118,6 +1131,11 @@ class DetectorIrregular(Detector):
 
         # Map names to indices in the prepared matrix
         name_to_idx = {n: i for i, n in enumerate(names)}
+        if source == "obs":
+            if features_x is not None:
+                features_x = [n for f in features_x for n in self._obs_feature_names.get(f, [])]
+            if features_y is not None:
+                features_y = [n for f in features_y for n in self._obs_feature_names.get(f, [])]
 
         # 3. Generate Y chunks (for pre-computing K@Y)
         if mode == "symmetric":
@@ -1221,8 +1239,8 @@ class DetectorIrregular(Detector):
             missing = [c for c in cols if c not in self.adata.obs.columns]
             if missing:
                 raise KeyError(f"obs columns missing: {missing}")
-            X_csc = sp.csc_matrix(self.adata.obs[cols].to_numpy(dtype=np.float64))
-            names = list(cols)
+            matrix, names, means, stds = self._prepare_data(source, cols, self.min_cells, layer)
+            return matrix, names, means, stds * np.sqrt((self.n - 1) / self.n)
         else:
             raise ValueError(f"source must be 'var' or 'obs', got '{source}'.")
 

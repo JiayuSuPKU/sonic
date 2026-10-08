@@ -102,7 +102,7 @@ def normalize_background(
     >>> bool(np.allclose(np.prod(P_tilde, axis=-2), 1.0))
     True
     """
-    log_spec = np.log(spectra + eps)
+    log_spec = np.log(np.asarray(spectra, dtype=np.float64) + eps)
     bg = log_spec.mean(axis=axis, keepdims=True)
     return np.exp(log_spec - bg)
 
@@ -156,8 +156,9 @@ def normalize_covariates(
     Raises
     ------
     ValueError
-        If ``covariate_spectra`` has a different last-axis length than
-        ``spectra``.
+        If the last-axis lengths differ or the covariate design spans all
+        frequency bins, leaving no residual dimensions. Reduce the number
+        of covariates or increase the number of supported frequency bins.
 
     Notes
     -----
@@ -266,14 +267,19 @@ def normalize_covariates(
             f"covariate_spectra has n_bins={covariate_spectra.shape[-1]}."
         )
     n_bins = spectra.shape[-1]
-    log_spec = np.log(spectra + eps)
-    log_cov = np.log(covariate_spectra + eps)
+    log_spec = np.log(np.asarray(spectra, dtype=np.float64) + eps)
+    log_cov = np.log(np.asarray(covariate_spectra, dtype=np.float64) + eps)
 
     X = log_cov.T
     if fit_intercept:
         X = np.hstack([np.ones((n_bins, 1)), X])
-    pinv = np.linalg.pinv(X)
-    fitted = (X @ (pinv @ log_spec.T)).T
+    beta, _, rank, _ = np.linalg.lstsq(X, log_spec.T, rcond=1e-15)
+    if rank >= n_bins:
+        raise ValueError(
+            f"Covariate design has no residual dimensions: rank={rank}, n_bins={n_bins}. "
+            "Use fewer covariates or more supported frequency bins."
+        )
+    fitted = (X @ beta).T
     # Reuse the fitted-value buffer for residuals and their exponentials.
     np.subtract(log_spec, fitted, out=fitted)
     return np.exp(fitted, out=fitted)
@@ -285,91 +291,40 @@ def normalize_shape(
     axis: int = -1,
     eps: float = 1e-12,
 ) -> np.ndarray:
-    """Project each spectrum onto the probability simplex along ``axis``.
+    """Normalize each nonzero spectrum to unit total power along ``axis``.
 
-    Each fibre along ``axis`` is divided by its L1 norm, so the result
-    is a proper probability distribution over the entries along that
-    axis. Two fibres that differ only by a positive scalar produce
-    identical outputs - only the **shape** of the power-vs-frequency
-    curve survives, the overall scale is removed.
+    Spectra differing only by a positive scalar have identical shapes, up to
+    floating-point rounding. All-zero spectra stay zero. Scaling by the largest
+    entry before summing avoids overflow and preserves very small powers.
 
     Parameters
     ----------
     spectra : np.ndarray
-        Non-negative spectra :math:`P`. Any leading dimensions are
-        preserved; normalization acts along ``axis`` only.
+        Non-negative spectra. Any leading dimensions are preserved.
     axis : int, default -1
-        Axis to L1-normalize along (typically the trailing
-        frequency-bin axis).
+        Frequency axis to normalize.
     eps : float, default 1e-12
-        Floor :math:`\\varepsilon` on the per-fibre sum to avoid
-        division by zero.
+        Retained for backward compatibility; no floor is applied to positive
+        totals. Zero totals are handled explicitly.
 
     Returns
     -------
     np.ndarray
-        Shape-normalized spectra :math:`\\tilde P`, same shape as
-        ``spectra``, summing to 1 along ``axis``. Never mutates the
-        input.
+        Float64 spectra summing to one wherever power is present, with zero
+        spectra unchanged. Never mutates the input.
 
     Notes
     -----
-    Let :math:`P` denote the input spectrum with :math:`K` entries
-    along ``axis`` and :math:`\\varepsilon` the ``eps`` floor. The
-    output is the per-fibre L1 quotient
-
-    .. math::
-
-        \\tilde P_{\\ldots,k}
-        = \\frac{P_{\\ldots,k}}
-                {\\sum_{k'=1}^{K} P_{\\ldots,k'} + \\varepsilon},
-
-    so :math:`\\sum_{k} \\tilde P_{\\ldots,k} = 1` for every
-    leading-index combination (modulo the :math:`\\varepsilon` floor;
-    fibres whose total sum is below :math:`\\varepsilon` are
-    effectively returned unchanged because the numerator dominates
-    the floor).
-
-    Equivalently, in log-space this is per-fibre log-sum centering,
-
-    .. math::
-
-        \\log \\tilde P_{\\ldots,k}
-        = \\log P_{\\ldots,k}
-          - \\log\\!\\Bigl( \\textstyle\\sum_{k'=1}^{K}
-            P_{\\ldots,k'} + \\varepsilon \\Bigr).
-
-    After this transform every fibre is a probability vector over
-    frequency bins, so distances such as Jensen-Shannon and
-    total-variation are well-defined between fibres.
-
-    Used internally by the spectrum comparison functions
-    (:func:`sonic.comparators.multisample.compare_two_groups`,
-    :func:`sonic.comparators.multisample.compare_two_groups_masked`,
-    :func:`sonic.comparators.multisample.compare_glm`) when their
-    ``normalize_shape=True`` keyword argument is set - the
-    differential-frequency test then fires only on shape redistribution
-    across radial bins, not on overall amplitude changes.
-
-    Companion functions:
-
-    - :func:`normalize_background` removes per-sample multiplicative
-      gain via cross-gene geometric-mean centering in log-space.
-    - :func:`normalize_covariates` removes per-bin bias linear in
-      user-supplied covariate spectra.
-
-    Examples
-    --------
-    >>> import numpy as np
-    >>> x = np.array([[1.0, 2.0, 4.0], [10.0, 20.0, 40.0]])
-    >>> P_tilde = normalize_shape(x, axis=-1)
-    >>> bool(np.allclose(P_tilde.sum(axis=-1), 1.0))
-    True
-    >>> bool(np.allclose(P_tilde[0], P_tilde[1]))  # only the shape survives
-    True
+    Used by comparison functions when ``normalize_shape=True`` to isolate
+    frequency redistribution independently of overall amplitude. Unlike
+    ``normalize_background``, normalization acts independently on each gene
+    within each sample.
     """
-    total = spectra.sum(axis=axis, keepdims=True)
-    return spectra / (total + eps)
+    spectra = np.asarray(spectra, dtype=np.float64)
+    scale = spectra.max(axis=axis, keepdims=True, initial=0.0)
+    scaled = np.divide(spectra, scale, out=np.zeros_like(spectra), where=scale > 0)
+    total = scaled.sum(axis=axis, keepdims=True)
+    return np.divide(scaled, total, out=scaled, where=total > 0)
 
 
 def _normalize_shape_apply(spectra: np.ndarray) -> np.ndarray:

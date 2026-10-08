@@ -90,6 +90,9 @@ class ComparatorIrregular(_ComparatorBase):
         sample's Nyquist is ``1 / (2 * max(dy, dx))``. Radial features bin each
         sample's spectrum onto those shared edges; ``feature_mode='2d'`` uses
         the same edges as the polar radius grid after rotation alignment.
+        The 2D path evaluates one extra Fourier mode on each side of both axes
+        for interpolation at the Nyquist boundary. This preserves the original
+        physical frequencies without periodically wrapping off-grid spectra.
     freq_edges : np.ndarray, optional
         Explicit shared radial-frequency bin edges. When supplied, these edges
         are used as-is for all samples and override the automatic
@@ -245,13 +248,15 @@ class ComparatorIrregular(_ComparatorBase):
         self._grid_shapes = grids
         self._spacings = spacings
 
-    def _nufft_spectrum_chunker(self, i: int):
+    def _nufft_spectrum_chunker(self, i: int, *, frequency_padding: int = 0):
         """Build ``(spectrum_chunk_fn, dc, presence, n_genes, grid)`` for sample ``i``.
 
         ``spectrum_chunk_fn(start, stop)`` mean-centres + NUFFTs just that
         gene-chunk to its ``(stop-start, ny, nx)`` power spectrum, filling the
         shared ``dc`` / ``presence`` arrays on the way. The dense
         ``(n_genes, ny, nx)`` spectrum is never assembled by the caller.
+        With ``frequency_padding=1``, each chunk includes an evaluated border
+        of Fourier modes for polar interpolation; the returned grid is unpadded.
         """
         from sonic.kernels.nufft import power_spectrum_2d_nufft
 
@@ -265,6 +270,7 @@ class ComparatorIrregular(_ComparatorBase):
         n_spots = X_src.shape[0]
 
         if sp.issparse(X_src):
+            X_src = X_src.astype(np.float64, copy=False)
             dc = np.asarray(X_src.mean(axis=0)).ravel()
             nnz_per = np.asarray((X_src != 0).sum(axis=0)).ravel()
             X_csc = X_src.tocsc()
@@ -295,6 +301,7 @@ class ComparatorIrregular(_ComparatorBase):
                 eps=self._nufft_eps,
                 nthreads=self._workers,
                 center_coords=True,
+                frequency_padding=frequency_padding,
             )
             p_chunk /= n_spots**2
             return np.moveaxis(p_chunk, -1, 0)  # (chunk, ny, nx)
@@ -307,8 +314,10 @@ class ComparatorIrregular(_ComparatorBase):
         progress: bool,
         landmark_genes: Sequence[str] | None = None,
     ) -> tuple[list[np.ndarray], np.ndarray, np.ndarray]:
+        padding = 1 if self.feature_mode == "2d" else 0
+        work_grids = [(ny + 2 * padding, nx + 2 * padding) for ny, nx in self._grid_shapes]
         n_jobs, self._nufft_chunk_size = self._resolve_spectrum_schedule(
-            self._nufft_chunk_size_spec, self._grid_shapes, n_jobs=n_jobs
+            self._nufft_chunk_size_spec, work_grids, n_jobs=n_jobs
         )
         chunk_size = self._nufft_chunk_size
         n_samples_total = len(self.samples)
@@ -364,14 +373,18 @@ class ComparatorIrregular(_ComparatorBase):
             lm_idx = np.asarray([name_to_idx[g] for g in landmark_genes], dtype=int)
         # Cache explicit landmark spectra only within budget; else warn + use a
         # single streamed geometric-mean of the landmark genes.
-        cache_landmarks = lm_idx is not None and self._landmark_cache_fits(len(lm_idx))
+        cache_landmarks = lm_idx is not None and self._landmark_cache_fits(
+            len(lm_idx), frequency_padding=1
+        )
 
         # Pass A: landmark + dc/presence per sample.
         grids = list(self._grid_shapes)
 
         # Per-sample parallelism helper for landmark spectra
         def _landmark_one(i: int, pbar: Any = None) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-            spec_chunk_fn, dc, presence, n_genes, grid_i = self._nufft_spectrum_chunker(i)
+            spec_chunk_fn, dc, presence, n_genes, grid_i = self._nufft_spectrum_chunker(
+                i, frequency_padding=1
+            )
             if lm_idx is None:
                 lm = stream_geomean_landmark(
                     spec_chunk_fn, n_genes, grid_i, chunk_size=chunk_size, pbar=pbar
@@ -418,13 +431,16 @@ class ComparatorIrregular(_ComparatorBase):
             fft_solver=self._spectrum_fft_solver,
             spacings=self._spacings,
             progress=progress,
+            frequency_padding=1,
         )
         self.rotation_angles_ = angles
 
         # Pass B: re-stream, rotate, physical-frequency polar resample.
         # Per-sample parallelism helper for feature spectra (binned)
         def _feature_one(i: int, pbar: Any = None) -> np.ndarray:
-            spec_chunk_fn, _dc, _pres, n_genes, grid_i = self._nufft_spectrum_chunker(i)
+            spec_chunk_fn, _dc, _pres, n_genes, grid_i = self._nufft_spectrum_chunker(
+                i, frequency_padding=1
+            )
             return stream_polar_features(
                 spec_chunk_fn,
                 n_genes,
@@ -437,6 +453,7 @@ class ComparatorIrregular(_ComparatorBase):
                 n_theta=self._n_theta_bins,
                 fft_solver=self._spectrum_fft_solver,
                 pbar=pbar,
+                frequency_padding=1,
             )
 
         feats = _run_per_sample(
@@ -546,6 +563,7 @@ class ComparatorIrregular(_ComparatorBase):
                 eps=self._nufft_eps,
                 nthreads=self._workers,
                 center_coords=True,
+                frequency_padding=1 if self.feature_mode == "2d" else 0,
             )
             p /= block.shape[0] ** 2
             # power_spectrum_2d_nufft returns (ny, nx, M) for multi-column values.
@@ -578,6 +596,7 @@ class ComparatorIrregular(_ComparatorBase):
                     spacing=self._spacings[i],
                     n_theta=self._n_theta_bins,
                     fft_solver=self._spectrum_fft_solver,
+                    frequency_padding=1,
                 )
             out.append(cov_feat)
         return out

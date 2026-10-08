@@ -744,18 +744,18 @@ class MatrixKernelBase(Kernel):
         self._trace_rvs_cache = {"n_vectors": n_vectors, "rvs": rvs, "Y": Y}
         return self._trace_rvs_cache
 
-    def _stable_centered_traces(self) -> tuple[float, float]:
-        """Trace and squared norm of explicit HKH, without raw-trace cancellation.
+    def _stable_centered_traces(self, diagonal_shift: float = 0.0) -> tuple[float, float]:
+        """Moments of H(K - diagonal_shift I)H without raw-trace cancellation.
 
         Only used when the subtraction formula loses at least half of float64
         precision. Remove a constant offset before summing, then center rows in
         blocks of at most 8 MiB (at least one row). Cache both moments so Q and R
-        reuse the fallback.
+        reuse the fallback. Nonzero diagonal shifts bypass this cache.
         """
-        cached = getattr(self, "_centered_trace_cache", None)
+        cached = getattr(self, "_centered_trace_cache", None) if diagonal_shift == 0 else None
         if cached is not None:
             return cached
-        offset = float(self._K[0, 0])
+        offset = float(self._K[0, 0]) - diagonal_shift
         row_mean = np.empty(self.n)
         col_offset = np.zeros(self.n)
         chunk = max(1, (8 << 20) // (8 * self.n))
@@ -769,6 +769,7 @@ class MatrixKernelBase(Kernel):
                     if sp.issparse(rows)
                     else np.array(rows, dtype=float, copy=True)
                 )
+                block[np.arange(stop - start), np.arange(start, stop)] -= diagonal_shift
                 block -= offset  # H(K - offset * 11')H = HKH.
                 if phase == 0:
                     row_mean[start:stop] = block.mean(axis=1)
@@ -781,7 +782,8 @@ class MatrixKernelBase(Kernel):
                 del block
             if phase == 0:
                 col_offset -= row_mean.mean()
-        self._centered_trace_cache = (first, second)
+        if diagonal_shift == 0:
+            self._centered_trace_cache = (first, second)
         return first, second
 
     def trace(self, n_probes: int | None = None) -> float:

@@ -16,6 +16,100 @@ from sonic.detectors.irregular import DetectorIrregular
 from sonic.statistics import spatial_r_test
 
 
+def test_dense_float32_detector_matches_identical_float64_values():
+    rng = np.random.default_rng(166)
+    coords = rng.uniform(0, 10, (256, 2))
+    values = (1e8 + 8 * rng.integers(-2, 3, (256, 3))).astype(np.float32)
+    results = []
+    for x in (values, values.astype(float)):
+        data = anndata.AnnData(x)
+        data.obsm["spatial"] = coords
+        detector = DetectorIrregular(kernel_method="gaussian", bandwidth=1).setup_data(data)
+        results.append(detector.compute_qstat(n_jobs=1, show_progress=False).sort_index())
+    np.testing.assert_allclose(results[0], results[1], rtol=1e-12)
+    assert values.dtype == np.float32
+
+
+@pytest.mark.parametrize("method", ["gaussian", "matern"])
+def test_distance_graph_requires_complete_explicit_distances(method):
+    distances = np.abs(np.arange(4)[:, None] - np.arange(4)[None, :]).astype(float)
+    data = anndata.AnnData(np.arange(4.0)[:, None])
+    data.obsp["distances"] = sp.csr_matrix(np.where(distances == 1, distances, 0))
+    with pytest.raises(ValueError, match="incomplete neighbor-distance"):
+        DetectorIrregular(kernel_method=method).setup_data(
+            data, obsp_key="distances", is_distance=True
+        )
+    # Complete sparse and dense distances have identical semantics.
+    kernels = []
+    for matrix in (distances, sp.csr_matrix(distances)):
+        data.obsp["distances"] = matrix
+        detector = DetectorIrregular(kernel_method=method).setup_data(
+            data, obsp_key="distances", is_distance=True
+        )
+        kernels.append(detector.kernel_.Kx(np.eye(4)))
+    np.testing.assert_allclose(*kernels)
+
+
+def test_incoming_edges_do_not_make_a_node_isolated():
+    data = anndata.AnnData(np.arange(5.0)[:, None])
+    graph = sp.csr_matrix(([1.0] * 3, ([0, 1, 2], [1, 2, 3])), shape=(5, 5))
+    data.obsp["graph"] = graph
+    detector = DetectorIrregular(kernel_method="moran").setup_data(data, obsp_key="graph")
+    assert list(detector.adata.obs_names) == ["0", "1", "2", "3"]
+    assert data.n_obs == 5
+    np.testing.assert_array_equal(data.obsp["graph"].toarray(), graph.toarray())
+
+
+@pytest.mark.parametrize("backend", ["matrix", "nufft"])
+def test_categorical_metadata_q_and_r_match_explicit_indicators(backend):
+    rng = np.random.default_rng(21)
+    labels = pd.Categorical(np.repeat(["A", "B"], 16))
+    values = np.column_stack([labels == "A", labels == "B", rng.normal(size=32)]).astype(float)
+    data = anndata.AnnData(values)
+    data.var_names = ["celltype_A", "celltype_B", "signal"]
+    data.obs["celltype"] = labels
+    data.obs["signal"] = values[:, 2]
+    data.obsm["spatial"] = rng.uniform(0, 4, (32, 2))
+    kwargs = {"grid_shape": (8, 8), "spacing": (1, 1)} if backend == "nufft" else {}
+    detector = DetectorIrregular(backend=backend, kernel_method="gaussian", **kwargs).setup_data(
+        data
+    )
+    q = detector.compute_qstat(
+        source="obs", features=["celltype"], n_jobs=1, workers=1, show_progress=False
+    )
+    q_ref = detector.compute_qstat(
+        features=["celltype_A", "celltype_B"], n_jobs=1, workers=1, show_progress=False
+    )
+    np.testing.assert_allclose(q[["Q", "P_value"]], q_ref[["Q", "P_value"]])
+    for target in (None, ["signal"]):
+        actual = detector.compute_rstat(
+            ["celltype"], target, source="obs", n_jobs=1, workers=1, show_progress=False
+        )
+        expected = detector.compute_rstat(
+            ["celltype_A", "celltype_B"], target, n_jobs=1, workers=1, show_progress=False
+        )
+        pd.testing.assert_frame_equal(
+            actual.reset_index(drop=True), expected.reset_index(drop=True)
+        )
+    assert data.obs.celltype.dtype == "category"
+
+
+@pytest.mark.parametrize("backend", ["matrix", "nufft"])
+@pytest.mark.parametrize("source", ["var", "obs"])
+def test_detector_rejects_nonfinite_observations(backend, source):
+    rng = np.random.default_rng(26)
+    data = anndata.AnnData(rng.normal(size=(16, 2)))
+    data.var_names = ["x", "y"]
+    data.X[0, 0] = np.nan
+    data.obs["x"] = data.X[:, 0]
+    data.obsm["spatial"] = rng.uniform(0, 4, (16, 2))
+    detector = DetectorIrregular(backend=backend, kernel_method="gaussian").setup_data(data)
+    with pytest.raises(ValueError, match="finite"):
+        detector.compute_qstat(
+            source=source, features=["x"], n_jobs=1, workers=1, show_progress=False
+        )
+
+
 @pytest.mark.parametrize("sparse", [False, True])
 def test_obsp_moran_uses_signed_null_calibration(sparse):
     from scipy.stats import norm
@@ -811,6 +905,10 @@ def test_r_zero_null_variance_is_nonsignificant(backend):
     ).setup_data(data)
     if backend == "matrix":
         detector.kernel_ = MatrixKernel.from_matrix(np.zeros((64, 64)))
+    else:
+        # A finite, broad Gaussian still has positive variance. Use an actual
+        # zero operator to exercise the deterministic-null behavior.
+        detector.kernel_._fft_kernel.spectrum[:] = 0.0
     assert detector.kernel_.square_trace() == 0
     result = detector.compute_rstat(n_jobs=1, workers=1, show_progress=False)
     assert len(result) == 4

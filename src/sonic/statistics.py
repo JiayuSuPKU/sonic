@@ -45,6 +45,7 @@ from sonic.kernels import Kernel
 from sonic.utils import (
     _DEFAULT_CHUNK_BUDGET,
     _parse_memory_budget,
+    _require_finite,
     auto_chunk_size,
     resolve_chunk_size,
 )
@@ -947,7 +948,16 @@ def compute_null_params(  # noqa: C901
             mean_Q = float(kernel.trace())
             params["var_R"] = second
         m = n - 1
-        var_Q = 2.0 * (m * second - mean_Q**2) / (m + 2) if dirichlet_correction else 2.0 * second
+        contrast_second = second - mean_Q**2 / m
+        if dirichlet_correction and contrast_second <= np.sqrt(np.finfo(float).eps) * second:
+            # Near identity, the raw trace subtraction loses the entire Q
+            # variance. Evaluate B = H(K - tr(HKH) I / m)H directly instead.
+            if isinstance(kernel, MatrixKernelBase) and not precision:
+                contrast_second = kernel._stable_centered_traces(diagonal_shift=mean_Q / m)[1]
+            else:
+                traces = _estimate_kernel_traces(kernel, n_probes=probe_count, centered=True)
+                contrast_second = traces["powers"][2] * traces["scale"] ** 2
+        var_Q = 2.0 * m * contrast_second / (m + 2) if dirichlet_correction else 2.0 * second
         var_Q = max(var_Q, 0.0)
         params["mean_Q"] = float(mean_Q)
         params["var_Q"] = float(var_Q)
@@ -963,6 +973,7 @@ def compute_null_params(  # noqa: C901
 
 def _sparse_mean_std(X: sp.spmatrix, ddof: int = 1) -> tuple[np.ndarray, np.ndarray]:
     """Stable column moments without densification or input mutation."""
+    _require_finite(X)
     X = X.astype(np.float64, copy=False)
     if X.format not in ("csr", "csc"):
         X = X.tocsc()
@@ -1109,6 +1120,8 @@ def spatial_q_test(  # noqa: C901
     """
     Univariate spatial Q-test for detecting spatial variability.
 
+    All observed values must be finite, including in score-only calls.
+
     Top-level chunking wrapper — splits the feature batch along the
     trailing axis into blocks of ``chunk_size`` features, dispatches
     each block to the backend-specific per-chunk helper
@@ -1186,6 +1199,7 @@ def spatial_q_test(  # noqa: C901
     memory_budget_bytes = _parse_memory_budget(memory_budget_bytes)
     is_fft = isinstance(kernel, FFTKernel)
     is_nufft = isinstance(kernel, NUFFTKernel)
+    _require_finite(Xn, "Q-test observations")
     # Prepare the null once for every backend before splitting features.
     # Score-only calls never estimate traces or fit a distribution.
     if return_pval:
@@ -1360,6 +1374,8 @@ def spatial_r_test(  # noqa: C901
     """
     Bivariate spatial R-test for correlation between two spatial variables.
 
+    Both observation arrays must be finite, including in score-only calls.
+
     Top-level chunking wrapper — splits the paired feature batch along
     the trailing axis into blocks of ``chunk_size`` features, dispatches
     each block to the backend-specific per-chunk helper
@@ -1434,6 +1450,8 @@ def spatial_r_test(  # noqa: C901
     memory_budget_bytes = _parse_memory_budget(memory_budget_bytes)
     is_fft = isinstance(kernel, FFTKernel)
     is_nufft = isinstance(kernel, NUFFTKernel)
+    _require_finite(Xn, "R-test X observations")
+    _require_finite(Yn, "R-test Y observations")
 
     # Resolve var_R once (cached across chunks).
     if return_pval and (null_params is None or "var_R" not in null_params):

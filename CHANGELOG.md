@@ -7,6 +7,74 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.0.0rc2] - 2026-10-07
+
+This release corrects spatial-test calibration and comparison numerics. Rerun
+affected analyses and invalidate cached statistics and spectra made with rc1.
+
+### Added
+- `spatial_q_test_fft_many` shares the variance calculation and Fourier transform
+  across compatible FFT kernels, with separate calibration for each kernel.
+- `memory_budget_bytes` overrides the fixed 2 GiB estimated batch-workspace
+  budget in detection, spectrum computation, and standalone spatial tests.
+  Accepts byte counts or size strings such as `"512 MB"`, `"2 GiB"`, and `"16 Gb"`.
+
+### Changed
+- Q-test defaults now consistently account for sample standardization:
+  Gaussian, Matérn, CAR, and graph-Laplacian kernels use upper-tail Welch on
+  matrices and upper-tail moment matching on FFT/NUFFT; Moran uses two-sided CLT.
+- NUFFT Q moment calibration now defaults to analytic lower traces plus 60
+  probes for higher traces. Request the reduced spectrum explicitly with
+  `compute_null_params(..., nufft_spectrum=True)`.
+- Automatic scheduling balances outer jobs against FFT/NUFFT threads, caps
+  automatic transform threads at four, and divides the fixed workspace budget
+  among active jobs. Explicit thread counts and memory budgets remain supported.
+- Centralize `auto_chunk_size` and `resolve_chunk_size` in `sonic.utils`.
+- Reduce comparison memory with blocked float64 calculations and grouped
+  observation masks; reuse GLM decompositions and avoid unnecessary eigenvalue
+  calculations for known positive-semidefinite effective-rank diagnostics.
+- Reduce spectral allocations and repeated transforms, and reuse prepared null
+  calibration across feature batches.
+- Reorganized the README and user guides around pattern detection and
+  cross-sample pattern comparison. Practical pages now lead with runnable
+  workflows, while statistical detail stays in the theory guide.
+
+### Fixed
+- Keep Gaussian/Matérn Fourier weights positive semidefinite and use the same
+  operator for scores and null calibration.
+- Correct finite-sample cumulants used by Liu's approximation and stabilize
+  degenerate and near-identity null distributions.
+- Calibrate masked-grid Q/R tests on observed bins, preserving structural holes
+  separately from observed biological zeros.
+- Resolve fractional gene-support cutoffs after removing isolated graph cells.
+- Mean-fill grids in float64 and preserve constant observed features so rounding
+  cannot produce artificial Q/R signal.
+- Correct R-test variance and Fourier weighting, preserve signed-kernel effects,
+  and exclude self-pairs from R-test inference and multiple-testing correction.
+- Stabilize sparse moments and centered products against integer overflow and
+  cancellation from large feature offsets.
+- Keep GLM rank, fitting, and contrast estimability consistent, retain spatial
+  metadata when subsetting comparators, and apply the +1 permutation correction
+  only to sampled nulls rather than exact enumeration.
+- Normalize comparison spectra by squared observation counts, including occupied
+  grid bins, to avoid power inflation from sampling density.
+- Promote cached float32 spectra before comparison and normalization calculations.
+- Evaluate a Fourier-mode border for NUFFT polar features, rotation landmarks,
+  and covariates instead of applying FFT-periodic boundary interpolation.
+- Reject saturated spectral covariate fits without partially normalizing samples.
+- Preserve shape-only comparisons at very small or large power scales;
+  zero spectra remain zero.
+- Preserve float64 moment accuracy for float32 detection data and sparse
+  NUFFT comparison inputs; reject nonfinite Q/R observations.
+- Stabilize centered NUFFT traces for broad kernels and finite-sample Q
+  variance for kernels near identity.
+- Reject incomplete sparse distance graphs and retain connectivity nodes
+  with incoming edges when removing isolated observations.
+- Align categorical metadata encoding across matrix and NUFFT Q/R tests.
+- Interpolate polar spectra across the FFT boundary within the Nyquist band.
+- Warn when NUFFT comparison differences are smaller than transform accuracy;
+  p-values remain sensitive to numerical error with zero replicate variance.
+
 ### Removed
 - **Incorrect FFT hex topology.** `FFTKernel(topology="hex")` now fails
   with migration guidance because a scalar 2-D FFT does not preserve the
@@ -244,38 +312,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## Release Process
 
-The immediate release is the real prerelease `1.0.0rc1`. The thorough
-documentation rewrite remains deferred to the final `1.0.0`; until the RC is
-tagged, keep its changes under `Unreleased`.
+Prepare `v1.0.0rc2` for both `sonic-spatial` and the `quadsv` compatibility
+distribution. Versions are derived from the release tag by `setuptools-scm`;
+the fallback version alone does not change a Git checkout's version.
 
-- [x] Review the current installation, migration, and release notes for
-  accuracy; the full documentation rewrite is not an RC blocker.
+- [x] Add dated rc2 notes, update installation examples and version fallbacks,
+  and require `sonic-spatial>=1.0.0rc2,<2` in the compatibility source package.
 - [x] Run the full test suite: `pytest tests/ --cov=sonic`.
 - [x] Run lint checks: `ruff check src tests compat/quadsv/src`.
 - [x] Build the documentation without warnings:
   `sphinx-build -W -b html docs/ docs/_build/`.
-- [x] Add the pending `sonic-spatial` publisher with owner `JiayuSuPKU`,
-  repository `sonic`, workflow `release.yml`, and environment `pypi`.
-- [x] Add the additional `quadsv` publisher with the same identity. Keep the
-  existing QuadSV credential until this release succeeds.
-- [x] Update the compatibility requirement to
-  `sonic-spatial>=1.0.0rc1,<2` and make
-  the compatibility wheel, rather than the SONIC wheel, own the deprecated
-  `quadsv` import namespace.
-- [x] Confirm the new Read the Docs project builds successfully and legacy
-  documentation links remain available or redirect.
-- [x] Add a dated `1.0.0rc1` section below `Unreleased`, leaving a new empty
-  `Unreleased` section for future changes.
-- [ ] Commit the release preparation and create an annotated tag:
-  `git tag -a v1.0.0rc1 -m "SONIC 1.0.0rc1"`.
-- [x] Build both distributions: `python -m build` and
-  `python -m build compat/quadsv --outdir compat-dist`.
-- [x] Verify their metadata:
-  `python -m twine check dist/* compat-dist/*`.
-- [ ] Push `v1.0.0rc1`, then publish its GitHub prerelease to trigger trusted
+- [x] Build and inspect both distributions and run `twine check`.
+  Before tagging, validate candidate artifacts with
+  `SETUPTOOLS_SCM_PRETEND_VERSION=1.0.0rc2`; rebuild from the clean release tag
+  for publication. The release workflow pins QuadSV's dependency to the exact
+  SONIC version and verifies wheel versions and namespace ownership.
+- [x] Commit the release preparation and create an annotated tag:
+  `git tag -a v1.0.0rc2 -m "SONIC 1.0.0rc2"`.
+- [ ] Push `v1.0.0rc2`, then publish its GitHub prerelease to trigger trusted
   publishing of SONIC followed by the QuadSV compatibility package.
-- [ ] Verify clean installations of `sonic-spatial==1.0.0rc1` and
-  `quadsv==1.0.0rc1` from PyPI, then remove obsolete QuadSV credentials.
+- [ ] Verify clean installations of `sonic-spatial==1.0.0rc2` and
+  `quadsv==1.0.0rc2` from PyPI, and check the rc2 documentation build.
 
 ## [0.1.0] - 2026-02-02
 

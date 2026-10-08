@@ -1,23 +1,25 @@
 # SONIC: Spatial Organization through Nonrandom-pattern Inference and Comparison
 
-Detect spatial patterns in omics data via kernel-based hypothesis tests for spatial variability (*Q-tests*) and co-expression (*R-tests*), then compare spatial pattern spectra across samples or conditions.
+SONIC detects spatial patterns within one sample and compares patterns across
+multiple samples. It works with coordinates, graphs, and regular grids stored
+in `AnnData` or `SpatialData`.
 
-**Key features:**
-- **Reliable**: CAR kernel eliminates false negatives from Moran's I spectral cancellation  
-- **Scalable**: Implicit sparse solvers and FFT acceleration handle millions of spots  
-- **Universal**: Works with Visium, Visium HD, MERFISH, lineage trees, any spatial/graph data  
-- **Integrated**: Native `AnnData` and `SpatialData` support
-- **Comparative**: Alignment-free cross-sample pattern comparison with FFT/NUFFT spectra
+The two main workflows are:
+
+- **Pattern detection:** find spatially variable features with the Q-test and
+  spatially co-expressed feature pairs with the R-test.
+- **Pattern comparison:** find features whose spatial pattern changes between
+  samples or conditions, without registering the samples to one another.
 
 ## Installation
 
 Install the release candidate from PyPI:
 
 ```bash
-pip install sonic-spatial==1.0.0rc1
+pip install sonic-spatial==1.0.0rc2
 ```
 
-The distribution name is `sonic-spatial`; the Python import remains `sonic`.
+The distribution name is `sonic-spatial`; the Python import is `sonic`.
 
 For the latest source:
 
@@ -25,133 +27,62 @@ For the latest source:
 pip install "sonic-spatial @ git+https://github.com/JiayuSuPKU/sonic.git"
 ```
 
-For development:
+Code written for the former `quadsv` package remains supported through the
+compatibility distribution:
 
 ```bash
-git clone https://github.com/JiayuSuPKU/sonic.git && cd sonic && pip install -e .
+pip install quadsv==1.0.0rc2
 ```
 
-Code written for the former `quadsv` package remains supported by a separate
-compatibility distribution. `pip install quadsv==1.0.0rc1` installs SONIC,
-and legacy `quadsv` imports emit a deprecation warning while forwarding to the
-same implementation.
+## Detect patterns in one sample
 
-## Usage
-
-### Q-test: Single gene spatial variability
-
-```python
-import numpy as np
-from sonic import MatrixKernel, spatial_q_test
-
-# simulate coordinates and gene expression
-coords = np.random.randn(500, 2)
-gene_expression = np.random.randn(500)
-
-# build CAR kernel and run Q-test
-kernel = MatrixKernel.from_coordinates(coords, method='car', k_neighbors=15, rho=0.9)
-Q, pval = spatial_q_test(gene_expression, kernel)
-print(f"Q-statistic: {Q:.4f}, p-value: {pval:.4e}")
-```
-
-### R-test: Spatial co-expression
-
-```python
-from sonic import spatial_r_test
-
-# run R-test with the same kernel
-gene1, gene2 = np.random.randn(500), np.random.randn(500)
-R, pval = spatial_r_test(gene1, gene2, kernel)
-print(f"R-statistic: {R:.4f}, p-value: {pval:.4e}")
-```
-
-### FFT-accelerated tests (for regular grids like Visium HD)
-
-```python
-import numpy as np
-from sonic import FFTKernel, spatial_q_test, spatial_r_test
-
-# For grid data (e.g., 1000x1000 Visium HD)
-kernel_fft = FFTKernel(shape=(1000, 1000), method='car', rho=0.9)
-
-# simulate gene expression on grid
-gene_grid = np.random.randn(1000, 1000)
-
-# run FFT-based Q-test
-Q_fft, pval_fft = spatial_q_test(gene_grid, kernel_fft)
-print(f"FFT Q-test: Q={Q_fft:.4f}, p-value={pval_fft:.4e}")
-
-# run FFT-based R-test
-gene1_grid = np.random.randn(1000, 1000)
-gene2_grid = np.random.randn(1000, 1000)
-R_fft, pval_fft = spatial_r_test(gene1_grid, gene2_grid, kernel_fft)
-print(f"FFT R-test: R={R_fft:.4f}, p-value={pval_fft:.4e}")
-```
-
-### Tutorials
-
-#### Detect SVG and spatial co-expression using AnnData
+`Detector` reads an `AnnData` object with coordinates or a graph and tests all
+features in the expression matrix. Start with NUFFT and a Matérn kernel for
+two-dimensional spatial coordinates. Set `bandwidth` to the spatial scale of
+interest, in the same units as the coordinates.
 
 ```python
 import anndata as ad
 from sonic import Detector
 
 adata = ad.read_h5ad("spatial_data.h5ad")
+
 detector = Detector(
     adata,
-    kernel_method='car',
-    backend='matrix',
-    rho=0.9,
-    k_neighbors=4,
-).setup_data(adata, obsm_key='spatial', min_cells_frac=0.05)
+    kernel_method="matern",
+    backend="nufft",
+    bandwidth=2.0,
+    nu=1.5,
+).setup_data(adata, obsm_key="spatial", min_cells_frac=0.05)
 
-# Compute Q-statistics and p-values genome-wide
-q_results_df = detector.compute_qstat(source='var', features=None, return_pval=True)
+q_results = detector.compute_qstat(return_pval=True)
+svgs = q_results[q_results["P_adj"] < 0.05]
 
-# Returns DataFrame with columns: [Q, P_value, P_adj, Z_score]
-significant_genes = q_results_df[q_results_df['P_adj'] < 0.05]
-print(f"Found {len(significant_genes)} spatially variable genes")
-
-# Select top 1000 SVGs for pairwise R-test
-top_genes = significant_genes.sort_values('Q', ascending=False).head(1000).index.tolist()
-r_results_df = detector.compute_rstat(
-    source='var',
+top_genes = q_results.nlargest(100, "Q").index.tolist()
+r_results = detector.compute_rstat(
     features_x=top_genes,
     features_y=None,
     return_pval=True,
 )
-# Returns DataFrame with columns: [Feature_1, Feature_2, R, P_value, P_adj, Z_score]
-significant_pairs = r_results_df[r_results_df['P_adj'] < 0.05]
-print(f"Found {len(significant_pairs)} spatially co-expressed gene pairs")
 ```
 
-#### FFT-based Q-test for large grids
+Use `spatial_q_test` and `spatial_r_test` directly when you already have a
+kernel and want to test one feature or one feature pair. Regular rasterized
+grids, including Visium HD bins, use the same `Detector` interface with a
+`SpatialData` object.
 
-```python
-import spatialdata as sd
-from sonic import Detector
+## Compare patterns across samples
 
-sdata = sd.read_zarr("visium_hd.zarr/")
-detector = Detector(sdata, kernel_method='car', rho=0.9).setup_data(
-    sdata,
-    bins='Visium_HD_bin',
-    table_name='table',
-    col_key='array_col',
-    row_key='array_row',
-)
-results = detector.compute_qstat(
-    n_jobs=4, workers=2, return_pval=True
-)
-```
-
-#### Cross-sample spatial pattern comparison
+`Comparator` converts each sample into per-gene spatial spectra and tests for
+differences between groups. Samples may use different orientations and
+coordinate systems.
 
 ```python
 import anndata as ad
 import numpy as np
 from sonic import Comparator
 
-sample_paths = [
+paths = [
     "control_1.h5ad",
     "control_2.h5ad",
     "control_3.h5ad",
@@ -159,106 +90,70 @@ sample_paths = [
     "case_2.h5ad",
     "case_3.h5ad",
 ]
-samples = [ad.read_h5ad(path) for path in sample_paths]
-groups = np.array([0, 0, 0, 1, 1, 1])  # 1-D labels: control vs case
+samples = [ad.read_h5ad(path) for path in paths]
+groups = np.array([0, 0, 0, 1, 1, 1])
 
-cmp = (
-    Comparator(samples)
-    .compute_spectra(n_jobs=4)
-    .normalize_background()
+comparison = Comparator(samples).compute_spectra(n_jobs=4)
+
+# Optional: remove the sample-wide spectral background before testing.
+# comparison.normalize_background()
+
+pattern_results = comparison.test_diff_freq(
+    groups,
+    statistic="log_l2",
+    normalize_shape=True,
 )
-
-# Pattern-level difference: compares radial power spectra, not total expression.
-pattern_hits = cmp.test_diff_freq(groups, statistic='log_l2', normalize_shape=True)
-# Companion expression-level difference on the DC component.
-expression_hits = cmp.test_diff_expr(groups)
+expression_results = comparison.test_diff_expr(groups)
 ```
 
-`pattern_hits` returns per-gene columns `[Feature, Statistic, P_value, P_adj]`. Use `ComparatorGrid` or the same `Comparator(...)` factory with `SpatialData` samples for regular rasterized grids.
+`pattern_results` tests the spatial layout of each gene.
+`expression_results` tests its sample-level mean expression. Run both when
+you want to distinguish a pattern change from an expression-level change.
+Background normalization is optional: use it when sample-wide spectral
+differences are nuisance variation. It can also remove shared biological signal.
 
-**Full tutorials:** [See docs/guides/quickstart.rst](docs/guides/quickstart.rst), [docs/guides/multisample.rst](docs/guides/multisample.rst), and test suite examples.
+## Choose an interface
 
-## Kernel Methods
+Q-test defaults depend on the backend: Gaussian, Matérn, CAR and graph-Laplacian
+kernels use upper-tail Welch on MatrixKernel and upper-tail moment matching on
+FFTKernel/NUFFTKernel. Moran uses two-sided CLT on every backend. All defaults
+account for sample standardization. See the
+[kernel calibration table](https://sonic-spatial.readthedocs.io/en/latest/guides/kernels.html#default-q-test-calibration)
+for signed/custom kernels and overrides.
 
-| Method | Type | Spectrum | Parameters | Use Case |
-|--------|------|----------|------------|----------|
-| `gaussian` | Distance | Positive Definite | `bandwidth` | Isotropic, exponential decay |
-| `matern` | Distance | Positive Definite | `bandwidth`, `nu` | Tunable smoothness ✓ **Recommended** |
-| **`moran`** ⚠️ | Graph | **Indefinite** | `k_neighbors` | Autocorrelation (false negatives) |
-| `laplacian` | Graph | Semi-Definite | `k_neighbors` | High-frequency filter |
-| **`car`** ✓ | Graph | **Strictly Positive** | `rho`, `k_neighbors` | CAR kernel ✓ **Recommended** |
+| Input | Task | Interface |
+|---|---|---|
+| `AnnData` with coordinates or a graph | Detect patterns | `Detector` |
+| `SpatialData` with regular bins | Detect patterns on a large grid | `Detector` |
+| A list of `AnnData` samples | Compare patterns | `Comparator` |
+| A list of `SpatialData` samples | Compare patterns on regular grids | `Comparator` |
+| Arrays plus a kernel | Run one Q-test or R-test | `spatial_q_test`, `spatial_r_test` |
 
-**Recommendation:** Use `car` (CAR kernel) for robust, consistent detection across all functional patterns.
+## Documentation
 
-## Testing & Development
+- [Quick Start](https://sonic-spatial.readthedocs.io/en/latest/guides/quickstart.html)
+- [Choosing a kernel](https://sonic-spatial.readthedocs.io/en/latest/guides/kernels.html)
+- [Cross-sample comparison](https://sonic-spatial.readthedocs.io/en/latest/guides/multisample.html)
+- [Scaling to large datasets](https://sonic-spatial.readthedocs.io/en/latest/guides/scaling.html)
+- [Theory](https://sonic-spatial.readthedocs.io/en/latest/guides/theory.html)
+- [API reference](https://sonic-spatial.readthedocs.io/en/latest/autoapi/sonic/index.html)
+
+## Development
 
 ```bash
-pytest tests/ --cov=sonic              # Run all tests
-pytest tests/test_tutorials.py -v       # Run tutorial examples
-pip install -e ".[dev,docs]"            # Install dev + docs dependencies
+git clone https://github.com/JiayuSuPKU/sonic.git
+cd sonic
+pip install -e ".[dev,docs]"
+pytest -q
 ```
 
-### Troubleshooting
-Dependencies may be installed in a way that causes conflicts or unexpected behavior. 
-To confirm whether a failure is environment-specific, validate from a clean
-conda environment:
+See the [installation guide](https://sonic-spatial.readthedocs.io/en/latest/guides/installation.html)
+for environment troubleshooting.
 
-```bash
-conda create -n sonic-test -c conda-forge python=3.12 pip -y
-conda activate sonic-test
-python -m pip install -e ".[dev]"
-python -m pytest -q
-```
+## Citation
 
-There are several known issues that may arise due to problematic environment configurations:
+Su, Jiayu, et al. “On the consistent and scalable detection of spatial
+patterns.” arXiv:2602.02825 (2026). [Preprint](https://arxiv.org/abs/2602.02825)
 
-#### Numba cache error during import
-This happens before any tests run, often through `spatialdata -> xrspatial`, where helpers are 
-decorated with `numba.njit(cache=True)`. The typical error is:
-
-```text
-RuntimeError: cannot cache function ... no locator available
-```
-
-To fix this, either point Numba at a writable cache directory via
-
-```bash
-mkdir -p /private/tmp/numba-cache
-NUMBA_CACHE_DIR=/private/tmp/numba-cache python -c 'import sonic'
-```
-
- or disable JIT to bypass the import-time cache path via
-
-```bash
-NUMBA_DISABLE_JIT=1 python -m pytest -q
-```
-
-#### Segfault during irregular NUFFT tests
-On macOS arm64, having multiple OpenMP runtimes in one environment can cause segfaults. 
-For example, when running `finufft.nufft2d1 -> Plan.setpts`, conda OpenBLAS may load
- `$CONDA_PREFIX/lib/libomp.dylib` while the PyPI FINUFFT wheel may load
-`finufft/.dylibs/libomp.dylib`. 
-
-To fix this, either set the environment variable `KMP_DUPLICATE_LIB_OK=True`, which risks 
-introducing multithreading instability; or alternatively, use a single OpenMP runtime via
-
-```bash
-OMP_NUM_THREADS=1 python -m pytest -q
-```
-
-Longer-term, prefer a consistent conda-forge native stack so FINUFFT, OpenBLAS,
-NumPy/SciPy, and scikit-learn do not bring separate vendored OpenMP runtimes.
-
-### Documentation
-[ReadTheDocs](https://sonic-spatial.readthedocs.io/)
-
-## References
-
-Su, Jiayu, et al. "On the consistent and scalable detection of spatial patterns." arXiv (2026): 2602.02825. [link to preprint](https://arxiv.org/abs/2602.02825)
-
-
-## License & Support
-
-- **License:** BSD-3-Clause - see [LICENSE](LICENSE)  
-- **Issues:** [GitHub Issues](https://github.com/JiayuSuPKU/sonic/issues)
-- **Docs:** [ReadTheDocs](https://sonic-spatial.readthedocs.io/)
+SONIC is released under the [BSD 3-Clause License](LICENSE). Please report bugs
+and feature requests through [GitHub Issues](https://github.com/JiayuSuPKU/sonic/issues).

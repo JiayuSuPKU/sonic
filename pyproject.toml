@@ -179,4 +179,4 @@ where = ["src"]
 # generated file are missing — keep it in sync with the release being prepared.
 [tool.setuptools_scm]
 version_file = "src/sonic/_version.py"
-fallback_version = "1.0.0rc1"
+fallback_version = "1.0.0rc2"

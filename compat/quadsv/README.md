@@ -6,7 +6,7 @@ Nonrandom-pattern Inference and Comparison).
 Install the compatibility release candidate with:
 
 ```bash
-pip install quadsv==1.0.0rc1
+pip install quadsv==1.0.0rc2
 ```
 
 It installs `sonic-spatial` and preserves existing `quadsv` imports with a

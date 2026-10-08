@@ -10,7 +10,7 @@ readme = "README.md"
 requires-python = ">=3.10"
 license = "BSD-3-Clause"
 authors = [{name = "Jiayu Su"}]
-dependencies = ["sonic-spatial>=1.0.0rc1,<2"]
+dependencies = ["sonic-spatial>=1.0.0rc2,<2"]
 
 [project.urls]
 Documentation = "https://sonic-spatial.readthedocs.io/"
@@ -21,4 +21,4 @@ where = ["src"]
 
 [tool.setuptools_scm]
 root = "../.."
-fallback_version = "1.0.0rc1"
+fallback_version = "1.0.0rc2"

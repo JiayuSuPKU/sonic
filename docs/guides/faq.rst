@@ -1,113 +1,88 @@
 FAQ
 ===
 
-**What does** ``sonic`` **stand for?**
-   "Quadratic-form spatial variability." Every test in the library
-   reduces to the quadratic form
+What does SONIC stand for?
+--------------------------
 
-   .. math::
-
-      Q_n = \mathbf{z}^\top \tilde{\mathbf{K}} \mathbf{z},
-
-   where :math:`\tilde{\mathbf{K}} = \mathbf{H}\mathbf{K}\mathbf{H}`
-   is the double-centred kernel matrix. See :doc:`/guides/theory`.
-
-**Why is Moran's I problematic for SVG detection?**
-   Moran's I uses an indefinite adjacency matrix as its kernel, so
-   its eigenvalues span both signs. Patterns aligned with positive
-   eigenspaces cancel patterns aligned with negative ones, which
-   produces false negatives. Use the CAR kernel
-   :math:`\mathbf{K} = (\mathbf{I} - \rho \tilde{\mathbf{W}})^{-1}`
-   instead. It is strictly positive definite for any
-   :math:`0 < \rho < 1`. See :doc:`/guides/theory` (Theorem 2).
-
-   .. code-block:: python
-
-      from sonic import MatrixKernel
-
-      kernel = MatrixKernel.from_coordinates(
-          coords, method="car", k_neighbors=4, rho=0.9
-      )
-
-**What is the difference between Q-test and R-test?**
-   :func:`~sonic.spatial_q_test` is univariate:
-   :math:`Q = \mathbf{z}^\top \mathbf{K} \mathbf{z}`. It asks
-   whether *one* feature is spatially structured under the kernel.
-   Use it to identify spatially variable genes.
-
-   :func:`~sonic.spatial_r_test` is bivariate:
-   :math:`R = \mathbf{x}^\top \mathbf{K} \mathbf{y}`. It asks
-   whether *two* features share a spatial pattern. Use it to find
-   spatially co-expressed gene pairs.
-
-**Which backend should I pick?**
-   You can let the :func:`~sonic.Detector` factory decide from your
-   input type:
-
-   .. code-block:: python
-
-      from sonic import Detector
-
-      # AnnData → DetectorIrregular
-      det = Detector(adata, kernel_method="matern", backend="nufft").setup_data(adata)
-
-      # SpatialData → DetectorGrid
-      det = Detector(sdata, kernel_method="car", rho=0.9).setup_data(sdata, ...)
-
-   For explicit control:
-
-   .. list-table::
-      :header-rows: 1
-      :widths: 28 72
-
-      * - Backend
-        - When to use
-      * - ``backend="matrix"`` (:class:`~sonic.MatrixKernel`)
-        - Any coordinate cloud or graph. Pick this for ``car``,
-          ``moran``, or ``graph_laplacian`` kernels, or when you have
-          a precomputed adjacency in ``adata.obsp``. Storage
-          (dense / sparse / sparse-precision) is selected from
-          ``n``.
-      * - ``backend="nufft"`` (:class:`~sonic.NUFFTKernel`)
-        - Irregular 2-D coordinates with around :math:`10^4` spots
-          or more. Runs at ``O(n log n)`` per feature. Pairs with
-          Gaussian or Matérn.
-      * - :class:`~sonic.DetectorGrid`
-          (:class:`~sonic.FFTKernel`)
-        - Regular rasterised grids (Visium HD). Reads
-          :class:`spatialdata.SpatialData` directly and uses an
-          FFT.
-
-**Can I use** ``sonic`` **on non-spatial data?**
-   Yes, as long as you can encode "closeness" as coordinates or as
-   a graph. Common cases:
-
-   - A k-NN graph in PCA space (single-cell trajectories).
-   - A pseudo-time ordering or a lineage tree.
-   - A custom adjacency in ``adata.obsp``.
-
-   Pass coordinates to
-   :meth:`sonic.MatrixKernel.from_coordinates`, or a precomputed
-   kernel or precision matrix to
-   :meth:`sonic.MatrixKernel.from_matrix`. To use an
-   ``adata.obsp[key]`` directly, call
-   :meth:`~sonic.DetectorIrregular.setup_data` with
-   ``obsp_key=key``. Add ``is_distance=True`` if the matrix stores
-   distances rather than affinities.
-
-**Does** ``sonic`` **support 3-D coordinates?**
-   The :class:`~sonic.MatrixKernel` family does. Pass 3-D coords
-   to :meth:`sonic.MatrixKernel.from_coordinates` the same way you
-   would for 2-D. The FFT and NUFFT backends are 2-D only for now.
-   If you need 3-D Fourier acceleration, please open a feature
-   request on `GitHub <https://github.com/JiayuSuPKU/sonic/issues>`_.
+Spatial Organization through Nonrandom-pattern Inference and Comparison.
 
 
-Further help
-------------
+What is the difference between the Q-test and R-test?
+-----------------------------------------------------
 
-- :doc:`/guides/quickstart` for the getting-started tour.
-- :doc:`/guides/theory` for derivations.
-- :doc:`/autoapi/sonic/index` for the API reference.
-- `GitHub Issues <https://github.com/JiayuSuPKU/sonic/issues>`_
-  for bug reports and feature requests.
+The Q-test asks whether one feature has a spatial pattern. Use it to find
+spatially variable genes or other spatially structured measurements.
+
+The R-test asks whether two features share a spatial pattern. Use it after the
+Q-test to study spatial co-expression among a smaller set of features.
+
+See :doc:`/guides/quickstart` for both workflows and :doc:`/guides/theory` for
+the definitions.
+
+
+Which backend should I use?
+---------------------------
+
+.. list-table::
+   :header-rows: 1
+   :widths: 28 72
+
+   * - Backend
+     - Use it for
+   * - ``backend="nufft"``
+     - The starting workflow for two-dimensional spatial Q-tests, using Matérn.
+   * - ``backend="matrix"``
+     - Precomputed graphs or explicit graph neighbourhoods with CAR, Moran, or graph Laplacian kernels.
+   * - Grid detector
+     - Rectangular rasterized ``SpatialData`` bins, such as Visium HD square bins.
+
+The :func:`~sonic.Detector` factory chooses the detector from the input type;
+``backend`` chooses how an ``AnnData`` coordinate dataset is processed. See
+:doc:`/guides/kernels` for examples.
+
+
+Does the FFT backend support hexagonal grids?
+---------------------------------------------
+
+No. The FFT backend supports rectangular grids with periodic boundaries. A
+staggered hex grid has row-dependent neighbours and cannot be represented by
+the scalar FFT operator used by SONIC.
+
+For standard Visium spots, keep the physical coordinates and use the Matrix or
+NUFFT path. For an exact hex adjacency, build that graph explicitly and use a
+Matrix kernel.
+
+
+Why prefer CAR over Moran's I for detection?
+--------------------------------------------
+
+Moran's I can let different spatial components cancel, which can hide a real
+pattern. CAR avoids that cancellation and is the recommended starting point
+for smooth graph-based patterns.
+
+Use Moran's I when you need comparability with an existing analysis. The
+mathematical explanation is in :doc:`/guides/theory`.
+
+
+Can SONIC analyze non-spatial data?
+-----------------------------------
+
+Yes, if closeness can be represented by coordinates or a graph. Examples
+include a k-nearest-neighbour graph in a latent space, a pseudotime ordering,
+or a lineage graph. Store a precomputed matrix in ``adata.obsp`` and pass its
+key to :meth:`~sonic.DetectorIrregular.setup_data`.
+
+
+Does SONIC support three-dimensional coordinates?
+--------------------------------------------------
+
+:class:`~sonic.MatrixKernel` supports three-dimensional coordinates. The FFT
+and NUFFT backends are currently two-dimensional.
+
+
+Where should I report a problem?
+--------------------------------
+
+Open an issue on `GitHub <https://github.com/JiayuSuPKU/sonic/issues>`_ and
+include the SONIC version, input type, backend, and smallest example that
+reproduces the problem.

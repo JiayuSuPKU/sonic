@@ -1,155 +1,31 @@
 Quick Start
 ===========
 
-A 5-minute tour. ``sonic`` does three things:
+Use SONIC for two main tasks:
 
-1. **Score one feature** with :func:`~sonic.spatial_q_test`. Does
-   its expression depend on space?
-2. **Score every feature in a tissue** with :func:`~sonic.Detector`.
-   Which genes are spatially variable?
-3. **Compare slides** with :func:`~sonic.Comparator`. Do two
-   groups of samples differ in spatial pattern?
+1. Detect spatial patterns within one sample.
+2. Compare spatial patterns across several samples.
 
-The kernel you pass to the single-sample tests decides what kind of
-spatial structure earns a high score. CAR and Matérn kernels reward
-smooth gradients; a graph-Laplacian kernel rewards sharp differences
-between neighbouring spots. See :doc:`/guides/kernels`. For
-cross-sample comparisons, ``sonic`` compares frequency-domain
-pattern spectra so samples do not need to be spatially registered.
+The examples use the :func:`~sonic.Detector` and
+:func:`~sonic.Comparator` factories. They select the coordinate or grid
+implementation from the input type.
 
 
-The four layers
----------------
+Pattern detection
+-----------------
 
-Every name listed below is importable from the top-level package
-with ``from sonic import ...``.
-
-.. list-table::
-   :header-rows: 1
-   :widths: 18 30 52
-
-   * - Layer
-     - What it does
-     - Public names
-   * - **Kernels**
-     - Encode the spatial structure to look for.
-     - :class:`~sonic.MatrixKernel` (any coords or graph),
-       :class:`~sonic.FFTKernel` (regular grid),
-       :class:`~sonic.NUFFTKernel` (irregular 2-D coords).
-       Backend authors can subclass
-       :class:`sonic.kernels.Kernel` or
-       :class:`sonic.kernels.MatrixKernelBase` for a custom
-       backend; see :doc:`/guides/kernels`.
-   * - **Tests**
-     - Compute the test statistic and a p-value on a feature
-       vector or batch.
-     - :func:`~sonic.spatial_q_test` (univariate),
-       :func:`~sonic.spatial_r_test` (bivariate),
-       and helpers :func:`~sonic.compute_null_params`,
-       :func:`~sonic.auto_chunk_size`, :func:`~sonic.liu_sf`.
-   * - **Detectors**
-     - Genome-wide pattern screening on one sample.
-     - :class:`~sonic.DetectorIrregular`,
-       :class:`~sonic.DetectorGrid`, and the dispatch factory
-       :func:`~sonic.Detector`.
-   * - **Comparators**
-     - Cross-sample pattern comparison between groups of slides.
-     - :class:`~sonic.ComparatorIrregular`,
-       :class:`~sonic.ComparatorGrid`, and the dispatch factory
-       :func:`~sonic.Comparator`.
+The Q-test finds features whose values depend on location. The R-test finds
+pairs of features that share a spatial pattern. Use
+:func:`~sonic.Detector` to run either test across an entire dataset.
 
 
-Test one feature
-----------------
+AnnData with coordinates
+~~~~~~~~~~~~~~~~~~~~~~~~
 
-Score whether a gene's expression depends on space, given a kernel.
-
-.. code-block:: python
-
-   import numpy as np
-   from sonic import NUFFTKernel, spatial_q_test
-
-   rng = np.random.default_rng(0)
-   coords = rng.uniform(0, 20, size=(500, 2))
-   gene = rng.standard_normal(500)
-
-   kernel = NUFFTKernel(coords, method="matern", bandwidth=2.0, nu=1.5)
-   Q, pval = spatial_q_test(gene, kernel)
-   print(f"Q = {Q:.4f}, p-value = {pval:.4e}")
-
-Reading the result:
-
-- **High Q with low p-value.** The gene's expression depends on
-  location, in the way this kernel looks for. Here the kernel is
-  Matérn, which looks for smooth large-scale gradients.
-- **Low Q with high p-value.** The gene looks spatially independent
-  under this kernel.
-
-The kernel choice matters. Swap the Matérn for a graph-Laplacian
-kernel and a gene that scored low above can score high if its
-expression changes sharply between neighbouring spots. See
-:doc:`/guides/kernels` for picking a kernel.
-
-The same :func:`~sonic.spatial_q_test` call works with any kernel
-type. Pass a :class:`~sonic.MatrixKernel` for an arbitrary
-coordinate cloud or graph, an :class:`~sonic.FFTKernel` for a
-regular 2-D grid, or :class:`~sonic.NUFFTKernel` for irregular 2-D
-coordinates. The companion :func:`~sonic.spatial_r_test` tests two
-features at a time for spatial co-expression.
-
-.. dropdown:: Reuse the null fit across many features
-
-   When you test many features against the same kernel, precompute
-   the null distribution once with
-   :func:`~sonic.compute_null_params` and pass the result back into
-   the test:
-
-   .. code-block:: python
-
-      from sonic import compute_null_params, spatial_q_test
-
-      null = compute_null_params(kernel, method="liu")  # one-time cost
-      for gene in gene_matrix.T:
-          Q, pval = spatial_q_test(gene, kernel, null_params=null)
-
-   :func:`~sonic.spatial_q_test` and :func:`~sonic.spatial_r_test`
-   also accept a ``chunk_size`` keyword. The default ``"auto"``
-   dispatches to :func:`~sonic.auto_chunk_size` to size each batch
-   for the kernel's cache sweet spot. See :doc:`/guides/scaling` for
-   the cost model.
-
-
-Test every feature in an AnnData
---------------------------------
-
-The :func:`~sonic.Detector` factory picks the right detector class
-from the input type. An :class:`anndata.AnnData` returns a
-:class:`~sonic.DetectorIrregular`; a
-:class:`spatialdata.SpatialData` returns a
-:class:`~sonic.DetectorGrid`.
-
-Expected ``adata`` layout:
-
-- ``adata.X`` (or a layer in ``adata.layers``) is the
-  ``(n_obs, n_vars)`` count or expression matrix. Sparse formats
-  are fine. The detector consumes one column at a time, so you do
-  not need to densify up front.
-- ``adata.obsm[obsm_key]`` is an ``(n_obs, 2)`` or ``(n_obs, 3)``
-  array of spatial coordinates in some physical unit. The
-  ``bandwidth`` argument should be in the same unit. Required for
-  the ``"nufft"`` backend and for any distance-based kernel
-  (``"gaussian"``, ``"matern"``).
-- ``adata.obsp[obsp_key]`` is an ``(n_obs, n_obs)`` adjacency,
-  affinity, or distance matrix. Used by the ``"matrix"`` backend
-  when you want to feed a precomputed graph instead of building
-  one from coordinates.
-
-You need at least one of ``obsm_key`` or ``obsp_key``. If you pass
-both, ``obsp_key`` wins.
-
-Build the detector, attach the data with
-:meth:`~sonic.DetectorIrregular.setup_data`, then run
-:meth:`~sonic.DetectorIrregular.compute_qstat`:
+The input is an :class:`anndata.AnnData` with expression values in ``adata.X``
+or a layer and coordinates in ``adata.obsm["spatial"]``. Start with NUFFT and a
+Matérn kernel for two-dimensional spatial coordinates. Choose ``bandwidth`` in
+coordinate units to match the spatial scale of interest.
 
 .. code-block:: python
 
@@ -157,88 +33,84 @@ Build the detector, attach the data with
    from sonic import Detector
 
    adata = ad.read_h5ad("spatial_tissue.h5ad")
-   print(f"Data: {adata.n_obs} spots × {adata.n_vars} genes")
+   print(f"{adata.n_obs} spots × {adata.n_vars} genes")
 
    detector = Detector(
        adata,
        kernel_method="matern",
        backend="nufft",
-       bandwidth=25.0,   # same units as adata.obsm["spatial"]
+       bandwidth=2.0,
        nu=1.5,
-   ).setup_data(adata, obsm_key="spatial", min_cells_frac=0.05)
+   ).setup_data(
+       adata,
+       obsm_key="spatial",
+       min_cells_frac=0.05,
+   )
 
-   results = detector.compute_qstat(n_jobs=4, return_pval=True)
-   svgs = results[results["P_adj"] < 0.05]
-   print(f"Found {len(svgs)} SVGs at FDR < 5%")
+   q_results = detector.compute_qstat(n_jobs=4)
+   svgs = q_results[q_results["P_adj"] < 0.05]
+   print(f"Found {len(svgs)} spatially variable genes")
 
-The same detector handles spatial co-expression through
-:meth:`~sonic.DetectorIrregular.compute_rstat`:
+``q_results`` is indexed by feature name and sorted by Q. It contains the test
+statistic, a p-value, and a Benjamini-Hochberg adjusted p-value.
+
+After finding spatially variable genes, test a smaller set for spatial
+co-expression:
 
 .. code-block:: python
 
-   top_genes = results.nlargest(100, "Q").index.tolist()
-   coexp = detector.compute_rstat(
+   top_genes = q_results.nlargest(100, "Q").index.tolist()
+   r_results = detector.compute_rstat(
        features_x=top_genes,
-       features_y=None,    # all pairs within ``features_x``
+       features_y=None,
        n_jobs=4,
-       return_pval=True,
    )
 
-.. dropdown:: Picking a backend (matrix vs nufft)
-
-   :class:`~sonic.DetectorIrregular` ships two backends, selected
-   with the ``backend`` keyword.
-
-   ``backend="nufft"`` builds a :class:`~sonic.NUFFTKernel`. It
-   runs at ``O(n log n)`` per feature and never materialises an
-   ``(n, n)`` matrix, so it scales to large ``n``. Use it with
-   smooth kernels (Gaussian, Matérn).
-
-   ``backend="matrix"`` builds a :class:`~sonic.MatrixKernel`,
-   which picks dense, sparse, or sparse-precision storage based on
-   ``n``. Use it for graph kernels (``car``, ``moran``,
-   ``graph_laplacian``) or when you have a precomputed adjacency in
-   ``adata.obsp[obsp_key]``.
-
-   Example with the matrix backend and a CAR kernel:
-
-   .. code-block:: python
-
-      detector = Detector(
-          adata,
-          kernel_method="car",
-          backend="matrix",
-          rho=0.9,
-          k_neighbors=15,
-      ).setup_data(adata, obsm_key="spatial", min_cells_frac=0.05)
+``features_y=None`` tests pairs within ``features_x``. Pass a second list to
+test every pair between two feature sets.
 
 
-Large regular grids (Visium HD)
--------------------------------
+Which backend should I use?
+~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
-For rasterised grids in :class:`spatialdata.SpatialData` containers,
-the same :func:`~sonic.Detector` factory returns a
-:class:`~sonic.DetectorGrid`. Kernel hyper-parameters go to the
-constructor. The bin / table / coordinate layout goes to
-:meth:`~sonic.DetectorGrid.setup_data`.
+.. list-table::
+   :header-rows: 1
+   :widths: 30 30 40
 
-Expected ``sdata`` layout:
+   * - Data
+     - Starting point
+     - Use when
+   * - Two-dimensional coordinates, smooth patterns
+     - ``backend="nufft"`` with Matérn
+     - Default starting point for spatial Q-tests.
+   * - Coordinates or a graph
+     - ``backend="matrix"`` with CAR
+     - You want graph neighbourhoods or have a matrix in ``adata.obsp``.
+   * - Regular rasterized bins
+     - :class:`~sonic.DetectorGrid` through :func:`~sonic.Detector`
+     - The input is :class:`spatialdata.SpatialData`, such as Visium HD.
 
-- A bin element ``sdata[bins]`` (typically a
-  :class:`geopandas.GeoDataFrame` of bin polygons) that defines
-  the rasterisation grid. For Visium HD this is one of the
-  ``square_002um`` / ``square_008um`` / ``square_016um``
-  shape collections; for imaging data, any shape collection
-  whose footprint covers the rectangular grid you want to
-  rasterise against.
-- A table ``sdata.tables[table_name]`` whose ``X`` is the
-  ``(n_bins, n_vars)`` expression matrix and whose ``obs``
-  carries the integer column / row indices of each bin
-  (``col_key`` and ``row_key``).
-- The pair ``(col_key, row_key)`` must yield a contiguous
-  rectangular layout. Missing bins are filled with zeros.
+For a precomputed adjacency or connectivity matrix, replace ``obsm_key`` with
+``obsp_key``:
 
-Code:
+.. code-block:: python
+
+   detector = Detector(
+       adata,
+       kernel_method="car",
+       backend="matrix",
+       rho=0.9,
+   ).setup_data(adata, obsp_key="connectivities")
+
+See :doc:`/guides/kernels` for other kernels and tuning parameters.
+
+
+SpatialData with regular bins
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+For a regular grid, pass a :class:`spatialdata.SpatialData` object and the keys
+needed to rasterize its table. The row and column fields must define a
+contiguous rectangular grid.
 
 .. code-block:: python
 
@@ -253,28 +125,55 @@ Code:
        neighbor_degree=1,
    ).setup_data(
        sdata,
-       bins="square_008um",       # name of the bin element in sdata
-       table_name="square_008um", # name of the table in sdata.tables
-       col_key="array_col",       # integer column index in table.obs
-       row_key="array_row",       # integer row index in table.obs
+       bins="square_008um",
+       table_name="square_008um",
+       col_key="array_col",
+       row_key="array_row",
        min_count=10,
    )
-   results = detector.compute_qstat(n_jobs=4, return_pval=True)
+
+   q_results = detector.compute_qstat()
+
+The grid backend uses periodic boundaries. Standard Visium spot layouts are
+hexagonal; use the coordinate workflow for those samples. FFT acceleration is
+limited to rectangular grids.
 
 
-Compare Patterns Across Samples
--------------------------------
+Observed expression and numeric metadata must be finite; NaN and infinity are
+rejected before testing. Missing categorical metadata is also rejected.
+Categorical ``obs`` features are expanded into indicator columns for both Q
+and R tests on the matrix and NUFFT backends. Structural holes in a grid
+remain supported and are excluded from the observed domain.
 
-The :func:`~sonic.Comparator` factory picks
-:class:`~sonic.ComparatorIrregular` for a list of
-:class:`anndata.AnnData` samples and :class:`~sonic.ComparatorGrid`
-for a list of :class:`spatialdata.SpatialData` samples. The
-pattern-comparison path is alignment-free: each sample is converted
-to per-gene spatial power spectra, spectra are reduced to common
-radial frequency bins, and per-gene group differences are tested
-with :meth:`~sonic.ComparatorIrregular.test_diff_freq`.
+Test one feature directly
+~~~~~~~~~~~~~~~~~~~~~~~~~
 
-For AnnData samples:
+Use the lower-level functions when you already have arrays and want to run one
+test.
+
+.. code-block:: python
+
+   from sonic import NUFFTKernel, spatial_q_test, spatial_r_test
+
+   kernel = NUFFTKernel(
+       coords,
+       method="matern",
+       bandwidth=2.0,
+       nu=1.5,
+   )
+   Q, q_pvalue = spatial_q_test(gene_x, kernel)
+   R, r_pvalue = spatial_r_test(gene_x, gene_y, kernel)
+
+
+Pattern comparison
+------------------
+
+Pattern comparison asks whether a gene's spatial layout changes across samples
+or conditions. SONIC compares spatial spectra, so samples can have different
+positions and orientations.
+
+The shortest workflow takes a list of :class:`anndata.AnnData` samples with
+shared ``var_names`` and coordinates in ``obsm["spatial"]``:
 
 .. code-block:: python
 
@@ -291,61 +190,57 @@ For AnnData samples:
        "case_3.h5ad",
    ]
    samples = [ad.read_h5ad(path) for path in paths]
-   design = np.array([0, 0, 0, 1, 1, 1])  # 1-D labels -> binary contrast
+   groups = np.array([0, 0, 0, 1, 1, 1])
 
-   cmp = (
-       Comparator(samples)
-       .compute_spectra(n_jobs=4)
-       .normalize_background()
-   )
+   comparison = Comparator(samples).compute_spectra(n_jobs=4)
 
-   pattern_hits = cmp.test_diff_freq(
-       design,
+   # Optional: remove the sample-wide spectral background before testing.
+   # comparison.normalize_background()
+
+   pattern_results = comparison.test_diff_freq(
+       groups,
        statistic="log_l2",
        normalize_shape=True,
    )
-   expression_hits = cmp.test_diff_expr(design)
+   expression_results = comparison.test_diff_expr(groups)
 
-``pattern_hits`` is sorted by evidence of differential spatial
-pattern and has columns ``Feature``, ``Statistic``, ``P_value``, and
-``P_adj``. ``normalize_shape=True`` isolates redistribution of power
-across radial frequencies from overall pattern amplitude. The
-companion ``expression_hits`` table tests the DC component, so a gene
-can be pattern-only, expression-only, or both.
+``pattern_results`` ranks genes by changes in spatial layout.
+``normalize_shape=True`` removes overall spectrum amplitude before testing, so
+the comparison focuses on how power moves across spatial scales.
+``expression_results`` tests each gene's sample-level mean expression.
+Background normalization is optional. Use it when sample-wide spectral
+differences are nuisance variation; it can also remove shared biological signal.
 
-For :class:`spatialdata.SpatialData` grids, keep the same
-``Comparator`` factory and pass the grid rasterization keys:
+A gene can therefore show:
+
+- a pattern change without a mean-expression change;
+- a mean-expression change without a pattern change;
+- both changes.
+
+For regular grids, pass a list of :class:`spatialdata.SpatialData` samples and
+the rasterization keys:
 
 .. code-block:: python
 
-   import numpy as np
-   import spatialdata as sd
-   from sonic import Comparator
-
-   samples = [sd.read_zarr(path) for path in zarr_paths]
-   design = np.array([0, 0, 0, 1, 1, 1])
-
-   cmp = Comparator(
-       samples,
+   comparison = Comparator(
+       spatial_samples,
        bins="square_008um",
        table_name="square_008um",
        col_key="array_col",
        row_key="array_row",
-   ).compute_spectra().normalize_background()
+   ).compute_spectra()
 
-   pattern_hits = cmp.test_diff_freq(design, statistic="log_l2")
+   pattern_results = comparison.test_diff_freq(groups)
 
-See :doc:`/guides/multisample` for covariate residualisation,
-permutation nulls, GLM contrasts, unit scaling, and Visium-specific
-notes.
+See :doc:`/guides/multisample` for covariate maps, physical coordinate units,
+permutation tests, and multi-factor designs.
 
 
 Next steps
 ----------
 
-- :doc:`/guides/kernels`. Pick a kernel for your data.
-- :doc:`/guides/multisample`. Compare spatial patterns across groups
-  of slides.
-- :doc:`/guides/scaling`. Performance and complexity reference.
-- :doc:`/guides/theory`. Mathematical background.
-- :doc:`/autoapi/sonic/index`. Full API reference.
+- :doc:`/guides/kernels` for choosing a kernel.
+- :doc:`/guides/multisample` for cross-sample analysis.
+- :doc:`/guides/scaling` for memory and runtime controls.
+- :doc:`/guides/theory` for the statistical derivations.
+- :doc:`/autoapi/sonic/index` for the full API.

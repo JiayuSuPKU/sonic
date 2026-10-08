@@ -1,5 +1,5 @@
-Welcome
-=======
+SONIC
+=====
 
 .. toctree::
    :maxdepth: 2
@@ -9,10 +9,10 @@ Welcome
    self
    guides/installation
    guides/quickstart
-   guides/theory
-   guides/scaling
    guides/kernels
    guides/multisample
+   guides/scaling
+   guides/theory
    guides/faq
 
 .. toctree::
@@ -30,78 +30,94 @@ Welcome
    changelog
 
 **SONIC** (Spatial Organization through Nonrandom-pattern Inference and
-Comparison) is a Python library
-for **detecting** and **comparing** spatial patterns in omics data. 
-With it you can score how much each gene's expression depends on space, find gene
-pairs that share a spatial pattern, and compare patterns across multiple samples 
-without alignment, all through a single statistical framework.
-
-The kernel you pass to the test decides what kind of spatial structure
-counts. A CAR or Matérn kernel rewards smooth gradients across the
-tissue. A graph-Laplacian kernel rewards sharp boundaries between
-neighbouring spots. See :doc:`/guides/kernels` for how to pick one.
-
-The library is built for spatial transcriptomics (Visium, Visium HD,
-MERFISH, Slide-seq, Xenium, ...) but works with any data that has
-spatial or graph structure.
+Comparison) detects spatial patterns in omics data and compares those patterns
+across samples. It accepts coordinates, graphs, and regular grids through
+:class:`anndata.AnnData` and :class:`spatialdata.SpatialData`.
 
 
-Key features
-------------
+Pattern detection
+-----------------
 
-- **Reliable.** Uses positive-definite kernels, which avoid the
-  false negatives that affect Moran's I.
-- **Scalable.** Handles millions of spots through sparse solvers
-  and FFT / NUFFT acceleration.
-- **Flexible.** Accepts arbitrary 2-D coordinates, regular grids,
-  and precomputed graphs.
-- **Integrated.** Reads :class:`anndata.AnnData` and
-  :class:`spatialdata.SpatialData` directly.
-- **Comparative.** Ranks genes by cross-sample spatial-pattern
-  differences using alignment-free FFT / NUFFT spectra.
-
-
-Quick example
--------------
+Use :func:`~sonic.Detector` to screen every feature in one sample. The Q-test
+finds spatially variable features; the R-test finds feature pairs that share a
+spatial pattern.
 
 .. code-block:: python
 
-   import numpy as np
-   from sonic import NUFFTKernel, spatial_q_test
+   from sonic import Detector
 
-   # Spatial coordinates and one gene's expression vector
-   rng = np.random.default_rng(0)
-   coords = rng.uniform(0, 20, size=(500, 2))
-   gene = rng.standard_normal(500)
+   detector = Detector(
+       adata,
+       kernel_method="matern",
+       backend="nufft",
+       bandwidth=2.0,
+       nu=1.5,
+   ).setup_data(adata, obsm_key="spatial")
 
-   # Build a Matérn kernel and test the gene for spatial variability
-   kernel = NUFFTKernel(coords, method="matern", bandwidth=2.0, nu=1.5)
-   Q, pval = spatial_q_test(gene, kernel)
-   print(f"Q = {Q:.4f}, p-value = {pval:.4e}")
+   q_results = detector.compute_qstat()
 
-.. dropdown:: What is the Q-statistic?
-
-   The Q-statistic
-   :math:`Q = \mathbf{z}^\top \mathbf{K z}` measures how strongly
-   a feature's values line up with the spatial structure encoded
-   by the kernel ``K``. A large Q means the feature is spatially
-   structured in the way ``K`` looks for; a small Q means the
-   feature is spatially independent under ``K``. Different kernels
-   look for different things: CAR and Matérn pick up smooth,
-   large-scale variation, while a graph Laplacian picks up sharp,
-   local variation. See :doc:`/guides/theory` for the derivation
-   and :doc:`/guides/kernels` for picking a kernel.
+Start with NUFFT and Matérn for two-dimensional spatial coordinates; choose
+``bandwidth`` in coordinate units. The kernel determines which patterns
+receive a high score. CAR and Matérn favour smooth spatial changes;
+the graph Laplacian favours sharp differences
+between neighbours. The :doc:`guides/kernels` guide gives practical defaults.
 
 
-Getting started
----------------
+Pattern comparison
+------------------
 
-- :doc:`/guides/installation`
-- :doc:`/guides/quickstart` (a 5-minute tour)
-- :doc:`/guides/kernels` (pick a kernel for your data)
-- :doc:`/guides/multisample` (compare slides across groups)
-- :doc:`/guides/theory` and :doc:`/guides/scaling` (math and
-  performance)
+Use :func:`~sonic.Comparator` when you have several samples. SONIC compares
+per-gene spatial spectra across samples with different spots, orientations, or
+coordinate systems.
+
+.. code-block:: python
+
+   from sonic import Comparator
+
+   comparison = Comparator(samples).compute_spectra()
+
+   # Optional: remove the sample-wide spectral background before testing.
+   # comparison.normalize_background()
+   pattern_results = comparison.test_diff_freq(groups, normalize_shape=True)
+   expression_results = comparison.test_diff_expr(groups)
+
+The two result tables answer different questions. ``pattern_results`` tests
+whether spatial layout changes between groups; ``expression_results`` tests
+whether sample-level mean expression changes. See :doc:`guides/multisample`
+for covariates and multi-factor designs.
+Background normalization is optional and should be enabled only when
+sample-wide spectral differences are nuisance variation.
+
+
+Choose your input
+-----------------
+
+.. list-table::
+   :header-rows: 1
+   :widths: 30 30 40
+
+   * - Input
+     - Data layout
+     - SONIC interface
+   * - :class:`anndata.AnnData`
+     - Coordinates or a precomputed graph
+     - :func:`~sonic.Detector` or :func:`~sonic.Comparator`
+   * - :class:`spatialdata.SpatialData`
+     - Regular rasterized bins
+     - :func:`~sonic.Detector` or :func:`~sonic.Comparator`
+   * - NumPy arrays
+     - One feature or feature pair plus a kernel
+     - :func:`~sonic.spatial_q_test` or :func:`~sonic.spatial_r_test`
+
+
+Start here
+----------
+
+- :doc:`guides/installation`
+- :doc:`guides/quickstart`
+- :doc:`guides/kernels`
+- :doc:`guides/multisample`
+- :doc:`guides/theory` for derivations and proofs
 
 
 Citation
@@ -111,9 +127,5 @@ Su, Jiayu, et al.
 *On the consistent and scalable detection of spatial patterns.*
 `arXiv:2602.02825 (2026) <https://arxiv.org/pdf/2602.02825>`_.
 
-
-Reporting issues
-----------------
-
-Please open a ticket on the
-`GitHub Issues page <https://github.com/JiayuSuPKU/sonic/issues>`_.
+Please report bugs and feature requests through
+`GitHub Issues <https://github.com/JiayuSuPKU/sonic/issues>`_.

@@ -19,7 +19,7 @@ except ImportError:
 
 HAS_SPATIALDATA = importlib.util.find_spec("spatialdata") is not None
 
-from sonic.kernels import MatrixKernel
+from sonic.kernels import MatrixKernel, NUFFTKernel
 from sonic.statistics import compute_null_params, spatial_q_test, spatial_r_test
 
 
@@ -42,12 +42,11 @@ class TestTutorialBasicQTest(unittest.TestCase):
         """Test: Q-test basic workflow from README.
 
         Step-by-step:
-        1. Build CAR kernel from coordinates
+        1. Build a NUFFT Matérn kernel from coordinates
         2. Compute Q-statistic and p-value
         3. Verify output format
         """
-        # Build CAR kernel (recommended)
-        kernel = MatrixKernel.from_coordinates(self.coords, method="car", k_neighbors=15, rho=0.9)
+        kernel = NUFFTKernel(self.coords, method="matern", bandwidth=2.0, nu=1.5)
 
         # Compute Q-test
         Q, pval = spatial_q_test(self.gene_expr, kernel)
@@ -63,7 +62,7 @@ class TestTutorialBasicQTest(unittest.TestCase):
 
     def test_q_test_different_null_approximations(self):
         """Test: Q-test with different null approximation methods."""
-        kernel = MatrixKernel.from_coordinates(self.coords, method="car", k_neighbors=15, rho=0.9)
+        kernel = NUFFTKernel(self.coords, method="matern", bandwidth=2.0, nu=1.5)
 
         # Test with different null approximations
         methods = ["welch", "moments"]
@@ -81,7 +80,7 @@ class TestTutorialBasicQTest(unittest.TestCase):
 
     def test_q_test_multiple_genes(self):
         """Test: Q-test on multiple genes (matrix input)."""
-        kernel = MatrixKernel.from_coordinates(self.coords, method="car", k_neighbors=15, rho=0.9)
+        kernel = NUFFTKernel(self.coords, method="matern", bandwidth=2.0, nu=1.5)
 
         # Stack multiple genes
         n_genes = 5
@@ -174,7 +173,7 @@ class TestTutorialAnnDataWorkflow(unittest.TestCase):
         from sonic.detectors.irregular import DetectorIrregular
 
         # Initialize detector with kernel config, then attach data
-        detector = DetectorIrregular(kernel_method="car", k_neighbors=10, rho=0.9)
+        detector = DetectorIrregular(kernel_method="matern", backend="nufft", bandwidth=2.0, nu=1.5)
         detector.setup_data(self.adata, min_cells_frac=0.05)
 
         # Verify detector initialized
@@ -189,7 +188,7 @@ class TestTutorialAnnDataWorkflow(unittest.TestCase):
         """Test: Compute Q-statistics for subset of genes."""
         from sonic.detectors.irregular import DetectorIrregular
 
-        detector = DetectorIrregular(kernel_method="car", k_neighbors=10, rho=0.9)
+        detector = DetectorIrregular(kernel_method="matern", backend="nufft", bandwidth=2.0, nu=1.5)
         detector.setup_data(self.adata, min_cells_frac=0.05)
 
         # Compute Q-statistics for subset of genes
@@ -211,7 +210,7 @@ class TestTutorialAnnDataWorkflow(unittest.TestCase):
         """Test: Compute pairwise R-statistics."""
         from sonic.detectors.irregular import DetectorIrregular
 
-        detector = DetectorIrregular(kernel_method="car", k_neighbors=10, rho=0.9)
+        detector = DetectorIrregular(kernel_method="matern", backend="nufft", bandwidth=2.0, nu=1.5)
         detector.setup_data(self.adata, min_cells_frac=0.05)
 
         # Test on small subset for speed

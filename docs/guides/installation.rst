@@ -6,9 +6,15 @@ Release candidate
 
 .. code-block:: bash
 
-   pip install sonic-spatial==1.0.0rc1
+   pip install sonic-spatial==1.0.0rc2
 
 The Python import remains ``sonic``.
+
+Install the current GitHub source with:
+
+.. code-block:: bash
+
+   pip install 'sonic-spatial @ git+https://github.com/JiayuSuPKU/sonic.git'
 
 
 Development install
@@ -32,7 +38,7 @@ The compatibility distribution installs SONIC while preserving deprecated
 
 .. code-block:: bash
 
-   pip install quadsv==1.0.0rc1
+   pip install quadsv==1.0.0rc2
 
 
 Requirements
@@ -57,13 +63,30 @@ Verify the install
 .. code-block:: python
 
    import sonic
+   from sonic import Comparator, Detector
 
    print(sonic.__version__)
-   print(sorted(sonic.__all__))
 
-You should see 17 public names organised into four layers (see
-:doc:`/guides/quickstart` for what each layer does). The top-level
-package is the user-facing surface. The canonical submodule paths
-(``sonic.kernels.*``, ``sonic.detectors.*``,
-``sonic.comparators.multisample``, ``sonic.statistics``) are
-documented under :doc:`/autoapi/sonic/index`.
+If these imports succeed, continue with :doc:`/guides/quickstart`.
+
+
+Development troubleshooting
+---------------------------
+
+If Numba reports ``no locator available`` while importing a dependency, point
+it to a writable cache directory:
+
+.. code-block:: bash
+
+   mkdir -p /private/tmp/sonic-numba-cache
+   NUMBA_CACHE_DIR=/private/tmp/sonic-numba-cache python -c 'import sonic'
+
+On macOS, a test process that crashes inside FINUFFT may have loaded more than
+one OpenMP runtime. First retry with one OpenMP thread:
+
+.. code-block:: bash
+
+   OMP_NUM_THREADS=1 python -m pytest -q
+
+A clean conda-forge environment is the quickest way to confirm whether either
+problem comes from the current environment.

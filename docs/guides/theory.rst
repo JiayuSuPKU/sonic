@@ -14,14 +14,11 @@ non-parametric dependence tests. The Q-statistic is
 where :math:`\mathbf{z}` is the standardised feature vector and
 :math:`\mathbf{K}` is a kernel matrix that encodes spatial
 structure. Under the null hypothesis of spatial independence,
-:math:`Q_n` follows a weighted :math:`\chi^2` distribution whose
-weights are the eigenvalues of :math:`\mathbf{K}`. Moment-matching
-approximations turn that distribution into a fast p-value, giving
-the Q-test. The kernel choice critically affects the consistency
+:math:`Q_n` is often approximated by a weighted :math:`\chi^2`
+distribution. Sample standardization requires finite-sample moment
+corrections, described below. Moment-matching approximations give a fast
+p-value for the Q-test. The kernel choice critically affects the consistency
 and the power of the resulting test.
-
-This page summarises the key theoretical results.
-
 
 Theorem 1: Q-tests detect mean shifts only
 ------------------------------------------
@@ -117,38 +114,126 @@ Use CAR as the default for graph-flavoured spatial-pattern
 detection.
 
 
-Null-distribution approximations
---------------------------------
+.. _q-null-calibration:
 
-Under :math:`H_0`, :math:`Q_n` follows a weighted :math:`\chi^2`
-mixture
+Null calibration paths
+----------------------
+
+With sample-standardized features, Q is a **ratio** of quadratic forms.
+Under an iid central Gaussian null, with :math:`m=n-1` and eigenvalues of
+:math:`A=HKH` on the centered subspace,
 
 .. math::
 
-   Q_n \;\sim\; \sum_{i=1}^{m} \lambda_i \chi^2_1,
-   \qquad m = n - 1,
+   Q = m\frac{\sum_i \lambda_i Z_i^2}{\sum_i Z_i^2},
+   \qquad Z_i \overset{\mathrm{iid}}{\sim} N(0,1).
 
-where :math:`\lambda_i` are the eigenvalues of the double-centred
-kernel :math:`\tilde{\mathbf{K}} = \mathbf{H}\mathbf{K}\mathbf{H}`.
-``sonic`` ships three moment-matching fits, selected through the
-``method`` argument of :func:`~sonic.compute_null_params`:
+The unstandardized statistic instead has the Gaussian mixture null
+:math:`\sum_i\lambda_i\chi^2_1`. SONIC keeps these models separate:
+``compute_null_params(..., dirichlet_correction=True)`` uses finite-sample
+ratio moments, while ``liu_sf(...)`` retains the mixture model
+used by analytic comparison. Setting ``dirichlet_correction=False`` opts
+into the unstandardized moment approximation for detection.
 
-- ``"clt"``: a normal fit to :math:`(c_1, c_2)`. Valid for any
-  :math:`\mathbf{K}`, including indefinite kernels. This is the
-  only sensible choice for Moran's I.
-- ``"welch"``: a scaled central :math:`\chi^2` fit to
-  :math:`(c_1, c_2)`. PSD kernels only. This is the default when it
-  applies.
-- ``"liu"``: a shifted non-central :math:`\chi^2` fit to
-  :math:`(c_1, c_2, c_3, c_4)`. PSD kernels only. Tightest tail.
+.. list-table::
+   :header-rows: 1
+   :widths: 25 50 25
 
-Here :math:`c_p = \operatorname{tr}(\tilde{\mathbf{K}}^p)` is the
-:math:`p`-th spectral power sum. ``sonic`` also applies a
-finite-:math:`n` Dirichlet(1/2) correction to
-:math:`\operatorname{Var}[Q_n]`. See :doc:`/guides/scaling` for the
-formula, the cumulant-evaluation paths (FFT / NUFFT analytic,
-Matrix Frobenius, Hutchinson probes), and the full complexity
-table.
+   * - Path
+     - Calibration
+     - Tail
+   * - Q, ``method="welch"``
+     - Scaled central chi-square matching mean and variance.
+     - Upper
+   * - Q, ``method="moments"``
+     - Corrected moments; fit selection below.
+     - Upper
+   * - Q, ``method="clt"``
+     - Normal approximation, also used for recognized signed kernels.
+     - Two-sided
+   * - R
+     - Zero-mean normal approximation using ``var_R``.
+     - Two-sided
+   * - ``liu_sf(...)``
+     - Gaussian quadratic-form mixture approximation.
+     - Upper
+
+PSD matrix kernels default to Welch; PSD FFT/NUFFT kernels default to moment matching.
+``compute_null_params(kernel)`` and ``spatial_q_test`` use the same automatic selection.
+The :ref:`kernel-by-kernel default table <q-null-defaults>` includes all built-in
+methods, precomputed matrices, and the detector defaults.
+Recognized signed kernels, including Moran, default to two-sided CLT. They also
+accept explicit ``method="moments"`` with ``dirichlet_correction=True``:
+the finite-sample moment formulas require a symmetric kernel, not PSD.
+Welch and the unstandardized moment fit remain restricted to PSD kernels.
+A normal fallback within moment matching retains an upper tail; it does not become the
+CLT test. A zero-variance null or constant input feature returns p=1.
+
+For a Moran kernel, opt into upper-tail calibration with::
+
+   from sonic import spatial_q_test
+   from sonic.statistics import compute_null_params
+
+   params = compute_null_params(kernel, method="moments")
+   Q, p = spatial_q_test(data, kernel, null_params=params)
+
+This tests unusually large Q (positive spatial association). The default CLT
+test also detects unusually small Q. Both are analytic Gaussian-null
+approximations, rather than a permutation calibration of Moran's statistic.
+NUFFT Moran kernels use centered trace probes because their full signed
+spectrum is unavailable; FFT kernels retain all signed spectral modes.
+
+For finite-sample moment matching, the implementation applies this order:
+
+1. Match four moments with Liu when its noncentral chi-square parameters
+   are admissible (``fit="liu4"``).
+2. Otherwise try a bounded four-moment beta fit (``fit="beta4"``).
+3. Otherwise match positive skewness with a central chi-square
+   (``fit="chi2_skewness"``).
+4. Remaining symmetric/left-skewed shapes use ``fit="normal_fallback"``.
+   This is an approximation, not a guarantee of tail calibration for
+   strongly asymmetric shapes.
+
+The cache records the statistical ``model`` and ``tail``. For moment matching,
+``source`` identifies spectrum versus probe estimates, and
+``params["q_fit"]["family"]`` / ``["fit"]`` identify the distribution
+and matching rule. Null preparation happens once before feature chunking;
+all backends use the same p-value evaluator.
+Detector Z-scores use the same corrected mean and variance as their p-values;
+for a non-normal fit, a Z-score does not imply a normal-tail p-value.
+
+The cache contains the prepared fit and reporting moments, without
+intermediate trace estimates. Rebuild it with ``compute_null_params`` after
+changing the kernel or calibration settings. Incomplete caches are rejected.
+Finite-sample fitting uses direct scaled traces of :math:`B=A-\operatorname{tr}(A)H/m`
+to avoid cancellation near constant spectra. FFT kernels use their full
+spectrum. Matrix moment fits use a full spectrum only for dense kernels with
+at most 2000 observations, an already cached full spectrum, or an explicit
+``k_eigen`` request. Sparse and precision-backed kernels use probes. NUFFT
+moment calibration always defaults to analytic lower traces and 60 probes for
+higher traces, even with a cached spectrum. To request its reduced
+eigendecomposition, prepare the null explicitly:
+
+.. code-block:: python
+
+   null_params = compute_null_params(kernel, method="moments", nufft_spectrum=True)
+   q, p = spatial_q_test(values, kernel, null_params=null_params)
+
+This opt-in uses at most 2000 retained Fourier modes and falls back to probes
+when the reduced spectrum is unavailable. It is approximate because of
+spectral truncation and NUFFT numerical accuracy. An integer ``k_eigen``
+requests top-k Lanczos instead; explicit ``n_probes`` overrides either spectrum
+request. NUFFT Welch/CLT use only the analytic lower traces.
+
+``n_probes`` controls a shared budget: 60 by default for moment matching and
+15 for precision-backed Welch/CLT. Explicit Welch/CLT traces remain exact.
+Precision kernels reuse the probes and first solves for higher traces, with
+one additional application per probe for third and fourth powers. Probe
+blocks target 256 MiB of temporary workspace, excluding the kernel and
+existing caches. When the global centering offset must first be estimated,
+large jobs replay the initial solves instead of retaining all solutions.
+The same unshifted second trace supplies ``var_R``. Moment and probe
+approximations need particular care for extreme tails.
 
 
 R-test: bivariate spatial co-expression
@@ -205,7 +290,6 @@ See also
 
 - :doc:`/guides/quickstart` for practical recipes.
 - :doc:`/guides/kernels` for kernel selection and design.
-- :doc:`/guides/scaling` for null-distribution and operator
-  complexity.
+- :doc:`/guides/scaling` for practical runtime and memory controls.
 - :doc:`/autoapi/sonic/statistics/index` for the statistical-test
   API.

@@ -819,3 +819,99 @@ def test_fft_q_matches_centered_dense_operator(solver, shape, method):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+@pytest.mark.parametrize("solver", ["fft2", "rfft2"])
+@pytest.mark.parametrize("shape", [(8, 10), (7, 9)])
+@pytest.mark.parametrize("is_standardized", [False, True])
+@pytest.mark.parametrize("centering", [False, True])
+def test_many_fft_q_matches_separate_calls(solver, shape, is_standardized, centering):
+    from sonic import spatial_q_test_fft_many
+
+    rng = np.random.default_rng(28)
+    data = rng.normal(size=(*shape, 5))
+    data[..., 0] = 0
+    data[..., 1] = 3
+    data[..., 2] *= 1e-14
+    if not is_standardized:
+        data[..., 3] += 1e12
+        data[..., 4] *= 1e153
+    original = data.copy()
+    data.setflags(write=False)
+    kernels = [
+        FFTKernel(shape, method=method, fft_solver=solver, workers=1, centering=centering)
+        for method in ["car", "gaussian", "moran"]
+    ]
+    kernels.append(kernels[0])
+    params = [compute_null_params(k) for k in kernels]
+    params[-1] = compute_null_params(kernels[0], method="welch")
+    expected = [
+        spatial_q_test(data, k, null_params=p, is_standardized=is_standardized, chunk_size=2)
+        for k, p in zip(kernels, params, strict=True)
+    ]
+    actual = spatial_q_test_fft_many(
+        data, kernels, null_params=params, is_standardized=is_standardized, chunk_size=2
+    )
+    for i in range(len(kernels)):
+        np.testing.assert_allclose(actual[0][i], expected[i][0], rtol=1e-10, atol=1e-10)
+        np.testing.assert_allclose(actual[1][i], expected[i][1], rtol=1e-10, atol=1e-10)
+    single = spatial_q_test_fft_many(
+        data[..., :1], kernels, null_params=params, is_standardized=is_standardized
+    )
+    assert single[0].shape == (4, 1)
+    np.testing.assert_allclose(single[0], actual[0][:, :1])
+    np.testing.assert_array_equal(data, original)
+
+
+def test_many_fft_q_reuses_transform_and_scores(monkeypatch):
+    from unittest.mock import patch
+
+    from sonic import spatial_q_test_fft_many
+    from sonic.kernels import fft
+
+    data = np.random.default_rng(17).normal(size=(9, 11, 5)).astype(np.float32)
+    kernel = FFTKernel((9, 11), method="car", workers=1)
+    params = [{"method": "welch"}, {"method": "moments"}]
+    with patch.object(fft, "power_spectrum_2d", wraps=fft.power_spectrum_2d) as transform:
+        with patch.object(
+            kernel, "_quadratic_from_power", wraps=kernel._quadratic_from_power
+        ) as score:
+            q, p = spatial_q_test_fft_many(data, [kernel, kernel], params, chunk_size=2)
+            assert transform.call_count == score.call_count == 3
+    for i, param in enumerate(params):
+        np.testing.assert_allclose((q[i], p[i]), spatial_q_test(data, kernel, param))
+
+    def unexpected(*args, **kwargs):
+        raise AssertionError("Score-only calls must not prepare a null")
+
+    monkeypatch.setattr("sonic.statistics._prepare_q_null", unexpected)
+    result = spatial_q_test_fft_many(
+        data[..., 0], [kernel], return_pval=False, memory_budget_bytes="1 MiB"
+    )
+    assert result.shape == (1, 1)
+    np.testing.assert_allclose(result[0, 0], q[0, 0])
+
+
+def test_many_fft_q_validates_compatibility():
+    from sonic import spatial_q_test_fft_many
+
+    data = np.ones((8, 9, 3))
+    kernel = FFTKernel((8, 9), workers=1)
+    with pytest.raises(ValueError, match="non-empty sequence"):
+        spatial_q_test_fft_many(data, [])
+    with pytest.raises(ValueError, match="FFTKernel"):
+        spatial_q_test_fft_many(data, [np.eye(72)])
+    for other in [
+        FFTKernel((8, 10), workers=1),
+        FFTKernel((8, 9), fft_solver="rfft2", workers=1),
+        FFTKernel((8, 9), centering=False, workers=1),
+    ]:
+        with pytest.raises(ValueError, match="share grid shape"):
+            spatial_q_test_fft_many(data, [kernel, other])
+    with pytest.raises(ValueError, match="one entry per kernel"):
+        spatial_q_test_fft_many(data, [kernel], [])
+    with pytest.raises(ValueError, match="Data must have shape"):
+        spatial_q_test_fft_many(data[:, :-1], [kernel])
+    data[0, 0, 0] = np.nan
+    with pytest.raises(ValueError, match="finite"):
+        spatial_q_test_fft_many(data, [kernel])

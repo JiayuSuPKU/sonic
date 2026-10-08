@@ -33,6 +33,7 @@ EXPECTED_ALL: list[str] = [
     "NUFFTKernel",
     # Statistical tests
     "spatial_q_test",
+    "spatial_q_test_fft_many",
     "spatial_r_test",
     # Detectors
     "DetectorIrregular",
@@ -84,6 +85,7 @@ def test_every_public_name_resolves_and_documented():
 # stale; this test fails loudly.
 # ---------------------------------------------------------------------------
 _CANONICAL_PATHS: dict[str, tuple[str, str]] = {
+    "spatial_q_test_fft_many": ("sonic.statistics", "spatial_q_test_fft_many"),
     # name on sonic: (submodule, attribute on submodule)
     "MatrixKernel": ("sonic.kernels", "MatrixKernel"),
     "FFTKernel": ("sonic.kernels.fft", "FFTKernel"),

@@ -12,6 +12,7 @@ The public top-level API is organised in four layers:
    A single entry point per test dispatches on the kernel type (matrix, FFT,
    or NUFFT). Signature: ``(x, kernel, null_params=None, return_pval=True,
    is_standardized=False)``.
+   :func:`spatial_q_test_fft_many` shares transforms across compatible FFT kernels.
 3. **Detectors** — :class:`DetectorIrregular` consumes :class:`anndata.AnnData`
    (irregular grids, matrix/NUFFT backends); :class:`DetectorGrid` consumes
    :class:`spatialdata.SpatialData` (regular grids, FFT backend).
@@ -45,7 +46,7 @@ from sonic.detectors.irregular import DetectorIrregular
 from sonic.kernels import MatrixKernel
 from sonic.kernels.fft import FFTKernel
 from sonic.kernels.nufft import NUFFTKernel
-from sonic.statistics import spatial_q_test, spatial_r_test
+from sonic.statistics import spatial_q_test, spatial_q_test_fft_many, spatial_r_test
 
 # The :class:`~sonic.kernels.Kernel` and
 # :class:`~sonic.kernels.MatrixKernelBase` ABCs are intentionally not
@@ -60,6 +61,7 @@ __all__ = [
     "NUFFTKernel",
     # Statistical tests
     "spatial_q_test",
+    "spatial_q_test_fft_many",
     "spatial_r_test",
     # Detectors
     "DetectorIrregular",

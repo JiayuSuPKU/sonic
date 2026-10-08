@@ -323,6 +323,8 @@ def power_spectrum_anisotropy(
 def effective_rank(
     cov: np.ndarray,
     weights: np.ndarray | None = None,
+    *,
+    assume_psd: bool = False,
 ) -> float:
     r"""Effective rank (participation ratio) of a covariance matrix.
 
@@ -351,6 +353,11 @@ def effective_rank(
         effective rank of the weighted form :math:`W^{1/2} \mathrm{cov}\,W^{1/2}`,
         useful for analysing how a frequency-weighted L2 statistic
         actually distributes its sensitivity across eigen-directions.
+    assume_psd : bool, default False
+        If the covariance is known to be symmetric positive semidefinite,
+        compute ``trace(C)**2 / sum(C*C)`` without an eigendecomposition.
+        The default retains clipping of negative eigenvalues. Internal
+        covariance estimates use this faster path.
 
     Returns
     -------
@@ -371,17 +378,24 @@ def effective_rank(
     if cov.ndim != 2 or cov.shape[0] != cov.shape[1]:
         raise ValueError(f"cov must be a square 2D matrix, got shape {cov.shape}.")
     n_bins = cov.shape[0]
-    if weights is None:
-        eigvals = np.linalg.eigvalsh(cov)
-    else:
+    if weights is not None:
         w = np.asarray(weights, dtype=float)
         if w.shape != (n_bins,):
             raise ValueError(f"weights must have length n_bins={n_bins}, got shape {w.shape}.")
         if np.any(w < 0):
             raise ValueError("weights must be non-negative.")
         sqW = np.sqrt(w)
-        M = (sqW[:, None] * cov) * sqW[None, :]
-        eigvals = np.linalg.eigvalsh(M)
+        cov = (sqW[:, None] * cov) * sqW[None, :]
+    if assume_psd:
+        scale = np.max(np.abs(cov), initial=0.0)
+        if scale == 0:
+            return float("nan")
+        scaled = cov / scale
+        trace = float(np.trace(scaled))
+        if trace <= 0:
+            return float("nan")
+        return float(trace**2 / np.einsum("ij,ij->", scaled, scaled))
+    eigvals = np.linalg.eigvalsh(cov)
     eigvals = np.maximum(eigvals, 0.0)
     s = float(eigvals.sum())
     if s <= 0:
@@ -436,7 +450,7 @@ def gene_pattern_diversity(
     centred = log_s - log_s.mean(axis=0, keepdims=True)
     G = log_s.shape[0]
     cov = (centred.T @ centred) / max(G - 1, 1)
-    return effective_rank(cov, weights=weights)
+    return effective_rank(cov, weights=weights, assume_psd=True)
 
 
 def radial_bin_spectrum(

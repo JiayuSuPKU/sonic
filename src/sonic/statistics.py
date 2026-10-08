@@ -58,6 +58,7 @@ __all__ = [
     "compute_null_params",
     "liu_sf",
     "spatial_q_test",
+    "spatial_q_test_fft_many",
     "spatial_r_test",
 ]
 
@@ -1281,6 +1282,103 @@ def spatial_q_test(  # noqa: C901
 def _r_null_variance(kernel: Kernel) -> float:
     """Variance of standardized X'KY, independent of the kernel's trace view."""
     return max(float(_centered_kernel(kernel).square_trace()), 0.0)
+
+
+def spatial_q_test_fft_many(  # noqa: C901
+    Xn: np.ndarray,
+    kernels: Sequence[Kernel],
+    null_params: Sequence[dict | None] | None = None,
+    return_pval: bool = True,
+    is_standardized: bool = False,
+    chunk_size: int | str = "auto",
+    show_progress: bool = False,
+    *,
+    memory_budget_bytes: int | str = _DEFAULT_CHUNK_BUDGET,
+) -> np.ndarray | tuple[np.ndarray, np.ndarray]:
+    """Run Q-tests for compatible FFT kernels with one transform per chunk.
+
+    Parameters
+    ----------
+    Xn : np.ndarray
+        Grid observations of shape ``(ny, nx)`` or ``(ny, nx, n_features)``.
+        Inputs are never modified. Constant features receive Q=0 and p=1
+        unless ``is_standardized=True``.
+    kernels : sequence of FFTKernel
+        Non-empty sequence sharing grid shape, FFT solver and centering.
+        Spectra and physical spacings may differ. Transform workers come
+        from the first kernel. Repeat the same kernel to compare different
+        null approximations without recomputing its Q statistic.
+    null_params : sequence of dict or None, optional
+        One calibration per kernel, following :func:`spatial_q_test`.
+        Each entry may be a prepared fit, ``{"method": "welch"}`` (or
+        ``"moments"`` / ``"clt"``), or None for the kernel's default.
+        By default Fourier kernels use moments; signed spectra use CLT.
+        Calibrations remain separate even though Fourier power is shared.
+    return_pval : bool, default True
+        Return both scores and p-values. False skips null calibration.
+    is_standardized : bool, default False
+        Whether observations are already sample-standardized.
+    chunk_size : int or {'auto'}, default 'auto'
+        Features per transform; -1 disables chunking. Auto uses the same
+        FFT chunk sizing as :func:`spatial_q_test`.
+    show_progress : bool, default False
+        Show progress across feature chunks.
+    memory_budget_bytes : int or str, default 2147483648 (2 GiB)
+        Auto-chunk workspace budget, also accepting strings such as
+        ``"512 MiB"``. Excludes inputs, kernels, calibration and output arrays.
+        Explicit chunk sizes bypass automatic memory sizing.
+
+    Returns
+    -------
+    Q : np.ndarray
+        Shape ``(n_kernels, n_features)`` in input order, including a trailing
+        length-one axis for a single feature.
+    pval : np.ndarray
+        Same shape as Q; returned only when ``return_pval=True``.
+
+    Examples
+    --------
+    Compare calibrations using one kernel and one FFT per feature chunk::
+
+        q, p = spatial_q_test_fft_many(
+            data, [kernel, kernel],
+            null_params=[{"method": "welch"}, {"method": "moments"}],
+        )
+    """
+    from sonic.kernels.fft import FFTKernel, _q_scores_fft
+
+    kernels = list(kernels)
+    if not kernels or not all(isinstance(k, FFTKernel) for k in kernels):
+        raise ValueError("kernels must be a non-empty sequence of FFTKernel instances.")
+    first = kernels[0]
+    layout = (first.ny, first.nx, first.fft_solver, first.centering)
+    if any((k.ny, k.nx, k.fft_solver, k.centering) != layout for k in kernels):
+        raise ValueError("FFT kernels must share grid shape, fft_solver and centering.")
+    Xn = np.asarray(Xn)
+    if Xn.ndim not in (2, 3) or Xn.shape[:2] != layout[:2]:
+        raise ValueError(f"Data must have shape {layout[:2]} or {(*layout[:2], 'n_features')}.")
+    _require_finite(Xn, "Q-test observations")
+    memory_budget_bytes = _parse_memory_budget(memory_budget_bytes)
+    params = [None] * len(kernels) if null_params is None else list(null_params)
+    if len(params) != len(kernels):
+        raise ValueError("null_params must contain one entry per kernel.")
+    if return_pval:
+        params = [_prepare_q_null(k, p) for k, p in zip(kernels, params, strict=True)]
+    M = _feature_count(Xn, is_fft=True)
+    chunk = _resolve_chunk_size(chunk_size, first, M, memory_budget_bytes=memory_budget_bytes)
+    Q = np.empty((len(kernels), M))
+    P = np.empty_like(Q) if return_pval else None
+    starts = range(0, M, chunk)
+    iterator = tqdm(starts, desc="Q-test chunks") if show_progress and len(starts) > 1 else starts
+    for start in iterator:
+        end = min(start + chunk, M)
+        block = Xn if Xn.ndim == 2 else Xn[..., start:end]
+        scores, valid = _q_scores_fft(block, kernels, is_standardized)
+        Q[:, start:end] = scores
+        if return_pval:
+            for i, param in enumerate(params):
+                P[i, start:end] = np.where(valid, _q_pvalues(scores[i], param), 1.0)
+    return (Q, P) if return_pval else Q
 
 
 def _r_test_matrix(  # noqa: C901

@@ -673,6 +673,58 @@ class FFTKernel(Kernel):
         return float(np.sum(self.eigenvalues(return_full_layout=True) ** 2))
 
 
+def _q_scores_fft(Xn: np.ndarray, kernels, is_standardized: bool = False):
+    """Score compatible FFT kernels using one variance calculation and transform.
+
+    The caller validates shared grid, solver and centering. Always return a
+    (n_kernels, n_features) array plus the feature validity mask.
+    """
+    kernel = kernels[0]
+    Xn = np.asarray(Xn, dtype=float)
+    if Xn.ndim == 2:
+        Xn = Xn[..., np.newaxis]
+
+    ny, nx, M = Xn.shape
+    if ny != kernel.ny or nx != kernel.nx:
+        raise ValueError(
+            f"Data shape ({ny}, {nx}) does not match kernel ({kernel.ny}, {kernel.nx})"
+        )
+
+    # Center in Fourier space, then apply sample-variance scaling to Q.
+    # This avoids allocating a standardized copy of the entire feature batch.
+    if is_standardized:
+        valid = np.any(Xn, axis=(0, 1))
+    else:
+        variance = np.var(Xn, axis=(0, 1), ddof=1)
+        valid = variance > 1e-24
+        # Extreme magnitudes can overflow raw Fourier power before the final
+        # variance division. Standardize those batches before transforming.
+        max_weight = max(
+            max(1.0, float(k.spectrum.max()), -float(k.spectrum.min())) for k in kernels
+        )
+        variance_limit = np.finfo(float).max / kernel.n_grid**2 / max_weight
+        if np.any(variance > variance_limit):
+            Xn = Xn - Xn.mean(axis=(0, 1), keepdims=True)
+            np.divide(Xn, np.sqrt(variance), out=Xn, where=valid)
+            Xn[..., ~valid] = 0.0
+            variance = np.ones_like(variance)
+    power = power_spectrum_2d(
+        Xn,
+        fft_solver=kernel.fft_solver,
+        workers=kernel.workers,
+        center=kernel.centering or not is_standardized,
+    )
+    scores = {}
+    for k in kernels:
+        if id(k) not in scores:
+            scores[id(k)] = k._quadratic_from_power(power)
+    Q = np.array([scores[id(k)] for k in kernels])
+    if not is_standardized:
+        np.divide(Q, variance, out=Q, where=valid)
+        Q[:, ~valid] = 0.0
+    return Q, valid
+
+
 def _q_test_fft(  # noqa: C901
     Xn: np.ndarray,
     kernel: FFTKernel,
@@ -737,42 +789,9 @@ def _q_test_fft(  # noqa: C901
     >>> data = np.random.randn(ny, nx)
     >>> Q, pval = spatial_q_test(data, kernel)
     """
-    Xn = np.asarray(Xn, dtype=float)
-    if Xn.ndim == 2:
-        Xn = Xn[..., np.newaxis]
-
-    ny, nx, M = Xn.shape
-    if ny != kernel.ny or nx != kernel.nx:
-        raise ValueError(
-            f"Data shape ({ny}, {nx}) does not match kernel ({kernel.ny}, {kernel.nx})"
-        )
-
-    # Center in Fourier space, then apply sample-variance scaling to Q.
-    # This avoids allocating a standardized copy of the entire feature batch.
-    if is_standardized:
-        valid = np.any(Xn, axis=(0, 1))
-    else:
-        variance = np.var(Xn, axis=(0, 1), ddof=1)
-        valid = variance > 1e-24
-        # Extreme magnitudes can overflow raw Fourier power before the final
-        # variance division. Standardize those batches before transforming.
-        max_weight = max(1.0, float(kernel.spectrum.max()), -float(kernel.spectrum.min()))
-        variance_limit = np.finfo(float).max / kernel.n_grid**2 / max_weight
-        if np.any(variance > variance_limit):
-            Xn = Xn - Xn.mean(axis=(0, 1), keepdims=True)
-            np.divide(Xn, np.sqrt(variance), out=Xn, where=valid)
-            Xn[..., ~valid] = 0.0
-            variance = np.ones_like(variance)
-    power = power_spectrum_2d(
-        Xn,
-        fft_solver=kernel.fft_solver,
-        workers=kernel.workers,
-        center=kernel.centering or not is_standardized,
-    )
-    Q = kernel._quadratic_from_power(power)
-    if not is_standardized:
-        np.divide(Q, variance, out=Q, where=valid)
-        Q[~valid] = 0.0
+    scores, valid = _q_scores_fft(Xn, [kernel], is_standardized)
+    Q = scores[0]
+    M = Q.size
     if M == 1:
         Q = Q.item()
 

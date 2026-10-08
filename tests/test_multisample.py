@@ -1290,3 +1290,101 @@ def test_welch_cauchy_excludes_only_constant_bins(masked):
     assert (
         actual.loc["2", "P_value"] < 1e-100
     )  # Different constants in the two arms remain informative.
+
+
+@pytest.mark.parametrize("masked", [False, True])
+@pytest.mark.parametrize("glm", [False, True])
+@pytest.mark.parametrize("shape_only", [False, True])
+def test_blocked_covariance_matches_independent_per_gene_fits(  # noqa: C901
+    monkeypatch, masked, glm, shape_only
+):
+    from sonic.comparators import multisample as ms
+
+    rng = np.random.default_rng(42)
+    spectra = rng.lognormal(size=(12, 23, 7)).astype(np.float32)
+    labels = np.tile([0, 1], 6)
+    design = np.column_stack([np.ones(12), labels, rng.normal(size=12)])
+    contrast = np.array([0.0, 1.0, 0.0])
+    weights = np.arange(7, dtype=float)
+    weights /= weights.sum()
+    presence = np.ones((12, 23), bool)
+    if masked:
+        presence[0, :5] = False
+        presence[1, 5:10] = False  # Same count, different design.
+        presence[:, 17:19] = False
+        presence[3:, 19:21] = False  # No GLM residual df; too few in each arm.
+        presence[labels == 1, 21:] = False  # Contrast not estimable.
+        spectra[~presence] = np.nan
+    original = spectra.copy()
+    spectra.setflags(write=False)
+    observed = np.full(23, np.nan)
+    scales = np.full(23, np.nan)
+    beta = np.full((3, 23, 7), np.nan)
+    covariance = np.zeros((7, 7))
+    pooled_df = 0
+    for j in range(23):
+        keep = presence[:, j]
+        x = design[keep]
+        if not len(x):
+            continue
+        values = spectra[keep, j].astype(float)
+        if shape_only:
+            values = normalize_shape(values)
+        logs = np.log(np.maximum(values, 1e-12))
+        if glm:
+            fit, _, rank, _ = np.linalg.lstsq(x, logs, rcond=None)
+            inverse = np.linalg.pinv(x)
+            if len(x) <= rank or not np.allclose(contrast @ inverse @ x, contrast):
+                continue
+            beta[:, j] = fit
+            effect = contrast @ fit
+            residuals = logs - x @ fit
+            scale = np.sum((contrast @ inverse) ** 2)
+            df = len(x) - rank
+        else:
+            groups = labels[keep]
+            a, b = groups == 0, groups == 1
+            if a.sum() < 2 or b.sum() < 2:
+                continue
+            ma, mb = logs[a].mean(axis=0), logs[b].mean(axis=0)
+            effect = ma - mb
+            residuals = logs - np.where(a[:, None], ma, mb)
+            scale = 1 / a.sum() + 1 / b.sum()
+            df = len(x) - 2
+        observed[j] = np.sqrt(np.sum(weights * effect**2))
+        scales[j] = scale
+        covariance += residuals.T @ residuals
+        pooled_df += df
+    covariance /= pooled_df
+    weighted = np.sqrt(weights[:, None] * weights) * covariance
+    eigenvalues = np.maximum(np.linalg.eigvalsh(weighted), 0)
+    pvalues = np.array(
+        [
+            liu_sf(t**2, eigenvalues * s) if np.isfinite(t) else np.nan
+            for t, s in zip(observed, scales, strict=True)
+        ]
+    )
+
+    # Force small blocks so both grouping and within-group chunk boundaries run.
+    monkeypatch.setattr(ms, "_COMPARISON_WORKSPACE_BYTES", 8 * 8 * 12 * 7 * 2)
+    name = "_estimate_" + ("glm" if glm else "two_group")
+    name += "_masked_null_covariance" if masked else "_null_covariance"
+    args = [spectra, design, contrast] if glm else [spectra, labels]
+    if masked:
+        args.append(presence)
+    with patch.object(ms, "_decompose_glm_design", wraps=ms._decompose_glm_design) as decompose:
+        with patch.object(ms, "_log_spectra_block", wraps=ms._log_spectra_block) as blocks:
+            state = getattr(ms, name)(*args, freq_weights=weights, normalize_shape=shape_only)
+            assert max(call.args[0].shape[1] for call in blocks.call_args_list) <= 3
+        if glm:
+            expected = sum(mask.any() for mask in np.unique(presence.T, axis=0))
+            assert decompose.call_count == expected
+    np.testing.assert_allclose(state["observed"], observed, atol=1e-12, equal_nan=True)
+    np.testing.assert_allclose(state["sigma_log"], covariance, atol=1e-12)
+    np.testing.assert_allclose(
+        ms._log_l2_pvalues_from_state(state), pvalues, atol=1e-12, equal_nan=True
+    )
+    np.testing.assert_array_equal(state["eligible"], np.isfinite(observed))
+    if glm:
+        np.testing.assert_allclose(state["beta"], beta, atol=1e-12, equal_nan=True)
+    np.testing.assert_array_equal(spectra, original)

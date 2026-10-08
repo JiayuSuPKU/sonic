@@ -844,3 +844,30 @@ def test_rotation_uses_physical_frequencies_on_rectangular_grids(solver, angle):
     assert np.linalg.norm(features[1] - features[0]) / np.linalg.norm(features[0]) < 0.08
     for before, after in zip(originals, spectra, strict=True):
         np.testing.assert_array_equal(before, after)
+
+
+@pytest.mark.parametrize("weighted", [False, True])
+@pytest.mark.parametrize("scale", [1e-200, 1.0, 1e200])
+def test_effective_rank_psd_traces_match_eigenvalues(weighted, scale):
+    rng = np.random.default_rng(92)
+    x = rng.normal(size=(5, 13))  # Singular PSD covariance.
+    cov = x.T @ x
+    weights = np.linspace(0, 1, 13) if weighted else None
+    expected = effective_rank(cov, weights)
+    np.testing.assert_allclose(effective_rank(cov * scale, weights, assume_psd=True), expected)
+    assert np.isnan(effective_rank(np.zeros((3, 3)), assume_psd=True))
+    # Default public behavior must still clip genuinely negative eigenvalues.
+    assert effective_rank(np.diag([-3.0, 1.0, 1.0])) == pytest.approx(2.0)
+
+
+def test_gene_pattern_diversity_uses_psd_fast_path(monkeypatch):
+    rng = np.random.default_rng(3)
+    spectra = rng.lognormal(size=(50, 9))
+    weights = np.arange(9, dtype=float)
+    expected = effective_rank(np.cov(np.log(spectra), rowvar=False), weights)
+
+    def unexpected(*args, **kwargs):
+        raise AssertionError("An internally constructed covariance needs no eigendecomposition")
+
+    monkeypatch.setattr(np.linalg, "eigvalsh", unexpected)
+    assert gene_pattern_diversity(spectra, weights) == pytest.approx(expected)

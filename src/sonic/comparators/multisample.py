@@ -11,6 +11,13 @@ This module consumes normalized or raw per-sample arrays and provides:
 
 The public comparator classes in :mod:`sonic.comparators` wrap these
 array-level functions for AnnData and SpatialData inputs.
+
+Analytic log-L2 comparisons accumulate one pooled covariance in gene blocks,
+using a fixed 32 MiB scratch-space target (at least one gene). Inputs, returned
+diagnostics and the cross-bin covariance are excluded from that target.
+Shape normalization and float64 conversion happen within each block. Genes
+with identical observation masks share their design decomposition; p-values
+and BH correction still use the complete tested gene set.
 """
 
 from __future__ import annotations
@@ -43,6 +50,39 @@ logger = logging.getLogger(__name__)
 
 _AVAILABLE_STATISTICS = ("log_l2", "welch_t_cauchy")
 _NULL_OPTIONS = ("permutation", "analytic")
+
+# Bound analytic-comparison scratch space, allowing for eight float64 arrays.
+# Inputs, returned diagnostics, and the n_bins² covariance are excluded; at
+# least one gene is processed even if it alone exceeds this workspace target.
+_COMPARISON_WORKSPACE_BYTES = 32 * (1 << 20)
+
+
+def _comparison_blocks(n_samples, n_genes, n_bins, n_terms=0):
+    """Yield gene slices without materializing whole-panel log/residual arrays."""
+    step = max(1, _COMPARISON_WORKSPACE_BYTES // (8 * 8 * max(n_samples, n_terms, 1) * n_bins))
+    for start in range(0, n_genes, step):
+        yield slice(start, min(start + step, n_genes))
+
+
+def _log_spectra_block(spectra, normalize_shape):
+    """Make an owned float64 log block, preserving the caller's spectra."""
+    if normalize_shape:
+        block = _normalize_shape_apply(spectra)
+    else:
+        block = np.array(spectra, dtype=np.float64, copy=True)
+    np.maximum(block, 1e-12, out=block)
+    np.log(block, out=block)
+    return block
+
+
+def _presence_groups(presence):
+    """Yield sample masks and gene indices, grouping complete masks, not counts."""
+    if presence.shape[1] == 0:
+        return
+    _, inverse = np.unique(np.packbits(presence, axis=0).T, axis=0, return_inverse=True)
+    order = np.argsort(inverse, kind="stable")
+    for genes in np.split(order, np.flatnonzero(np.diff(inverse[order])) + 1):
+        yield presence[:, genes[0]], genes
 
 
 class _AnalyticNullMetadata(TypedDict, total=False):
@@ -642,6 +682,21 @@ def _maybe_log_expression(
     return np.log(values + eps)
 
 
+def _two_group_log_block(log_a, log_b, weights):
+    """Consume owned log blocks, returning statistics and residual cross-products."""
+    offset = log_a[0] - log_b[0]
+    log_a -= log_a[:1].copy()
+    log_b -= log_b[:1].copy()
+    mean_a = log_a.mean(axis=0)
+    mean_b = log_b.mean(axis=0)
+    observed = np.sqrt(np.sum(weights * (offset + (mean_a - mean_b)) ** 2, axis=-1))
+    log_a -= mean_a
+    log_b -= mean_b
+    a = log_a.reshape(-1, log_a.shape[-1])
+    b = log_b.reshape(-1, log_b.shape[-1])
+    return observed, a.T @ a + b.T @ b
+
+
 def _estimate_two_group_null_covariance(
     spectra: np.ndarray,
     groups: np.ndarray,
@@ -657,7 +712,7 @@ def _estimate_two_group_null_covariance(
     Liu eigenvalues used by both :func:`compare_two_groups` and
     :meth:`sonic.comparators.base._ComparatorBase.estimate_null_covariance`.
     """
-    spectra = np.asarray(spectra, dtype=np.float64)
+    spectra = np.asarray(spectra)
     if spectra.ndim != 3:
         raise ValueError(f"spectra must be 3D (n_samples, n_genes, n_bins), got {spectra.shape}.")
     n_samples, n_genes, n_bins = spectra.shape
@@ -669,12 +724,7 @@ def _estimate_two_group_null_covariance(
         raise ValueError(f"groups must contain exactly two distinct values, got {uniq}.")
     group_codes = (groups == uniq[1]).astype(int)
 
-    if normalize_shape:
-        spectra = _normalize_shape_apply(spectra)
-
     group_a_mask = group_codes == 0
-    group_a = spectra[group_a_mask]
-    group_b = spectra[~group_a_mask]
     n_a = int(group_a_mask.sum())
     n_b = int((~group_a_mask).sum())
     df_resid = n_a + n_b - 2
@@ -682,21 +732,14 @@ def _estimate_two_group_null_covariance(
         raise ValueError("Analytic two-group tests require positive residual degrees of freedom.")
     weights = _resolve_freq_weights(freq_weights, n_bins)
 
-    # Compute the weighted log-L2 statistic.
-    log_group_a = np.log(np.maximum(group_a, 1e-12))
-    log_group_b = np.log(np.maximum(group_b, 1e-12))
-    offset = log_group_a[0] - log_group_b[0]
-    log_group_a -= log_group_a[:1].copy()
-    log_group_b -= log_group_b[:1].copy()
-    mean_diff = offset + (log_group_a.mean(axis=0) - log_group_b.mean(axis=0))
-    observed = np.sqrt(np.sum(weights * mean_diff**2, axis=-1))
-
-    # Pool within-group residuals across genes to compute the cross-bin covariance.
-    residuals_a = log_group_a - log_group_a.mean(axis=0, keepdims=True)
-    residuals_b = log_group_b - log_group_b.mean(axis=0, keepdims=True)
-    residuals = np.concatenate([residuals_a, residuals_b], axis=0)
-    residual_2d = residuals.reshape(n_samples * n_genes, n_bins)
-    sigma_log = (residual_2d.T @ residual_2d) / (n_genes * df_resid)
+    observed = np.empty(n_genes)
+    sigma_log = np.zeros((n_bins, n_bins))
+    for block in _comparison_blocks(n_samples, n_genes, n_bins):
+        log_a = _log_spectra_block(spectra[group_a_mask, block], normalize_shape)
+        log_b = _log_spectra_block(spectra[~group_a_mask, block], normalize_shape)
+        observed[block], covariance = _two_group_log_block(log_a, log_b, weights)
+        sigma_log += covariance
+    sigma_log /= n_genes * df_resid
     _maybe_warn_small_df_analytic(df_resid)
 
     # Compute eigenvalues of the weighted covariance and contrast scale for p-value calculation.
@@ -741,7 +784,7 @@ def _estimate_two_group_masked_null_covariance(  # noqa: C901
     """
     if int(min_samples_per_group) < 2:
         raise ValueError(f"min_samples_per_group must be >= 2, got {min_samples_per_group}.")
-    spectra = np.asarray(spectra, dtype=np.float64)
+    spectra = np.asarray(spectra)
     if spectra.ndim != 3:
         raise ValueError(f"spectra must be 3D, got {spectra.shape}.")
     n_samples, n_genes, n_bins = spectra.shape
@@ -759,11 +802,7 @@ def _estimate_two_group_masked_null_covariance(  # noqa: C901
         raise ValueError("groups must contain exactly two distinct values.")
     group_codes = (groups == uniq[1]).astype(int)
 
-    if normalize_shape:
-        spectra = _normalize_shape_apply(spectra)
-
     group_a_mask = group_codes == 0
-    log_spectra = np.log(np.maximum(spectra, 1e-12))
     weights = _resolve_freq_weights(freq_weights, n_bins)
     sigma_acc = np.zeros((n_bins, n_bins), dtype=np.float64)
     pooled_df = 0
@@ -774,37 +813,24 @@ def _estimate_two_group_masked_null_covariance(  # noqa: C901
     n_obs_b = np.zeros(n_genes, dtype=int)
     df_resid = np.zeros(n_genes, dtype=int)
 
-    # Compute each eligible gene's statistic and contribution to the pooled covariance.
-    for gene_idx in range(n_genes):
-        sample_mask = presence[:, gene_idx]
-        idx_a = np.where(group_a_mask & sample_mask)[0]
-        idx_b = np.where(~group_a_mask & sample_mask)[0]
-        n_obs_a[gene_idx] = len(idx_a)
-        n_obs_b[gene_idx] = len(idx_b)
-        df_gene = max(len(idx_a) + len(idx_b) - 2, 1)
-        df_resid[gene_idx] = df_gene
-        if len(idx_a) < min_samples_per_group or len(idx_b) < min_samples_per_group:
+    for sample_mask, genes in _presence_groups(presence):
+        idx_a = np.flatnonzero(group_a_mask & sample_mask)
+        idx_b = np.flatnonzero(~group_a_mask & sample_mask)
+        n_a, n_b = len(idx_a), len(idx_b)
+        n_obs_a[genes], n_obs_b[genes] = n_a, n_b
+        df_gene = max(n_a + n_b - 2, 1)
+        df_resid[genes] = df_gene
+        if n_a < min_samples_per_group or n_b < min_samples_per_group:
             continue
-
-        # Compute the test statistic.
-        log_a = log_spectra[idx_a, gene_idx, :]
-        log_b = log_spectra[idx_b, gene_idx, :]
-        offset = log_a[0] - log_b[0]
-        log_a -= log_a[:1].copy()
-        log_b -= log_b[:1].copy()
-        mean_a = log_a.mean(axis=0, keepdims=True)
-        mean_b = log_b.mean(axis=0, keepdims=True)
-        mean_diff = offset + (mean_a.ravel() - mean_b.ravel())
-        observed[gene_idx] = float(np.sqrt(np.sum(weights * mean_diff**2)))
-        scale = (1.0 / n_obs_a[gene_idx]) + (1.0 / n_obs_b[gene_idx])
-        contrast_scale[gene_idx] = scale
-
-        # Compute the contribution to the pooled covariance.
-        res_a = log_a - mean_a
-        res_b = log_b - mean_b
-        sigma_acc += (res_a.T @ res_a) + (res_b.T @ res_b)
-        pooled_df += df_gene
-        eligible[gene_idx] = True
+        contrast_scale[genes] = 1.0 / n_a + 1.0 / n_b
+        eligible[genes] = True
+        pooled_df += df_gene * len(genes)
+        for block in _comparison_blocks(n_a + n_b, len(genes), n_bins):
+            cols = genes[block]
+            log_a = _log_spectra_block(spectra[idx_a[:, None], cols], normalize_shape)
+            log_b = _log_spectra_block(spectra[idx_b[:, None], cols], normalize_shape)
+            observed[cols], covariance = _two_group_log_block(log_a, log_b, weights)
+            sigma_acc += covariance
 
     if pooled_df == 0:
         raise ValueError(
@@ -857,7 +883,7 @@ def _estimate_glm_null_covariance(
     covariance across genes, and the single contrast variance scale
     ``c'(X'X)^+c`` applied to the Liu eigenvalues.
     """
-    spectra = np.asarray(spectra, dtype=np.float64)
+    spectra = np.asarray(spectra)
     if spectra.ndim != 3:
         raise ValueError(f"spectra must be 3D (n_samples, n_genes, n_bins), got {spectra.shape}.")
     n_samples, n_genes, n_bins = spectra.shape
@@ -865,9 +891,6 @@ def _estimate_glm_null_covariance(
     # Resolve the design matrix and contrast vector.
     design_matrix, design_columns = _build_design_matrix(design, n_samples)
     contrast_vector = _resolve_contrast(contrast, design_columns)
-
-    if normalize_shape:
-        spectra = _normalize_shape_apply(spectra)
 
     n_terms = design_matrix.shape[1]
     if contrast_vector.shape != (n_terms,):
@@ -884,24 +907,24 @@ def _estimate_glm_null_covariance(
             f"(rank={rank}, n_terms={n_terms})."
         )
 
-    # Compute the OLS fit for each gene.
-    log_spectra = np.log(np.maximum(spectra, 1e-12))
-    response = log_spectra.reshape(n_samples, n_genes * n_bins)
-    beta_flat, residual_flat, theta_flat = _fit_glm_response(
-        response, design_matrix, design_inverse, contrast_vector, rank
-    )
-    beta = beta_flat.reshape(n_terms, n_genes, n_bins)
-    theta = theta_flat.reshape(n_genes, n_bins)
-
-    # Compute the pooled residual covariance
-    residual_2d = residual_flat.reshape(n_samples * n_genes, n_bins)
-    sigma_log = (residual_2d.T @ residual_2d) / (n_genes * df_resid)
+    weights = _resolve_freq_weights(freq_weights, n_bins)
+    observed = np.empty(n_genes)
+    beta = np.empty((n_terms, n_genes, n_bins))
+    sigma_log = np.zeros((n_bins, n_bins))
+    for block in _comparison_blocks(n_samples, n_genes, n_bins, n_terms):
+        response = _log_spectra_block(spectra[:, block], normalize_shape).reshape(n_samples, -1)
+        beta_block, residuals, theta = _fit_glm_response(
+            response, design_matrix, design_inverse, contrast_vector, rank
+        )
+        beta[:, block] = beta_block.reshape(n_terms, -1, n_bins)
+        observed[block] = np.sqrt(np.sum(weights * theta.reshape(-1, n_bins) ** 2, axis=-1))
+        residuals = residuals.reshape(-1, n_bins)
+        sigma_log += residuals.T @ residuals
+    sigma_log /= n_genes * df_resid
     _maybe_warn_small_df_analytic(df_resid)
 
     # Compute the weighted log-L2 statistic, contrast scale, and eigenvalues.
     contrast_scale = float(np.sum((contrast_vector @ design_inverse) ** 2))
-    weights = _resolve_freq_weights(freq_weights, n_bins)
-    observed = np.sqrt(np.sum(weights * theta**2, axis=-1))
     sqrt_weights = np.sqrt(weights)
     weighted_cov = sqrt_weights[:, None] * sigma_log * sqrt_weights[None, :]
     weighted_cov_eigenvalues = np.maximum(np.linalg.eigvalsh(weighted_cov), 0.0)
@@ -945,7 +968,7 @@ def _estimate_glm_masked_null_covariance(  # noqa: C901
     """
     if int(min_resid_df) < 1:
         raise ValueError(f"min_resid_df must be >= 1, got {min_resid_df}.")
-    spectra = np.asarray(spectra, dtype=np.float64)
+    spectra = np.asarray(spectra)
     if spectra.ndim != 3:
         raise ValueError(f"spectra must be 3D (n_samples, n_genes, n_bins), got {spectra.shape}.")
     n_samples, n_genes, n_bins = spectra.shape
@@ -960,15 +983,11 @@ def _estimate_glm_masked_null_covariance(  # noqa: C901
     design_matrix, design_columns = _build_design_matrix(design, n_samples)
     contrast_vector = _resolve_contrast(contrast, design_columns)
 
-    if normalize_shape:
-        spectra = _normalize_shape_apply(spectra)
-
     n_terms = design_matrix.shape[1]
     if contrast_vector.shape != (n_terms,):
         raise ValueError(f"contrast length {contrast_vector.shape} != design cols ({n_terms},).")
 
     # Compute the OLS fit for each gene and estimate the pooled residual covariance.
-    log_spectra = np.log(np.maximum(spectra, 1e-12))
     weights = _resolve_freq_weights(freq_weights, n_bins)
     sqrt_weights = np.sqrt(weights)
     n_obs = np.zeros(n_genes, dtype=int)
@@ -980,16 +999,16 @@ def _estimate_glm_masked_null_covariance(  # noqa: C901
     sigma_acc = np.zeros((n_bins, n_bins), dtype=float)
     pooled_df = 0
 
-    for gene_idx in range(n_genes):
-        sample_mask = np.asarray(presence[:, gene_idx], dtype=bool)
-        n_obs[gene_idx] = int(sample_mask.sum())
-        if n_obs[gene_idx] == 0:
+    for sample_mask, genes in _presence_groups(presence):
+        count = int(sample_mask.sum())
+        n_obs[genes] = count
+        if count == 0:
             continue
 
         gene_design = design_matrix[sample_mask]
         design_inverse, rank_gene, estimable = _decompose_glm_design(gene_design, contrast_vector)
-        df_gene = n_obs[gene_idx] - rank_gene
-        df_resid[gene_idx] = df_gene
+        df_gene = count - rank_gene
+        df_resid[genes] = df_gene
         if df_gene < int(min_resid_df):
             continue
         if not estimable:
@@ -999,19 +1018,20 @@ def _estimate_glm_masked_null_covariance(  # noqa: C901
         if not np.isfinite(scale) or scale <= 0.0:
             continue
 
-        # Compute the OLS fit and the test statistic.
-        gene_response = log_spectra[sample_mask, gene_idx, :]
-        gene_beta, residuals, theta = _fit_glm_response(
-            gene_response, gene_design, design_inverse, contrast_vector, rank_gene
-        )
-        observed[gene_idx] = float(np.sqrt(np.sum(weights * theta**2)))
-        beta[:, gene_idx, :] = gene_beta
-
-        # Compute the residuals and accumulate the pooled covariance.
-        sigma_acc += residuals.T @ residuals
-        pooled_df += df_gene
-        contrast_scale[gene_idx] = scale
-        eligible[gene_idx] = True
+        rows = np.flatnonzero(sample_mask)
+        for block in _comparison_blocks(count, len(genes), n_bins, n_terms):
+            cols = genes[block]
+            response = _log_spectra_block(spectra[rows[:, None], cols], normalize_shape)
+            gene_beta, residuals, theta = _fit_glm_response(
+                response.reshape(count, -1), gene_design, design_inverse, contrast_vector, rank_gene
+            )
+            observed[cols] = np.sqrt(np.sum(weights * theta.reshape(-1, n_bins) ** 2, axis=-1))
+            beta[:, cols] = gene_beta.reshape(n_terms, -1, n_bins)
+            residuals = residuals.reshape(-1, n_bins)
+            sigma_acc += residuals.T @ residuals
+        pooled_df += df_gene * len(genes)
+        contrast_scale[genes] = scale
+        eligible[genes] = True
 
     if pooled_df == 0:
         raise ValueError(
@@ -1163,7 +1183,7 @@ def compare_two_groups(  # noqa: C901
         )
     if null not in _NULL_OPTIONS:
         raise ValueError(f"Unknown null='{null}'. Options: {list(_NULL_OPTIONS)}.")
-    spectra = np.asarray(spectra, dtype=np.float64)
+    spectra = np.asarray(spectra)
     if spectra.ndim != 3:
         raise ValueError(f"spectra must be 3D (n_samples, n_genes, n_bins), got {spectra.shape}.")
     n_samples, n_genes, _ = spectra.shape
@@ -1175,6 +1195,8 @@ def compare_two_groups(  # noqa: C901
         raise ValueError(f"groups must contain exactly two distinct values, got {uniq}.")
     group_codes = (groups == uniq[1]).astype(int)  # 0 = first label sorted, 1 = second
 
+    if statistic != "log_l2" or null != "analytic":
+        spectra = np.asarray(spectra, dtype=np.float64)
     rng = np.random.default_rng(random_state)  # ignored if using analytic null
 
     # Run per-bin t tests and combine into a single gene-level statistic
@@ -1318,7 +1340,7 @@ def compare_two_groups_masked(  # noqa: C901
         )
     if null not in _NULL_OPTIONS:
         raise ValueError(f"Unknown null='{null}'. Options: {list(_NULL_OPTIONS)}.")
-    spectra = np.asarray(spectra, dtype=np.float64)
+    spectra = np.asarray(spectra)
     if spectra.ndim != 3:
         raise ValueError(f"spectra must be 3D, got {spectra.shape}.")
     n_samples, n_genes, _ = spectra.shape
@@ -1333,6 +1355,8 @@ def compare_two_groups_masked(  # noqa: C901
         raise ValueError("groups must contain exactly two distinct values.")
     group_codes = (groups == uniq[1]).astype(int)
 
+    if statistic != "log_l2" or null != "analytic":
+        spectra = np.asarray(spectra, dtype=np.float64)
     rng = np.random.default_rng(random_state)  # ignored if using analytic null
 
     if gene_names is None:

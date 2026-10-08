@@ -155,6 +155,8 @@ def _qstat_worker_fft(
     # Structural holes are NaN after rasterization. Mean-fill them so the
     # Q-test's subsequent centering maps missing bins to zero residuals.
     data_chunk = _mean_fill_missing(data_chunk, axis=(1, 2))
+    # Exact constants have no spatial signal, regardless of centering roundoff.
+    data_chunk[np.ptp(data_chunk, axis=(1, 2)) == 0] = 0.0
     # Transpose to (ny, nx, M) for kernel
     data_chunk_transposed = np.moveaxis(data_chunk, 0, -1)
 
@@ -602,6 +604,7 @@ class DetectorGrid(Detector):
         # Mean-fill structural holes first; after centering they become zero
         # residuals and the full FFT grid supplies the standardization scale.
         data = _mean_fill_missing(data, axis=(1, 2))
+        data[np.ptp(data, axis=(1, 2)) == 0] = 0.0
         means = np.mean(data, axis=(1, 2), keepdims=True)
         stds = np.std(data, axis=(1, 2), keepdims=True, ddof=1)
 

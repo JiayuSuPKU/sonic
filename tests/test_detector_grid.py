@@ -503,6 +503,49 @@ class TestDetectorGridStatistic(unittest.TestCase):
         np.testing.assert_allclose(missing_embeddings, filled_embeddings, rtol=1e-10, atol=1e-12)
 
 
+@pytest.mark.parametrize("dtype", [np.float32, np.float64])
+@pytest.mark.parametrize("solver", ["fft2", "rfft2"])
+@pytest.mark.parametrize("masked", [False, True])
+def test_constant_grid_features_have_no_q_or_r_signal(dtype, solver, masked, monkeypatch):
+    monkeypatch.setattr("gc.collect", lambda: None)
+    yy, xx = np.indices((16, 16))
+    observed = (xx < 16 * 0.7) & (yy > 16 * 0.1) if masked else np.ones((16, 16), bool)
+    values = np.array(
+        [np.full((16, 16), c) for c in (3.3, 10000.1, 1e20)]
+        + [np.random.default_rng(71).normal(size=(16, 16))],
+        dtype=dtype,
+    )
+    values[:, ~observed] = np.nan
+    original = values.copy()
+    names = ["constant", "large", "huge", "signal"]
+    raster = MockDataArray(values, names)
+    sdata = MockSpatialData("cells", MockTable(np.ones((observed.sum(), 4)), names))
+    with patch("sonic._rasterize.rasterize_table", return_value=raster):
+        detector = DetectorGrid(kernel_method="car", fft_solver=solver).setup_data(
+            sdata, bins="bins", table_name="cells", col_key="col", row_key="row"
+        )
+
+    for return_pval in (True, False):
+        q = detector.compute_qstat(
+            n_jobs=1, workers=1, chunk_size=2, return_pval=return_pval, show_progress=False
+        ).loc[names[:3]]
+        np.testing.assert_array_equal(q[["Q", "Z_score"]], 0.0)
+        r = detector.compute_rstat(
+            names[:3],
+            ["signal"],
+            workers=1,
+            chunk_size=2,
+            return_pval=return_pval,
+            show_progress=False,
+        )
+        np.testing.assert_array_equal(r.R, 0.0)
+        if return_pval:
+            np.testing.assert_array_equal(q[["P_value", "P_adj"]], 1.0)
+            np.testing.assert_array_equal(r[["P_value", "P_adj"]], 1.0)
+            np.testing.assert_array_equal(r.Z_score, 0.0)
+    np.testing.assert_array_equal(values, original)
+
+
 @pytest.mark.parametrize("shape", [(8, 8), (7, 9)])
 @pytest.mark.parametrize("solver", ["fft2", "rfft2"])
 @pytest.mark.parametrize("method", ["gaussian", "matern", "car", "graph_laplacian", "moran"])

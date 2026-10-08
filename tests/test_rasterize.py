@@ -39,6 +39,24 @@ class _FakeSData:
 
 
 class TestMeanFillMissing:
+    @pytest.mark.parametrize("dtype", [np.float32, np.float64])
+    def test_preserves_constant_features_and_missing_features(self, dtype):
+        yy, xx = np.indices((16, 16))
+        observed = (xx < 16 * 0.7) & (yy > 16 * 0.1)
+        values = np.full((3, 16, 16), 3.3, dtype=dtype)
+        values[1] = np.arange(256).reshape(16, 16)
+        values[:, ~observed] = np.nan
+        values[2] = np.nan
+        original = values.copy()
+
+        out = _mean_fill_missing(values, axis=(1, 2))
+
+        assert out.dtype == np.float64
+        np.testing.assert_array_equal(out[0], float(dtype(3.3)))
+        np.testing.assert_array_equal(out[:, observed], original[:, observed])
+        np.testing.assert_allclose(out[1, ~observed], original[1, observed].mean(dtype=float))
+        assert np.isnan(out[2]).all()
+
     def test_fills_in_place_with_each_feature_mean(self):
         values = np.array(
             [

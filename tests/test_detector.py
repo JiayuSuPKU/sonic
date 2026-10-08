@@ -60,6 +60,28 @@ def test_incoming_edges_do_not_make_a_node_isolated():
     np.testing.assert_array_equal(data.obsp["graph"].toarray(), graph.toarray())
 
 
+@pytest.mark.parametrize("method", ["moran", "graph_laplacian", "car"])
+@pytest.mark.parametrize("fraction, cutoff", [(0.13, 6), (0.001, 1), (None, 10)])
+def test_gene_support_uses_cells_retained_by_graph(method, fraction, cutoff):
+    values = np.zeros((100, 2))
+    values[:6, 0] = 1.0
+    values[:50, 1] = np.arange(1, 51)
+    data = anndata.AnnData(values)
+    data.var_names = ["sparse", "dense"]
+    data.obsp["graph"] = sp.csr_matrix(
+        (np.ones(49), (np.arange(49), np.arange(1, 50))), shape=(100, 100)
+    )
+    detector = DetectorIrregular(kernel_method=method).setup_data(
+        data, obsp_key="graph", min_cells=10, min_cells_frac=fraction
+    )
+    assert detector.n == 50
+    assert detector.min_cells == cutoff
+    result = detector.compute_qstat(n_jobs=1, show_progress=False)
+    assert set(result.index) == ({"sparse", "dense"} if cutoff <= 6 else {"dense"})
+    assert data.n_obs == 100
+    np.testing.assert_array_equal(data.X, values)
+
+
 @pytest.mark.parametrize("backend", ["matrix", "nufft"])
 def test_categorical_metadata_q_and_r_match_explicit_indicators(backend):
     rng = np.random.default_rng(21)

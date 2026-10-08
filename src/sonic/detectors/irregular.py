@@ -443,7 +443,8 @@ class DetectorIrregular(Detector):
             tested. Clamped to ``[1, n_obs]``.
         min_cells_frac : float, optional
             If provided, overrides ``min_cells`` with
-            ``max(1, int(min_cells_frac * n_obs))``.
+            ``max(1, int(min_cells_frac * n_obs))``, using the cells retained
+            after removing isolated nodes from a connectivity matrix.
 
         Returns
         -------
@@ -451,10 +452,6 @@ class DetectorIrregular(Detector):
         """
         self.adata = adata
         self.n = adata.shape[0]
-        if min_cells_frac is not None:
-            self.min_cells = max(1, int(min_cells_frac * self.n))
-        else:
-            self.min_cells = min(min_cells, self.n)
 
         if obsp_key is not None:
             if self.backend_ == "nufft":
@@ -467,6 +464,11 @@ class DetectorIrregular(Detector):
             )
         else:
             self._build_kernel_from_obsm(obsm_key=obsm_key)
+
+        if min_cells_frac is not None:
+            self.min_cells = max(1, int(min_cells_frac * self.n))
+        else:
+            self.min_cells = min(min_cells, self.n)
 
         self._data_ready = True
         return self
@@ -616,7 +618,6 @@ class DetectorIrregular(Detector):
                 W = W[keep_mask][:, keep_mask]
                 self.adata = self.adata[keep_mask].copy()
                 self.n = W.shape[0]
-                self.min_cells = min(self.min_cells, self.n)
 
             # Symmetric normalization after removing truly isolated nodes.
             row_sums = np.array(W.sum(axis=1)).flatten()

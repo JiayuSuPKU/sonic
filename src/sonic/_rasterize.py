@@ -27,15 +27,20 @@ __all__ = ["ensure_csc_table", "rasterize_table"]
 
 
 def _mean_fill_missing(values: np.ndarray, axis: tuple[int, ...]) -> np.ndarray:
-    """Mean-fill ``NaN`` bins in place so centering makes their residuals zero."""
+    """Mean-fill ``NaN`` bins in float64, reusing float64 inputs in place."""
+    values = np.asarray(values, dtype=np.float64)
     missing = np.isnan(values)
     if not missing.any():
         return values
+    # Detect constants before filling: even float64 summation can perturb them.
+    minimum = np.fmin.reduce(values, axis=axis, keepdims=True)
+    constant = minimum == np.fmax.reduce(values, axis=axis, keepdims=True)
     n_observed = np.prod([values.shape[i] for i in axis]) - missing.sum(axis=axis, keepdims=True)
     np.copyto(values, 0.0, where=missing)
     sums = values.sum(axis=axis, keepdims=True)
     means = np.full_like(sums, np.nan)
     np.divide(sums, n_observed, out=means, where=n_observed > 0)
+    np.copyto(means, minimum, where=constant)
     np.copyto(values, means, where=missing)
     return values
 

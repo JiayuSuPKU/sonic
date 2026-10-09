@@ -28,7 +28,7 @@ jobs:
             *) echo "Release tag must start with v"; exit 1 ;;
           esac
           sed -i -E \
-            "s#^dependencies = \[\"sonic-spatial[^\"]*\"\]$#dependencies = [\"sonic-spatial==${version}\"]#" \
+            "s#^dependencies = \[\"sonic-spatial[^\"]*\"\]\$#dependencies = [\"sonic-spatial==${version}\"]#" \
             compat/quadsv/pyproject.toml
           grep -Fqx \
             "dependencies = [\"sonic-spatial==${version}\"]" \

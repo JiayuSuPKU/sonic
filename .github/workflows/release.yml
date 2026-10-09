@@ -35,7 +35,11 @@ jobs:
             compat/quadsv/pyproject.toml
           echo "version=$version" >> "$GITHUB_OUTPUT"
       - run: python -m build
+        env:
+          SETUPTOOLS_SCM_PRETEND_VERSION: ${{ steps.release.outputs.version }}
       - run: python -m build compat/quadsv --outdir compat-dist
+        env:
+          SETUPTOOLS_SCM_PRETEND_VERSION: ${{ steps.release.outputs.version }}
       - run: python -m twine check dist/* compat-dist/*
       - name: Verify release version and wheel ownership
         env:

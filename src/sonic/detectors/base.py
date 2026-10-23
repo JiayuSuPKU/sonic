@@ -62,8 +62,7 @@ class Detector(ABC):
     def __init__(self, kernel_method: str, **kernel_params: Any) -> None:
         if kernel_method not in self._available_kernels:
             raise ValueError(
-                f"kernel_method must be one of {self._available_kernels}, "
-                f"got {kernel_method!r}."
+                f"kernel_method must be one of {self._available_kernels}, got {kernel_method!r}."
             )
         self.kernel_method_: str = kernel_method
         self.kernel_params_: dict = self._merge_kernel_defaults(kernel_method, dict(kernel_params))

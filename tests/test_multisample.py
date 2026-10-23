@@ -160,9 +160,9 @@ class TestLogL2AnalyticNull:
         for g in ("0", "1", "2", "3", "4"):
             p_perm = df_perm.loc[df_perm["Feature"] == g, "P_value"].iloc[0]
             p_analytic = df_analytic.loc[df_analytic["Feature"] == g, "P_value"].iloc[0]
-            assert (
-                p_analytic < p_perm
-            ), f"gene {g}: analytic={p_analytic:.3g} not < perm={p_perm:.3g}"
+            assert p_analytic < p_perm, (
+                f"gene {g}: analytic={p_analytic:.3g} not < perm={p_perm:.3g}"
+            )
             assert p_analytic < 1.0 / 71.0, f"gene {g}: analytic={p_analytic:.3g} above perm floor"
 
     def test_analytic_argument_is_ignored_for_welch_t_cauchy(self):
@@ -213,12 +213,12 @@ class TestLogL2AnalyticNull:
         df = compare_two_groups(spectra, groups, statistic="log_l2", null="analytic")
         ks_p = kstest(df["P_value"].to_numpy(), "uniform")[1]
         fpr05 = (df["P_value"] < 0.05).mean()
-        assert (
-            fpr05 < 0.10
-        ), f"Full-Sigma analytic p-values should be near-calibrated; got Pr(p<.05)={fpr05:.3f}"
-        assert (
-            ks_p > 1e-3 or fpr05 < 0.07
-        ), f"Full-Sigma analytic p-values should be roughly uniform; KS_p={ks_p:.3g} fpr05={fpr05:.3f}"
+        assert fpr05 < 0.10, (
+            f"Full-Sigma analytic p-values should be near-calibrated; got Pr(p<.05)={fpr05:.3f}"
+        )
+        assert ks_p > 1e-3 or fpr05 < 0.07, (
+            f"Full-Sigma analytic p-values should be roughly uniform; KS_p={ks_p:.3g} fpr05={fpr05:.3f}"
+        )
 
     def test_masked_analytic_parity_with_unmasked_when_complete(self):
         """All-present masks should match the unmasked analytic path."""
@@ -270,9 +270,9 @@ class TestLogL2AnalyticNull:
         fpr_m = (df_m.loc[valid, "P_value"] < 0.05).mean()
 
         assert 0.0 < fpr_m < 0.20, f"masked FPR={fpr_m:.3f} far from nominal"
-        assert (
-            0.5 * fpr_full < fpr_m < 2.0 * fpr_full + 0.02
-        ), f"masked vs unmasked FPR mismatch: masked={fpr_m:.3f} unmasked={fpr_full:.3f}"
+        assert 0.5 * fpr_full < fpr_m < 2.0 * fpr_full + 0.02, (
+            f"masked vs unmasked FPR mismatch: masked={fpr_m:.3f} unmasked={fpr_full:.3f}"
+        )
 
     def test_masked_analytic_skips_genes_with_insufficient_presence(self):
         """Genes below per-group presence thresholds should report NaN p-values."""

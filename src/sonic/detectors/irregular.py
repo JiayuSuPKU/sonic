@@ -489,8 +489,7 @@ class DetectorIrregular(Detector):
         """
         if obsm_key not in self.adata.obsm:
             raise KeyError(
-                f"adata.obsm has no key '{obsm_key}'; "
-                f"available: {list(self.adata.obsm.keys())}."
+                f"adata.obsm has no key '{obsm_key}'; available: {list(self.adata.obsm.keys())}."
             )
         coords = np.asarray(self.adata.obsm[obsm_key], dtype=np.float64)
         if coords.ndim != 2 or coords.shape[1] != 2:
@@ -875,7 +874,9 @@ class DetectorIrregular(Detector):
         n_features = (
             len(features)
             if features is not None
-            else self.adata.n_vars if source == "var" else len(self.adata.obs.columns)
+            else self.adata.n_vars
+            if source == "var"
+            else len(self.adata.obs.columns)
         )
         n_batches = max(1, (n_features + chunk_size - 1) // chunk_size)
         n_jobs, n_workers = resolve_parallelism(

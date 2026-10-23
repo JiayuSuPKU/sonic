@@ -147,6 +147,13 @@ pip install -e ".[dev,docs]"
 pytest -q
 ```
 
+We use Ruff for linting and formatting, with a 100-character line limit.
+
+```bash
+ruff check src tests compat/quadsv/src
+ruff format --check src tests compat/quadsv/src
+```
+
 See the [installation guide](https://sonic-spatial.readthedocs.io/en/latest/guides/installation.html)
 for environment troubleshooting.
 

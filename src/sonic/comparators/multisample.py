@@ -516,11 +516,11 @@ def _build_design_matrix(
 
     if not isinstance(design, pd.DataFrame):
         raise TypeError(
-            f"design must be a numpy ndarray or pandas DataFrame, " f"got {type(design).__name__}."
+            f"design must be a numpy ndarray or pandas DataFrame, got {type(design).__name__}."
         )
     if len(design) != n_samples:
         raise ValueError(
-            f"design DataFrame length {len(design)} does not match " f"n_samples={n_samples}."
+            f"design DataFrame length {len(design)} does not match n_samples={n_samples}."
         )
     try:
         import patsy
@@ -578,7 +578,7 @@ def _resolve_contrast(
             matches = [col for col in design_columns if col.startswith(contrast + "[T.")]
             if not matches:
                 raise ValueError(
-                    f"Contrast '{contrast}' not found in design columns " f"{list(design_columns)}."
+                    f"Contrast '{contrast}' not found in design columns {list(design_columns)}."
                 )
             if len(matches) > 1:
                 raise ValueError(
@@ -595,7 +595,7 @@ def _resolve_contrast(
         for k, v in contrast.items():
             if k not in design_columns:
                 raise ValueError(
-                    f"Contrast key '{k}' not in design columns " f"{list(design_columns)}."
+                    f"Contrast key '{k}' not in design columns {list(design_columns)}."
                 )
             contrast_vector[list(design_columns).index(k)] = float(v)
         return contrast_vector
@@ -791,8 +791,7 @@ def _estimate_two_group_masked_null_covariance(  # noqa: C901
     presence = np.asarray(presence, dtype=bool)
     if presence.shape != (n_samples, n_genes):
         raise ValueError(
-            f"presence shape {presence.shape} != (n_samples, n_genes) = "
-            f"({n_samples}, {n_genes})."
+            f"presence shape {presence.shape} != (n_samples, n_genes) = ({n_samples}, {n_genes})."
         )
     groups = np.asarray(groups)
     if groups.shape != (n_samples,):
@@ -975,8 +974,7 @@ def _estimate_glm_masked_null_covariance(  # noqa: C901
     presence = np.asarray(presence, dtype=bool)
     if presence.shape != (n_samples, n_genes):
         raise ValueError(
-            f"presence shape {presence.shape} != (n_samples, n_genes) = "
-            f"({n_samples}, {n_genes})."
+            f"presence shape {presence.shape} != (n_samples, n_genes) = ({n_samples}, {n_genes})."
         )
 
     # Resolve the design matrix and contrast vector.
@@ -1240,7 +1238,7 @@ def compare_two_groups(  # noqa: C901
     )
     if is_exact:
         logger.info(
-            "Exact permutation test: enumerated %d distinct relabellings " "(C(%d, %d)).",
+            "Exact permutation test: enumerated %d distinct relabellings (C(%d, %d)).",
             perm_labels.shape[0],
             n_samples,
             int((group_codes == 0).sum()),
@@ -1346,8 +1344,7 @@ def compare_two_groups_masked(  # noqa: C901
     n_samples, n_genes, _ = spectra.shape
     if presence.shape != (n_samples, n_genes):
         raise ValueError(
-            f"presence shape {presence.shape} != (n_samples, n_genes) = "
-            f"({n_samples}, {n_genes})."
+            f"presence shape {presence.shape} != (n_samples, n_genes) = ({n_samples}, {n_genes})."
         )
     groups = np.asarray(groups)
     uniq = np.unique(groups)

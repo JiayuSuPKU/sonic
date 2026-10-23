@@ -230,8 +230,7 @@ class ComparatorIrregular(_ComparatorBase):
         for i, ad_s in enumerate(samples_list):
             if obsm_key not in ad_s.obsm:
                 raise KeyError(
-                    f"sample {i} has no obsm['{obsm_key}']; "
-                    f"available: {list(ad_s.obsm.keys())}."
+                    f"sample {i} has no obsm['{obsm_key}']; available: {list(ad_s.obsm.keys())}."
                 )
             c = np.asarray(ad_s.obsm[obsm_key], dtype=np.float64)
             if c.ndim != 2 or c.shape[1] != 2:

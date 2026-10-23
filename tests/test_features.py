@@ -473,7 +473,7 @@ class TestRotationAlignment:
         unrot_dist = np.linalg.norm(sp_cur_tgt - sp_ref_tgt)
         rot_dist = np.linalg.norm(rotated[1] - sp_ref_tgt)
         assert rot_dist < 0.95 * unrot_dist, (
-            f"rotation failed to reduce distance: unrot={unrot_dist:.2g} " f"rot={rot_dist:.2g}"
+            f"rotation failed to reduce distance: unrot={unrot_dist:.2g} rot={rot_dist:.2g}"
         )
 
 

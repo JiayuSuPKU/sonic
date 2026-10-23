@@ -118,7 +118,7 @@ def Detector(data: Any, **kwargs: Any) -> Any:  # noqa: N802 - factory mimics cl
     if _is_spatialdata(data):
         return DetectorGrid(**kwargs)
     raise TypeError(
-        f"Detector cannot dispatch on type {type(data).__name__!r}; " f"{_supported_types_msg()}."
+        f"Detector cannot dispatch on type {type(data).__name__!r}; {_supported_types_msg()}."
     )
 
 
@@ -168,7 +168,7 @@ def Comparator(  # noqa: N802 - factory mimics class names
     items = list(data_list)
     if len(items) == 0:
         raise TypeError(
-            f"Comparator requires a non-empty list of samples; " f"{_supported_types_msg()}."
+            f"Comparator requires a non-empty list of samples; {_supported_types_msg()}."
         )
     all_anndata = all(_is_anndata(x) for x in items)
     all_spatialdata = all(_is_spatialdata(x) for x in items)

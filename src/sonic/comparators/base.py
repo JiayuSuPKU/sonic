@@ -565,7 +565,7 @@ class _ComparatorBase:
         dropped = int((~supported_bins).sum())
         if dropped:
             logger.info(
-                "Dropped %d radial bins with missing sample support " "(retained=%d).",
+                "Dropped %d radial bins with missing sample support (retained=%d).",
                 dropped,
                 int(supported_bins.sum()),
             )
@@ -1365,7 +1365,7 @@ def _validate_design(  # noqa: C901 — dispatch over three input shapes is esse
     if isinstance(design, np.ndarray):
         if design.ndim != 2 or design.shape[0] != n_samples:
             raise ValueError(
-                f"design ndarray must be (n_samples, p) = ({n_samples}, p), " f"got {design.shape}."
+                f"design ndarray must be (n_samples, p) = ({n_samples}, p), got {design.shape}."
             )
         return None, design
     raise TypeError(

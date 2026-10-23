@@ -115,9 +115,9 @@ class TestNormalizationPrimitives:
         for fn in (normalize_background, normalize_covariates, normalize_shape):
             sig = inspect.signature(fn)
             assert "eps" in sig.parameters, f"{fn.__name__} missing eps kwarg"
-            assert (
-                sig.parameters["eps"].default == 1e-12
-            ), f"{fn.__name__} eps default differs from 1e-12"
+            assert sig.parameters["eps"].default == 1e-12, (
+                f"{fn.__name__} eps default differs from 1e-12"
+            )
 
     def test_covariates_output_strictly_positive(self):
         rng = np.random.default_rng(0)

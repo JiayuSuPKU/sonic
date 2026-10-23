@@ -283,6 +283,35 @@ def power_spectrum_2d_nufft(
     >>> P.shape
     (32, 32)
     """
+    coefficients = _fourier_coefficients_2d_nufft(
+        coords,
+        values,
+        grid_shape,
+        spacing,
+        unit_scale,
+        eps,
+        center_coords,
+        nthreads,
+        frequency_padding,
+    )
+    power = np.abs(coefficients)
+    del coefficients
+    np.square(power, out=power)
+    return power
+
+
+def _fourier_coefficients_2d_nufft(
+    coords: np.ndarray,
+    values: np.ndarray,
+    grid_shape: tuple[int, int],
+    spacing: tuple[float, float],
+    unit_scale: float = 1.0,
+    eps: float = 1e-6,
+    center_coords: bool = True,
+    nthreads: int = 1,
+    frequency_padding: int = 0,
+) -> np.ndarray:
+    """Unnormalized complex NUFFT in ``(ny, nx[, M])`` native FFT order."""
     if nthreads < 1 or int(nthreads) != nthreads:
         raise ValueError("nthreads must be a positive integer.")
     nthreads = int(nthreads)
@@ -335,14 +364,10 @@ def power_spectrum_2d_nufft(
         nthreads=nthreads,
     )
 
-    power = np.abs(f_hat)
-    del f_hat
-    np.square(power, out=power)
-
     if squeeze:
-        return power
+        return f_hat
     # Put the feature axis back at the end to match power_spectrum_2d(x=(ny, nx, M)).
-    return np.moveaxis(power, 0, -1)
+    return np.moveaxis(f_hat, 0, -1)
 
 
 # ---------------------------------------------------------------------------
@@ -1341,8 +1366,7 @@ def _r_test_nufft(
         Yn = Yn[:, None]
     if Xn.shape[0] != kernel.n or Yn.shape[0] != kernel.n:
         raise ValueError(
-            f"Xn, Yn first dim must equal kernel.n={kernel.n}; "
-            f"got {Xn.shape[0]}, {Yn.shape[0]}."
+            f"Xn, Yn first dim must equal kernel.n={kernel.n}; got {Xn.shape[0]}, {Yn.shape[0]}."
         )
 
     Xz = Xn if is_standardized else _standardize_features(Xn)

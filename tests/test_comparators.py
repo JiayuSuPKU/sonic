@@ -19,7 +19,7 @@ from geopandas import GeoDataFrame
 from spatialdata.models import ShapesModel, TableModel
 
 from sonic.comparators import ComparatorGrid, ComparatorIrregular
-from sonic.comparators.features import radial_bin_spectrum
+from sonic.comparators.binning import _bin_radial_spectrum
 from sonic.comparators.multisample import (
     compare_glm_masked,
     compare_glm_scalar,
@@ -434,7 +434,6 @@ class TestComparatorGridFeatures:
         assert 8 <= cmp._fft_chunk_size <= cmp._auto_chunk_cap
         assert cmp.rotation_angles_.shape == (2,)
         assert cmp.rotation_angles_[0] == pytest.approx(0.0)
-        assert cmp._raw_2d_spectra is None
         assert cmp.freq_edges_requested_.shape == (5,)
         assert cmp.frequency_bin_counts_.shape == (2, cmp.freq_edges_requested_.size - 1)
         assert cmp.frequency_bin_intervals_.shape[0] <= 4
@@ -512,7 +511,6 @@ class TestComparatorGridFeatures:
             spacing=spacings,
             fft_chunk_size=1,
         ).compute_spectra(n_jobs=1, landmark_genes=["g0"], progress=False)
-        cmp._raw_2d_spectra = [np.asarray([i]) for i in range(len(cmp.samples))]
 
         sub = cmp.subset([2, 0])
 
@@ -528,7 +526,6 @@ class TestComparatorGridFeatures:
         np.testing.assert_array_equal(sub.rotation_angles_, cmp.rotation_angles_[[2, 0]])
         assert sub._grid_shapes == [(8, 8), (8, 8)]
         assert sub._spacings == [spacings[2], spacings[0]]
-        assert [int(x[0]) for x in sub._raw_2d_spectra] == [2, 0]
 
         mask_sub = cmp.subset(np.array([False, True, True]))
         np.testing.assert_array_equal(mask_sub.spectra_, cmp.spectra_[[1, 2]])
@@ -596,7 +593,7 @@ class TestComparatorIrregularFeatures:
             adaptive_freq_edges=False,
         ).compute_spectra(n_jobs=1, progress=False)
 
-        raw_small = radial_bin_spectrum(
+        raw_small = _bin_radial_spectrum(
             np.ones((2, 9, 9), dtype=float),
             grid_shape=(9, 9),
             n_bins=8,
@@ -691,7 +688,6 @@ class TestComparatorIrregularFeatures:
         assert cmp._spacings == spacings
         assert cmp._n_theta_bins == 6
         assert 8 <= cmp._nufft_chunk_size <= cmp._auto_chunk_cap
-        assert cmp._raw_2d_spectra is None
         assert cmp.rotation_angles_.shape == (3,)
         assert cmp.rotation_angles_[0] == pytest.approx(0.0)
         assert cmp.spectra_.shape == (3, 3, 4 * 6)
@@ -1627,8 +1623,6 @@ def test_2d_alignment_respects_physical_spacing(backend, monkeypatch):
 
 @pytest.mark.parametrize("landmarks", [None, ["g0"]])
 def test_nufft_2d_genes_and_covariates_use_evaluated_frequency_border(landmarks):
-    from scipy.ndimage import map_coordinates
-
     rng = np.random.default_rng(37)
     coords = rng.uniform(0, 8, (41, 2))
     values = rng.lognormal(size=(41, 2))
@@ -1652,12 +1646,22 @@ def test_nufft_2d_genes_and_covariates_use_evaluated_frequency_border(landmarks)
     fy, fx = np.meshgrid(modes, modes, indexing="ij")
     transform = np.exp(-2j * np.pi * (fy[..., None] * coords[:, 0] + fx[..., None] * coords[:, 1]))
     exact = abs(transform @ (values - values.mean(axis=0))) ** 2 / len(coords) ** 2
-    radii = (edges[1:] + edges[:-1]) / 2
-    angles = np.linspace(0, np.pi, 36, endpoint=False)
-    points = np.array(
-        [5 + radii[:, None] * np.sin(angles) * 8, 5 + radii[:, None] * np.cos(angles) * 8]
+    from tests.test_features import _polar_area_reference
+
+    expected = np.stack(
+        [
+            _polar_area_reference(
+                np.fft.ifftshift(exact[..., i]),
+                (8, 8),
+                (1.0, 1.0),
+                edges,
+                36,
+                float(cmp.rotation_angles_[0]),
+                padded=True,
+            )
+            for i in range(2)
+        ]
     )
-    expected = np.stack([map_coordinates(exact[..., i], points, order=1).ravel() for i in range(2)])
     np.testing.assert_allclose(cmp.spectra_[0], expected, rtol=1e-9, atol=1e-12)
     covariates = cmp._covariate_features_from_keys(["cov"])
     np.testing.assert_allclose(covariates[0][0], expected[0], rtol=1e-9, atol=1e-12)
@@ -1675,3 +1679,50 @@ def test_covariate_normalization_failure_preserves_all_samples(monkeypatch):
         cmp.normalize_covariates(["cov_a"])
     np.testing.assert_array_equal(cmp.spectra_, original)
     assert cmp.spectra_.dtype == np.float32
+
+
+@pytest.mark.parametrize("backend", ["fft", "nufft"])
+def test_2d_schedule_uses_transform_workspace(backend, monkeypatch):
+    import os
+
+    monkeypatch.setattr(os, "cpu_count", lambda: 8)
+    names = ["a", "b", "c"]
+    shape = (12, 14)
+    values = [np.random.default_rng(i + 60).normal(size=(3, *shape)) for i in range(2)]
+    edges = np.linspace(0, 0.5, 5)
+    options = {
+        "feature_mode": "2d",
+        "spacing": (1, 1),
+        "freq_edges": edges,
+        "n_theta_bins": 4,
+        "workers": 1,
+    }
+    if backend == "fft":
+        comparator = ComparatorGrid(
+            _install_grid_rasters(monkeypatch, values, names),
+            bins="bins",
+            table_name="table",
+            col_key="col",
+            row_key="row",
+            **options,
+        )
+        per_feature = 64 * np.prod(shape)
+    else:
+        comparator = ComparatorIrregular(
+            _grid_samples_to_adata(values, names), grid_shape=shape, eps=1e-12, **options
+        )
+        per_feature = 64 * (np.prod(np.asarray(shape) + 2) + np.prod(shape))
+    budget = int(4 * per_feature)
+    comparator.compute_spectra(n_jobs=2, progress=False, memory_budget_bytes=budget)
+    parallel = comparator.spectra_.copy()
+    assert getattr(comparator, f"_{backend}_chunk_size") == 2
+    comparator.compute_spectra(n_jobs=1, progress=False, memory_budget_bytes=budget)
+    np.testing.assert_allclose(comparator.spectra_, parallel, atol=1e-10)
+    assert getattr(comparator, f"_{backend}_chunk_size") > 2
+    comparator.compute_spectra(n_jobs=-1, progress=False, memory_budget_bytes=int(per_feature))
+    np.testing.assert_allclose(comparator.spectra_, parallel, atol=1e-10)
+    assert getattr(comparator, f"_{backend}_chunk_size") == 1
+    with pytest.raises(ValueError, match="cannot fit one feature"):
+        comparator.compute_spectra(
+            n_jobs=2, progress=False, memory_budget_bytes=int(2 * per_feature - 1)
+        )

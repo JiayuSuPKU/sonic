@@ -22,17 +22,9 @@ import spatialdata as sd
 from sonic._rasterize import _mean_fill_missing
 from sonic.comparators.base import (
     _ComparatorBase,
-    _run_per_sample,
-    _unpack_sample_quads,
     _validate_common,
 )
-from sonic.comparators.features import (
-    compute_sample_spectrum,
-    estimate_rotations_from_landmarks,
-    stream_geomean_landmark,
-    stream_polar_features,
-    stream_radial_features,
-)
+from sonic.comparators.features import compute_sample_spectrum
 
 __all__ = ["ComparatorGrid"]
 
@@ -105,6 +97,7 @@ class ComparatorGrid(_ComparatorBase):
         If None, inferred from the first sample's table. All samples must
         share ``var_names``.
     feature_mode : {'radial', '2d'}, default 'radial'
+        2D features are adaptive, area-weighted radial/angular band means.
     n_radial_bins : int, default 30
         Number of radial frequency intervals used when ``freq_edges`` is not
         supplied. Radial mode excludes only the DC cell from the first interval,
@@ -280,265 +273,28 @@ class ComparatorGrid(_ComparatorBase):
         """
         return np.asarray(img.sel(c=list(names)).values, dtype=np.float64)
 
-    def _sample_spectrum_chunker(self, i: int):
-        """Build a ``(spectrum_chunk_fn, n_genes, (ny, nx))`` for one sample.
-
-        ``spectrum_chunk_fn(start, stop)`` materialises just that gene-batch of
-        the lazy raster (by name, in :attr:`gene_names` order), mean-centres +
-        FFTs it, and returns the ``(stop-start, ny, n_kx)`` power spectrum.
-        Callers pass it to the streaming reducers, so the dense raster is never
-        held.
-        """
+    def _sample_spectrum_chunker(self, i: int, *, gene_indices=None):
+        """Stream selected genes' powers and collect their DC/presence in the same pass."""
         img = self._rasterize_one(self.samples[i])
-        _, ny, nx = img.shape
-        n_genes = len(self.gene_names)
+        names = (
+            self.gene_names if gene_indices is None else [self.gene_names[j] for j in gene_indices]
+        )
+        n_genes = len(names)
+        dc = np.empty(n_genes, dtype=float)
+        presence = np.empty(n_genes, dtype=bool)
 
         def _spec_chunk(start: int, stop: int) -> np.ndarray:
-            block = self._batch_raster(img, self.gene_names[start:stop])
-            return _grid_spectrum(
+            block = self._batch_raster(img, names[start:stop])
+            presence[start:stop] = _observed_nonzero_fraction(block) >= self._presence_threshold
+            spectrum, dc[start:stop] = _grid_spectrum(
                 block,
                 fft_solver=self._spectrum_fft_solver,
                 workers=self._workers,
-                return_dc=False,
+                return_dc=True,
             )
+            return spectrum
 
-        return _spec_chunk, n_genes, (ny, nx)
-
-    def _compute_spectra(
-        self,
-        n_jobs: int,
-        progress: bool,
-        landmark_genes: Sequence[str] | None = None,
-    ) -> tuple[list[np.ndarray], np.ndarray, np.ndarray]:
-        """Per-sample features via lazy, gene-chunk-streamed rasterisation.
-
-        Radial mode streams rasterise → per-gene-chunk FFT → radial-bin. 2d mode
-        does a two-pass streamed rotation alignment (geomean or explicit-landmark
-        angle estimation, then rotate + physical-frequency polar resample per
-        chunk). The full ``(n_genes, ny, nx)`` raster / 2D spectra are never held
-        in either mode (see :meth:`_ComparatorBase._compute_spectra`).
-        """
-        # Resolve spacing and cheap raster shapes before defining/adapting the
-        # shared frequency edges; adaptive bin merging needs both.
-        n_samples = len(self.samples)
-        spacings = (
-            self._spacing_override
-            if self._spacing_override is not None
-            else [(1.0, 1.0)] * n_samples
-        )
-        self._spacings = list(spacings)
-        shapes = [tuple(self._rasterize_one(s).shape[-2:]) for s in self.samples]
-        self._grid_shapes = [(int(ny), int(nx)) for ny, nx in shapes]
-        self._resolve_freq_edges()
-
-        # Resolve 'auto' chunk size. The lazy rasters carry their (ny, nx) as
-        # cheap dask metadata, so we can scan shapes without materialising any
-        # pixels, then size the chunk to bound the per-chunk dense footprint.
-        n_jobs, self._fft_chunk_size = self._resolve_spectrum_schedule(
-            self._fft_chunk_size_spec, shapes, n_jobs=n_jobs
-        )
-        if self._fft_chunk_size_spec == "auto":
-            logger.info(
-                "auto fft_chunk_size=%d (max lattice %d px, cap %d, budget %.1f GiB).",
-                self._fft_chunk_size,
-                max((ny * nx for (ny, nx) in shapes), default=1),
-                self._auto_chunk_cap,
-                self._auto_chunk_budget_bytes / 1024**3,
-            )
-        if self.feature_mode == "radial":
-            return self._compute_spectra_radial(n_jobs, progress, spacings)
-        return self._compute_spectra_2d(n_jobs, progress, spacings, landmark_genes)
-
-    def _compute_spectra_radial(
-        self, n_jobs: int, progress: bool, spacings: list[tuple[float, float]]
-    ) -> tuple[list[np.ndarray], np.ndarray, np.ndarray]:
-        chunk = self._fft_chunk_size
-
-        # Per-sample parallelism worker function
-        def _one(
-            i: int, pbar: Any = None
-        ) -> tuple[np.ndarray, np.ndarray, np.ndarray, tuple[int, int]]:
-            img = self._rasterize_one(self.samples[i])
-            _, ny, nx = img.shape
-            n_genes = len(self.gene_names)
-            dc = np.empty(n_genes, dtype=np.float64)
-            presence = np.empty(n_genes, dtype=bool)
-
-            def _spec_chunk(start: int, stop: int) -> np.ndarray:
-                block = self._batch_raster(img, self.gene_names[start:stop])
-                presence[start:stop] = _observed_nonzero_fraction(block) >= self._presence_threshold
-                spectrum, dc[start:stop] = _grid_spectrum(
-                    block,
-                    fft_solver=self._spectrum_fft_solver,
-                    workers=self._workers,
-                    return_dc=True,
-                )
-                return spectrum
-
-            feat = stream_radial_features(
-                _spec_chunk,
-                n_genes,
-                (ny, nx),
-                chunk_size=chunk,
-                fft_solver=self._spectrum_fft_solver,
-                spacing=spacings[i],
-                edges=self.freq_edges,
-                pbar=pbar,
-            )
-            return feat, dc, presence, (ny, nx)
-
-        feats, dc, presence, grids = _unpack_sample_quads(
-            _run_per_sample(
-                _one,
-                len(self.samples),
-                n_chunks_per_sample=int(np.ceil(len(self.gene_names) / chunk)),
-                desc="Radial spectra (streaming)",
-                n_jobs=n_jobs,
-                progress=progress,
-            )
-        )
-        self._grid_shapes = grids
-        return feats, dc, presence
-
-    def _compute_spectra_2d(  # noqa: C901 — two-pass streamed rotation alignment
-        self,
-        n_jobs: int,
-        progress: bool,
-        spacings: list[tuple[float, float]],
-        landmark_genes: Sequence[str] | None,
-    ) -> tuple[list[np.ndarray], np.ndarray, np.ndarray]:
-        chunk = self._fft_chunk_size
-        name_to_idx = {g: j for j, g in enumerate(self.gene_names)}
-        lm_idx: np.ndarray | None = None
-        if landmark_genes is not None:
-            missing = [g for g in landmark_genes if g not in name_to_idx]
-            if missing:
-                raise KeyError(f"landmark_genes not in gene_names: {missing}")
-            lm_idx = np.asarray([name_to_idx[g] for g in landmark_genes], dtype=int)
-
-        # ---- Pass A: per-sample rotation landmark + DC/presence ----
-        # The per-sample grid shape is only known after the first rasterise, so
-        # the explicit-landmark cache-budget decision (cache per-gene spectra vs.
-        # warn + collapse to a streamed geomean) is made on the first iteration.
-        if lm_idx is not None:
-            probe_grids = [tuple(self._rasterize_one(s).shape[-2:]) for s in self.samples]
-            self._grid_shapes = probe_grids
-            cache_landmarks = self._landmark_cache_fits(len(lm_idx))
-        else:
-            cache_landmarks = False
-
-        # Per-sample parallelism worker for landmark spectra
-        def _landmark_one(
-            i: int, pbar: Any = None
-        ) -> tuple[np.ndarray, np.ndarray, np.ndarray, tuple[int, int]]:
-            img = self._rasterize_one(self.samples[i])
-            _, ny, nx = img.shape
-            n_genes = len(self.gene_names)
-            dc = np.empty(n_genes, dtype=np.float64)
-            presence = np.empty(n_genes, dtype=bool)
-
-            def _spec_chunk(start: int, stop: int, _img=img, _dc=dc, _pr=presence):
-                block = self._batch_raster(_img, self.gene_names[start:stop])
-                _pr[start:stop] = _observed_nonzero_fraction(block) >= self._presence_threshold
-                spectrum, _dc[start:stop] = _grid_spectrum(
-                    block,
-                    fft_solver=self._spectrum_fft_solver,
-                    workers=self._workers,
-                    return_dc=True,
-                )
-                return spectrum
-
-            if lm_idx is None:
-                # Default: stream the cross-gene geomean landmark; this single
-                # pass over all genes also fills dc/presence (side effect).
-                lm = stream_geomean_landmark(
-                    _spec_chunk, n_genes, (ny, nx), chunk_size=chunk, pbar=pbar
-                )
-            else:
-                # Explicit landmarks: dc/presence need a full pass over ALL genes.
-                for start in range(0, n_genes, chunk):
-                    _spec_chunk(start, min(start + chunk, n_genes))
-                    if pbar is not None:
-                        pbar.update(1)
-                if cache_landmarks:
-                    # Within budget: cache the landmark genes' per-gene spectra.
-                    lm_names = [self.gene_names[j] for j in lm_idx]
-                    lm = _grid_spectrum(
-                        self._batch_raster(img, lm_names),
-                        fft_solver=self._spectrum_fft_solver,
-                        workers=self._workers,
-                    )
-                    if pbar is not None:
-                        pbar.update(1)
-                else:
-                    # Over budget: stream the geometric mean of the landmark genes.
-                    lm = stream_geomean_landmark(
-                        _spec_chunk,
-                        n_genes,
-                        (ny, nx),
-                        chunk_size=chunk,
-                        gene_subset=lm_idx,
-                        pbar=pbar,
-                    )
-            return lm, dc, presence, (ny, nx)
-
-        if lm_idx is None:
-            n_pass_a_chunks = int(np.ceil(len(self.gene_names) / chunk))
-        elif cache_landmarks:
-            n_pass_a_chunks = int(np.ceil(len(self.gene_names) / chunk)) + 1
-        else:
-            n_pass_a_chunks = int(np.ceil(len(self.gene_names) / chunk)) + int(
-                np.ceil(len(lm_idx) / chunk)
-            )
-        landmarks, dc, presence, grids = _unpack_sample_quads(
-            _run_per_sample(
-                _landmark_one,
-                len(self.samples),
-                n_chunks_per_sample=max(1, n_pass_a_chunks),
-                desc="2D landmarks (streaming)",
-                n_jobs=n_jobs,
-                progress=progress,
-            )
-        )
-
-        angles = estimate_rotations_from_landmarks(
-            landmarks,
-            grids,
-            fft_solver=self._spectrum_fft_solver,
-            spacings=spacings,
-            progress=progress,
-        )
-        self.rotation_angles_ = angles
-
-        # Record the rasterize_bins lattice shape learned during the landmark pass.
-        self._grid_shapes = grids
-
-        # ---- Pass B: re-stream, rotate, physical-frequency polar resample ----
-        # Per-sample parallelism worker for feature spectra (binned)
-        def _feature_one(i: int, pbar: Any = None) -> np.ndarray:
-            spec_chunk_fn, n_genes, (ny, nx) = self._sample_spectrum_chunker(i)
-            return stream_polar_features(
-                spec_chunk_fn,
-                n_genes,
-                (ny, nx),
-                float(angles[i]),
-                chunk_size=chunk,
-                freq_edges=self.freq_edges,
-                spacing=spacings[i],
-                n_theta=self._n_theta_bins,
-                fft_solver=self._spectrum_fft_solver,
-                pbar=pbar,
-            )
-
-        feats = _run_per_sample(
-            _feature_one,
-            len(self.samples),
-            n_chunks_per_sample=int(np.ceil(len(self.gene_names) / chunk)),
-            desc="2D features (streaming)",
-            n_jobs=n_jobs,
-            progress=progress,
-        )
-        return [np.asarray(f) for f in feats], dc, presence
+        return _spec_chunk, dc, presence, n_genes, tuple(img.shape[-2:])
 
     # ------------------------------------------------------------------
     def _covariate_features_from_keys(self, keys: Sequence[str]) -> list[np.ndarray]:

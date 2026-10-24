@@ -6,8 +6,17 @@ import numpy as np
 import pytest
 import scipy.fft
 
+from sonic.comparators.binning import (
+    _adapt_radial_edges,
+    _bin_radial_spectrum,
+    _mode_pair_counts,
+    _polar_bin_reducer,
+    _polar_quadrature_counts,
+    _radial_bin_cell_counts,
+    _stream_polar_features,
+    _stream_radial_features,
+)
 from sonic.comparators.features import (
-    adapt_frequency_edges,
     align_spectra_by_rotation,
     apply_rotations_to_spectra,
     compute_sample_spectrum,
@@ -15,83 +24,767 @@ from sonic.comparators.features import (
     estimate_rotations_from_landmarks,
     gene_pattern_diversity,
     power_spectrum_anisotropy,
-    radial_bin_counts,
-    radial_bin_spectrum,
     stream_geomean_landmark,
-    stream_polar_features,
-    stream_radial_features,
 )
 from sonic.kernels.fft import power_spectrum_2d
 
 
-@pytest.mark.parametrize(
-    "grid,spacing", [((8, 8), (1.0, 1.0)), ((9, 7), (1.0, 1.5)), ((8, 11), (1.5, 1.0))]
-)
-@pytest.mark.parametrize("angle", [0.0, 73.0])
-def test_padded_nufft_polar_features_match_direct_fourier_modes(grid, spacing, angle):
+def _polar_area_reference(
+    product, shape, spacing, edges, n_theta, rotation, *, padded=False, density=2
+):
+    """Independent pointwise SciPy evaluation of area-weighted band quadrature."""
     from scipy.ndimage import map_coordinates
 
-    from sonic.comparators.features import _build_landmark_polar_stack
-    from sonic.kernels.nufft import power_spectrum_2d_nufft
-
-    rng = np.random.default_rng(32)
-    domain = np.asarray(grid) * spacing
-    coords = rng.uniform(size=(37, 2)) * domain
-    values = rng.normal(size=37)
-    values -= values.mean()
-    power = power_spectrum_2d_nufft(coords, values, grid, spacing, eps=1e-12, frequency_padding=1)[
-        None
-    ]
-    # Direct Fourier evaluation, including the otherwise missing positive edge.
-    frequencies = [
-        (np.arange(n + 2) - (n + 2) // 2) / length for n, length in zip(grid, domain, strict=True)
-    ]
-    fy, fx = np.meshgrid(*frequencies, indexing="ij")
-    exact = (
-        abs(
-            np.exp(-2j * np.pi * (fy[..., None] * coords[:, 0] + fx[..., None] * coords[:, 1]))
-            @ values
-        )
-        ** 2
-    )
-    np.testing.assert_allclose(np.fft.fftshift(power[0]), exact, rtol=1e-9, atol=1e-9)
-    edges = np.linspace(0, 0.5 / max(spacing), 31)
-    radii = (edges[1:] + edges[:-1]) / 2
-
-    def reference(rotation):
-        theta = np.linspace(0, np.pi, 36, endpoint=False) - np.deg2rad(rotation)
-        yy = (grid[0] + 2) // 2 + radii[:, None] * np.sin(theta) * domain[0]
-        xx = (grid[1] + 2) // 2 + radii[:, None] * np.cos(theta) * domain[1]
-        return map_coordinates(exact, np.array([yy, xx]), order=1, mode="constant")
-
-    actual = stream_polar_features(
-        lambda start, stop: power[start:stop],
-        1,
-        grid,
-        angle,
-        chunk_size=1,
-        freq_edges=edges,
-        spacing=spacing,
-        n_theta=36,
-        fft_solver="fft2",
-        frequency_padding=1,
-    )
-    np.testing.assert_allclose(actual[0], reference(angle).ravel(), rtol=1e-9, atol=1e-9)
-    landmark = _build_landmark_polar_stack(
-        power, grid, "fft2", 36, edges, spacing, frequency_padding=1
-    )
-    expected = reference(0).T
-    expected -= expected.mean(axis=0, keepdims=True)
-    np.testing.assert_allclose(landmark[0], expected, rtol=1e-9, atol=1e-9)
+    shifted = np.fft.fftshift(product)
+    result = np.full((len(edges) - 1, n_theta), np.nan, dtype=product.dtype)
+    step = 1 / (density * max(n * d for n, d in zip(shape, spacing, strict=True)))
+    width = np.pi / n_theta
+    for band, (lo, hi) in enumerate(zip(edges[:-1], edges[1:], strict=True)):
+        if hi > 0.5 / max(spacing) * (1 + 2e-9):
+            continue
+        nr, nt = max(1, int(np.ceil((hi - lo) / step))), max(3, int(np.ceil(hi * width / step)))
+        boundaries = np.linspace(lo, hi, nr + 1)
+        a, b = boundaries[:-1], boundaries[1:]
+        radii = (2 / 3) * (a * a + a * b + b * b) / (a + b)
+        weights = (b - a) * (b + a)
+        for sector in range(n_theta):
+            theta = (sector + (np.arange(nt) + 0.5) / nt - 0.5) * width - np.deg2rad(rotation)
+            yy = shifted.shape[0] // 2 + radii[:, None] * np.sin(theta) * shape[0] * spacing[0]
+            xx = shifted.shape[1] // 2 + radii[:, None] * np.cos(theta) * shape[1] * spacing[1]
+            values = map_coordinates(
+                shifted,
+                np.array([yy, xx]),
+                order=1,
+                mode="constant" if padded else "grid-wrap",
+                cval=np.nan,
+            )
+            result[band, sector] = np.average(values.mean(axis=1), weights=weights)
+    return result.ravel()
 
 
-def _axis_angle_error(observed: float, expected: float) -> float:
-    """Smallest axial-angle error in degrees."""
+def _axis_angle_error(observed, expected):
+    """Smallest axial-angle error in degrees, for scalars or arrays."""
     return abs((observed - expected + 90.0) % 180.0 - 90.0)
 
 
+class TestSpectrum:
+    """Mean centering, DC values, and input preservation."""
+
+    @pytest.mark.parametrize("solver", ["fft2", "rfft2"])
+    @pytest.mark.parametrize(
+        "dtype,offset", [(np.float64, 3.0), (np.float64, 1e12), (np.float32, 1e5)]
+    )
+    def test_spectrum_centering_preserves_dc_and_input(self, solver, dtype, offset):
+        sample = (np.random.default_rng(3).normal(size=(3, 7, 9)) + offset).astype(dtype)
+        sample[1] = offset
+        original = sample.copy()
+        sample.flags.writeable = False
+        spectrum, dc = compute_sample_spectrum(sample, fft_solver=solver, return_dc=True)
+        centered = sample - sample.mean(axis=(1, 2), keepdims=True)
+        transform = scipy.fft.fft2 if solver == "fft2" else scipy.fft.rfft2
+        expected = np.abs(transform(centered, axes=(1, 2))) ** 2
+        expected /= (sample.shape[1] * sample.shape[2]) ** 2
+        expected[:, 0, 0] = 0.0
+        np.testing.assert_allclose(
+            spectrum, expected, rtol=1e-6 if dtype == np.float32 else 1e-12, atol=1e-10
+        )
+        np.testing.assert_array_equal(dc, sample.mean(axis=(1, 2)))
+        np.testing.assert_array_equal(sample, original)
+
+
+class TestRadialBinning:
+    """Radial binning, physical spacing, and shared frequency support."""
+
+    def test_isotropic_gaussian_bump_decreases_radially(self):
+        ny, nx = 32, 32
+        y, x = np.meshgrid(np.arange(ny) - ny / 2, np.arange(nx) - nx / 2, indexing="ij")
+        r2 = y**2 + x**2
+        bump = np.exp(-r2 / (2 * 4.0**2))
+        P = power_spectrum_2d(bump, fft_solver="fft2")
+        rb = _bin_radial_spectrum(
+            P, grid_shape=(ny, nx), n_bins=20, fft_solver="fft2", spacing=(1.0, 1.0), edges=None
+        )
+        assert rb[0] > rb[-1]
+        # Allow small mid-range reshuffles from discretization.
+        assert (np.diff(rb) <= 1e-6).sum() >= len(rb) - 4
+
+    def test_radial_consistent_across_solvers(self):
+        rng = np.random.default_rng(1)
+        img = rng.standard_normal((16, 24))
+        P_full = power_spectrum_2d(img, fft_solver="fft2")
+        P_half = power_spectrum_2d(img, fft_solver="rfft2")
+        rb_full = _bin_radial_spectrum(
+            P_full, grid_shape=(16, 24), n_bins=8, fft_solver="fft2", spacing=(1.0, 1.0), edges=None
+        )
+        rb_half = _bin_radial_spectrum(
+            P_half,
+            grid_shape=(16, 24),
+            n_bins=8,
+            fft_solver="rfft2",
+            spacing=(1.0, 1.0),
+            edges=None,
+        )
+        np.testing.assert_allclose(rb_full, rb_half, rtol=1e-9, atol=1e-9)
+
+    def test_exclude_dc_keeps_first_radial_interval(self):
+        spectrum = np.zeros((4, 4))
+        spectrum[0, 0] = 100.0  # DC should be removed from the first interval.
+        spectrum[0, 1] = 4.0  # The first nonzero kx frequency should remain.
+
+        rb = _bin_radial_spectrum(
+            spectrum,
+            grid_shape=(4, 4),
+            fft_solver="fft2",
+            edges=np.array([0.0, 0.3, 1.0]),
+            spacing=(1.0, 1.0),
+        )
+
+        assert rb.shape == (2,)
+        assert rb[0] > 0.0
+
+    def test_shape_validation(self):
+        with pytest.raises(ValueError, match="last two dims"):
+            _bin_radial_spectrum(
+                np.zeros((10, 10)),
+                grid_shape=(8, 8),
+                fft_solver="fft2",
+                spacing=(1.0, 1.0),
+                edges=None,
+            )
+
+    def test_adapt_frequency_edges_supports_every_grid(self):
+        shapes = [(32, 32), (9, 9)]
+        spacings = [(1.0, 1.0), (1.0, 1.0)]
+        requested = np.linspace(0.0, 0.5 * (1.0 + 1e-9), 9)
+
+        adapted = _adapt_radial_edges(shapes, spacings, requested)
+
+        assert adapted.size < requested.size
+        assert adapted[[0, -1]] == pytest.approx(requested[[0, -1]])
+        counts = [
+            _radial_bin_cell_counts(shape, spacing=spacing, edges=adapted)
+            for shape, spacing in zip(shapes, spacings, strict=True)
+        ]
+        assert np.all(np.asarray(counts) > 0)
+
+    def test_physical_spacing_changes_bin_scale(self):
+        rng = np.random.default_rng(0)
+        img = rng.standard_normal((40, 40))
+
+        P = power_spectrum_2d(img, fft_solver="rfft2")
+        rb1 = _bin_radial_spectrum(
+            P, grid_shape=(40, 40), n_bins=10, fft_solver="rfft2", spacing=(1.0, 1.0), edges=None
+        )
+        rb2 = _bin_radial_spectrum(
+            P, grid_shape=(40, 40), n_bins=10, fft_solver="rfft2", spacing=(10.0, 10.0), edges=None
+        )
+        np.testing.assert_allclose(rb1, rb2, rtol=1e-10)
+
+    def test_common_edges_across_heterogeneous_grids(self):
+        rng = np.random.default_rng(0)
+
+        img_a = rng.standard_normal((40, 40))
+        img_b = rng.standard_normal((50, 60))
+        Pa = power_spectrum_2d(img_a, fft_solver="rfft2")
+        Pb = power_spectrum_2d(img_b, fft_solver="rfft2")
+        edges = np.linspace(0, 0.3, 11)
+        rb_a = _bin_radial_spectrum(
+            Pa, grid_shape=(40, 40), fft_solver="rfft2", spacing=(1.0, 1.0), edges=edges
+        )
+        rb_b = _bin_radial_spectrum(
+            Pb, grid_shape=(50, 60), fft_solver="rfft2", spacing=(1.0, 1.0), edges=edges
+        )
+        assert rb_a.shape == rb_b.shape == (10,)
+
+    def test_explicit_edges_non_monotonic_raises(self):
+        P = np.zeros((8, 5))
+        with pytest.raises(ValueError, match="monotonically"):
+            _bin_radial_spectrum(
+                P,
+                grid_shape=(8, 8),
+                fft_solver="rfft2",
+                edges=np.array([0.0, 0.5, 0.2]),
+                spacing=(1.0, 1.0),
+            )
+
+    @pytest.mark.parametrize("shape", [(8, 8), (7, 9)])
+    @pytest.mark.parametrize("solver", ["fft2", "rfft2"])
+    @pytest.mark.parametrize("exclude_dc", [False, True])
+    def test_radial_bins_discard_out_of_band_modes(self, shape, solver, exclude_dc):
+        ky = np.fft.fftfreq(shape[0])[:, None]
+        kx = np.fft.fftfreq(shape[1])[None, :]
+        radius = np.hypot(ky, kx)
+        edges = np.array([0.125, 0.25, 0.5])
+        power = radius**2
+        power[(radius < edges[0]) | (radius > edges[-1])] = 1000.0
+        counts, _ = np.histogram(radius, bins=edges)
+        sums, _ = np.histogram(radius, bins=edges, weights=power)
+        if solver == "rfft2":
+            power = power[:, : shape[1] // 2 + 1]
+        kwargs = {
+            "fft_solver": solver,
+            "edges": edges,
+            "spacing": (1.0, 1.0),
+            "exclude_dc": exclude_dc,
+        }
+        np.testing.assert_allclose(_radial_bin_cell_counts(shape, **kwargs), counts)
+        np.testing.assert_allclose(_bin_radial_spectrum(power, shape, **kwargs), sums / counts)
+
+    @pytest.mark.parametrize("shape", [(8, 8), (7, 9)])
+    @pytest.mark.parametrize("solver", ["fft2", "rfft2"])
+    def test_radial_reduction_preserves_missing_bins_and_ignores_excluded_nans(self, shape, solver):
+        ny, nx = shape
+        kx = np.fft.fftfreq(nx) if solver == "fft2" else np.fft.rfftfreq(nx)
+        radius = np.hypot(np.fft.fftfreq(ny)[:, None], kx[None, :])
+        weights = np.ones(radius.shape)
+        if solver == "rfft2":
+            weights[:, 1 : (nx + 1) // 2] = 2
+        edges = np.array([0.10, 0.11, 0.2, 0.35])
+        # Multiple leading axes and a non-contiguous spectrum layout.
+        spectra = np.random.default_rng(2).uniform(size=radius.shape + (3, 2)).transpose(2, 3, 0, 1)
+        spectra[..., (radius < edges[0]) | (radius > edges[-1])] = np.nan
+        spectra[0, 0, 1, 1] = np.nan  # An included NaN affects its bin alone.
+        expected = np.full((3, 2, 3), np.nan)
+        for i, (left, right) in enumerate(zip(edges[:-1], edges[1:], strict=True)):
+            keep = (radius >= left) & ((radius <= right) if i == 2 else (radius < right))
+            if keep.any():
+                expected[..., i] = (spectra[..., keep] * weights[keep]).sum(axis=-1) / weights[
+                    keep
+                ].sum()
+        got = _bin_radial_spectrum(
+            spectra, shape, fft_solver=solver, edges=edges, spacing=(1.0, 1.0)
+        )
+        np.testing.assert_allclose(got, expected, rtol=1e-12, equal_nan=True)
+
+
+class TestPolarBinning:
+    """Polar interpolation, quadrature, and Fourier-mode support."""
+
+    @pytest.mark.parametrize(
+        "grid,spacing", [((8, 8), (1.0, 1.0)), ((9, 7), (1.0, 1.5)), ((8, 11), (1.5, 1.0))]
+    )
+    @pytest.mark.parametrize("angle", [0.0, 73.0])
+    def test_padded_nufft_polar_features_match_direct_fourier_modes(self, grid, spacing, angle):
+        from scipy.ndimage import map_coordinates
+
+        from sonic.comparators.features import _build_landmark_polar_stack
+        from sonic.kernels.nufft import power_spectrum_2d_nufft
+
+        rng = np.random.default_rng(32)
+        domain = np.asarray(grid) * spacing
+        coords = rng.uniform(size=(37, 2)) * domain
+        values = rng.normal(size=37)
+        values -= values.mean()
+        power = power_spectrum_2d_nufft(
+            coords, values, grid, spacing, eps=1e-12, frequency_padding=1
+        )[None]
+        # Direct Fourier evaluation, including the otherwise missing positive edge.
+        frequencies = [
+            (np.arange(n + 2) - (n + 2) // 2) / length
+            for n, length in zip(grid, domain, strict=True)
+        ]
+        fy, fx = np.meshgrid(*frequencies, indexing="ij")
+        exact = (
+            abs(
+                np.exp(-2j * np.pi * (fy[..., None] * coords[:, 0] + fx[..., None] * coords[:, 1]))
+                @ values
+            )
+            ** 2
+        )
+        np.testing.assert_allclose(np.fft.fftshift(power[0]), exact, rtol=1e-9, atol=1e-9)
+        edges = np.linspace(0, 0.5 / max(spacing), 31)
+        radii = (edges[1:] + edges[:-1]) / 2
+
+        def reference(rotation):
+            theta = np.linspace(0, np.pi, 36, endpoint=False) - np.deg2rad(rotation)
+            yy = (grid[0] + 2) // 2 + radii[:, None] * np.sin(theta) * domain[0]
+            xx = (grid[1] + 2) // 2 + radii[:, None] * np.cos(theta) * domain[1]
+            return map_coordinates(exact, np.array([yy, xx]), order=1, mode="constant")
+
+        actual = _stream_polar_features(
+            lambda start, stop: power[start:stop],
+            1,
+            grid,
+            angle_deg=angle,
+            chunk_size=1,
+            edges=edges,
+            spacing=spacing,
+            n_theta=36,
+            fft_solver="fft2",
+            frequency_padding=1,
+        )
+        expected_area = _polar_area_reference(
+            np.fft.ifftshift(exact), grid, spacing, edges, 36, angle, padded=True
+        )
+        np.testing.assert_allclose(actual[0], expected_area, rtol=1e-9, atol=1e-9)
+        landmark = _build_landmark_polar_stack(
+            power, grid, "fft2", 36, edges, spacing, frequency_padding=1
+        )
+        expected = reference(0).T
+        expected -= expected.mean(axis=0, keepdims=True)
+        np.testing.assert_allclose(landmark[0], expected, rtol=1e-9, atol=1e-9)
+
+    @pytest.mark.parametrize("n", [8, 9, 16])
+    @pytest.mark.parametrize("angle", [0.0, 17.0])
+    def test_polar_interpolation_wraps_inside_nyquist_band(self, n, angle):
+        power = np.ones((1, n, n))
+        power[:, 0, 0] = 0
+        options = {
+            "angle_deg": angle,
+            "chunk_size": 1,
+            "spacing": (1.0, 1.0),
+            "n_theta": 36,
+            "fft_solver": "fft2",
+        }
+
+        def chunk(start, stop):
+            return power[start:stop]
+
+        result = _stream_polar_features(chunk, 1, (n, n), edges=np.array([0.4, 0.5]), **options)
+        np.testing.assert_allclose(result, 1.0)
+        unsupported = _stream_polar_features(
+            chunk, 1, (n, n), edges=np.array([0.5, 0.6]), **options
+        )
+        assert np.isnan(unsupported).all()
+
+    @pytest.mark.parametrize("shape,spacing", [((32, 48), (1.0, 1.0)), ((33, 49), (1.5, 0.5))])
+    def test_adaptive_polar_area_mean_and_density(self, shape, spacing):
+        fy = np.fft.fftfreq(shape[0], spacing[0])[:, None]
+        fx = np.fft.fftfreq(shape[1], spacing[1])[None, :]
+        power = 1 + fy**2 + fx**2
+        edges = np.array([0.01, 0.06, 0.18, 0.30])
+        reducer, counts = _polar_bin_reducer(
+            shape, spacing=spacing, edges=edges, n_theta=12, angle_deg=17
+        )
+        assert np.all(reducer.data >= 0)
+        np.testing.assert_allclose(np.asarray(reducer.sum(axis=1)).ravel(), 1, atol=1e-14)
+        np.testing.assert_allclose(reducer @ np.ones(power.size), 1, atol=1e-14)
+        expected = np.repeat(1 + (edges[:-1] ** 2 + edges[1:] ** 2) / 2, 12)
+        # Bilinear interpolation of a quadratic differs from its exact field by O(df**2).
+        interpolation_error = (
+            sum((1 / (n * d)) ** 2 for n, d in zip(shape, spacing, strict=True)) / 4
+        )
+        np.testing.assert_allclose(
+            reducer @ power.ravel(), expected, atol=interpolation_error, rtol=0
+        )
+        nr, nt, supported = _polar_quadrature_counts(
+            shape, spacing=spacing, edges=edges, n_theta=12
+        )
+        assert np.all(counts > 0) and supported.all()
+        assert nr[-1] > nr[0] and nt[-1] > nt[0]
+        fine_nr, fine_nt, _ = _polar_quadrature_counts(
+            tuple(2 * n for n in shape), spacing=spacing, edges=edges, n_theta=12
+        )
+        assert np.all(fine_nr >= nr) and np.all(fine_nt >= nt)
+
+    @pytest.mark.parametrize("rotation", [0, 17, 73])
+    def test_adaptive_polar_quadrature_converges(self, rotation):
+        shape, spacing, edges, ntheta = (33, 41), (1.0, 1.0), np.array([0.02, 0.13, 0.29, 0.45]), 8
+        fy = np.fft.fftfreq(shape[0])[:, None]
+        fx = np.fft.fftfreq(shape[1])[None, :]
+        power = 1 + np.exp(-((fy - 0.12) ** 2 + (fx - 0.18) ** 2) / (2 * 0.04**2))
+        dense = _polar_area_reference(power, shape, spacing, edges, ntheta, rotation, density=16)
+        estimates = []
+        for density in (2, 4):
+            reducer, _ = _polar_bin_reducer(
+                shape,
+                spacing=spacing,
+                edges=edges,
+                n_theta=ntheta,
+                angle_deg=rotation,
+                oversampling=density,
+            )
+            estimates.append(reducer @ power.ravel())
+        assert np.max(abs(estimates[0] - dense)) < 0.01
+        assert np.linalg.norm(estimates[1] - dense) < np.linalg.norm(estimates[0] - dense)
+
+    @pytest.mark.parametrize("periodic, expected", [(True, 1), (False, 2)])
+    def test_mode_pair_counts_distinguish_fft_aliases_from_nufft_boundaries(
+        self, periodic, expected
+    ):
+        from scipy.sparse import csr_matrix
+
+        # On a 4x6 lattice, (-2, +1) and (-2, -1) alias conjugate FFT indices,
+        # but are distinct physical frequency pairs on irregular coordinates.
+        reducer = csr_matrix(([0.2, 0.4, 0.4], ([0, 0, 0], [0, 13, 17])), shape=(1, 24))
+        assert _mode_pair_counts(reducer, (4, 6), periodic=periodic)[0] == expected
+
+
+class TestRotationAlignment:
+    """Rotation recovery and application on synthetic spatial patterns."""
+
+    @staticmethod
+    def _stripes(ny: int, nx: int, period: float = 8.0) -> np.ndarray:
+        y = np.arange(ny)[:, None]
+        return np.broadcast_to(np.sin(2 * np.pi * y / period).astype(float), (ny, nx)).copy()
+
+    @staticmethod
+    def _stripes_rotated(ny: int, nx: int, angle: float, period: float = 8.0) -> np.ndarray:
+        import scipy.ndimage
+
+        base = TestRotationAlignment._stripes(ny, nx, period=period)
+        return scipy.ndimage.rotate(base, angle=angle, reshape=False, order=1, mode="reflect")
+
+    @staticmethod
+    def _sine_at_angle(ny, nx, ky0, kx0, phi_deg):
+        """Generate a sinusoid after rotating its wave vector analytically."""
+        phi = np.deg2rad(phi_deg)
+        c, s = np.cos(phi), np.sin(phi)
+        ky = ky0 * c - kx0 * s
+        kx = ky0 * s + kx0 * c
+        yy, xx = np.meshgrid(np.arange(ny), np.arange(nx), indexing="ij")
+        return np.sin(2 * np.pi * (ky * yy / ny + kx * xx / nx))
+
+    def _landmark_spectra(self, ny, nx, frequencies, angles):
+        return [
+            compute_sample_spectrum(
+                np.stack([self._sine_at_angle(ny, nx, k, 0.0, angle) for k in frequencies]),
+                fft_solver="fft2",
+            )
+            for angle in angles
+        ]
+
+    def test_single_landmark_recovers_known_rotation(self):
+        ny = nx = 48
+        true_angle = 25.0
+        ref = self._stripes(ny, nx)
+        rot = self._stripes_rotated(ny, nx, true_angle)
+
+        sp_ref = compute_sample_spectrum(ref[None, :, :], fft_solver="fft2")
+        sp_rot = compute_sample_spectrum(rot[None, :, :], fft_solver="fft2")
+        _, angles = align_spectra_by_rotation(
+            [sp_ref, sp_rot],
+            grid_shapes=[(ny, nx), (ny, nx)],
+            target_spectra=[sp_ref, sp_rot],
+            fft_solver="fft2",
+            reference_index=0,
+            n_theta=360,
+        )
+        recovered = angles[1] % 180.0
+        true_mod = true_angle % 180.0
+        diff = _axis_angle_error(recovered, true_mod)
+        assert diff < 5.0, f"recovered={recovered}, true={true_mod}, diff={diff}"
+
+    def test_per_landmark_alignment_handles_perpendicular_landmarks(self):
+        """Per-landmark alignment survives landmarks on perpendicular axes."""
+        ny = nx = 96
+        true_angle = 30.0
+
+        lm_h = self._sine_at_angle(ny, nx, 12.0, 0.0, 0.0)
+        lm_v = self._sine_at_angle(ny, nx, 0.0, 12.0, 0.0)
+        ref_stack = np.stack([lm_h, lm_v], axis=0)
+        rot_stack = np.stack(
+            [
+                self._sine_at_angle(ny, nx, 12.0, 0.0, true_angle),
+                self._sine_at_angle(ny, nx, 0.0, 12.0, true_angle),
+            ],
+            axis=0,
+        )
+        sp_ref = compute_sample_spectrum(ref_stack, fft_solver="fft2")
+        sp_rot = compute_sample_spectrum(rot_stack, fft_solver="fft2")
+
+        angles = estimate_rotations_from_landmarks(
+            [sp_ref, sp_rot],
+            grid_shapes=[(ny, nx), (ny, nx)],
+            fft_solver="fft2",
+            n_theta=720,
+        )
+        diff = _axis_angle_error(angles[1], true_angle)
+        assert diff < 3.0, f"per-landmark recovered={angles[1]}, expected {true_angle}"
+
+    def test_shape_validation(self):
+        sp = compute_sample_spectrum(
+            np.random.default_rng(0).standard_normal((3, 16, 16)), fft_solver="fft2"
+        )
+        sp_bad = compute_sample_spectrum(
+            np.random.default_rng(0).standard_normal((2, 16, 16)), fft_solver="fft2"
+        )
+        with pytest.raises(ValueError, match="must match across samples"):
+            align_spectra_by_rotation(
+                [sp, sp_bad], grid_shapes=[(16, 16), (16, 16)], fft_solver="fft2"
+            )
+        with pytest.raises(ValueError, match="reference_index"):
+            align_spectra_by_rotation(
+                [sp, sp],
+                grid_shapes=[(16, 16), (16, 16)],
+                reference_index=9,
+                fft_solver="fft2",
+            )
+
+    def test_apply_rotations_to_different_target(self):
+        import scipy.ndimage
+
+        ny = nx = 48
+        true_angle = 18.0
+        ref_landmark = self._stripes(ny, nx)
+        cur_landmark = self._stripes_rotated(ny, nx, true_angle)
+
+        rng = np.random.default_rng(0)
+        ref_target = rng.standard_normal((3, ny, nx))
+        cur_target = np.stack(
+            [
+                scipy.ndimage.rotate(
+                    ref_target[j], true_angle, reshape=False, order=1, mode="reflect"
+                )
+                for j in range(3)
+            ],
+            axis=0,
+        )
+        sp_ref_lm = compute_sample_spectrum(ref_landmark[None, :, :], fft_solver="fft2")
+        sp_cur_lm = compute_sample_spectrum(cur_landmark[None, :, :], fft_solver="fft2")
+        sp_ref_tgt = compute_sample_spectrum(ref_target, fft_solver="fft2")
+        sp_cur_tgt = compute_sample_spectrum(cur_target, fft_solver="fft2")
+
+        angles = estimate_rotations_from_landmarks(
+            [sp_ref_lm, sp_cur_lm],
+            grid_shapes=[(ny, nx), (ny, nx)],
+            fft_solver="fft2",
+            n_theta=360,
+        )
+        rotated = apply_rotations_to_spectra(
+            [sp_ref_tgt, sp_cur_tgt],
+            grid_shapes=[(ny, nx), (ny, nx)],
+            angles_deg=angles,
+            fft_solver="fft2",
+        )
+        # Interpolation blurs Fourier peaks; require a clear improvement in distance.
+        unrot_dist = np.linalg.norm(sp_cur_tgt - sp_ref_tgt)
+        rot_dist = np.linalg.norm(rotated[1] - sp_ref_tgt)
+        assert rot_dist < 0.95 * unrot_dist, (
+            f"rotation failed to reduce distance: unrot={unrot_dist:.2g} rot={rot_dist:.2g}"
+        )
+
+    def test_multi_sample_recovery_with_multiple_landmarks(self):
+        ny = nx = 96
+        rng = np.random.default_rng(42)
+        n_samples = 8
+        k0s = [10.0, 16.0, 22.0, 30.0]
+
+        true_angles = np.concatenate([[0.0], rng.uniform(-80.0, 80.0, size=n_samples - 1)])
+        spectra = self._landmark_spectra(ny, nx, k0s, true_angles)
+        recovered = estimate_rotations_from_landmarks(
+            spectra,
+            grid_shapes=[(ny, nx)] * n_samples,
+            fft_solver="fft2",
+            n_theta=720,
+        )
+        errs = _axis_angle_error(recovered, true_angles)
+        assert errs[0] == 0, "reference angle must be exactly 0"
+        # FFT-bin aliasing sets the practical accuracy limit for these landmarks.
+        assert errs[1:].max() < 4.0, (
+            f"per-sample errors (deg): {errs[1:].round(2).tolist()}; "
+            f"true angles: {true_angles[1:].round(2).tolist()}; "
+            f"recovered: {recovered[1:].round(2).tolist()}"
+        )
+        assert errs[1:].mean() < 2.0
+
+    def test_more_landmarks_reduces_bias(self):
+        """More landmark frequencies should reduce mean recovery error."""
+        ny = nx = 96
+        rng = np.random.default_rng(0)
+        true_angles = np.concatenate([[0.0], rng.uniform(-70.0, 70.0, size=6)])
+
+        def errs_for_k0s(k0s):
+            spectra = self._landmark_spectra(ny, nx, k0s, true_angles)
+            rec = estimate_rotations_from_landmarks(
+                spectra,
+                grid_shapes=[(ny, nx)] * len(true_angles),
+                fft_solver="fft2",
+                n_theta=720,
+            )
+            return _axis_angle_error(rec, true_angles)[1:]
+
+        one = errs_for_k0s([12.0]).mean()
+        many = errs_for_k0s([10.0, 14.0, 20.0, 26.0, 34.0]).mean()
+        assert many <= one + 0.1, (
+            f"multi-landmark bias ({many:.2f} deg) did not improve over "
+            f"single-landmark ({one:.2f} deg)"
+        )
+
+    def test_apply_rotations_matches_raw_reference(self):
+        ny = nx = 96
+        rng = np.random.default_rng(7)
+        n_samples = 5
+        k0s = [10.0, 16.0, 24.0]
+
+        true_angles = np.concatenate([[0.0], rng.uniform(-60.0, 60.0, size=n_samples - 1)])
+        spectra = self._landmark_spectra(ny, nx, k0s, true_angles)
+        angles = estimate_rotations_from_landmarks(
+            spectra,
+            grid_shapes=[(ny, nx)] * n_samples,
+            fft_solver="fft2",
+            n_theta=720,
+        )
+        corrected = apply_rotations_to_spectra(
+            spectra,
+            grid_shapes=[(ny, nx)] * n_samples,
+            angles_deg=angles,
+            fft_solver="fft2",
+        )
+        for i in range(1, n_samples):
+            d_before = np.linalg.norm(spectra[i] - spectra[0])
+            d_after = np.linalg.norm(corrected[i] - spectra[0])
+            # Sharp sinusoidal peaks retain interpolation error even at the correct angle.
+            assert d_after < 0.95 * d_before, (
+                f"sample {i}: rotation-correction did not tighten distance "
+                f"(before={d_before:.2g}, after={d_after:.2g})"
+            )
+
+    @pytest.mark.parametrize("solver", ["fft2", "rfft2"])
+    @pytest.mark.parametrize("angle", [0.0, 30.0, -40.0])
+    def test_rotation_uses_physical_frequencies_on_rectangular_grids(self, solver, angle):
+        shapes = [(64, 64), (65, 97)]
+        spacings = [(1.0, 1.0), (2.0, 0.5)]
+
+        def spectrum(shape, spacing, direction):
+            fy = np.fft.fftfreq(shape[0], d=spacing[0])[:, None]
+            fx = np.fft.fftfreq(shape[1], d=spacing[1])[None, :]
+            theta = np.deg2rad(direction)
+            result = []
+            for radius in (0.08, 0.16):
+                ky, kx = radius * np.sin(theta), radius * np.cos(theta)
+                result.append(
+                    sum(
+                        np.exp(-((fy - sign * ky) ** 2 + (fx - sign * kx) ** 2) / (2 * 0.025**2))
+                        for sign in (-1, 1)
+                    )
+                )
+            result = np.array(result)
+            return result if solver == "fft2" else result[..., : shape[1] // 2 + 1]
+
+        spectra = [
+            spectrum(shapes[0], spacings[0], 50),
+            spectrum(shapes[1], spacings[1], 50 - angle),
+        ]
+        originals = [x.copy() for x in spectra]
+        rotated, angles = align_spectra_by_rotation(
+            spectra,
+            shapes,
+            target_spectra=spectra,
+            fft_solver=solver,
+            spacings=spacings,
+            n_theta=360,
+        )
+        assert _axis_angle_error(angles[1], angle) < 2.0
+        expected = spectrum(shapes[1], spacings[1], 50)
+        assert np.linalg.norm(rotated[1] - expected) / np.linalg.norm(expected) < 0.08
+        features = []
+        for spec, shape, spacing, recovered in zip(spectra, shapes, spacings, angles, strict=True):
+            features.append(
+                _stream_polar_features(
+                    lambda start, stop, spec=spec: spec[start:stop],
+                    2,
+                    shape,
+                    angle_deg=recovered,
+                    chunk_size=1,
+                    edges=np.linspace(0, 0.22, 12),
+                    spacing=spacing,
+                    n_theta=72,
+                    fft_solver=solver,
+                )
+            )
+        assert np.linalg.norm(features[1] - features[0]) / np.linalg.norm(features[0]) < 0.08
+        for before, after in zip(originals, spectra, strict=True):
+            np.testing.assert_array_equal(before, after)
+
+
+class TestStreamingFeatures:
+    """Chunked feature construction matches full-spectrum references."""
+
+    def test_stream_radial_features_matches_full_stack_binning(self):
+        rng = np.random.default_rng(0)
+        spec = rng.uniform(0.1, 4.0, size=(5, 10, 6))
+        edges = np.linspace(0.0, 0.5, 7)
+        calls = []
+
+        def chunk(start, stop):
+            calls.append((start, stop))
+            return spec[start:stop]
+
+        streamed = _stream_radial_features(
+            chunk,
+            n_features=spec.shape[0],
+            grid_shape=(10, 10),
+            chunk_size=2,
+            fft_solver="rfft2",
+            spacing=(1.0, 1.0),
+            edges=edges,
+        )
+        full = _bin_radial_spectrum(
+            spec,
+            grid_shape=(10, 10),
+            n_bins=6,
+            fft_solver="rfft2",
+            spacing=(1.0, 1.0),
+            edges=edges,
+        )
+        assert calls == [(0, 2), (2, 4), (4, 5)]
+        np.testing.assert_allclose(streamed, full, rtol=1e-12, atol=1e-12)
+
+    def test_stream_geomean_landmark_matches_full_stack_and_subset(self):
+        rng = np.random.default_rng(1)
+        spec = rng.uniform(0.1, 3.0, size=(6, 8, 8))
+
+        def chunk(start, stop):
+            return spec[start:stop]
+
+        all_genes = stream_geomean_landmark(
+            chunk,
+            n_genes=spec.shape[0],
+            grid_shape=(8, 8),
+            chunk_size=2,
+            eps=1e-12,
+        )
+        expected_all = np.exp(np.log(spec + 1e-12).mean(axis=0))[None, ...]
+        np.testing.assert_allclose(all_genes, expected_all, rtol=1e-12, atol=1e-12)
+
+        subset = np.array([1, 4, 5])
+        subset_landmark = stream_geomean_landmark(
+            chunk,
+            n_genes=spec.shape[0],
+            grid_shape=(8, 8),
+            chunk_size=2,
+            gene_subset=subset,
+            eps=1e-12,
+        )
+        expected_subset = np.exp(np.log(spec[subset] + 1e-12).mean(axis=0))[None, ...]
+        np.testing.assert_allclose(subset_landmark, expected_subset, rtol=1e-12, atol=1e-12)
+
+        with pytest.raises(ValueError, match=">= 1 gene"):
+            stream_geomean_landmark(
+                chunk,
+                n_genes=spec.shape[0],
+                grid_shape=(8, 8),
+                chunk_size=2,
+                gene_subset=np.array([], dtype=int),
+            )
+
+    def test_stream_polar_features_is_chunk_size_invariant_for_rfft2(self):
+        rng = np.random.default_rng(2)
+        images = rng.standard_normal((4, 16, 16))
+        spec = compute_sample_spectrum(images, fft_solver="rfft2")
+        edges = np.linspace(0.0, 0.5, 5)
+
+        def chunk(start, stop):
+            return spec[start:stop]
+
+        options = {
+            "n_features": spec.shape[0],
+            "grid_shape": (16, 16),
+            "angle_deg": 17.0,
+            "edges": edges,
+            "spacing": (1.0, 1.0),
+            "n_theta": 12,
+            "fft_solver": "rfft2",
+        }
+        one_chunk = _stream_polar_features(chunk, chunk_size=spec.shape[0], **options)
+        many_chunks = _stream_polar_features(chunk, chunk_size=1, **options)
+        assert one_chunk.shape == (4, 4 * 12)
+        np.testing.assert_allclose(many_chunks, one_chunk, rtol=1e-12, atol=1e-12)
+
+
 class TestPowerSpectrumAnisotropy:
-    """Second-angular-moment diagnostics for raw 2D spectra."""
+    """Angular anisotropy and orientation across Fourier layouts."""
 
     def test_axis_aligned_full_fft_spectra(self):
         power = np.zeros((3, 8, 8), dtype=float)
@@ -183,7 +876,7 @@ class TestPowerSpectrumAnisotropy:
 
 
 class TestPatternDiversity:
-    """Effective-rank and pattern-diversity feature diagnostics."""
+    """Effective rank and diversity, including the PSD fast path."""
 
     def test_effective_rank_identity_equals_K(self):
         for K in [3, 10, 30]:
@@ -237,637 +930,111 @@ class TestPatternDiversity:
         assert gene_pattern_diversity(spectra_rank1) < 1.5
         assert gene_pattern_diversity(spectra_iid) > K * 0.5
 
+    @pytest.mark.parametrize("weighted", [False, True])
+    @pytest.mark.parametrize("scale", [1e-200, 1.0, 1e200])
+    def test_effective_rank_psd_traces_match_eigenvalues(self, weighted, scale):
+        rng = np.random.default_rng(92)
+        x = rng.normal(size=(5, 13))  # Singular PSD covariance.
+        cov = x.T @ x
+        weights = np.linspace(0, 1, 13) if weighted else None
+        expected = effective_rank(cov, weights)
+        np.testing.assert_allclose(effective_rank(cov * scale, weights, assume_psd=True), expected)
+        assert np.isnan(effective_rank(np.zeros((3, 3)), assume_psd=True))
+        # Default public behavior must still clip genuinely negative eigenvalues.
+        assert effective_rank(np.diag([-3.0, 1.0, 1.0])) == pytest.approx(2.0)
 
-class TestRadialBinning:
-    """Radial power binning across FFT solver layouts."""
+    def test_gene_pattern_diversity_uses_psd_fast_path(self, monkeypatch):
+        rng = np.random.default_rng(3)
+        spectra = rng.lognormal(size=(50, 9))
+        weights = np.arange(9, dtype=float)
+        expected = effective_rank(np.cov(np.log(spectra), rowvar=False), weights)
 
-    def test_isotropic_gaussian_bump_decreases_radially(self):
-        ny, nx = 32, 32
-        y, x = np.meshgrid(np.arange(ny) - ny / 2, np.arange(nx) - nx / 2, indexing="ij")
-        r2 = y**2 + x**2
-        bump = np.exp(-r2 / (2 * 4.0**2))
-        P = power_spectrum_2d(bump, fft_solver="fft2")
-        rb = radial_bin_spectrum(P, grid_shape=(ny, nx), n_bins=20, fft_solver="fft2")
-        assert rb[0] > rb[-1]
-        # Allow small mid-range reshuffles from discretization.
-        assert (np.diff(rb) <= 1e-6).sum() >= len(rb) - 4
+        def unexpected(*args, **kwargs):
+            raise AssertionError("An internally constructed covariance needs no eigendecomposition")
 
-    def test_radial_consistent_across_solvers(self):
-        rng = np.random.default_rng(1)
-        img = rng.standard_normal((16, 24))
-        P_full = power_spectrum_2d(img, fft_solver="fft2")
-        P_half = power_spectrum_2d(img, fft_solver="rfft2")
-        rb_full = radial_bin_spectrum(P_full, grid_shape=(16, 24), n_bins=8, fft_solver="fft2")
-        rb_half = radial_bin_spectrum(P_half, grid_shape=(16, 24), n_bins=8, fft_solver="rfft2")
-        np.testing.assert_allclose(rb_full, rb_half, rtol=1e-9, atol=1e-9)
+        monkeypatch.setattr(np.linalg, "eigvalsh", unexpected)
+        assert gene_pattern_diversity(spectra, weights) == pytest.approx(expected)
 
-    def test_exclude_dc_keeps_first_radial_interval(self):
-        spectrum = np.zeros((4, 4))
-        spectrum[0, 0] = 100.0  # DC should be removed from the first interval.
-        spectrum[0, 1] = 4.0  # The first nonzero kx frequency should remain.
 
-        rb = radial_bin_spectrum(
-            spectrum,
-            grid_shape=(4, 4),
-            fft_solver="fft2",
-            edges=np.array([0.0, 0.3, 1.0]),
+class TestCompatibility:
+    """Legacy import signatures and public alignment locations."""
+
+    def test_legacy_binning_imports_preserve_signatures_and_spacing_defaults(self):
+        from sonic.comparators import features
+
+        shape = (8, 10)
+        power = compute_sample_spectrum(
+            np.random.default_rng(73).normal(size=(2, *shape)), fft_solver="fft2"
         )
-
-        assert rb.shape == (2,)
-        assert rb[0] > 0.0
-
-    def test_shape_validation(self):
-        with pytest.raises(ValueError, match="last two dims"):
-            radial_bin_spectrum(np.zeros((10, 10)), grid_shape=(8, 8), fft_solver="fft2")
-
-    def test_adapt_frequency_edges_supports_every_grid(self):
-        shapes = [(32, 32), (9, 9)]
-        spacings = [(1.0, 1.0), (1.0, 1.0)]
-        requested = np.linspace(0.0, 0.5 * (1.0 + 1e-9), 9)
-
-        adapted = adapt_frequency_edges(shapes, spacings, requested)
-
-        assert adapted.size < requested.size
-        assert adapted[[0, -1]] == pytest.approx(requested[[0, -1]])
-        counts = [
-            radial_bin_counts(shape, spacing=spacing, edges=adapted)
-            for shape, spacing in zip(shapes, spacings, strict=True)
-        ]
-        assert np.all(np.asarray(counts) > 0)
-
-
-@pytest.mark.parametrize("shape", [(8, 8), (7, 9)])
-@pytest.mark.parametrize("solver", ["fft2", "rfft2"])
-@pytest.mark.parametrize("exclude_dc", [False, True])
-def test_radial_bins_discard_out_of_band_modes(shape, solver, exclude_dc):
-    ky = np.fft.fftfreq(shape[0])[:, None]
-    kx = np.fft.fftfreq(shape[1])[None, :]
-    radius = np.hypot(ky, kx)
-    edges = np.array([0.125, 0.25, 0.5])
-    power = radius**2
-    power[(radius < edges[0]) | (radius > edges[-1])] = 1000.0
-    counts, _ = np.histogram(radius, bins=edges)
-    sums, _ = np.histogram(radius, bins=edges, weights=power)
-    if solver == "rfft2":
-        power = power[:, : shape[1] // 2 + 1]
-    kwargs = {"fft_solver": solver, "edges": edges, "exclude_dc": exclude_dc}
-    np.testing.assert_allclose(radial_bin_counts(shape, **kwargs), counts)
-    np.testing.assert_allclose(radial_bin_spectrum(power, shape, **kwargs), sums / counts)
-
-
-@pytest.mark.parametrize("n", [8, 9, 16])
-@pytest.mark.parametrize("angle", [0.0, 17.0])
-def test_polar_interpolation_wraps_inside_nyquist_band(n, angle):
-    power = np.ones((1, n, n))
-    power[:, 0, 0] = 0
-    result = stream_polar_features(
-        lambda start, stop: power[start:stop],
-        1,
-        (n, n),
-        angle,
-        chunk_size=1,
-        freq_edges=np.array([0.4, 0.5]),
-        spacing=(1.0, 1.0),
-        n_theta=36,
-        fft_solver="fft2",
-    )
-    np.testing.assert_allclose(result, 1.0)
-    with pytest.raises(ValueError, match="Nyquist limits"):
-        stream_polar_features(
-            lambda start, stop: power[start:stop],
-            1,
-            (n, n),
-            angle,
-            chunk_size=1,
-            freq_edges=np.array([0.5, 0.6]),
-            spacing=(1.0, 1.0),
-            n_theta=36,
-            fft_solver="fft2",
+        edges = np.array([0.05, 0.20, 0.40])
+        radius = np.hypot(np.fft.fftfreq(shape[0])[:, None], np.fft.fftfreq(shape[1])[None, :])
+        counts, _ = np.histogram(radius, bins=edges)
+        expected = np.stack(
+            [np.histogram(radius, bins=edges, weights=values)[0] / counts for values in power]
         )
-
-
-class TestRotationAlignment:
-    """Rotation alignment APIs on small synthetic spectra."""
-
-    @staticmethod
-    def _stripes(ny: int, nx: int, period: float = 8.0) -> np.ndarray:
-        y = np.arange(ny)[:, None]
-        return np.broadcast_to(np.sin(2 * np.pi * y / period).astype(float), (ny, nx)).copy()
-
-    @staticmethod
-    def _stripes_rotated(ny: int, nx: int, angle: float, period: float = 8.0) -> np.ndarray:
-        import scipy.ndimage
-
-        base = TestRotationAlignment._stripes(ny, nx, period=period)
-        return scipy.ndimage.rotate(base, angle=angle, reshape=False, order=1, mode="reflect")
-
-    def test_single_landmark_recovers_known_rotation(self):
-        ny = nx = 48
-        true_angle = 25.0
-        ref = self._stripes(ny, nx)
-        rot = self._stripes_rotated(ny, nx, true_angle)
-
-        sp_ref = compute_sample_spectrum(ref[None, :, :], fft_solver="fft2")
-        sp_rot = compute_sample_spectrum(rot[None, :, :], fft_solver="fft2")
-        _, angles = align_spectra_by_rotation(
-            [sp_ref, sp_rot],
-            grid_shapes=[(ny, nx), (ny, nx)],
-            target_spectra=[sp_ref, sp_rot],
-            fft_solver="fft2",
-            reference_index=0,
-            n_theta=360,
+        # Positional options and old keyword names remain accepted at the old import.
+        np.testing.assert_allclose(
+            features.radial_bin_spectrum(power, shape, 30, "fft2", True, None, edges), expected
         )
-        recovered = angles[1] % 180.0
-        true_mod = true_angle % 180.0
-        diff = min(abs(recovered - true_mod), 180.0 - abs(recovered - true_mod))
-        assert diff < 5.0, f"recovered={recovered}, true={true_mod}, diff={diff}"
-
-    def test_per_landmark_alignment_handles_perpendicular_landmarks(self):
-        """Per-landmark alignment survives landmarks on perpendicular axes."""
-        ny = nx = 96
-        true_angle = 30.0
-
-        lm_h = TestRotationSimulation._sine_at_angle(ny, nx, 12.0, 0.0, 0.0)
-        lm_v = TestRotationSimulation._sine_at_angle(ny, nx, 0.0, 12.0, 0.0)
-        ref_stack = np.stack([lm_h, lm_v], axis=0)
-        rot_stack = np.stack(
-            [
-                TestRotationSimulation._sine_at_angle(ny, nx, 12.0, 0.0, true_angle),
-                TestRotationSimulation._sine_at_angle(ny, nx, 0.0, 12.0, true_angle),
-            ],
-            axis=0,
+        np.testing.assert_array_equal(
+            features.radial_bin_counts(shape, 30, "fft2", True, None, edges), counts
         )
-        sp_ref = compute_sample_spectrum(ref_stack, fft_solver="fft2")
-        sp_rot = compute_sample_spectrum(rot_stack, fft_solver="fft2")
-
-        angles = estimate_rotations_from_landmarks(
-            [sp_ref, sp_rot],
-            grid_shapes=[(ny, nx), (ny, nx)],
-            fft_solver="fft2",
-            n_theta=720,
-        )
-        diff = TestRotationSimulation._canon_err(angles[1], true_angle)
-        assert diff < 3.0, f"per-landmark recovered={angles[1]}, expected {true_angle}"
-
-    def test_shape_validation(self):
-        sp = compute_sample_spectrum(
-            np.random.default_rng(0).standard_normal((3, 16, 16)), fft_solver="fft2"
-        )
-        sp_bad = compute_sample_spectrum(
-            np.random.default_rng(0).standard_normal((2, 16, 16)), fft_solver="fft2"
-        )
-        with pytest.raises(ValueError, match="must match across samples"):
-            align_spectra_by_rotation(
-                [sp, sp_bad], grid_shapes=[(16, 16), (16, 16)], fft_solver="fft2"
-            )
-        with pytest.raises(ValueError, match="reference_index"):
-            align_spectra_by_rotation(
-                [sp, sp],
-                grid_shapes=[(16, 16), (16, 16)],
-                reference_index=9,
-                fft_solver="fft2",
-            )
-
-    def test_apply_rotations_to_different_target(self):
-        import scipy.ndimage
-
-        ny = nx = 48
-        true_angle = 18.0
-        ref_landmark = self._stripes(ny, nx)
-        cur_landmark = self._stripes_rotated(ny, nx, true_angle)
-
-        rng = np.random.default_rng(0)
-        ref_target = rng.standard_normal((3, ny, nx))
-        cur_target = np.stack(
-            [
-                scipy.ndimage.rotate(
-                    ref_target[j], true_angle, reshape=False, order=1, mode="reflect"
-                )
-                for j in range(3)
-            ],
-            axis=0,
-        )
-        sp_ref_lm = compute_sample_spectrum(ref_landmark[None, :, :], fft_solver="fft2")
-        sp_cur_lm = compute_sample_spectrum(cur_landmark[None, :, :], fft_solver="fft2")
-        sp_ref_tgt = compute_sample_spectrum(ref_target, fft_solver="fft2")
-        sp_cur_tgt = compute_sample_spectrum(cur_target, fft_solver="fft2")
-
-        angles = estimate_rotations_from_landmarks(
-            [sp_ref_lm, sp_cur_lm],
-            grid_shapes=[(ny, nx), (ny, nx)],
-            fft_solver="fft2",
-            n_theta=360,
-        )
-        rotated = apply_rotations_to_spectra(
-            [sp_ref_tgt, sp_cur_tgt],
-            grid_shapes=[(ny, nx), (ny, nx)],
-            angles_deg=angles,
-            fft_solver="fft2",
-        )
-        # After applying the recovered rotation to the target spectra, the
-        # L2 distance between sample 1 and the reference should drop.
-        # Tolerance is loose because scipy.ndimage.rotate is itself lossy
-        # on discrete grids (interpolation ringing around high-amplitude
-        # FFT peaks). Even a perfectly recovered angle leaves substantial
-        # residual mismatch; we only require a clear improvement.
-        unrot_dist = np.linalg.norm(sp_cur_tgt - sp_ref_tgt)
-        rot_dist = np.linalg.norm(rotated[1] - sp_ref_tgt)
-        assert rot_dist < 0.95 * unrot_dist, (
-            f"rotation failed to reduce distance: unrot={unrot_dist:.2g} rot={rot_dist:.2g}"
-        )
-
-
-class TestRotationSimulation:
-    """Rotation simulations that avoid pixel-interpolation bias."""
-
-    @staticmethod
-    def _sine_at_angle(ny, nx, ky0, kx0, phi_deg):
-        """Generate a sinusoid after rotating its wave vector analytically."""
-        phi = np.deg2rad(phi_deg)
-        c, s = np.cos(phi), np.sin(phi)
-        ky = ky0 * c - kx0 * s
-        kx = ky0 * s + kx0 * c
-        yy, xx = np.meshgrid(np.arange(ny), np.arange(nx), indexing="ij")
-        return np.sin(2 * np.pi * (ky * yy / ny + kx * xx / nx))
-
-    @staticmethod
-    def _canon_err(a, b):
-        d = np.abs(np.mod(a, 180.0) - np.mod(b, 180.0))
-        return np.minimum(d, 180.0 - d)
-
-    def test_multi_sample_recovery_with_multiple_landmarks(self):
-        ny = nx = 96
-        rng = np.random.default_rng(42)
-        n_samples = 8
-        k0s = [10.0, 16.0, 22.0, 30.0]
-
-        ref_landmarks = np.stack([self._sine_at_angle(ny, nx, k0, 0.0, 0.0) for k0 in k0s], axis=0)
-        true_angles = np.concatenate([[0.0], rng.uniform(-80.0, 80.0, size=n_samples - 1)])
-        samples = [ref_landmarks]
-        for ang in true_angles[1:]:
-            samples.append(
-                np.stack(
-                    [self._sine_at_angle(ny, nx, k0, 0.0, ang) for k0 in k0s],
-                    axis=0,
-                )
-            )
-        spectra = [compute_sample_spectrum(s, fft_solver="fft2") for s in samples]
-        recovered = estimate_rotations_from_landmarks(
-            spectra,
-            grid_shapes=[(ny, nx)] * n_samples,
-            fft_solver="fft2",
-            n_theta=720,
-        )
-        errs = self._canon_err(recovered, true_angles)
-        assert errs[0] == 0, "reference angle must be exactly 0"
-        # FFT-bin aliasing sets the practical accuracy limit for these landmarks.
-        assert errs[1:].max() < 4.0, (
-            f"per-sample errors (deg): {errs[1:].round(2).tolist()}; "
-            f"true angles: {true_angles[1:].round(2).tolist()}; "
-            f"recovered: {recovered[1:].round(2).tolist()}"
-        )
-        assert errs[1:].mean() < 2.0
-
-    def test_more_landmarks_reduces_bias(self):
-        """More landmark frequencies should reduce mean recovery error."""
-        ny = nx = 96
-        rng = np.random.default_rng(0)
-        true_angles = np.concatenate([[0.0], rng.uniform(-70.0, 70.0, size=6)])
-
-        def errs_for_k0s(k0s):
-            samples = [
-                np.stack([self._sine_at_angle(ny, nx, k, 0.0, a) for k in k0s], axis=0)
-                for a in true_angles
-            ]
-            spectra = [compute_sample_spectrum(s, fft_solver="fft2") for s in samples]
-            rec = estimate_rotations_from_landmarks(
-                spectra,
-                grid_shapes=[(ny, nx)] * len(samples),
-                fft_solver="fft2",
-                n_theta=720,
-            )
-            return self._canon_err(rec, true_angles)[1:]
-
-        one = errs_for_k0s([12.0]).mean()
-        many = errs_for_k0s([10.0, 14.0, 20.0, 26.0, 34.0]).mean()
-        assert many <= one + 0.1, (
-            f"multi-landmark bias ({many:.2f} deg) did not improve over "
-            f"single-landmark ({one:.2f} deg)"
-        )
-
-    def test_apply_rotations_matches_raw_reference(self):
-        ny = nx = 96
-        rng = np.random.default_rng(7)
-        n_samples = 5
-        k0s = [10.0, 16.0, 24.0]
-
-        ref_landmarks = np.stack([self._sine_at_angle(ny, nx, k0, 0.0, 0.0) for k0 in k0s], axis=0)
-        true_angles = np.concatenate([[0.0], rng.uniform(-60.0, 60.0, size=n_samples - 1)])
-        samples = [ref_landmarks]
-        for ang in true_angles[1:]:
-            samples.append(
-                np.stack(
-                    [self._sine_at_angle(ny, nx, k0, 0.0, ang) for k0 in k0s],
-                    axis=0,
-                )
-            )
-        spectra = [compute_sample_spectrum(s, fft_solver="fft2") for s in samples]
-        angles = estimate_rotations_from_landmarks(
-            spectra,
-            grid_shapes=[(ny, nx)] * n_samples,
-            fft_solver="fft2",
-            n_theta=720,
-        )
-        corrected = apply_rotations_to_spectra(
-            spectra,
-            grid_shapes=[(ny, nx)] * n_samples,
-            angles_deg=angles,
-            fft_solver="fft2",
-        )
-        for i in range(1, n_samples):
-            d_before = np.linalg.norm(spectra[i] - spectra[0])
-            d_after = np.linalg.norm(corrected[i] - spectra[0])
-            # Tolerance is loose because (a) scipy.ndimage.rotate on a
-            # discrete spectrum is lossy: every applied angle ringing-blurs
-            # high-amplitude FFT peaks, and (b) delta-like spectra of
-            # sinusoids are the worst-case for bilinear rotation, so a
-            # "perfect" recovery still leaves ~20-40% residual L2. The
-            # recovery accuracy of ``angles`` itself is tested elsewhere;
-            # here we only require a visible improvement.
-            assert d_after < 0.95 * d_before, (
-                f"sample {i}: rotation-correction did not tighten distance "
-                f"(before={d_before:.2g}, after={d_after:.2g})"
-            )
-
-
-class TestPhysicalFrequencyBinning:
-    """Physical-frequency binning with spacing and shared bin edges."""
-
-    def test_physical_spacing_changes_bin_scale(self):
-        rng = np.random.default_rng(0)
-        img = rng.standard_normal((40, 40))
-
-        P = power_spectrum_2d(img, fft_solver="rfft2")
-        rb1 = radial_bin_spectrum(
-            P, grid_shape=(40, 40), n_bins=10, fft_solver="rfft2", spacing=(1.0, 1.0)
-        )
-        rb2 = radial_bin_spectrum(
-            P, grid_shape=(40, 40), n_bins=10, fft_solver="rfft2", spacing=(10.0, 10.0)
-        )
-        np.testing.assert_allclose(rb1, rb2, rtol=1e-10)
-
-    def test_common_edges_across_heterogeneous_grids(self):
-        rng = np.random.default_rng(0)
-
-        img_a = rng.standard_normal((40, 40))
-        img_b = rng.standard_normal((50, 60))
-        Pa = power_spectrum_2d(img_a, fft_solver="rfft2")
-        Pb = power_spectrum_2d(img_b, fft_solver="rfft2")
-        edges = np.linspace(0, 0.3, 11)
-        rb_a = radial_bin_spectrum(
-            Pa, grid_shape=(40, 40), fft_solver="rfft2", spacing=(1.0, 1.0), edges=edges
-        )
-        rb_b = radial_bin_spectrum(
-            Pb, grid_shape=(50, 60), fft_solver="rfft2", spacing=(1.0, 1.0), edges=edges
-        )
-        assert rb_a.shape == rb_b.shape == (10,)
-
-    def test_explicit_edges_non_monotonic_raises(self):
-        P = np.zeros((8, 5))
-        with pytest.raises(ValueError, match="monotonically"):
-            radial_bin_spectrum(
-                P, grid_shape=(8, 8), fft_solver="rfft2", edges=np.array([0.0, 0.5, 0.2])
-            )
-
-
-@pytest.mark.parametrize("shape", [(8, 8), (7, 9)])
-@pytest.mark.parametrize("solver", ["fft2", "rfft2"])
-def test_radial_reduction_preserves_missing_bins_and_ignores_excluded_nans(shape, solver):
-    ny, nx = shape
-    kx = np.fft.fftfreq(nx) if solver == "fft2" else np.fft.rfftfreq(nx)
-    radius = np.hypot(np.fft.fftfreq(ny)[:, None], kx[None, :])
-    weights = np.ones(radius.shape)
-    if solver == "rfft2":
-        weights[:, 1 : (nx + 1) // 2] = 2
-    edges = np.array([0.10, 0.11, 0.2, 0.35])
-    # Multiple leading axes and a non-contiguous spectrum layout.
-    spectra = np.random.default_rng(2).uniform(size=radius.shape + (3, 2)).transpose(2, 3, 0, 1)
-    spectra[..., (radius < edges[0]) | (radius > edges[-1])] = np.nan
-    spectra[0, 0, 1, 1] = np.nan  # An included NaN affects its bin alone.
-    expected = np.full((3, 2, 3), np.nan)
-    for i, (left, right) in enumerate(zip(edges[:-1], edges[1:], strict=True)):
-        keep = (radius >= left) & ((radius <= right) if i == 2 else (radius < right))
-        if keep.any():
-            expected[..., i] = (spectra[..., keep] * weights[keep]).sum(axis=-1) / weights[
-                keep
-            ].sum()
-    got = radial_bin_spectrum(spectra, shape, fft_solver=solver, edges=edges)
-    np.testing.assert_allclose(got, expected, rtol=1e-12, equal_nan=True)
-
-
-class TestStreamingFeatureHelpers:
-    """Streaming helpers should match full-stack feature construction."""
-
-    def test_stream_radial_features_matches_full_stack_binning(self):
-        rng = np.random.default_rng(0)
-        spec = rng.uniform(0.1, 4.0, size=(5, 10, 6))
-        edges = np.linspace(0.0, 0.5, 7)
-        calls = []
 
         def chunk(start, stop):
-            calls.append((start, stop))
-            return spec[start:stop]
+            return power[start:stop]
 
-        streamed = stream_radial_features(
-            chunk,
-            n_genes=spec.shape[0],
-            grid_shape=(10, 10),
-            chunk_size=2,
-            fft_solver="rfft2",
-            spacing=(1.0, 1.0),
-            edges=edges,
-        )
-        full = radial_bin_spectrum(
-            spec,
-            grid_shape=(10, 10),
-            n_bins=6,
-            fft_solver="rfft2",
-            spacing=(1.0, 1.0),
-            edges=edges,
-        )
-        assert calls == [(0, 2), (2, 4), (4, 5)]
-        np.testing.assert_allclose(streamed, full, rtol=1e-12, atol=1e-12)
-
-    def test_stream_geomean_landmark_matches_full_stack_and_subset(self):
-        rng = np.random.default_rng(1)
-        spec = rng.uniform(0.1, 3.0, size=(6, 8, 8))
-
-        def chunk(start, stop):
-            return spec[start:stop]
-
-        all_genes = stream_geomean_landmark(
-            chunk,
-            n_genes=spec.shape[0],
-            grid_shape=(8, 8),
-            chunk_size=2,
-            eps=1e-12,
-        )
-        expected_all = np.exp(np.log(spec + 1e-12).mean(axis=0))[None, ...]
-        np.testing.assert_allclose(all_genes, expected_all, rtol=1e-12, atol=1e-12)
-
-        subset = np.array([1, 4, 5])
-        subset_landmark = stream_geomean_landmark(
-            chunk,
-            n_genes=spec.shape[0],
-            grid_shape=(8, 8),
-            chunk_size=2,
-            gene_subset=subset,
-            eps=1e-12,
-        )
-        expected_subset = np.exp(np.log(spec[subset] + 1e-12).mean(axis=0))[None, ...]
-        np.testing.assert_allclose(subset_landmark, expected_subset, rtol=1e-12, atol=1e-12)
-
-        with pytest.raises(ValueError, match=">= 1 gene"):
-            stream_geomean_landmark(
+        np.testing.assert_allclose(
+            features.stream_radial_features(
                 chunk,
-                n_genes=spec.shape[0],
-                grid_shape=(8, 8),
-                chunk_size=2,
-                gene_subset=np.array([], dtype=int),
-            )
-
-    def test_stream_polar_features_is_chunk_size_invariant_for_rfft2(self):
-        rng = np.random.default_rng(2)
-        images = rng.standard_normal((4, 16, 16))
-        spec = compute_sample_spectrum(images, fft_solver="rfft2")
-        edges = np.linspace(0.0, 0.5, 5)
-
-        def chunk(start, stop):
-            return spec[start:stop]
-
-        one_chunk = stream_polar_features(
-            chunk,
-            n_genes=spec.shape[0],
-            grid_shape=(16, 16),
-            angle_deg=17.0,
-            chunk_size=spec.shape[0],
-            freq_edges=edges,
-            spacing=(1.0, 1.0),
-            n_theta=12,
-            fft_solver="rfft2",
+                n_genes=2,
+                grid_shape=shape,
+                chunk_size=1,
+                fft_solver="fft2",
+                spacing=None,
+                edges=edges,
+            ),
+            expected,
         )
-        many_chunks = stream_polar_features(
-            chunk,
-            n_genes=spec.shape[0],
-            grid_shape=(16, 16),
-            angle_deg=17.0,
-            chunk_size=1,
-            freq_edges=edges,
-            spacing=(1.0, 1.0),
-            n_theta=12,
-            fft_solver="rfft2",
+        # The old polar None default described a unit domain, not unit pixel spacing.
+        polar_edges = np.array([0.5, 1.5, 2.5])
+        expected_polar = np.stack(
+            [
+                _polar_area_reference(values, shape, (1 / 8, 1 / 10), polar_edges, 8, 17)
+                for values in power
+            ]
         )
-        assert one_chunk.shape == (4, 4 * 12)
-        np.testing.assert_allclose(many_chunks, one_chunk, rtol=1e-12, atol=1e-12)
-
-
-@pytest.mark.parametrize("solver", ["fft2", "rfft2"])
-@pytest.mark.parametrize("dtype,offset", [(np.float64, 3.0), (np.float64, 1e12), (np.float32, 1e5)])
-def test_spectrum_centering_preserves_dc_and_input(solver, dtype, offset):
-    sample = (np.random.default_rng(3).normal(size=(3, 7, 9)) + offset).astype(dtype)
-    sample[1] = offset
-    original = sample.copy()
-    sample.flags.writeable = False
-    spectrum, dc = compute_sample_spectrum(sample, fft_solver=solver, return_dc=True)
-    centered = sample - sample.mean(axis=(1, 2), keepdims=True)
-    transform = scipy.fft.fft2 if solver == "fft2" else scipy.fft.rfft2
-    expected = np.abs(transform(centered, axes=(1, 2))) ** 2
-    expected /= (sample.shape[1] * sample.shape[2]) ** 2
-    expected[:, 0, 0] = 0.0
-    np.testing.assert_allclose(
-        spectrum, expected, rtol=1e-6 if dtype == np.float32 else 1e-12, atol=1e-10
-    )
-    np.testing.assert_array_equal(dc, sample.mean(axis=(1, 2)))
-    np.testing.assert_array_equal(sample, original)
-
-
-@pytest.mark.parametrize("solver", ["fft2", "rfft2"])
-@pytest.mark.parametrize("angle", [0.0, 30.0, -40.0])
-def test_rotation_uses_physical_frequencies_on_rectangular_grids(solver, angle):
-    shapes = [(64, 64), (65, 97)]
-    spacings = [(1.0, 1.0), (2.0, 0.5)]
-
-    def spectrum(shape, spacing, direction):
-        fy = np.fft.fftfreq(shape[0], d=spacing[0])[:, None]
-        fx = np.fft.fftfreq(shape[1], d=spacing[1])[None, :]
-        theta = np.deg2rad(direction)
-        result = []
-        for radius in (0.08, 0.16):
-            ky, kx = radius * np.sin(theta), radius * np.cos(theta)
-            result.append(
-                sum(
-                    np.exp(-((fy - sign * ky) ** 2 + (fx - sign * kx) ** 2) / (2 * 0.025**2))
-                    for sign in (-1, 1)
-                )
-            )
-        result = np.array(result)
-        return result if solver == "fft2" else result[..., : shape[1] // 2 + 1]
-
-    spectra = [spectrum(shapes[0], spacings[0], 50), spectrum(shapes[1], spacings[1], 50 - angle)]
-    originals = [x.copy() for x in spectra]
-    rotated, angles = align_spectra_by_rotation(
-        spectra,
-        shapes,
-        target_spectra=spectra,
-        fft_solver=solver,
-        spacings=spacings,
-        n_theta=360,
-    )
-    assert TestRotationSimulation._canon_err(angles[1], angle) < 2.0
-    expected = spectrum(shapes[1], spacings[1], 50)
-    assert np.linalg.norm(rotated[1] - expected) / np.linalg.norm(expected) < 0.08
-    features = []
-    for spec, shape, spacing, recovered in zip(spectra, shapes, spacings, angles, strict=True):
-        features.append(
-            stream_polar_features(
-                lambda start, stop, spec=spec: spec[start:stop],
+        np.testing.assert_allclose(
+            features.stream_polar_features(
+                chunk,
                 2,
                 shape,
-                recovered,
+                17,
                 chunk_size=1,
-                freq_edges=np.linspace(0, 0.22, 12),
-                spacing=spacing,
-                n_theta=72,
-                fft_solver=solver,
-            )
+                freq_edges=polar_edges,
+                spacing=None,
+                n_theta=8,
+                fft_solver="fft2",
+            ),
+            expected_polar,
+            rtol=1e-12,
         )
-    assert np.linalg.norm(features[1] - features[0]) / np.linalg.norm(features[0]) < 0.08
-    for before, after in zip(originals, spectra, strict=True):
-        np.testing.assert_array_equal(before, after)
+        np.testing.assert_array_equal(
+            features.adapt_frequency_edges([shape], [(1, 1)], edges), edges
+        )
+        assert not {
+            "radial_bin_spectrum",
+            "radial_bin_counts",
+            "adapt_frequency_edges",
+            "stream_radial_features",
+            "stream_polar_features",
+        }.intersection(features.__all__)
 
+    def test_alignment_functions_stay_in_features(self):
+        from sonic.comparators import features
 
-@pytest.mark.parametrize("weighted", [False, True])
-@pytest.mark.parametrize("scale", [1e-200, 1.0, 1e200])
-def test_effective_rank_psd_traces_match_eigenvalues(weighted, scale):
-    rng = np.random.default_rng(92)
-    x = rng.normal(size=(5, 13))  # Singular PSD covariance.
-    cov = x.T @ x
-    weights = np.linspace(0, 1, 13) if weighted else None
-    expected = effective_rank(cov, weights)
-    np.testing.assert_allclose(effective_rank(cov * scale, weights, assume_psd=True), expected)
-    assert np.isnan(effective_rank(np.zeros((3, 3)), assume_psd=True))
-    # Default public behavior must still clip genuinely negative eigenvalues.
-    assert effective_rank(np.diag([-3.0, 1.0, 1.0])) == pytest.approx(2.0)
-
-
-def test_gene_pattern_diversity_uses_psd_fast_path(monkeypatch):
-    rng = np.random.default_rng(3)
-    spectra = rng.lognormal(size=(50, 9))
-    weights = np.arange(9, dtype=float)
-    expected = effective_rank(np.cov(np.log(spectra), rowvar=False), weights)
-
-    def unexpected(*args, **kwargs):
-        raise AssertionError("An internally constructed covariance needs no eigendecomposition")
-
-    monkeypatch.setattr(np.linalg, "eigvalsh", unexpected)
-    assert gene_pattern_diversity(spectra, weights) == pytest.approx(expected)
+        for name in (
+            "estimate_rotations_from_landmarks",
+            "apply_rotations_to_spectra",
+            "align_spectra_by_rotation",
+        ):
+            assert getattr(features, name).__module__ == "sonic.comparators.features"

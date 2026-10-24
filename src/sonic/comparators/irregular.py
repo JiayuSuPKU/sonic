@@ -15,16 +15,11 @@ import scipy.sparse as sp
 
 from sonic.comparators.base import (
     _ComparatorBase,
-    _run_per_sample,
-    _unpack_sample_triples,
     _validate_common,
 )
-from sonic.comparators.features import (
-    estimate_rotations_from_landmarks,
-    radial_bin_spectrum,
-    stream_geomean_landmark,
-    stream_polar_features,
-    stream_radial_features,
+from sonic.comparators.binning import (
+    _bin_radial_spectrum,
+    _stream_polar_features,
 )
 from sonic.utils import _NUFFT_CHUNK_CAP
 
@@ -56,6 +51,7 @@ class ComparatorIrregular(_ComparatorBase):
         If None, inferred from the first sample; every other sample must share
         the same ``var_names``.
     feature_mode : {'radial', '2d'}, default 'radial'
+        2D features are adaptive, area-weighted radial/angular band means.
     n_radial_bins : int, default 30
         Number of radial frequency intervals used when ``freq_edges`` is not
         supplied. Radial mode excludes only the DC cell from the first interval,
@@ -247,223 +243,48 @@ class ComparatorIrregular(_ComparatorBase):
         self._grid_shapes = grids
         self._spacings = spacings
 
-    def _nufft_spectrum_chunker(self, i: int, *, frequency_padding: int = 0):
-        """Build ``(spectrum_chunk_fn, dc, presence, n_genes, grid)`` for sample ``i``.
-
-        ``spectrum_chunk_fn(start, stop)`` mean-centres + NUFFTs just that
-        gene-chunk to its ``(stop-start, ny, nx)`` power spectrum, filling the
-        shared ``dc`` / ``presence`` arrays on the way. The dense
-        ``(n_genes, ny, nx)`` spectrum is never assembled by the caller.
-        With ``frequency_padding=1``, each chunk includes an evaluated border
-        of Fourier modes for polar interpolation; the returned grid is unpadded.
-        """
+    def _sample_spectrum_chunker(self, i: int, *, gene_indices=None):
+        """Stream selected genes' powers, collecting DC/presence only for each batch."""
         from sonic.kernels.nufft import power_spectrum_2d_nufft
 
         adata = self.samples[i]
-        pts = self._coords[i]
-        scale = self._unit_scales[i]
-        grid_i = self._grid_shapes[i]
-        spacing_i = self._spacings[i]
         X_src = adata.X if self._layer is None else adata.layers[self._layer]
-        n_genes = len(self.gene_names)
+        X_src = X_src.tocsc() if sp.issparse(X_src) else np.asarray(X_src)
+        columns = (
+            np.arange(len(self.gene_names)) if gene_indices is None else np.asarray(gene_indices)
+        )
+        n_genes = len(columns)
         n_spots = X_src.shape[0]
-
-        if sp.issparse(X_src):
-            X_src = X_src.astype(np.float64, copy=False)
-            dc = np.asarray(X_src.mean(axis=0)).ravel()
-            nnz_per = np.asarray((X_src != 0).sum(axis=0)).ravel()
-            X_csc = X_src.tocsc()
-            X_dense = None
-        else:
-            X_dense = np.asarray(X_src, dtype=np.float64)
-            dc = X_dense.mean(axis=0)
-            nnz_per = (X_dense != 0).sum(axis=0)
-            X_csc = None
-        presence = (nnz_per / max(n_spots, 1)) >= self._presence_threshold
+        grid_i = self._grid_shapes[i]
+        dc = np.empty(n_genes, dtype=float)
+        presence = np.empty(n_genes, dtype=bool)
+        padding = int(self.feature_mode == "2d")
 
         def _spec_chunk(start: int, stop: int) -> np.ndarray:
-            cols = slice(start, stop)
-            if X_csc is not None:
-                block = np.asarray(X_csc[:, cols].toarray(), dtype=np.float64)
-            else:
-                block = X_dense[:, cols].astype(np.float64, copy=True)
-            # Per-gene mean centering removes the DC bin and prevents per-sample
-            # mean-shift leakage into low-frequency bins. Raw DC scalars are kept
-            # on ``self.dc_`` for the complementary :meth:`test_diff_expr` path.
-            block -= dc[None, cols]
-            p_chunk = power_spectrum_2d_nufft(
-                pts,
+            values = X_src[:, columns[start:stop]]
+            block = np.array(
+                values.toarray() if sp.issparse(values) else values, dtype=float, copy=True
+            )
+            dc[start:stop] = block.mean(axis=0)
+            presence[start:stop] = (
+                np.count_nonzero(block, axis=0) / max(n_spots, 1)
+            ) >= self._presence_threshold
+            block -= dc[None, start:stop]
+            power = power_spectrum_2d_nufft(
+                self._coords[i],
                 block,
                 grid_shape=grid_i,
-                spacing=spacing_i,
-                unit_scale=scale,
+                spacing=self._spacings[i],
+                unit_scale=self._unit_scales[i],
                 eps=self._nufft_eps,
                 nthreads=self._workers,
                 center_coords=True,
-                frequency_padding=frequency_padding,
+                frequency_padding=padding,
             )
-            p_chunk /= n_spots**2
-            return np.moveaxis(p_chunk, -1, 0)  # (chunk, ny, nx)
+            power /= n_spots**2
+            return np.moveaxis(power, -1, 0)
 
         return _spec_chunk, dc, presence, n_genes, grid_i
-
-    def _compute_spectra(  # noqa: C901 — radial-stream / 2d two-pass dispatch
-        self,
-        n_jobs: int,
-        progress: bool,
-        landmark_genes: Sequence[str] | None = None,
-    ) -> tuple[list[np.ndarray], np.ndarray, np.ndarray]:
-        padding = 1 if self.feature_mode == "2d" else 0
-        work_grids = [(ny + 2 * padding, nx + 2 * padding) for ny, nx in self._grid_shapes]
-        n_jobs, self._nufft_chunk_size = self._resolve_spectrum_schedule(
-            self._nufft_chunk_size_spec, work_grids, n_jobs=n_jobs
-        )
-        chunk_size = self._nufft_chunk_size
-        n_samples_total = len(self.samples)
-        self._resolve_freq_edges()
-
-        if self.feature_mode != "radial":
-            return self._compute_spectra_2d(n_jobs, progress, landmark_genes)
-
-        # Per-sample parallelism helper
-        def _one(i: int, pbar: Any = None) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-            spec_chunk_fn, dc, presence, n_genes, grid_i = self._nufft_spectrum_chunker(i)
-            spacing_i = self._spacings[i]
-            # Within each sample, compute the radial spectrum sequentially, chunk by chunk
-            feat = stream_radial_features(
-                spec_chunk_fn,
-                n_genes,
-                grid_i,
-                chunk_size=chunk_size,
-                fft_solver=self._spectrum_fft_solver,
-                spacing=spacing_i,
-                # Shared edges were resolved at the top of this backend dispatcher.
-                edges=self.freq_edges,
-                pbar=pbar,
-            )
-            return feat, dc, presence
-
-        return _unpack_sample_triples(
-            _run_per_sample(
-                _one,
-                n_samples_total,
-                n_chunks_per_sample=int(np.ceil(len(self.gene_names) / chunk_size)),
-                desc="NUFFT spectra (per-gene chunks)",
-                n_jobs=n_jobs,
-                progress=progress,
-            )
-        )
-
-    def _compute_spectra_2d(  # noqa: C901 — two-pass landmark/feature worker setup
-        self,
-        n_jobs: int,
-        progress: bool,
-        landmark_genes: Sequence[str] | None,
-    ) -> tuple[list[np.ndarray], np.ndarray, np.ndarray]:
-        """Two-pass streamed rotation alignment (mirrors ``ComparatorGrid``)."""
-        chunk_size = self._nufft_chunk_size
-        n_samples = len(self.samples)
-        name_to_idx = {g: j for j, g in enumerate(self.gene_names)}
-        lm_idx: np.ndarray | None = None
-        if landmark_genes is not None:
-            missing = [g for g in landmark_genes if g not in name_to_idx]
-            if missing:
-                raise KeyError(f"landmark_genes not in gene_names: {missing}")
-            lm_idx = np.asarray([name_to_idx[g] for g in landmark_genes], dtype=int)
-        # Cache explicit landmark spectra only within budget; else warn + use a
-        # single streamed geometric-mean of the landmark genes.
-        cache_landmarks = lm_idx is not None and self._landmark_cache_fits(
-            len(lm_idx), frequency_padding=1
-        )
-
-        # Pass A: landmark + dc/presence per sample.
-        grids = list(self._grid_shapes)
-
-        # Per-sample parallelism helper for landmark spectra
-        def _landmark_one(i: int, pbar: Any = None) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-            spec_chunk_fn, dc, presence, n_genes, grid_i = self._nufft_spectrum_chunker(
-                i, frequency_padding=1
-            )
-            if lm_idx is None:
-                lm = stream_geomean_landmark(
-                    spec_chunk_fn, n_genes, grid_i, chunk_size=chunk_size, pbar=pbar
-                )
-            else:
-                if cache_landmarks:
-                    parts = []
-                    for j in lm_idx:
-                        parts.append(spec_chunk_fn(int(j), int(j) + 1))
-                        if pbar is not None:
-                            pbar.update(1)
-                    lm = np.concatenate(parts, axis=0)
-                else:
-                    lm = stream_geomean_landmark(
-                        spec_chunk_fn,
-                        n_genes,
-                        grid_i,
-                        chunk_size=chunk_size,
-                        gene_subset=lm_idx,
-                        pbar=pbar,
-                    )
-            return lm, dc, presence
-
-        if lm_idx is None:
-            n_pass_a_chunks = int(np.ceil(len(self.gene_names) / chunk_size))
-        elif cache_landmarks:
-            n_pass_a_chunks = int(len(lm_idx))
-        else:
-            n_pass_a_chunks = int(np.ceil(len(lm_idx) / chunk_size))
-        landmarks, dc, presence = _unpack_sample_triples(
-            _run_per_sample(
-                _landmark_one,
-                n_samples,
-                n_chunks_per_sample=max(1, n_pass_a_chunks),
-                desc="NUFFT 2D landmarks (per-sample chunks)",
-                n_jobs=n_jobs,
-                progress=progress,
-            )
-        )
-
-        angles = estimate_rotations_from_landmarks(
-            landmarks,
-            grids,
-            fft_solver=self._spectrum_fft_solver,
-            spacings=self._spacings,
-            progress=progress,
-            frequency_padding=1,
-        )
-        self.rotation_angles_ = angles
-
-        # Pass B: re-stream, rotate, physical-frequency polar resample.
-        # Per-sample parallelism helper for feature spectra (binned)
-        def _feature_one(i: int, pbar: Any = None) -> np.ndarray:
-            spec_chunk_fn, _dc, _pres, n_genes, grid_i = self._nufft_spectrum_chunker(
-                i, frequency_padding=1
-            )
-            return stream_polar_features(
-                spec_chunk_fn,
-                n_genes,
-                grid_i,
-                float(angles[i]),
-                chunk_size=chunk_size,
-                # Shared edges were resolved at the top of this backend dispatcher.
-                freq_edges=self.freq_edges,
-                spacing=self._spacings[i],
-                n_theta=self._n_theta_bins,
-                fft_solver=self._spectrum_fft_solver,
-                pbar=pbar,
-                frequency_padding=1,
-            )
-
-        feats = _run_per_sample(
-            _feature_one,
-            n_samples,
-            n_chunks_per_sample=int(np.ceil(len(self.gene_names) / chunk_size)),
-            desc="NUFFT 2D features (per-sample chunks)",
-            n_jobs=n_jobs,
-            progress=progress,
-        )
-        return [np.asarray(f) for f in feats], dc, presence
 
     # ------------------------------------------------------------------
     def _covariate_features_from_keys(  # noqa: C901 — per-key obs/var dispatch + per-sample loop
@@ -569,7 +390,7 @@ class ComparatorIrregular(_ComparatorBase):
             cov_2d = np.moveaxis(p, -1, 0)  # (n_cov, ny, nx)
             ny, nx = self._grid_shapes[i]
             if self.feature_mode == "radial":
-                cov_feat = radial_bin_spectrum(
+                cov_feat = _bin_radial_spectrum(
                     cov_2d,
                     grid_shape=(ny, nx),
                     n_bins=self._n_radial_bins,
@@ -585,13 +406,13 @@ class ComparatorIrregular(_ComparatorBase):
                 def _cov_chunk(start: int, stop: int, _cov_2d: np.ndarray = cov_2d) -> np.ndarray:
                     return _cov_2d[start:stop]
 
-                cov_feat = stream_polar_features(
+                cov_feat = _stream_polar_features(
                     _cov_chunk,
                     cov_2d.shape[0],
                     (ny, nx),
-                    angle,
+                    angle_deg=angle,
                     chunk_size=max(1, cov_2d.shape[0]),
-                    freq_edges=self.freq_edges,
+                    edges=self.freq_edges,
                     spacing=self._spacings[i],
                     n_theta=self._n_theta_bins,
                     fft_solver=self._spectrum_fft_solver,

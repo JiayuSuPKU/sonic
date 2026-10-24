@@ -16,7 +16,10 @@ inherit from. The mixin owns:
   ``test_diff_expr(design, ...)`` — design-at-call-time so a single
   fitted comparator can serve any number of unrelated contrasts on
   the same spectra;
-- the diagnostic ``effective_rank()``.
+- the diagnostic ``effective_rank()``;
+
+- the ``compute_cross_spectra`` driver that computes pairwise cross-spectra
+  for given feature pairs and populates the ``cross_spectra_`` attribute.
 
 The shape-only / sum-1 feature representation is reached via the
 ``normalize_shape: bool = False`` keyword on :meth:`test_diff_freq`
@@ -33,14 +36,21 @@ from __future__ import annotations
 import copy
 import logging
 import warnings
-from abc import abstractmethod
 from collections.abc import Sequence
+from dataclasses import replace
 from typing import TYPE_CHECKING, Any
 
 import numpy as np
 from joblib import Parallel, delayed
 from tqdm.auto import tqdm
 
+from sonic.comparators.binning import (
+    _adapt_radial_edges,
+    _bin_radial_spectrum,
+    _radial_bin_cell_counts,
+    _stream_polar_features,
+    _stream_radial_features,
+)
 from sonic.utils import _DEFAULT_CHUNK_BUDGET, _FFT_CHUNK_CAP, _parse_memory_budget
 
 # Suppress known deprecation warnings from SpatialData dependencies BEFORE importing them.
@@ -48,11 +58,11 @@ warnings.filterwarnings("ignore", category=FutureWarning, message=".*legacy Dask
 warnings.filterwarnings("ignore", category=UserWarning, message=".*pkg_resources is deprecated.*")
 
 from sonic.comparators.features import (
-    adapt_frequency_edges,
+    _ALIGNMENT_N_RADIUS,
+    _ALIGNMENT_N_THETA,
+    _estimate_rotations_from_polar,
+    _stream_landmark_polar,
     compute_sample_spectrum,
-    radial_bin_counts,
-    radial_bin_spectrum,
-    stream_polar_features,
 )
 from sonic.comparators.features import (
     gene_pattern_diversity as _gene_pattern_diversity,
@@ -80,6 +90,7 @@ from sonic.comparators.normalization import (
 )
 
 if TYPE_CHECKING:
+    from sonic.comparators.cross_spectrum import CrossSpectra
     from sonic.comparators.multisample import _AnalyticNullState
 
 __all__: list[str] = []
@@ -131,22 +142,12 @@ def _unpack_sample_triples(
     return [np.asarray(x) for x in feats], dc, presence
 
 
-def _unpack_sample_quads(
-    results: list[tuple[np.ndarray, np.ndarray, np.ndarray, Any]],
-) -> tuple[list[np.ndarray], np.ndarray, np.ndarray, list[Any]]:
-    """Convert ``[(features, dc, presence, extra), ...]`` to stacked outputs."""
-    feats, dc_list, pres_list, extra = zip(*results, strict=True)
-    dc = np.stack([np.asarray(x) for x in dc_list], axis=0)
-    presence = np.stack([np.asarray(x) for x in pres_list], axis=0)
-    return [np.asarray(x) for x in feats], dc, presence, list(extra)
-
-
 class _ComparatorBase:
     """Shared state + shared methods for NUFFT / FFT pattern comparators.
 
     Subclasses populate the small public surface and the underscored
     internal state listed below in ``__init__``, then implement
-    :meth:`_compute_spectra` to fill the post-``compute_spectra``
+    :meth:`_sample_spectrum_chunker` to fill the post-``compute_spectra``
     attributes. The comparator carries **no design / contrast state**:
     cross-sample comparisons are specified per-call on
     :meth:`test_diff_freq` and :meth:`test_diff_expr`, so a single
@@ -204,11 +205,18 @@ class _ComparatorBase:
         Fourier-grid intervals from true zero-power measurements in
         :attr:`spectra_`.
 
+    cross_spectra_ : CrossSpectra | None
+        Pairwise result set by ``compute_cross_spectra``. Its ``cross_spectra``
+        and matched ``auto_spectra`` use the same retained radial intervals
+        as ``spectra_``.
+        Successful auto-spectrum recomputation clears this result. Failed
+        computations leave all previously fitted results intact.
+
     Private state (set by subclasses; not part of the user API)
     -----------------------------------------------------------
     ``_n_radial_bins``, ``_n_theta_bins``, ``_fft_solver``, ``_workers``,
     ``_presence_threshold``, ``_spacings``,
-    ``_spectrum_fft_solver``, ``_grid_shapes``, ``_raw_2d_spectra``.
+    ``_spectrum_fft_solver``, ``_grid_shapes``.
     """
 
     # --- public attribute stubs populated by subclass __init__ --------
@@ -231,15 +239,15 @@ class _ComparatorBase:
 
     # --- populated by :meth:`compute_spectra` ---------------------------
     spectra_: np.ndarray | None = None
+    cross_spectra_: CrossSpectra | None = None
     dc_: np.ndarray | None = None
     presence_: np.ndarray | None = None
     rotation_angles_: np.ndarray | None = None
+    _alignment_landmark_genes: tuple[str, ...] | None = None
     frequency_bin_counts_: np.ndarray | None = None
     freq_edges_requested_: np.ndarray | None = None
     frequency_bin_intervals_: np.ndarray | None = None
     _supported_frequency_bin_mask: np.ndarray | None = None
-
-    _raw_2d_spectra: list[np.ndarray] | None = None
 
     # Angular resolution of the ``feature_mode='2d'`` polar feature grid:
     # the 2-D feature axis is ``n_radius_bins × _n_theta_bins`` over the
@@ -247,50 +255,124 @@ class _ComparatorBase:
     _n_theta_bins: int = 36
 
     # ------------------------------------------------------------------
-    @abstractmethod
-    def _compute_spectra(
-        self,
-        n_jobs: int,
-        progress: bool,
-        landmark_genes: Sequence[str] | None = None,
-    ) -> tuple[list[np.ndarray], np.ndarray, np.ndarray]:
-        """Stream per-sample **feature** spectra + DC + presence mask.
+    def _prepare_frequency_grid(self) -> None:
+        """Resolve common geometry and bin support without computing gene spectra."""
+        if self._spectrum_backend == "fft":
+            self._grid_shapes = [tuple(self._rasterize_one(s).shape[-2:]) for s in self.samples]
+            self._spacings = self._spacing_override or [(1.0, 1.0)] * len(self.samples)
+        self._resolve_freq_edges()
+        self._record_frequency_bin_metadata(
+            self._fft_cell_counts_for_edges(self.freq_edges),
+            self._fft_cell_counts_for_edges(self.freq_edges_requested_),
+        )
 
-        Implemented by each backend. The dense full ``(n_genes, ny, n_kx)`` 2D
-        spectra should **never** materialised in either mode and peak memory stays
-        at ``O(chunk · ny · nx)``. Returns ``(feats, dc, presence)``:
+    def _ensure_alignment(self, n_jobs, progress, landmark_genes=None, *, chunk_size=None):
+        """Reuse sample angles or estimate them from compact polar landmarks only.
 
-        - ``feature_mode='radial'`` — rasterise/NUFFT → per-gene-chunk FFT →
-          radial-bin, discarding each dense chunk; ``feats`` are
-          **radial-binned** ``(n_genes, n_feature_bins)`` arrays. No alignment
-          needed here, and the ``landmark_genes`` argument is ignored.
-        - ``feature_mode='2d'`` — a **two-pass** streamed rotation alignment:
-          (A) learn per-sample rotation angles against a reference using
-          landmark genes (default: use the per-sample *geometric-mean* spectrum as
-          a single landmark, like
-          :func:`sonic.comparators.normalization.normalize_background`; optionally, align
-          the spectra of an explicit ``landmark_genes`` set).
-          (B) for every gene-chunk, first rotate by the estimated angle, then
-          resample onto a polar ``(radius, theta)`` grid whose **radius axis is
-          the shared physical-frequency grid** (:attr:`freq_edges`, the same
-          edges the radial path uses) and whose ``theta`` axis (length
-          :attr:`_n_theta_bins`) carries direction, and flatten — discarding each
-          dense chunk. ``feats`` are
-          ``(n_genes, n_radius_bins · _n_theta_bins)`` and are cross-sample
-          aligned (heterogeneous lattices map the same physical frequency to
-          the same radius bin, like radial mode). The recovered angles are
-          stored on ``self.rotation_angles_``.
-
-        ``dc`` is ``(n_samples, n_genes)`` and ``presence`` is
-        ``(n_samples, n_genes)`` bool. Each backend calls
-        :meth:`_resolve_freq_edges` once its per-sample spacing metadata is known
-        and before any streamed reducer consumes :attr:`freq_edges`. When an
-        explicit ``landmark_genes`` set would require caching the full landmark
-        spectra beyond :attr:`_landmark_cache_warn_bytes`, the backend warns and
-        falls back to a single streamed geometric mean **of the landmark genes**
-        (see :meth:`_landmark_cache_fits`) instead of raising.
+        This helper populates :attr:`rotation_angles_` and :attr:`_alignment_landmark_genes`
+        to be used by :meth:`_compute_spectra` when ``feature_mode='2d'``.
         """
-        raise NotImplementedError
+        if self.feature_mode != "2d":  # only applies to 2D polar bins
+            return
+        names = None if landmark_genes is None else tuple(landmark_genes)
+        if names is not None:
+            if not names:
+                raise ValueError("landmark_genes must contain at least one gene")
+            missing = [g for g in names if g not in self.gene_names]
+            if missing:
+                raise KeyError(f"landmark_genes not in gene_names: {missing}")
+        if self.rotation_angles_ is not None and (
+            names is None or names == self._alignment_landmark_genes
+        ):
+            return
+        if len(self.samples) == 1:
+            angles = np.zeros(1)
+        else:
+            padding = int(self._spectrum_backend == "nufft")
+            grids = [(ny + 2 * padding, nx + 2 * padding) for ny, nx in self._grid_shapes]
+            spec = self._resolve_chunk_spec(chunk_size)
+            n_jobs, chunk = self._resolve_spectrum_schedule(spec, grids, n_jobs=n_jobs)
+            indices = None if names is None else [self.gene_names.index(g) for g in names]
+            n_genes = len(self.gene_names) if names is None else len(names)
+            use_geomean = names is None or not self._landmark_cache_fits(n_genes)
+            f_max = min(0.5 / max(spacing) for spacing in self._spacings)
+            edges = np.linspace(0.0, f_max, _ALIGNMENT_N_RADIUS + 1)
+
+            # Compute interpolated polar spectra for selected landmarks per sample.
+            def _one(i, pbar):
+                read, _dc, _presence, count, shape = self._sample_spectrum_chunker(
+                    i, gene_indices=indices
+                )
+
+                return _stream_landmark_polar(
+                    read,
+                    count,
+                    shape,
+                    chunk_size=chunk,
+                    fft_solver=self._spectrum_fft_solver,
+                    freq_edges=edges,
+                    spacing=self._spacings[i],
+                    geomean=use_geomean,
+                    frequency_padding=padding,
+                    pbar=pbar,
+                )
+
+            landmarks = _run_per_sample(
+                _one,
+                len(self.samples),
+                n_chunks_per_sample=int(np.ceil(n_genes / chunk)),
+                desc="Alignment landmarks",
+                n_jobs=n_jobs,
+                progress=progress,
+            )
+            angles = _estimate_rotations_from_polar(landmarks, progress=progress)
+        self.rotation_angles_ = angles
+        self._alignment_landmark_genes = names
+
+    def _compute_spectra(self, n_jobs, progress, landmark_genes=None, *, chunk_size=None):
+        """Stream raw feature powers and DC/presence through either backend."""
+        self._prepare_frequency_grid()
+        padding = int(self.feature_mode == "2d" and self._spectrum_backend == "nufft")
+        grids = [(ny + 2 * padding, nx + 2 * padding) for ny, nx in self._grid_shapes]
+        spec = self._resolve_chunk_spec(chunk_size)
+        n_jobs, chunk = self._resolve_spectrum_schedule(spec, grids, n_jobs=n_jobs)
+        setattr(self, f"_{self._spectrum_backend}_chunk_size", chunk)
+        self._ensure_alignment(n_jobs, progress, landmark_genes, chunk_size=chunk)
+
+        # Compute binned and flattened single-feature auto-spectra per sample.
+        def _one(i, pbar):
+            read, dc, presence, count, shape = self._sample_spectrum_chunker(i)
+            options = {
+                "chunk_size": chunk,
+                "fft_solver": self._spectrum_fft_solver,
+                "spacing": self._spacings[i],
+                "edges": self.freq_edges,
+                "pbar": pbar,
+            }
+            if self.feature_mode == "radial":
+                features = _stream_radial_features(read, count, shape, **options)
+            else:
+                features = _stream_polar_features(
+                    read,
+                    count,
+                    shape,
+                    angle_deg=float(self.rotation_angles_[i]),
+                    n_theta=self._n_theta_bins,
+                    frequency_padding=padding,
+                    **options,
+                )
+            return features, dc, presence
+
+        return _unpack_sample_triples(
+            _run_per_sample(
+                _one,
+                len(self.samples),
+                n_chunks_per_sample=int(np.ceil(len(self.gene_names) / chunk)),
+                desc="Spectra",
+                n_jobs=n_jobs,
+                progress=progress,
+            )
+        )
 
     # Backend cache sweet-spot cap for ``chunk_size='auto'`` — the empirically
     # tuned caps from :func:`sonic.utils.auto_chunk_size` (FFT → 32,
@@ -301,12 +383,25 @@ class _ComparatorBase:
 
     @staticmethod
     def _normalize_chunk_spec(spec: int | str) -> int | str:
-        """Validate a chunk-size spec at construction; return ``'auto'`` or a ``>=1`` int."""
-        if isinstance(spec, str):
-            if spec != "auto":
-                raise ValueError(f"chunk_size must be a positive int or 'auto', got {spec!r}.")
-            return "auto"
-        return max(1, int(spec))
+        """Accept only 'auto' or a positive integer, at construction and per call."""
+        if isinstance(spec, str) and spec == "auto":
+            return spec
+        if (
+            isinstance(spec, (int, np.integer))
+            and not isinstance(spec, (bool, np.bool_))
+            and spec >= 1
+        ):
+            return int(spec)
+        raise ValueError("chunk_size must be auto or a positive integer")
+
+    def _resolve_chunk_spec(self, chunk_size):
+        """Validate a call override without changing the constructor setting."""
+        spec = (
+            getattr(self, f"_{self._spectrum_backend}_chunk_size_spec")
+            if chunk_size is None
+            else chunk_size
+        )
+        return self._normalize_chunk_spec(spec)
 
     @staticmethod
     def _normalize_n_theta_bins(n_theta_bins: int) -> int:
@@ -355,8 +450,6 @@ class _ComparatorBase:
         Automatic jobs can shrink to fit one feature per sample job; explicit
         positive jobs retain their limit. Explicit chunks bypass memory sizing.
         """
-        if isinstance(spec, str) and spec != "auto":
-            raise ValueError(f"chunk_size must be a positive int or 'auto', got {spec!r}.")
         from sonic.utils import resolve_chunk_size, resolve_parallelism
 
         max_lat = max((ny * nx for (ny, nx) in grid_shapes), default=1)
@@ -379,45 +472,24 @@ class _ComparatorBase:
                 budget_bytes=self._auto_chunk_budget_bytes,
             )
             if spec == "auto"
-            else max(1, int(spec))
+            else spec
         )
         return n_jobs, chunk
 
-    # Rotation-landmark cache budget (bytes). An explicit ``landmark_genes``
-    # set in 2d mode needs its full ``(n_landmarks, ny, n_kx)`` spectra cached
-    # per sample to estimate angles; if the largest such cache would exceed this
-    # we raise rather than risk an OOM. The streamed *geomean* landmark (the
-    # default) is a single ``(1, ny, n_kx)`` spectrum and never trips this.
-    _landmark_cache_warn_bytes: int = 8 * 1024**3  # 8 GiB
+    # Compact polar stacks are retained only for the alignment pass.
+    _landmark_cache_warn_bytes: int = 8 * 1024**3
 
-    # ------------------------------------------------------------------
-    def _landmark_cache_fits(self, n_landmarks: int, *, frequency_padding: int = 0) -> bool:
-        """Whether caching ``n_landmarks`` full-2D spectra per sample fits budget.
-
-        The explicit-``landmark_genes`` path (2d mode) holds each sample's
-        ``(n_landmarks, ny, n_kx)`` landmark spectra in memory to estimate the
-        rotation. When the worst-case cache would exceed
-        :attr:`_landmark_cache_warn_bytes` this returns ``False`` so the caller
-        can fall back to a single streamed geometric-mean landmark (built over
-        just the landmark genes) instead of risking an OOM. Returns ``True``
-        (cache the per-gene landmark spectra) otherwise.
-        """
-        if not self._grid_shapes:
-            return True
-        worst = 0
-        for ny, nx in self._grid_shapes:
-            ny, nx = ny + 2 * frequency_padding, nx + 2 * frequency_padding
-            n_kx = nx if self._spectrum_fft_solver == "fft2" else nx // 2 + 1
-            worst = max(worst, n_landmarks * ny * n_kx * 8)
-        if worst > self._landmark_cache_warn_bytes:
+    def _landmark_cache_fits(self, n_landmarks: int) -> bool:
+        """Bound the total compact landmark cache across samples, excluding transform chunks."""
+        cache_bytes = len(self.samples) * n_landmarks * _ALIGNMENT_N_THETA * _ALIGNMENT_N_RADIUS * 8
+        if cache_bytes > self._landmark_cache_warn_bytes:
             warnings.warn(
                 f"Rotation alignment with {n_landmarks} explicit landmark genes would cache "
-                f"up to {worst / 1024**3:.1f} GiB of 2D spectra per sample "
+                f"{cache_bytes / 1024**3:.1f} GiB of polar spectra "
                 f"(limit {self._landmark_cache_warn_bytes / 1024**3:.1f} GiB). Falling back "
-                "to a single streamed geometric-mean of the landmark genes to avoid OOM. "
-                "Pass fewer landmark_genes or raise _landmark_cache_warn_bytes to keep the "
-                "per-gene landmark alignment.",
-                stacklevel=2,
+                "to a single streamed geometric-mean of the landmark genes to avoid OOM.",
+                UserWarning,
+                stacklevel=3,
             )
             return False
         return True
@@ -466,7 +538,7 @@ class _ComparatorBase:
             return None
         return np.vstack(
             [
-                radial_bin_counts(
+                _radial_bin_cell_counts(
                     shape,
                     n_bins=self._n_radial_bins,
                     fft_solver=self._spectrum_fft_solver,
@@ -486,7 +558,7 @@ class _ComparatorBase:
 
         edges = np.asarray(self.freq_edges, dtype=float)
         requested = edges.size - 1
-        self.freq_edges = adapt_frequency_edges(
+        self.freq_edges = _adapt_radial_edges(
             self._grid_shapes,
             self._spacings,
             edges,
@@ -506,27 +578,21 @@ class _ComparatorBase:
     def _select_supported_frequency_bins(
         self, features: np.ndarray, supported_bins: np.ndarray
     ) -> np.ndarray:
-        """Subset radial or 2D polar feature arrays to retained radial bins."""
-        if supported_bins.all():
-            return features
+        """Validate the feature axis and retain supported radial bands."""
         supported_bins = np.asarray(supported_bins, dtype=bool)
         n_radius = supported_bins.size
-        if self.feature_mode == "radial":
-            if features.shape[-1] != n_radius:
-                raise ValueError(
-                    f"radial feature axis has length {features.shape[-1]}, "
-                    f"expected {n_radius} bins before support filtering"
-                )
-            return features[..., supported_bins]
-
-        # In 2D mode, drop whole angular blocks for unsupported radial bins.
-        n_theta = self._n_theta_bins
+        n_theta = 1 if self.feature_mode == "radial" else self._n_theta_bins
         expected = n_radius * n_theta
         if features.shape[-1] != expected:
             raise ValueError(
-                f"2D feature axis has length {features.shape[-1]}, "
-                f"expected {expected} = {n_radius} radial bins x {n_theta} angles"
+                f"{self.feature_mode} feature axis has length {features.shape[-1]}, "
+                f"expected {expected} bins before support filtering"
             )
+        if supported_bins.all():
+            return features
+        if self.feature_mode == "radial":
+            return features[..., supported_bins]
+
         reshaped = features.reshape(*features.shape[:-1], n_radius, n_theta)
         kept = reshaped[..., supported_bins, :]
         return kept.reshape(*features.shape[:-1], int(supported_bins.sum()) * n_theta)
@@ -545,6 +611,9 @@ class _ComparatorBase:
 
         # Identify frequency bins in the current grid that are supported by all samples.
         supported_bins = (feature_grid_counts > 0).all(axis=0)
+        if self.feature_mode == "2d":
+            nyquist = min(0.5 / max(spacing) for spacing in self._spacings)
+            supported_bins &= np.asarray(self.freq_edges[1:]) <= nyquist * (1 + 2e-9)
         if not np.any(supported_bins):
             raise RuntimeError("No radial frequency bins are supported by every sample.")
 
@@ -580,9 +649,18 @@ class _ComparatorBase:
         progress: bool = True,
         *,
         memory_budget_bytes: int | str = _DEFAULT_CHUNK_BUDGET,
+        chunk_size: int | str | None = None,
     ) -> _ComparatorBase:
         """
-        Compute per-sample power spectra and (if ``feature_mode='2d'``) rotation-align.
+        Compute binned power spectra per feature per sample.
+
+        Frequency bins are either 1D radial (``feature_mode='radial'``) or
+        flattened 2D radial+angular (``feature_mode='2d'``).
+        In 2D mode, the per-sample spectra are optionally rotation-aligned using a
+        landmark gene set (default: a single geometric-mean landmark over all genes).
+        2D bins are interpolated after rotation to handle heterogeneous sample grids,
+        while empty 1D radial bins are adaptively merged to ensure every retained bin
+        has support in all samples.
 
         Parameters
         ----------
@@ -597,67 +675,62 @@ class _ComparatorBase:
             :attr:`gene_names`) whose spectra define the rotation-alignment
             landmarks. Recovered rotations are still applied to every gene in
             :attr:`gene_names`. If None (default), a single streamed geometric
-            mean over every gene is used as the landmark.
+            mean over every configured gene is used on the first call, without
+            presence filtering. Later calls reuse existing alignment when None
+            is passed or the same explicit landmark panel is supplied. A changed
+            panel refits alignment. Successful recomputation clears cross_spectra_.
         progress : bool, default True
             Show tqdm progress bars over the three phases (spectrum compute,
             optional rotation alignment, radial binning).
         memory_budget_bytes : int or str, default 2147483648 (2 GiB)
             Bytes or a size string, e.g. ``"512 MB"`` or ``"2 GiB"``. Units are
             case-insensitive: GB uses powers of 1000, GiB powers of 1024.
-            Positive estimated batch-workspace budget shared across actual
+            Positive estimated transform-workspace budget shared across actual
             sample jobs when ``fft_chunk_size`` / ``nufft_chunk_size`` is
             ``'auto'``. More jobs divide this fixed budget; increase it explicitly
-            to allow larger batches. Excludes stored inputs and retained outputs;
-            not a total-process memory limit. Explicit chunk sizes bypass sizing.
+            to allow larger batches. Setting explicit chunk sizes (``fft_chunk_size``
+            / ``nufft_chunk_size``) bypasses the budget limitation.
+
+        chunk_size : int, "auto" or None, default None
+            Genes per transform block. None uses the constructor setting;
+            explicit sizes override the budget for this call only.
 
         Returns
         -------
         self
+            Results replace the previous fit only after successful computation.
         """
-        self._auto_chunk_budget_bytes = _parse_memory_budget(memory_budget_bytes)
+        chunk_size = self._resolve_chunk_spec(chunk_size)
+        # Fit on a shallow copy: old arrays are never mutated by extraction.
+        pending = copy.copy(self)
+        pending._auto_chunk_budget_bytes = _parse_memory_budget(memory_budget_bytes)
         logger.info(
             "Computing per-sample spectra (n_samples=%d, mean-centered)...",
-            len(self.samples),
+            len(pending.samples),
         )
-        # ``_compute_spectra`` streams and returns the **final per-sample
-        # features** for both modes — radial-binned ``(n_genes, n_feature_bins)``
-        # (radial), or rotation-aligned physical-frequency polar features
-        # ``(n_genes, n_radius_bins · _n_theta_bins)`` (2d). The dense full 2D
-        # spectra are never held; rotation angles (2d) are recorded on
-        # ``self.rotation_angles_`` by the backend.
-        self._raw_2d_spectra = None
-        per_sample, self.dc_, self.presence_ = self._compute_spectra(
-            # Backends resolve jobs/chunks once their grid shapes are known.
+        pending.cross_spectra_ = None
+        per_sample, pending.dc_, pending.presence_ = pending._compute_spectra(
             n_jobs=1 if progress else n_jobs,
             progress=progress,
             landmark_genes=landmark_genes,
+            chunk_size=chunk_size,
         )
 
-        # The feature grid may be adaptively merged; diagnostics also preserve
-        # support on the originally requested grid.
-        feature_grid_counts = self._fft_cell_counts_for_edges(self.freq_edges)
-        requested_grid_counts = self._fft_cell_counts_for_edges(self.freq_edges_requested_)
-        supported_bins = self._record_frequency_bin_metadata(
-            feature_grid_counts,
-            requested_grid_counts,
-        )
+        supported_bins = pending._supported_frequency_bin_mask
 
-        # self._compute_spectra returns the raw features with potential NA values.
-        # Keep only features in the supported frequency bins.
+        # Drop unsupported radial bands consistently across all samples.
         feats = list(per_sample)
         if supported_bins is not None:
-            feats = [self._select_supported_frequency_bins(f, supported_bins) for f in feats]
-        n_feature_bins = min(f.shape[-1] for f in feats)
-        feats = [f[..., :n_feature_bins] for f in feats]
-        self.spectra_ = np.stack(feats, axis=0)
-        if hasattr(self, "_nufft_eps") and len(self.samples) > 1:
+            feats = [pending._select_supported_frequency_bins(f, supported_bins) for f in feats]
+        pending.spectra_ = np.stack(feats, axis=0)
+        if hasattr(self, "_nufft_eps") and len(pending.samples) > 1:
             # Diagnostic only: eps is a transform target, not a statistical
             # variance floor. Keep small real effects and p-values unchanged.
-            spread = np.ptp(self.spectra_, axis=0).max(axis=-1)
-            scale = self.spectra_.max(axis=(0, 2))
-            unresolved = (spread > 0) & (spread <= 2 * self._nufft_eps * scale)
-            if self.presence_ is not None:
-                unresolved &= self.presence_.all(axis=0)
+            spread = np.ptp(pending.spectra_, axis=0).max(axis=-1)
+            scale = pending.spectra_.max(axis=(0, 2))
+            unresolved = (spread > 0) & (spread <= 2 * pending._nufft_eps * scale)
+            if pending.presence_ is not None:
+                unresolved &= pending.presence_.all(axis=0)
             if unresolved.any():
                 warnings.warn(
                     f"{unresolved.sum()} feature(s) have between-sample spectral differences "
@@ -667,6 +740,81 @@ class _ComparatorBase:
                     UserWarning,
                     stacklevel=2,
                 )
+        self.__dict__.update(pending.__dict__)
+        return self
+
+    # ------------------------------------------------------------------
+    def compute_cross_spectra(
+        self,
+        pairs: Sequence[tuple[str, str]],
+        n_jobs: int = -1,
+        landmark_genes: Sequence[str] | None = None,
+        progress: bool = True,
+        *,
+        memory_budget_bytes: int | str = _DEFAULT_CHUNK_BUDGET,
+        chunk_size: int | str | None = None,
+    ) -> _ComparatorBase:
+        """Compute raw cross-spectra using the auto-spectrum grid and alignment.
+
+        Parameters
+        ----------
+        pairs : sequence of (str, str)
+            Ordered feature pairs, using F_x * conj(F_y). Self-pairs are
+            allowed; duplicate or reversed duplicate pairs are rejected.
+        n_jobs : int, default -1
+            Sample parallelism, as in compute_spectra. Progress reporting
+            processes samples serially; otherwise jobs share the memory budget.
+        landmark_genes : sequence of str, optional
+            Shared polar-alignment landmarks, as in compute_spectra. Cold calls
+            estimate alignment only but do not populate spectra_. None reuses
+            existing angles, or uses all configured genes on the first call.
+            If auto-spectra exist, change landmarks through compute_spectra first
+            to keep their frame consistent. Cross-spectra always use the same
+            alignment as the auto-spectra.
+        progress : bool, default True
+            Show progress during alignment and pair extraction.
+        memory_budget_bytes : int or str, default 2147483648 (2 GiB)
+            Estimated transform-workspace budget shared across sample jobs.
+        chunk_size : int, "auto" or None, default None
+            Features per transform block. None uses the constructor's
+            FFT/NUFFT chunk setting; explicit sizes override the budget.
+
+        Returns
+        -------
+        self
+            Raw results are stored in cross_spectra_. Its cross_spectra and
+            coherency arrays have axes (sample, pair, bin); auto_spectra has
+            axes (sample, selected gene, bin). Radial intervals match
+            frequency_bin_intervals_; polar bins flatten radius then angle.
+
+        Notes
+        -----
+        Existing spectra_ and its normalization are preserved. A successful call
+        replaces cross_spectra_ with exactly the requested pairs; failures preserve
+        the previous result and alignment. Results are not implicitly accumulated.
+
+        Matching auto_spectra are recomputed from source values and agree
+        with the selected genes in unnormalized spectra_ within numerical
+        tolerance. They do not follow background or covariate normalization;
+        coherency always uses its matched raw cross- and auto-spectra.
+
+        Polar alignment uses one shared axial angle per sample, modulo
+        180 degrees. A half turn conjugates the cross-spectrum, leaving its
+        real part and coherence unchanged but reversing its imaginary part.
+        """
+        from sonic.comparators.cross_spectrum import _compute_cross_spectra
+
+        pending = copy.copy(self)
+        pending.cross_spectra_ = _compute_cross_spectra(
+            pending,
+            pairs,
+            n_jobs=n_jobs,
+            progress=progress,
+            memory_budget_bytes=memory_budget_bytes,
+            chunk_size=chunk_size,
+            landmark_genes=landmark_genes,
+        )
+        self.__dict__.update(pending.__dict__)
         return self
 
     # ------------------------------------------------------------------
@@ -696,6 +844,17 @@ class _ComparatorBase:
         sub.dc_ = None if self.dc_ is None else self.dc_[idx]
         sub.presence_ = None if self.presence_ is None else self.presence_[idx]
         sub.rotation_angles_ = None if self.rotation_angles_ is None else self.rotation_angles_[idx]
+        if self.cross_spectra_ is not None:
+            result = self.cross_spectra_
+            sub.cross_spectra_ = replace(
+                result,
+                cross_spectra=result.cross_spectra[idx],
+                auto_spectra=result.auto_spectra[idx],
+                coherency_valid=result.coherency_valid[idx],
+                mode_pair_counts=result.mode_pair_counts[idx],
+                rotation_angles_deg=result.rotation_angles_deg[idx],
+                chunk_schedules=[result.chunk_schedules[i] for i in idx],
+            )
         sub.frequency_bin_counts_ = (
             None if self.frequency_bin_counts_ is None else self.frequency_bin_counts_[idx]
         )
@@ -705,7 +864,6 @@ class _ComparatorBase:
         for name in (
             "_spacings",
             "_grid_shapes",
-            "_raw_2d_spectra",
             "_coords",
             "_unit_scales",
             "_spacing_override",
@@ -819,7 +977,6 @@ class _ComparatorBase:
                     cov_feat,
                     self._supported_frequency_bin_mask,
                 )
-            cov_feat = cov_feat[..., : self.spectra_.shape[-1]]
             self._validate_covariate_features(cov_feat, sample_index=i, mode=covariate_mode)
             cov_features_per_sample[i] = cov_feat
         # Keep the original spectra intact if a later sample has a saturated design.
@@ -871,9 +1028,9 @@ class _ComparatorBase:
         # across samples when ``feature_mode='radial'``) is what aligns the
         # bins, not grid_shape.
         cov_shape = cov.shape[-2:]
-        spacing = self._spacings[sample_index] if self._spacings is not None else None
+        spacing = self._spacings[sample_index] if self._spacings is not None else (1.0, 1.0)
         if self.feature_mode == "radial":
-            return radial_bin_spectrum(
+            return _bin_radial_spectrum(
                 cov_2d,
                 grid_shape=cov_shape,
                 n_bins=self._n_radial_bins,
@@ -889,13 +1046,13 @@ class _ComparatorBase:
         def _cov_chunk(start: int, stop: int) -> np.ndarray:
             return cov_2d[start:stop]
 
-        return stream_polar_features(
+        return _stream_polar_features(
             _cov_chunk,
             cov_2d.shape[0],
             cov_shape,
-            angle,
+            angle_deg=angle,
             chunk_size=max(1, cov_2d.shape[0]),
-            freq_edges=self.freq_edges,
+            edges=self.freq_edges,
             spacing=spacing,
             n_theta=self._n_theta_bins,
             fft_solver=self._spectrum_fft_solver,

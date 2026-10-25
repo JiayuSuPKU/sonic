@@ -14,7 +14,7 @@ from sonic.comparators.multisample import (
     _AnalyticNullState,
     _estimate_glm_masked_null_covariance,
     _estimate_two_group_masked_null_covariance,
-    _log_l2_pvalues_from_state,
+    _l2_pvalues_from_state,
     compare_glm,
     compare_glm_masked,
     compare_glm_scalar,
@@ -1168,8 +1168,11 @@ def test_masked_liu_reuses_fits_without_changing_tails(mode, amplitude):
     for j in np.flatnonzero(state["eligible"]):
         expected[j] = liu_sf(state["observed"][j] ** 2, state["eigenvalues"][j])
     with patch("sonic.comparators.multisample.liu_sf", wraps=liu_sf) as fitted:
-        actual = _log_l2_pvalues_from_state(state)
-        assert fitted.call_count == np.unique(state["contrast_scale"][state["eligible"]]).size
+        actual = _l2_pvalues_from_state(state)
+        expected_fits = (
+            np.unique(state["contrast_scale"][state["eligible"]]).size if amplitude else 0
+        )
+        assert fitted.call_count == expected_fits
     np.testing.assert_array_equal(actual, expected)
 
 
@@ -1373,7 +1376,7 @@ def test_blocked_covariance_matches_independent_per_gene_fits(  # noqa: C901
     if masked:
         args.append(presence)
     with patch.object(ms, "_decompose_glm_design", wraps=ms._decompose_glm_design) as decompose:
-        with patch.object(ms, "_log_spectra_block", wraps=ms._log_spectra_block) as blocks:
+        with patch.object(ms, "_prepare_profile_block", wraps=ms._prepare_profile_block) as blocks:
             state = getattr(ms, name)(*args, freq_weights=weights, normalize_shape=shape_only)
             assert max(call.args[0].shape[1] for call in blocks.call_args_list) <= 3
         if glm:
@@ -1382,9 +1385,25 @@ def test_blocked_covariance_matches_independent_per_gene_fits(  # noqa: C901
     np.testing.assert_allclose(state["observed"], observed, atol=1e-12, equal_nan=True)
     np.testing.assert_allclose(state["sigma_log"], covariance, atol=1e-12)
     np.testing.assert_allclose(
-        ms._log_l2_pvalues_from_state(state), pvalues, atol=1e-12, equal_nan=True
+        ms._l2_pvalues_from_state(state), pvalues, atol=1e-12, equal_nan=True
     )
     np.testing.assert_array_equal(state["eligible"], np.isfinite(observed))
     if glm:
         np.testing.assert_allclose(state["beta"], beta, atol=1e-12, equal_nan=True)
     np.testing.assert_array_equal(spectra, original)
+
+
+@pytest.mark.parametrize("glm", [False, True])
+def test_scalar_result_builder_preserves_column_order_and_feature_names(glm):
+    rng = np.random.default_rng(50)
+    values = rng.normal(size=(10, 4))
+    groups = np.repeat([0, 1], 5)
+    if glm:
+        result = compare_glm_scalar(values, pd.DataFrame({"group": groups}), "group")
+        effect_column = "Estimate"
+    else:
+        result = compare_two_groups_scalar(values, groups)
+        effect_column = "Mean_diff"
+    assert list(result.columns) == ["Feature", "Statistic", effect_column, "P_value", "P_adj"]
+    assert set(result.Feature) == {"0", "1", "2", "3"}
+    assert result.Statistic.is_monotonic_decreasing

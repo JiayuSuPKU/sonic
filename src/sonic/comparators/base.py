@@ -851,6 +851,7 @@ class _ComparatorBase:
                 cross_spectra=result.cross_spectra[idx],
                 auto_spectra=result.auto_spectra[idx],
                 coherency_valid=result.coherency_valid[idx],
+                presence=result.presence[idx],
                 mode_pair_counts=result.mode_pair_counts[idx],
                 rotation_angles_deg=result.rotation_angles_deg[idx],
                 chunk_schedules=[result.chunk_schedules[i] for i in idx],
@@ -1164,6 +1165,10 @@ class _ComparatorBase:
 
         Notes
         -----
+        With numerically zero pooled residual covariance, a nonzero contrast
+        has NaN p-values (including BH adjustment); a zero contrast has p=1.
+        Untestable features are excluded from BH correction.
+
         Use the ``normalize_shape`` keyword for a one-shot shape-only
         test that leaves :attr:`spectra_` untouched for further
         analysis. For a permanent preprocessing transform that affects
@@ -1250,6 +1255,92 @@ class _ComparatorBase:
             freq_weights=freq_weights,
             max_exact_permutations=max_exact_permutations,
             normalize_shape=normalize_shape,
+        )
+
+    def test_cross_diff_freq(
+        self,
+        design: Any,
+        *,
+        contrast: str | dict[str, float] | np.ndarray | None = None,
+        representation: str = "coherence",
+        null: str = "analytic",
+        n_perm: int = 1000,
+        random_state: int | None = None,
+        freq_weights: np.ndarray | None = None,
+        max_exact_permutations: int = 10000,
+        min_samples_per_group: int = 2,
+        min_resid_df: int = 1,
+    ):
+        """Test a condition-associated cross-spectrum profile change per pair.
+
+        Parameters
+        ----------
+        design, contrast
+            Same binary labels or design-matrix contrast as :meth:`test_diff_freq`.
+            Unmasked analytic comparisons require positive residual degrees of
+            freedom; masked comparisons also apply the minimum group sizes.
+        representation : {'coherence', 'coherency'}, default 'coherence'
+            ``coherence`` compares ``log(max(abs(coherency)**2, 1e-12))``;
+            ``coherency`` compares its signed real part without a transform.
+            Both are invariant to conjugation under axial polar alignment.
+        null : {'analytic', 'permutation'}, default 'analytic'
+            Analytic DF Liu mixture null with residual covariance pooled across
+            eligible pairs with entrywise support, then PSD-corrected and subset
+            to each pair's valid bins. Label permutations are available only for
+            binary labels without an explicit contrast.
+        n_perm, random_state, max_exact_permutations
+            Same permutation controls as :meth:`test_diff_freq`.
+        freq_weights : ndarray, optional
+            Nonnegative weights on the original flattened frequency bins.
+            Zero-weight bins are excluded; weights are renormalized over each
+            pair's common valid bins. Polar order is radius then angle.
+        min_samples_per_group : int, default 2
+            Minimum observed samples per group under masked binary testing,
+            as in :meth:`test_diff_freq`. Ignored on unmasked and GLM paths.
+        min_resid_df : int, default 1
+            Minimum residual degrees of freedom under masked GLM testing,
+            as in :meth:`test_diff_freq`. Ignored on unmasked and binary paths.
+
+        Returns
+        -------
+        pandas.DataFrame
+            One aggregate row per requested pair, with ``Feature_1``,
+            ``Feature_2``, ``Statistic`` (weighted L2 distance), ``P_value``,
+            ``P_adj`` (BH), sample/bin counts and covariance diagnostics.
+            ``Status`` is ``ok``, ``self_pair``, ``no_common_bins``,
+            ``insufficient_samples``, ``ineligible_design`` or ``degenerate_null``.
+            Binary tests also include ``n_obs_A`` and ``n_obs_B``.
+            Untestable rows have NaN p-values and are excluded from BH correction.
+            ``attrs`` records retained sample/bin indices, transformation, design
+            and permutation settings. With masked presence, permutation counts/exactness
+            are recorded per pair; otherwise those settings are shared scalars.
+
+        Notes
+        -----
+        As in :meth:`test_diff_freq`, missing expression excludes samples;
+        both genes must be present for a pair's sample to be retained. Bins
+        must be valid in every retained sample. Analytic calibration assumes
+        approximately Gaussian contrast and comparable residual covariance (estimated by pooling
+        across pairs). Self-pairs are descriptive only and excluded from pooling.
+        """
+        from sonic.comparators.cross_spectrum import _compare_cross_spectra
+
+        if self.cross_spectra_ is None:
+            raise RuntimeError("Call .compute_cross_spectra() before .test_cross_diff_freq().")
+        groups, design_obj = _validate_design(design, len(self.samples))
+        return _compare_cross_spectra(
+            self.cross_spectra_,
+            design_obj,
+            groups=groups,
+            contrast=contrast,
+            representation=representation,
+            null=null,
+            n_perm=n_perm,
+            random_state=random_state,
+            freq_weights=freq_weights,
+            max_exact_permutations=max_exact_permutations,
+            min_samples_per_group=min_samples_per_group,
+            min_resid_df=min_resid_df,
         )
 
     def estimate_null_covariance(

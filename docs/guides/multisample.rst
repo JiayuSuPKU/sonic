@@ -76,14 +76,120 @@ of Fourier modes for interpolation at the sampling Nyquist boundary. The
 original frequency bins and physical units stay unchanged. FFT spectra use
 their periodic frequency boundary.
 
-NUFFT spectra retain approximation error controlled by ``eps``. With exactly
-zero within-group variation, even a tiny difference between computed spectra
-can receive a very small analytic p-value. Count normalization does not remove
+Both DF tests return NaN p-values for nonzero contrasts when the pooled
+residual covariance is numerically zero; zero contrasts return p=1.
+Untestable features are excluded from BH correction.
+
+NUFFT spectra retain approximation error controlled by ``eps``. With very small
+nonzero within-group variation, a tiny difference between computed spectra
+can still receive a very small analytic p-value. Count normalization does not remove
 this numerical limitation. ``compute_spectra()`` warns when a fully observed
 gene has nonzero between-sample spectral differences below the requested
 transform accuracy. This diagnostic leaves spectra and p-values unchanged;
 recompute with smaller ``eps`` and check effect-size stability before
 interpreting significance in such degenerate comparisons.
+
+
+Compare coupling between genes
+-----------------------------
+
+Cross-spectrum tests ask whether two genes change their spatial coupling
+across conditions, even when their individual auto-spectra stay unchanged.
+Compute the requested pairs once, then test either representation:
+
+.. code-block:: python
+
+   comparison.compute_cross_spectra([("CD8", "FoxP3"), ("CD8", "CD20")])
+
+   # DF-coherence: changes in coupling strength across frequency bins.
+   coupling = comparison.test_cross_diff_freq(groups)
+
+   # DF-coherency: changes in signed, in-phase coupling.
+   signed_coupling = comparison.test_cross_diff_freq(
+       groups, representation="coherency",
+   )
+
+``representation="coherence"`` uses ``log(max(C, 1e-12))``, where
+``C = abs(S_xy / sqrt(S_xx * S_yy))**2``. ``representation="coherency"``
+uses the real part of ``S_xy / sqrt(S_xx * S_yy)`` without a transformation.
+A radial sign reversal can change coherency while leaving coherence unchanged.
+For polar bins, coherence also includes the magnitude of the imaginary part;
+both tests are unaffected by the half-turn ambiguity of axial alignment.
+There is no signed L1 normalization or asinh transformation.
+
+Each test returns one aggregate p-value per pair. The statistic is the weighted
+L2 distance between mean profiles (or the specified GLM contrast). The analytic
+null follows DF: fit each pair's retained-sample design, pool residual
+cross-products into one shared covariance, then use each pair's supported
+covariance submatrix in the Liu mixture-chi-square approximation. There is no covariance inversion;
+the number of bins can exceed the number of samples. A larger pair panel does
+not increase the number of independent biological samples.
+
+As in ``test_diff_freq``, expression presence determines which samples are
+used, requiring both genes in a pair to be present. Only bins valid in every
+retained sample for that pair are tested. Invalid auto-power is never converted
+into valid zero coherence by the log floor. ``freq_weights`` refers to the
+original flattened bins (radius then angle for polar features); zero weights
+exclude bins, and weights are
+renormalized over retained bins. Support is fixed before inference and remains
+fixed across label permutations. ``attrs["bin_indices"]`` records the retained
+bin indices for each pair; ``attrs["sample_indices"]`` records retained samples.
+Different bin support sets share covariance estimates. For each covariance
+entry, residual cross-products are summed over eligible pairs supporting both
+bins and divided by those pairs' total residual degrees of freedom. Entries
+with no joint support start at zero. Because these entrywise estimates can
+form an indefinite matrix, negative eigenvalues of its correlation matrix are
+clipped, then its diagonal is rescaled to restore the pooled marginal variances.
+This PSD correction is applied once before taking each pair's principal
+submatrix and may change supported off-diagonal entries. Each test retains its
+own sample-dependent contrast scale and normalized bin weights.
+``N_pairs_pooled`` counts all eligible pairs in the shared pool; the number of
+contributors to individual entries varies with bin overlap. A singleton pool
+has no cross-pair covariance borrowing. The existing small-residual-df warnings
+are unchanged for both auto-spectrum and cross-spectrum DF; PSD correction
+does not establish finite-sample calibration.
+
+The output includes ``Feature_1``, ``Feature_2``, ``Statistic``, ``P_value``,
+``P_adj``, ``N_samples``, ``N_bins``, ``N_pairs_pooled``, ``DF_resid``,
+``Effective_rank``, and ``Status``. Self-pairs, pairs with no common supported
+bins, pairs with insufficient observations or an ineligible retained-sample
+design, and nonzero effects with a numerically zero pooled residual covariance
+have NaN p-values and an explanatory status. Constant null profiles have p=1.
+BH correction follows DF and applies separately to each call using only finite
+p-values. Untestable pairs and self-pairs are excluded.
+Running both representations does not automatically correct across both calls.
+
+Design matrices and ``contrast=`` follow ``test_diff_freq``. Binary comparisons
+require ``min_samples_per_group=2`` observed samples per arm on the masked
+path; masked GLMs require ``min_resid_df=1`` and an estimable contrast.
+Unmasked binary tests allow singleton arms: analytic inference requires positive
+residual degrees of freedom, while permutations need both labels to be present.
+These controls follow ``test_diff_freq``. Binary output includes ``n_obs_A`` and
+``n_obs_B``. Binary tests optionally support ``null="permutation"`` with
+``n_perm``, ``random_state``, and ``max_exact_permutations``. These are unrestricted
+sample-label permutations within each pair's retained samples. As in DF,
+masked pairs draw separately in original feature order, even when sample masks
+match. Unmasked pairs share relabellings. With masked presence, ``n_permutations``
+and ``exact_permutations`` in ``attrs`` are dictionaries keyed by pair.
+There are no residual or blocked permutations.
+Use independent biological samples, not repeated specimens as independent rows.
+
+The Liu approximation can accumulate large p-values at 1 when covariance has
+a dominant eigenvalue; it is an upper-tail approximation, not an exact
+finite-sample p-value calculation.
+
+The analytic null assumes approximately Gaussian contrasts and comparable
+residual covariance among pooled pairs. Log coherence is not a guaranteed
+variance-stabilizing transformation; very small coherence values, heterogeneous
+pair noise, small samples and small covariance pools require calibration checks.
+Pairs sharing a gene are dependent, and BH does not guarantee control under
+arbitrary dependence. Normalization removes multiplicative amplitude scaling,
+but does not eliminate all abundance, composition or sampling effects.
+
+Testing leaves cached auto- and cross-spectra unchanged. It materializes one
+support group's binned profiles at a time and uses bounded DF residual scratch
+blocks. The bin-by-bin covariance still uses quadratic memory in the number of
+retained bins; no Fourier coefficient cache is created.
 
 
 Regular grids

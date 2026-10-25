@@ -10,7 +10,9 @@ This module consumes normalized or raw per-sample arrays and provides:
   ``compare_glm_scalar`` with analytic t-distribution tests.
 
 The public comparator classes in :mod:`sonic.comparators` wrap these
-array-level functions for AnnData and SpatialData inputs.
+array-level functions for AnnData and SpatialData inputs. Pairwise test
+wrappers live in :mod:`sonic.comparators.cross_spectrum` and reuse the same
+inference helpers.
 
 Analytic log-L2 comparisons accumulate one pooled covariance in gene blocks,
 using a fixed 32 MiB scratch-space target (at least one gene). Inputs, returned
@@ -57,32 +59,39 @@ _NULL_OPTIONS = ("permutation", "analytic")
 _COMPARISON_WORKSPACE_BYTES = 32 * (1 << 20)
 
 
-def _comparison_blocks(n_samples, n_genes, n_bins, n_terms=0):
-    """Yield gene slices without materializing whole-panel log/residual arrays."""
+def _iter_feature_blocks(n_samples, n_features, n_bins, n_terms=0):
+    """Yield feature slices without materializing whole-panel profile/residual arrays."""
     step = max(1, _COMPARISON_WORKSPACE_BYTES // (8 * 8 * max(n_samples, n_terms, 1) * n_bins))
-    for start in range(0, n_genes, step):
-        yield slice(start, min(start + step, n_genes))
+    for start in range(0, n_features, step):
+        yield slice(start, min(start + step, n_features))
 
 
-def _log_spectra_block(spectra, normalize_shape):
-    """Make an owned float64 log block, preserving the caller's spectra."""
+def _prepare_profile_block(profiles, normalize_shape, *, log_transform=True):
+    """Make an owned float64 profile block, logarithmic by default."""
     if normalize_shape:
-        block = _normalize_shape_apply(spectra)
+        block = _normalize_shape_apply(profiles)
     else:
-        block = np.array(spectra, dtype=np.float64, copy=True)
-    np.maximum(block, 1e-12, out=block)
-    np.log(block, out=block)
+        block = np.array(profiles, dtype=np.float64, copy=True)
+    if log_transform:
+        np.maximum(block, 1e-12, out=block)
+        np.log(block, out=block)
     return block
 
 
-def _presence_groups(presence):
-    """Yield sample masks and gene indices, grouping complete masks, not counts."""
-    if presence.shape[1] == 0:
+def _profile_roundoff(*blocks):
+    """Estimate numerical resolution from the eligible transformed responses."""
+    scale = max(float(np.max(np.abs(block), initial=0.0)) for block in blocks)
+    return 32 * np.finfo(float).eps * max(scale, np.finfo(float).tiny)
+
+
+def _iter_mask_groups(masks):
+    """Yield a row mask and feature indices for columns with identical masks."""
+    if masks.shape[1] == 0:
         return
-    _, inverse = np.unique(np.packbits(presence, axis=0).T, axis=0, return_inverse=True)
+    _, inverse = np.unique(np.packbits(masks, axis=0).T, axis=0, return_inverse=True)
     order = np.argsort(inverse, kind="stable")
-    for genes in np.split(order, np.flatnonzero(np.diff(inverse[order])) + 1):
-        yield presence[:, genes[0]], genes
+    for features in np.split(order, np.flatnonzero(np.diff(inverse[order])) + 1):
+        yield masks[:, features[0]], features
 
 
 class _AnalyticNullMetadata(TypedDict, total=False):
@@ -101,10 +110,10 @@ class _AnalyticNullState(_AnalyticNullMetadata):
 
     The common fields below are returned by every analytic null estimator and
     by ``Comparator.estimate_null_covariance``. They are intentionally a little
-    richer than the minimum needed for p-values: ``compare_*`` needs only
-    ``observed``, ``eigenvalues``, and ``eligible``, while public diagnostics
-    also need the pooled covariance, weights, effective rank, and residual
-    degrees-of-freedom metadata.
+    richer than the minimum needed for p-values. The pooled covariance,
+    profile-scale roundoff and sample counts also identify contrasts whose
+    noise null cannot be estimated; diagnostics expose the weights, effective
+    rank and residual degrees of freedom.
 
     Common fields
     -------------
@@ -114,10 +123,15 @@ class _AnalyticNullState(_AnalyticNullMetadata):
     masked
         Whether gene-specific missingness was used.
     observed
-        Per-gene log-L2 statistic, shape ``(n_genes,)``. Masked helpers use
-        ``NaN`` for ineligible genes.
+        Per-feature L2 statistic on the tested profile scale, shape
+        ``(n_features,)``. Masked helpers use ``NaN`` for ineligible genes.
     sigma_log
-        Pooled residual covariance of log-spectra, shape ``(n_bins, n_bins)``.
+        Pooled residual covariance, shape ``(n_bins, n_bins)``. Auto-spectra
+        and coherence normally use the log scale, while signed coherency uses
+        the original scale. The legacy name is retained for diagnostics.
+    roundoff
+        Numerical tolerance from eligible transformed profiles in positive-weight
+        bins, used to identify a numerically zero residual covariance.
     freq_weights
         Normalized non-negative bin weights, shape ``(n_bins,)``.
     weighted_cov
@@ -136,7 +150,8 @@ class _AnalyticNullState(_AnalyticNullMetadata):
         Residual degrees of freedom, scalar for unmasked paths and per-gene
         vector for masked paths.
     eligible
-        Boolean per-gene mask identifying rows that receive finite p-values.
+        Boolean per-feature mask identifying eligible fits; degenerate nonzero
+        contrasts can still have NaN p-values.
 
     Two-group-only metadata
     -----------------------
@@ -151,7 +166,7 @@ class _AnalyticNullState(_AnalyticNullMetadata):
     contrast_vector
         Numeric contrast vector aligned to ``design_columns``.
     beta
-        Fitted log-spectrum coefficients, shape ``(n_terms, n_genes, n_bins)``.
+        Fitted profile coefficients, shape ``(n_terms, n_features, n_bins)``.
         Masked paths keep ``NaN`` coefficients for ineligible genes.
     n_obs
         Number of observed samples. Unmasked paths return a scalar; masked
@@ -162,6 +177,7 @@ class _AnalyticNullState(_AnalyticNullMetadata):
     masked: bool
     observed: np.ndarray
     sigma_log: np.ndarray
+    roundoff: float
     freq_weights: np.ndarray
     weighted_cov: np.ndarray
     eigenvalues: np.ndarray
@@ -243,7 +259,7 @@ def _welch_test(
 # ---------------------------------------------------------------------------
 
 
-def _exchangeable_group_labels(
+def _make_label_permutations(
     groups: np.ndarray,
     n_perm: int,
     rng: np.random.Generator,
@@ -306,40 +322,38 @@ def _exchangeable_group_labels(
     return perm_labels, False
 
 
-def _run_statistic_with_perm(
-    stat_name: str,
-    spectra: np.ndarray,
+def _run_l2_permutations(
+    profiles: np.ndarray,
     group_codes: np.ndarray,
     perm_labels: np.ndarray,
     *,
     freq_weights: np.ndarray | None = None,
     is_exact: bool = False,
+    log_transform: bool = True,
 ) -> tuple[np.ndarray, np.ndarray]:
-    """Compute observed log-L2 statistics and permutation tail probabilities.
+    """Compute L2 statistics and label-permutation tails on transformed profiles.
 
     ``perm_labels`` is a ``(n_perm_used, n_samples)`` matrix of group
-    relabellings (as produced by :func:`_exchangeable_group_labels`).
-    Log spectra and weights are prepared once. Only per-gene exceedance
-    counts are retained; no permutations-by-genes null matrix is allocated.
+    relabellings (as produced by :func:`_make_label_permutations`).
+    Profiles and weights are prepared once; ``log_transform=False`` keeps
+    signed profiles on their original scale. Only per-feature exceedance
+    counts are retained; no permutations-by-features null matrix is allocated.
     Exhaustive enumeration uses the exact tail; sampled nulls get +1 correction.
     """
-    if stat_name != "log_l2":
-        raise ValueError(f"Permutation statistic must be 'log_l2', got {stat_name!r}.")
-    if not np.all(np.isfinite(spectra)):
+    if not np.all(np.isfinite(profiles)):
         raise ValueError("Permutation tests require finite spectra for observed samples.")
     uniq = np.unique(group_codes)
     a_val = uniq[0]
-    log_spectra = np.maximum(spectra, 1e-12)
-    np.log(log_spectra, out=log_spectra)
-    log_spectra -= log_spectra[:1].copy()
-    weights = _resolve_freq_weights(freq_weights, spectra.shape[-1])
+    response = _prepare_profile_block(profiles, False, log_transform=log_transform)
+    response -= response[:1].copy()
+    weights = _resolve_freq_weights(freq_weights, profiles.shape[-1])
 
     def statistic(a: np.ndarray) -> np.ndarray:
-        diff = log_spectra[a].mean(axis=0) - log_spectra[~a].mean(axis=0)
+        diff = response[a].mean(axis=0) - response[~a].mean(axis=0)
         return np.sqrt(np.sum(weights * diff**2, axis=-1))
 
     observed = statistic(group_codes == a_val)
-    exceedances = np.zeros(spectra.shape[1], dtype=np.int64)
+    exceedances = np.zeros(profiles.shape[1], dtype=np.int64)
     for labels in perm_labels:
         exceedances += statistic(labels == a_val) >= observed
     correction = 0.0 if is_exact else 1.0
@@ -391,7 +405,7 @@ def _run_welch_t_cauchy_analytic(
 _ANALYTIC_MIN_DF_NO_WARN = 3
 
 
-def _maybe_warn_small_df_analytic(df_resid: int) -> None:
+def _maybe_warn_small_df_analytic(df_resid: int, *, log_transform: bool = True) -> None:
     """Warn the user when running the analytic path at very small residual df.
 
     Suppress with ``warnings.filterwarnings('ignore',
@@ -400,29 +414,13 @@ def _maybe_warn_small_df_analytic(df_resid: int) -> None:
     if df_resid < _ANALYTIC_MIN_DF_NO_WARN:
         rel_noise_pct = 100.0 * (2.0 / max(df_resid, 1)) ** 0.5
         warnings.warn(
-            f"log_l2 + null='analytic' at residual df={df_resid}: "
+            f"{'log_l2' if log_transform else 'l2'} + null='analytic' at residual df={df_resid}: "
             f"Variance estimator σ̂² has ~{rel_noise_pct:.0f}% relative noise, "
             f"so the analytic null may be anti-conservative on a per-test basis. "
-            f"For n_a + n_b ≤ 4, prefer statistic='welch_t_cauchy' for stricter "
-            f"calibration (at the cost of some sensitivity).",
+            "Check calibration with binary-label permutations when samples are exchangeable.",
             UserWarning,
             stacklevel=3,
         )
-
-
-def _log_l2_analytic_pvalues(
-    statistic: np.ndarray,
-    lambs: np.ndarray,
-) -> np.ndarray:
-    """Analytic p-values for ``log_l2`` via Liu's mixture-χ² tail.
-
-    ``statistic`` is the ``(n_genes,)`` log-L2 distance between group means
-    (square root of the quadratic form ``D'WD``).
-    Squaring it here gives the H₀ statistic distributed as ``Σ_k λ_k χ²_1``,
-    which Liu's approximation handles directly.
-    """
-    statistic_sq = np.asarray(statistic, dtype=float) ** 2
-    return np.asarray(liu_sf(statistic_sq, lambs), dtype=float)
 
 
 def _effective_rank_from_eigenvalues(eigenvalues: np.ndarray) -> float:
@@ -434,20 +432,36 @@ def _effective_rank_from_eigenvalues(eigenvalues: np.ndarray) -> float:
     return float((total * total) / np.sum(eig * eig))
 
 
-def _log_l2_pvalues_from_state(state: _AnalyticNullState) -> np.ndarray:
+def _weighted_covariance_eigensystem(covariance, weights):
+    """Return weighted covariance, nonnegative eigenvalues and effective rank."""
+    sqrt_weights = np.sqrt(weights)
+    weighted_cov = sqrt_weights[:, None] * covariance * sqrt_weights[None, :]
+    eigenvalues = np.maximum(np.linalg.eigvalsh(weighted_cov), 0.0)
+    return weighted_cov, eigenvalues, _effective_rank_from_eigenvalues(eigenvalues)
+
+
+def _l2_pvalues_from_state(state: _AnalyticNullState) -> np.ndarray:
     """Evaluate Liu-tail p-values from shared analytic null state.
 
-    The state must already contain the observed log-L2 statistic and the
+    The state must already contain the observed L2 statistic and the
     contrast-scaled Liu eigenvalues produced by one of the
     ``_estimate_*_null_covariance`` helpers. Unmasked states carry one
     eigenvalue vector reused for every gene; masked states carry a per-gene
     eigenvalue matrix and an ``eligible`` mask so skipped genes remain ``NaN``.
-    Genes with the same contrast scale share one Liu fit.
+    The observed distance is squared for the mixture-chi-square tail.
+    Genes with the same contrast scale share one Liu fit. With numerically zero
+    residual covariance, zero effects return p=1 and nonzero effects return NaN.
     """
     observed = np.asarray(state["observed"], dtype=float)
     eigenvalues = np.asarray(state["eigenvalues"], dtype=float)
+    roundoff = state["roundoff"]
+    variances = np.diag(state["sigma_log"])
+    if np.max(variances, where=state["freq_weights"] > 0, initial=0.0) <= roundoff**2:
+        n_observed = state["n_obs"] if "n_obs" in state else state["n_obs_A"] + state["n_obs_B"]
+        zero = observed <= roundoff * np.sqrt(state["contrast_scale"] * n_observed)
+        return np.where(state["eligible"] & zero, 1.0, np.nan)
     if eigenvalues.ndim == 1:
-        return _log_l2_analytic_pvalues(observed, eigenvalues)
+        return np.asarray(liu_sf(observed**2, eigenvalues), dtype=float)
 
     pvals = np.full(observed.shape, np.nan, dtype=float)
     indices = np.flatnonzero(state["eligible"])
@@ -626,6 +640,27 @@ def _decompose_glm_design(
     return inverse, rank, bool(estimable)
 
 
+def _prepare_glm_design(design, contrast, n_samples):
+    """Resolve and validate one design for reuse across response blocks.
+
+    Returns the matrix, column names, contrast vector, OLS inverse and rank.
+    Masked tests still decompose each distinct observed-sample design separately.
+    """
+    matrix, columns = _build_design_matrix(design, n_samples)
+    vector = _resolve_contrast(contrast, columns)
+    inverse, rank, estimable = _decompose_glm_design(matrix, vector)
+    if n_samples <= rank:
+        raise ValueError(
+            f"design has no residual degrees of freedom: n_samples={n_samples}, rank={rank}."
+        )
+    if not estimable:
+        raise ValueError(
+            "contrast is not estimable from the supplied design matrix "
+            f"(rank={rank}, n_terms={matrix.shape[1]})."
+        )
+    return matrix, columns, vector, inverse, rank
+
+
 def _fit_glm_response(
     response: np.ndarray,
     design: np.ndarray,
@@ -682,18 +717,18 @@ def _maybe_log_expression(
     return np.log(values + eps)
 
 
-def _two_group_log_block(log_a, log_b, weights):
-    """Consume owned log blocks, returning statistics and residual cross-products."""
-    offset = log_a[0] - log_b[0]
-    log_a -= log_a[:1].copy()
-    log_b -= log_b[:1].copy()
-    mean_a = log_a.mean(axis=0)
-    mean_b = log_b.mean(axis=0)
+def _fit_two_group_block(response_a, response_b, weights):
+    """Consume owned profile blocks, returning L2 statistics and residual cross-products."""
+    offset = response_a[0] - response_b[0]
+    response_a -= response_a[:1].copy()
+    response_b -= response_b[:1].copy()
+    mean_a = response_a.mean(axis=0)
+    mean_b = response_b.mean(axis=0)
     observed = np.sqrt(np.sum(weights * (offset + (mean_a - mean_b)) ** 2, axis=-1))
-    log_a -= mean_a
-    log_b -= mean_b
-    a = log_a.reshape(-1, log_a.shape[-1])
-    b = log_b.reshape(-1, log_b.shape[-1])
+    response_a -= mean_a
+    response_b -= mean_b
+    a = response_a.reshape(-1, response_a.shape[-1])
+    b = response_b.reshape(-1, response_b.shape[-1])
     return observed, a.T @ a + b.T @ b
 
 
@@ -703,6 +738,7 @@ def _estimate_two_group_null_covariance(
     *,
     freq_weights: np.ndarray | None = None,
     normalize_shape: bool = False,
+    log_transform: bool = True,
 ) -> _AnalyticNullState:
     """Compute analytic null state for unmasked two-group ``log_l2`` tests.
 
@@ -711,6 +747,9 @@ def _estimate_two_group_null_covariance(
     within-group covariance of residual log-spectra, and the contrast-scaled
     Liu eigenvalues used by both :func:`compare_two_groups` and
     :meth:`sonic.comparators.base._ComparatorBase.estimate_null_covariance`.
+
+    Set ``log_transform=False`` for signed cross-spectrum profiles; in that
+    case ``sigma_log`` contains covariance on the original profile scale.
     """
     spectra = np.asarray(spectra)
     if spectra.ndim != 3:
@@ -733,30 +772,39 @@ def _estimate_two_group_null_covariance(
     weights = _resolve_freq_weights(freq_weights, n_bins)
 
     observed = np.empty(n_genes)
-    sigma_log = np.zeros((n_bins, n_bins))
-    for block in _comparison_blocks(n_samples, n_genes, n_bins):
-        log_a = _log_spectra_block(spectra[group_a_mask, block], normalize_shape)
-        log_b = _log_spectra_block(spectra[~group_a_mask, block], normalize_shape)
-        observed[block], covariance = _two_group_log_block(log_a, log_b, weights)
-        sigma_log += covariance
-    sigma_log /= n_genes * df_resid
-    _maybe_warn_small_df_analytic(df_resid)
+    residual_cov = np.zeros((n_bins, n_bins))
+    roundoff = 0.0
+    for block in _iter_feature_blocks(n_samples, n_genes, n_bins):
+        response_a = _prepare_profile_block(
+            spectra[group_a_mask, block], normalize_shape, log_transform=log_transform
+        )
+        response_b = _prepare_profile_block(
+            spectra[~group_a_mask, block], normalize_shape, log_transform=log_transform
+        )
+        roundoff = max(
+            roundoff, _profile_roundoff(response_a[..., weights > 0], response_b[..., weights > 0])
+        )
+        observed[block], covariance = _fit_two_group_block(response_a, response_b, weights)
+        residual_cov += covariance
+    residual_cov /= n_genes * df_resid
+    _maybe_warn_small_df_analytic(df_resid, log_transform=log_transform)
 
     # Compute eigenvalues of the weighted covariance and contrast scale for p-value calculation.
-    sqrt_weights = np.sqrt(weights)
-    weighted_cov = sqrt_weights[:, None] * sigma_log * sqrt_weights[None, :]
-    weighted_cov_eigenvalues = np.maximum(np.linalg.eigvalsh(weighted_cov), 0.0)
+    weighted_cov, weighted_cov_eigenvalues, effective_rank = _weighted_covariance_eigensystem(
+        residual_cov, weights
+    )
     contrast_scale = (1.0 / max(n_a, 1)) + (1.0 / max(n_b, 1))
     eigenvalues = weighted_cov_eigenvalues * contrast_scale
     return {
         "mode": "two_group",
         "masked": False,
         "observed": observed,
-        "sigma_log": sigma_log,
+        "sigma_log": residual_cov,
+        "roundoff": roundoff,
         "freq_weights": weights,
         "weighted_cov": weighted_cov,
         "eigenvalues": eigenvalues,
-        "effective_rank": _effective_rank_from_eigenvalues(weighted_cov_eigenvalues),
+        "effective_rank": effective_rank,
         "contrast_scale": contrast_scale,
         "df_resid": df_resid,
         "n_obs_A": n_a,
@@ -772,6 +820,8 @@ def _estimate_two_group_masked_null_covariance(  # noqa: C901
     *,
     freq_weights: np.ndarray | None = None,
     normalize_shape: bool = False,
+    log_transform: bool = True,
+    allow_empty: bool = False,
     min_samples_per_group: int = 2,
 ) -> _AnalyticNullState:
     """Compute analytic null state for masked two-group ``log_l2`` tests.
@@ -781,6 +831,9 @@ def _estimate_two_group_masked_null_covariance(  # noqa: C901
     their observed statistics and eigenvalues are then computed with their own
     ``1 / n_A + 1 / n_B`` contrast scale. Ineligible genes retain ``NaN`` in
     ``observed``, ``contrast_scale``, and ``eigenvalues``.
+    ``log_transform=False`` fits signed profiles without the log floor.
+    ``allow_empty=True`` returns an ineligible state for an empty covariance
+    pool, allowing cross-spectrum callers to report other support groups.
     """
     if int(min_samples_per_group) < 2:
         raise ValueError(f"min_samples_per_group must be >= 2, got {min_samples_per_group}.")
@@ -805,6 +858,7 @@ def _estimate_two_group_masked_null_covariance(  # noqa: C901
     weights = _resolve_freq_weights(freq_weights, n_bins)
     sigma_acc = np.zeros((n_bins, n_bins), dtype=np.float64)
     pooled_df = 0
+    roundoff = 0.0
     observed = np.full(n_genes, np.nan, dtype=float)
     contrast_scale = np.full(n_genes, np.nan, dtype=float)
     eligible = np.zeros(n_genes, dtype=bool)
@@ -812,7 +866,7 @@ def _estimate_two_group_masked_null_covariance(  # noqa: C901
     n_obs_b = np.zeros(n_genes, dtype=int)
     df_resid = np.zeros(n_genes, dtype=int)
 
-    for sample_mask, genes in _presence_groups(presence):
+    for sample_mask, genes in _iter_mask_groups(presence):
         idx_a = np.flatnonzero(group_a_mask & sample_mask)
         idx_b = np.flatnonzero(~group_a_mask & sample_mask)
         n_a, n_b = len(idx_a), len(idx_b)
@@ -824,14 +878,22 @@ def _estimate_two_group_masked_null_covariance(  # noqa: C901
         contrast_scale[genes] = 1.0 / n_a + 1.0 / n_b
         eligible[genes] = True
         pooled_df += df_gene * len(genes)
-        for block in _comparison_blocks(n_a + n_b, len(genes), n_bins):
+        for block in _iter_feature_blocks(n_a + n_b, len(genes), n_bins):
             cols = genes[block]
-            log_a = _log_spectra_block(spectra[idx_a[:, None], cols], normalize_shape)
-            log_b = _log_spectra_block(spectra[idx_b[:, None], cols], normalize_shape)
-            observed[cols], covariance = _two_group_log_block(log_a, log_b, weights)
+            response_a = _prepare_profile_block(
+                spectra[idx_a[:, None], cols], normalize_shape, log_transform=log_transform
+            )
+            response_b = _prepare_profile_block(
+                spectra[idx_b[:, None], cols], normalize_shape, log_transform=log_transform
+            )
+            roundoff = max(
+                roundoff,
+                _profile_roundoff(response_a[..., weights > 0], response_b[..., weights > 0]),
+            )
+            observed[cols], covariance = _fit_two_group_block(response_a, response_b, weights)
             sigma_acc += covariance
 
-    if pooled_df == 0:
+    if pooled_df == 0 and not allow_empty:
         raise ValueError(
             "estimate_null_covariance: no genes meet "
             f"min_samples_per_group={min_samples_per_group} per arm. "
@@ -839,13 +901,15 @@ def _estimate_two_group_masked_null_covariance(  # noqa: C901
         )
 
     if eligible.any():
-        _maybe_warn_small_df_analytic(int(np.median(df_resid[eligible])))
+        _maybe_warn_small_df_analytic(
+            int(np.median(df_resid[eligible])), log_transform=log_transform
+        )
 
     # Compute covariance-dependent eigenvalues after the shared covariance is known.
-    sqrt_weights = np.sqrt(weights)
-    sigma_log = sigma_acc / pooled_df
-    weighted_cov = sqrt_weights[:, None] * sigma_log * sqrt_weights[None, :]
-    weighted_cov_eigenvalues = np.maximum(np.linalg.eigvalsh(weighted_cov), 0.0)
+    residual_cov = sigma_acc / max(pooled_df, 1)
+    weighted_cov, weighted_cov_eigenvalues, effective_rank = _weighted_covariance_eigensystem(
+        residual_cov, weights
+    )
     eigenvalues = np.full((n_genes, n_bins), np.nan, dtype=float)
     eigenvalues[eligible] = contrast_scale[eligible, None] * weighted_cov_eigenvalues[None, :]
 
@@ -853,11 +917,12 @@ def _estimate_two_group_masked_null_covariance(  # noqa: C901
         "mode": "two_group",
         "masked": True,
         "observed": observed,
-        "sigma_log": sigma_log,
+        "sigma_log": residual_cov,
+        "roundoff": roundoff,
         "freq_weights": weights,
         "weighted_cov": weighted_cov,
         "eigenvalues": eigenvalues,
-        "effective_rank": _effective_rank_from_eigenvalues(weighted_cov_eigenvalues),
+        "effective_rank": effective_rank,
         "contrast_scale": contrast_scale,
         "df_resid": df_resid,
         "n_obs_A": n_obs_a,
@@ -873,6 +938,7 @@ def _estimate_glm_null_covariance(
     *,
     freq_weights: np.ndarray | None = None,
     normalize_shape: bool = False,
+    log_transform: bool = True,
 ) -> _AnalyticNullState:
     """Compute analytic null state for unmasked GLM ``log_l2`` tests.
 
@@ -881,69 +947,86 @@ def _estimate_glm_null_covariance(
     effect converted to log-L2 ``observed`` values, the pooled residual
     covariance across genes, and the single contrast variance scale
     ``c'(X'X)^+c`` applied to the Liu eigenvalues.
+
+    Set ``log_transform=False`` for signed cross-spectrum profiles; in that
+    case ``sigma_log`` contains covariance on the original profile scale.
     """
     spectra = np.asarray(spectra)
     if spectra.ndim != 3:
         raise ValueError(f"spectra must be 3D (n_samples, n_genes, n_bins), got {spectra.shape}.")
-    n_samples, n_genes, n_bins = spectra.shape
+    prepared_design = _prepare_glm_design(design, contrast, spectra.shape[0])
+    return _fit_glm_profiles(
+        spectra,
+        prepared_design,
+        freq_weights=freq_weights,
+        normalize_shape=normalize_shape,
+        log_transform=log_transform,
+    )
 
-    # Resolve the design matrix and contrast vector.
-    design_matrix, design_columns = _build_design_matrix(design, n_samples)
-    contrast_vector = _resolve_contrast(contrast, design_columns)
 
+def _fit_glm_profiles(
+    profiles,
+    prepared_design,
+    *,
+    freq_weights=None,
+    normalize_shape=False,
+    log_transform=True,
+) -> _AnalyticNullState:
+    """Fit profile blocks and pool residuals using an already validated GLM design.
+
+    ``profiles`` must be a 3D array with the same sample order as the tuple
+    returned by ``_prepare_glm_design``. Keep beta and the legacy ``sigma_log``
+    key for callers that inspect the analytic covariance diagnostics.
+    """
+    n_samples, n_features, n_bins = profiles.shape
+    design_matrix, design_columns, contrast_vector, design_inverse, rank = prepared_design
     n_terms = design_matrix.shape[1]
-    if contrast_vector.shape != (n_terms,):
-        raise ValueError(f"contrast length {contrast_vector.shape} != design cols ({n_terms},).")
-    design_inverse, rank, estimable = _decompose_glm_design(design_matrix, contrast_vector)
     df_resid = n_samples - rank
-    if df_resid <= 0:
-        raise ValueError(
-            f"design has no residual degrees of freedom: n_samples={n_samples}, rank={rank}."
-        )
-    if not estimable:
-        raise ValueError(
-            "contrast is not estimable from the supplied design matrix "
-            f"(rank={rank}, n_terms={n_terms})."
-        )
-
     weights = _resolve_freq_weights(freq_weights, n_bins)
-    observed = np.empty(n_genes)
-    beta = np.empty((n_terms, n_genes, n_bins))
-    sigma_log = np.zeros((n_bins, n_bins))
-    for block in _comparison_blocks(n_samples, n_genes, n_bins, n_terms):
-        response = _log_spectra_block(spectra[:, block], normalize_shape).reshape(n_samples, -1)
+    observed = np.empty(n_features)
+    beta = np.empty((n_terms, n_features, n_bins))
+    residual_cov = np.zeros((n_bins, n_bins))
+    roundoff = 0.0
+    for block in _iter_feature_blocks(n_samples, n_features, n_bins, n_terms):
+        response = _prepare_profile_block(
+            profiles[:, block], normalize_shape, log_transform=log_transform
+        ).reshape(n_samples, -1)
+        roundoff = max(
+            roundoff, _profile_roundoff(response.reshape(n_samples, -1, n_bins)[..., weights > 0])
+        )
         beta_block, residuals, theta = _fit_glm_response(
             response, design_matrix, design_inverse, contrast_vector, rank
         )
         beta[:, block] = beta_block.reshape(n_terms, -1, n_bins)
         observed[block] = np.sqrt(np.sum(weights * theta.reshape(-1, n_bins) ** 2, axis=-1))
         residuals = residuals.reshape(-1, n_bins)
-        sigma_log += residuals.T @ residuals
-    sigma_log /= n_genes * df_resid
-    _maybe_warn_small_df_analytic(df_resid)
+        residual_cov += residuals.T @ residuals
+    residual_cov /= n_features * df_resid
+    _maybe_warn_small_df_analytic(df_resid, log_transform=log_transform)
 
-    # Compute the weighted log-L2 statistic, contrast scale, and eigenvalues.
+    # Calibrate the L2 statistic on the tested profile scale.
     contrast_scale = float(np.sum((contrast_vector @ design_inverse) ** 2))
-    sqrt_weights = np.sqrt(weights)
-    weighted_cov = sqrt_weights[:, None] * sigma_log * sqrt_weights[None, :]
-    weighted_cov_eigenvalues = np.maximum(np.linalg.eigvalsh(weighted_cov), 0.0)
+    weighted_cov, weighted_cov_eigenvalues, effective_rank = _weighted_covariance_eigensystem(
+        residual_cov, weights
+    )
     eigenvalues = weighted_cov_eigenvalues * contrast_scale
     return {
         "mode": "glm",
         "masked": False,
         "observed": observed,
-        "sigma_log": sigma_log,
+        "sigma_log": residual_cov,
+        "roundoff": roundoff,
         "freq_weights": weights,
         "weighted_cov": weighted_cov,
         "eigenvalues": eigenvalues,
-        "effective_rank": _effective_rank_from_eigenvalues(weighted_cov_eigenvalues),
+        "effective_rank": effective_rank,
         "contrast_scale": contrast_scale,
         "df_resid": df_resid,
         "design_columns": design_columns,
         "contrast_vector": contrast_vector,
         "beta": beta,
         "n_obs": n_samples,
-        "eligible": np.ones(n_genes, dtype=bool),
+        "eligible": np.ones(n_features, dtype=bool),
     }
 
 
@@ -955,6 +1038,8 @@ def _estimate_glm_masked_null_covariance(  # noqa: C901
     *,
     freq_weights: np.ndarray | None = None,
     normalize_shape: bool = False,
+    log_transform: bool = True,
+    allow_empty: bool = False,
     min_resid_df: int = 1,
 ) -> _AnalyticNullState:
     """Compute analytic null state for masked GLM ``log_l2`` tests.
@@ -964,6 +1049,9 @@ def _estimate_glm_masked_null_covariance(  # noqa: C901
     and a positive finite contrast variance. Residual cross-products are pooled
     into one covariance estimate, while ``observed`` and contrast-scaled
     ``eigenvalues`` remain per-gene because missingness changes the design.
+    ``log_transform=False`` fits signed profiles without the log floor.
+    ``allow_empty=True`` returns an ineligible state for an empty covariance
+    pool, allowing cross-spectrum callers to report other support groups.
     """
     if int(min_resid_df) < 1:
         raise ValueError(f"min_resid_df must be >= 1, got {min_resid_df}.")
@@ -987,7 +1075,6 @@ def _estimate_glm_masked_null_covariance(  # noqa: C901
 
     # Compute the OLS fit for each gene and estimate the pooled residual covariance.
     weights = _resolve_freq_weights(freq_weights, n_bins)
-    sqrt_weights = np.sqrt(weights)
     n_obs = np.zeros(n_genes, dtype=int)
     df_resid = np.zeros(n_genes, dtype=int)
     observed = np.full(n_genes, np.nan, dtype=float)
@@ -996,8 +1083,9 @@ def _estimate_glm_masked_null_covariance(  # noqa: C901
     eligible = np.zeros(n_genes, dtype=bool)
     sigma_acc = np.zeros((n_bins, n_bins), dtype=float)
     pooled_df = 0
+    roundoff = 0.0
 
-    for sample_mask, genes in _presence_groups(presence):
+    for sample_mask, genes in _iter_mask_groups(presence):
         count = int(sample_mask.sum())
         n_obs[genes] = count
         if count == 0:
@@ -1017,9 +1105,12 @@ def _estimate_glm_masked_null_covariance(  # noqa: C901
             continue
 
         rows = np.flatnonzero(sample_mask)
-        for block in _comparison_blocks(count, len(genes), n_bins, n_terms):
+        for block in _iter_feature_blocks(count, len(genes), n_bins, n_terms):
             cols = genes[block]
-            response = _log_spectra_block(spectra[rows[:, None], cols], normalize_shape)
+            response = _prepare_profile_block(
+                spectra[rows[:, None], cols], normalize_shape, log_transform=log_transform
+            )
+            roundoff = max(roundoff, _profile_roundoff(response[..., weights > 0]))
             gene_beta, residuals, theta = _fit_glm_response(
                 response.reshape(count, -1), gene_design, design_inverse, contrast_vector, rank_gene
             )
@@ -1031,17 +1122,21 @@ def _estimate_glm_masked_null_covariance(  # noqa: C901
         contrast_scale[genes] = scale
         eligible[genes] = True
 
-    if pooled_df == 0:
+    if pooled_df == 0 and not allow_empty:
         raise ValueError(
             "estimate_null_covariance: no genes have enough observed "
             "samples and an estimable contrast to estimate the pooled covariance."
         )
 
-    # Compute the weighted log-L2 statistic, contrast scale, and eigenvalues.
-    _maybe_warn_small_df_analytic(int(np.median(df_resid[eligible])))
-    sigma_log = sigma_acc / pooled_df
-    weighted_cov = sqrt_weights[:, None] * sigma_log * sqrt_weights[None, :]
-    weighted_cov_eigenvalues = np.maximum(np.linalg.eigvalsh(weighted_cov), 0.0)
+    # Calibrate the L2 statistic on the tested profile scale.
+    if eligible.any():
+        _maybe_warn_small_df_analytic(
+            int(np.median(df_resid[eligible])), log_transform=log_transform
+        )
+    residual_cov = sigma_acc / max(pooled_df, 1)
+    weighted_cov, weighted_cov_eigenvalues, effective_rank = _weighted_covariance_eigensystem(
+        residual_cov, weights
+    )
     eigenvalues = np.full((n_genes, n_bins), np.nan, dtype=float)
     eigenvalues[eligible] = contrast_scale[eligible, None] * weighted_cov_eigenvalues[None, :]
 
@@ -1049,11 +1144,12 @@ def _estimate_glm_masked_null_covariance(  # noqa: C901
         "mode": "glm",
         "masked": True,
         "observed": observed,
-        "sigma_log": sigma_log,
+        "sigma_log": residual_cov,
+        "roundoff": roundoff,
         "freq_weights": weights,
         "weighted_cov": weighted_cov,
         "eigenvalues": eigenvalues,
-        "effective_rank": _effective_rank_from_eigenvalues(weighted_cov_eigenvalues),
+        "effective_rank": effective_rank,
         "contrast_scale": contrast_scale,
         "df_resid": df_resid,
         "design_columns": design_columns,
@@ -1223,14 +1319,14 @@ def compare_two_groups(  # noqa: C901
             freq_weights=freq_weights,
             normalize_shape=normalize_shape,
         )
-        pvals = _log_l2_pvalues_from_state(state)
+        pvals = _l2_pvalues_from_state(state)
         return _comparison_frame(n_genes, gene_names, state["observed"], pvals)
 
     # Permutation path: generate the exchangeable label set once, then evaluate
     # the same log_l2 statistic under every relabelling.
     if normalize_shape:
         spectra = _normalize_shape_apply(spectra)
-    perm_labels, is_exact = _exchangeable_group_labels(
+    perm_labels, is_exact = _make_label_permutations(
         group_codes,
         n_perm,
         rng,
@@ -1243,8 +1339,8 @@ def compare_two_groups(  # noqa: C901
             n_samples,
             int((group_codes == 0).sum()),
         )
-    observed, pvals = _run_statistic_with_perm(
-        statistic, spectra, group_codes, perm_labels, freq_weights=freq_weights, is_exact=is_exact
+    observed, pvals = _run_l2_permutations(
+        spectra, group_codes, perm_labels, freq_weights=freq_weights, is_exact=is_exact
     )
 
     df = _comparison_frame(n_genes, gene_names, observed, pvals)
@@ -1371,7 +1467,7 @@ def compare_two_groups_masked(  # noqa: C901
             normalize_shape=normalize_shape,
             min_samples_per_group=min_samples_per_group,
         )
-        pvals = _log_l2_pvalues_from_state(state)
+        pvals = _l2_pvalues_from_state(state)
         return _comparison_frame(
             n_genes,
             gene_names,
@@ -1417,14 +1513,13 @@ def compare_two_groups_masked(  # noqa: C901
             # Per-gene exchange set — enumerate exactly when C(n_obs, n_a_obs)
             # is small, otherwise sample. Subsets are typically smaller than
             # the global one so the exact path kicks in more often here.
-            perm_labels, is_exact = _exchangeable_group_labels(
+            perm_labels, is_exact = _make_label_permutations(
                 sub_groups,
                 n_perm,
                 rng,
                 max_exact_permutations=max_exact_permutations,
             )
-            observed, pval = _run_statistic_with_perm(
-                statistic,
+            observed, pval = _run_l2_permutations(
                 sub,
                 sub_groups,
                 perm_labels,
@@ -1515,7 +1610,7 @@ def compare_glm(
         freq_weights=freq_weights,
         normalize_shape=normalize_shape,
     )
-    pvals = _log_l2_pvalues_from_state(state)
+    pvals = _l2_pvalues_from_state(state)
     return _comparison_frame(len(state["observed"]), gene_names, state["observed"], pvals)
 
 
@@ -1572,7 +1667,7 @@ def compare_glm_masked(  # noqa: C901
         normalize_shape=normalize_shape,
         min_resid_df=min_resid_df,
     )
-    pvals = _log_l2_pvalues_from_state(state)
+    pvals = _l2_pvalues_from_state(state)
     return _comparison_frame(
         len(state["observed"]),
         gene_names,
@@ -1653,18 +1748,14 @@ def compare_two_groups_scalar(
     t_stat, pvals, mean_diff = _welch_test(a_vals, b_vals)
     observed = np.abs(t_stat)
 
-    if gene_names is None:
-        gene_names = [str(i) for i in range(n_genes)]
-    df = pd.DataFrame(
-        {
-            "Feature": list(gene_names),
-            "Statistic": observed,
-            "Mean_diff": mean_diff,
-            "P_value": pvals,
-        }
+    frame = _comparison_frame(
+        n_genes,
+        gene_names,
+        observed,
+        pvals,
+        extra={"Mean_diff": mean_diff},
     )
-    df["P_adj"] = apply_bh_correction(df["P_value"])
-    return df.sort_values("Statistic", ascending=False).reset_index(drop=True)
+    return frame[["Feature", "Statistic", "Mean_diff", "P_value", "P_adj"]]
 
 
 def compare_glm_scalar(
@@ -1723,19 +1814,9 @@ def compare_glm_scalar(
 
     if not np.isfinite(values).all():
         raise ValueError("Scalar GLM responses must be finite.")
-    design_matrix, design_columns = _build_design_matrix(design, n_samples)
-    contrast_vector = _resolve_contrast(contrast, design_columns)
-    design_inverse, rank, estimable = _decompose_glm_design(design_matrix, contrast_vector)
+    prepared_design = _prepare_glm_design(design, contrast, n_samples)
+    design_matrix, _, contrast_vector, design_inverse, rank = prepared_design
     df_resid = n_samples - rank
-    if df_resid <= 0:
-        raise ValueError(
-            f"design has no residual degrees of freedom: n_samples={n_samples}, rank={rank}."
-        )
-    if not estimable:
-        raise ValueError(
-            "contrast is not estimable from the supplied design matrix "
-            f"(rank={rank}, n_terms={design_matrix.shape[1]})."
-        )
 
     # Fit the OLS model
     _, resid, estimate = _fit_glm_response(
@@ -1757,15 +1838,11 @@ def compare_glm_scalar(
     observed = np.abs(t_stat)
     pvals = 2.0 * _t_dist.sf(observed, df_resid)
 
-    if gene_names is None:
-        gene_names = [str(i) for i in range(n_genes)]
-    df = pd.DataFrame(
-        {
-            "Feature": list(gene_names),
-            "Statistic": observed,
-            "Estimate": estimate,
-            "P_value": pvals,
-        }
+    frame = _comparison_frame(
+        n_genes,
+        gene_names,
+        observed,
+        pvals,
+        extra={"Estimate": estimate},
     )
-    df["P_adj"] = apply_bh_correction(df["P_value"])
-    return df.sort_values("Statistic", ascending=False).reset_index(drop=True)
+    return frame[["Feature", "Statistic", "Estimate", "P_value", "P_adj"]]

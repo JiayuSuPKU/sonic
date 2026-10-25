@@ -70,6 +70,60 @@ co-expression:
 test every pair between two feature sets.
 
 
+Explain an observed Q or R score
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+After ``setup_data``, request a spatial explanation for one feature or pair:
+
+.. code-block:: python
+
+   q_map = detector.explain_qstat("FoxP3")
+   r_map = detector.explain_rstat("CD8", "FoxP3", memory_budget_bytes="512 MiB")
+
+   print(q_map.scores[0])  # Sum of the Q contributions
+   print(r_map.scores[0])  # Sum of the R contributions
+   contributions = r_map.contributions[0]
+
+Calling ``compute_qstat`` or ``compute_rstat`` first is optional. Explanations
+use the same fitted kernel and feature preparation, and check reconstruction
+against an independently evaluated score. They do not fit a null distribution
+or provide regional p-values. R uses the symmetric allocation
+``(z_x * Kz_y + z_y * Kz_x) / 2`` and requires a symmetric real kernel.
+
+Both detector classes return ``sonic.explanation.SpatialExplanation``:
+
+- ``feature_names``: the selected name or ordered pair.
+- ``values``: original selected values, shape ``(n_observations, n_features)``.
+- ``filtered``: responses to the test-prepared values, shape
+  ``(1, n_observations, n_features)``. These are kernel-filtered fields, not
+  reconstructed expression intensities.
+- ``contributions``: signed allocations, shape ``(1, n_observations)``.
+- ``observation_indices``: original setup-time AnnData row positions, including
+  alignment after isolated graph nodes are removed; for grids, these are
+  C-order flattened raster indices, not source table row indices.
+- ``coordinates``: original AnnData coordinate order, or grid ``(y, x)``
+  coordinates from kernel spacing and origin ``(0, 0)``. These grid coordinates
+  are local kernel coordinates, not a SpatialData world-coordinate transform.
+  Graph-only explanations may have no coordinates.
+- ``metadata``: statistic, backend, source and normalization information.
+
+``scores`` is computed from the contributions, without storing a duplicate
+score array. Structural raster holes are omitted from returned rows while the
+reported Q/R retains its existing full-grid standardization scale.
+
+AnnData explanations accept ``source="obs"`` for individual numeric metadata
+columns, and ``layer=`` with ``source="var"``. Encode categorical levels into
+numeric columns before selecting one for explanation. Features excluded by the
+detector's expression/variance filters raise an error. Grid explanations use
+the raster prepared by ``setup_data``.
+
+Only the selected one/two features are densified. The memory budget estimates
+workspace and returned arrays; it excludes resident data, kernel storage, lazy
+factorization and library overhead. No Fourier coefficients or source-container
+references are retained. Plotting, crop selection and comparator band maps are
+not part of this initial interface.
+
+
 Which backend should I use?
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~
 

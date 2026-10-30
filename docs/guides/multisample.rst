@@ -192,6 +192,63 @@ blocks. The bin-by-bin covariance still uses quadratic memory in the number of
 retained bins; no Fourier coefficient cache is created.
 
 
+Explain selected frequency bins
+-------------------------------
+
+After selecting a feature and frequency bins, reconstruct their spatial
+contributions in an individual sample:
+
+.. code-block:: python
+
+   single = comparison.explain_spectrum(
+       "CD8", sample_index=0, bands=[1, 2], representation="power_norm",
+   )
+   pair = comparison.explain_spectrum(
+       ["CD8", "FoxP3"], sample_index=0, bands=[1, 2],
+       representation="coherency", memory_budget_bytes="512 MiB",
+   )
+   pair.scores  # pair.contributions.sum(axis=1)
+
+This uses the same ``SpatialExplanation`` container as detector Q/R maps.
+``values`` contains the selected original observations, ``filtered`` contains
+one field per bin and feature, and ``contributions`` contains one signed map
+per bin. ``observation_indices`` and ``coordinates`` locate the rows in the
+source sample. FFT indices address C-order raster cells; coordinates are local
+(y, x) positions with origin zero and the fitted spacing. NUFFT coordinates
+retain their source column order and units; ``metadata["unit_scale"]`` gives
+the conversion used for the frequency grid. No spatial coordinates are rotated.
+
+``bands`` indexes retained spectrum columns, including any removal of
+unsupported radial intervals. Polar columns flatten radius then angle.
+``metadata`` records these indices, corresponding radial intervals and angular
+centers, the sample alignment angle, and the representation. The fitted radial
+or interpolated polar reducer is reused without changing alignment or caches.
+
+One feature supports ``power`` and ``power_norm``; the latter divides by total
+raw power over **all retained bins**, not just the displayed bins. Pairs support
+``cross`` (real co-spectrum), ``coherency`` (real signed coherency), and
+``coherence`` (squared magnitude, including polar phase). For coherency, the
+observed denominator sqrt(P_x P_y) is fixed during allocation. For coherence,
+a complex cross-spectrum allocation a_i is mapped to
+Re(conj(S_xy) a_i) / (P_x P_y). This sums to coherence but may be negative locally.
+``filtered`` includes these fixed normalization and phase factors so that the
+shared elementwise contribution formula still applies.
+
+Scores reconstruct the **untransformed raw-source feature**. They do not
+attribute log profiles, aggregate DF statistics, p-values, or background- or
+covariate-adjusted caches. Raw features are recomputed even if such adjustments
+were previously applied to ``spectra_``; metadata labels this
+``spectrum_source="recomputed_raw"``. Use the same unchanged source data as the
+fit. These are descriptive allocations, not derivatives or local significance.
+
+Only one/two genes are transformed, and requested bands are processed one at a
+time. The memory estimate includes returned maps and transform/reducer scratch,
+but excludes resident inputs, rasterization internals and library overhead.
+Invalid normalized pair bins raise an error instead of producing a misleading
+map; finite raw power and co-spectrum maps remain available. Plotting and
+region selection are separate from this computation API.
+
+
 Regular grids
 -------------
 

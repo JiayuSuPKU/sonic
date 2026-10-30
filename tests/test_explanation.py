@@ -1,7 +1,8 @@
-"""Synthetic local checks for spatial explanation arrays and detector adapters."""
+"""Synthetic checks for shared spatial explanations and detector/comparator adapters."""
 
+import copy
 from dataclasses import fields
-from unittest.mock import patch
+from unittest.mock import PropertyMock, patch
 
 import anndata as ad
 import numpy as np
@@ -11,7 +12,9 @@ import scipy.sparse as sp
 from scipy.sparse.linalg import spsolve
 
 from sonic import DetectorGrid, DetectorIrregular, MatrixKernel
+from sonic.comparators.binning import _polar_bin_reducer, _radial_bin_reducer
 from sonic.explanation import SpatialExplanation, _explanation_from_responses
+from tests.test_cross_spectrum import EDGES, _irregular_points, make_comparator  # noqa: F401
 from tests.test_detector_grid import MockDataArray, MockSpatialData, MockTable
 
 
@@ -417,3 +420,367 @@ class TestDetectorExplanation:
     def test_setup_required(self, detector_cls):
         with pytest.raises(RuntimeError, match="setup_data"):
             detector_cls(kernel_method="gaussian").explain_qstat("a")
+
+
+class TestComparatorExplanation:
+    REPRESENTATIONS = ["power", "power_norm", "cross", "coherency", "coherence"]
+
+    @staticmethod
+    def _fit(comparator, angle=17):
+        if comparator.feature_mode == "2d":
+            comparator.rotation_angles_ = np.full(len(comparator.samples), angle, dtype=float)
+        return comparator.compute_spectra(progress=False, n_jobs=1).compute_cross_spectra(
+            [("a", "b"), ("a", "a")], progress=False, n_jobs=1
+        )
+
+    @staticmethod
+    def _explain(comparator, representation, bands, **kwargs):
+        features = "a" if representation.startswith("power") else ["a", "b"]
+        return comparator.explain_spectrum(
+            features, bands=bands, representation=representation, **kwargs
+        )
+
+    @staticmethod
+    def _expected(comparator, representation):
+        result = comparator.cross_spectra_
+        if representation.startswith("power"):
+            power = comparator.spectra_[0, 0]
+            return power / power.sum() if representation == "power_norm" else power
+        if representation == "cross":
+            return result.cross_spectra[0, 0].real
+        if representation == "coherency":
+            return result.coherency[0, 0].real
+        return result.coherence[0, 0]
+
+    @pytest.mark.parametrize("backend", ["fft", "nufft"])
+    @pytest.mark.parametrize("mode", ["radial", "2d"])
+    @pytest.mark.parametrize("representation", REPRESENTATIONS)
+    def test_reconstructs_extracted_features(self, make_comparator, backend, mode, representation):  # noqa: F811
+        values = np.random.default_rng(51).normal(size=(3, 16, 18))
+        comparator = self._fit(make_comparator(values, backend=backend, mode=mode))
+        bands = [2, 0] if mode == "radial" else [7, 0, 11]
+        result = self._explain(comparator, representation, bands)
+        np.testing.assert_allclose(
+            result.scores, self._expected(comparator, representation)[bands], atol=2e-10
+        )
+        np.testing.assert_array_equal(result.metadata["bands"], bands)
+        np.testing.assert_allclose(result.values[:, 0], values[0].ravel())
+        assert result.filtered.shape == (len(bands), 16 * 18, result.values.shape[1])
+        assert result.metadata["spectrum_source"] == "recomputed_raw"
+
+    @pytest.mark.parametrize("mode", ["radial", "2d"])
+    @pytest.mark.parametrize("representation", REPRESENTATIONS)
+    def test_direct_dft_spatial_oracle(self, mode, representation):
+        rng = np.random.default_rng(63)
+        shape, spacing, scale = (8, 10), (0.7, 1.1), 2.3
+        coords = rng.uniform(-2, 3, size=(37, 2))
+        values = rng.normal(size=(37, 3))
+        comparator = self._fit(
+            _irregular_points(
+                values, coords, shape=shape, mode=mode, spacing=spacing, unit_scales=[scale]
+            )
+        )
+        padding = int(mode == "2d")
+        modes = np.asarray(shape) + 2 * padding
+        fy = np.fft.fftfreq(modes[0]) * modes[0] / (shape[0] * spacing[0])
+        fx = np.fft.fftfreq(modes[1]) * modes[1] / (shape[1] * spacing[1])
+        frequencies = np.stack(np.meshgrid(fy, fx, indexing="ij"), axis=-1).reshape(-1, 2)
+        basis = np.exp(-2j * np.pi * (coords * scale) @ frequencies.T).T
+        if mode == "2d":
+            reducer, _ = _polar_bin_reducer(
+                shape, spacing=spacing, edges=EDGES, n_theta=4, angle_deg=17, frequency_padding=1
+            )
+        else:
+            reducer, _ = _radial_bin_reducer(shape, spacing=spacing, edges=EDGES, fft_solver="fft2")
+        retained = np.repeat(comparator._supported_frequency_bin_mask, 4 if mode == "2d" else 1)
+        reducer = reducer[retained]
+        g = 1 if representation.startswith("power") else 2
+        z = values[:, :g] - values[:, :g].mean(0)
+        coefficients = basis @ z / len(z)
+        coefficients[0] = 0
+        auto = reducer @ abs(coefficients) ** 2
+        cross = reducer @ (coefficients[:, 0] * coefficients[:, -1].conj())
+        if mode == "radial":
+            cross = cross.real
+        bands = [reducer.shape[0] - 1, 1]
+        result = self._explain(comparator, representation, bands)
+        for row, band in enumerate(bands):
+            weights = reducer.getrow(band).toarray().ravel()
+            weights[0] = 0
+            matrix = (basis.conj().T * weights) @ basis / len(z) ** 2
+            matrix -= matrix.mean(axis=0, keepdims=True)
+            response = matrix @ z
+            allocation = z[:, 0] * response[:, 0].real
+            if g == 2:
+                allocation = (z[:, 1] * response[:, 0] + z[:, 0] * response[:, 1].conj()) / 2
+                if mode == "radial":
+                    allocation = allocation.real
+            if representation == "power_norm":
+                allocation /= auto[:, 0].sum()
+            elif representation in ("coherency", "coherence"):
+                denominator = np.sqrt(auto[band, 0]) * np.sqrt(auto[band, 1])
+                allocation /= denominator
+                if representation == "coherence":
+                    allocation = ((cross[band] / denominator).conj() * allocation).real
+            np.testing.assert_allclose(result.contributions[row], allocation.real, atol=2e-10)
+        np.testing.assert_array_equal(result.coordinates, coords)
+        assert result.metadata["unit_scale"] == scale
+        if mode == "2d" and g == 2:
+            assert np.max(abs(cross.imag)) > 1e-5
+
+    @pytest.mark.parametrize("mode", ["radial", "2d"])
+    @pytest.mark.parametrize("representation", REPRESENTATIONS)
+    def test_fft_nufft_maps_match(self, make_comparator, mode, representation):  # noqa: F811
+        values = np.random.default_rng(80).normal(size=(3, 15, 17))
+        fft = self._fit(make_comparator(values, mode=mode))
+        nufft = self._fit(make_comparator(values, mode=mode, backend="nufft"))
+        a, b = [self._explain(c, representation, [1, 2]) for c in (fft, nufft)]
+        np.testing.assert_allclose(a.contributions, b.contributions, atol=2e-10)
+        np.testing.assert_allclose(a.filtered, b.filtered, atol=2e-10)
+        np.testing.assert_allclose(a.coordinates, b.coordinates)
+
+    @pytest.mark.parametrize("representation", REPRESENTATIONS)
+    def test_grid_holes_use_observed_support(self, make_comparator, representation):  # noqa: F811
+        values = np.random.default_rng(18).normal(size=(3, 15, 17))
+        values[:, 2:5, 4:7] = np.nan
+        comparator = self._fit(make_comparator(values, mode="2d", spacing=(0.8, 1.1)))
+        result = self._explain(comparator, representation, [1, 3])
+        indices = np.flatnonzero(np.isfinite(values[0].ravel()))
+        np.testing.assert_array_equal(result.observation_indices, indices)
+        np.testing.assert_allclose(
+            result.coordinates, np.c_[np.unravel_index(indices, (15, 17))] * [0.8, 1.1]
+        )
+        np.testing.assert_allclose(
+            result.scores, self._expected(comparator, representation)[[1, 3]], atol=1e-12
+        )
+        assert np.isnan(values[:, 2:5, 4:7]).all()
+
+    @pytest.mark.parametrize("representation", ["coherency", "coherence"])
+    def test_pair_swap_self_pair_scaling_translation(self, representation):
+        rng = np.random.default_rng(57)
+        coords, values = rng.uniform(0, 10, (61, 2)), rng.normal(size=(61, 3))
+        original = self._fit(_irregular_points(values, coords, mode="2d"))
+        result = self._explain(original, representation, [0, 4])
+        swapped = original.explain_spectrum(["b", "a"], bands=[0, 4], representation=representation)
+        np.testing.assert_allclose(swapped.contributions, result.contributions, atol=1e-12)
+        scaled = self._fit(_irregular_points(values * [3, 0.2, 1], coords + [100, -73], mode="2d"))
+        np.testing.assert_allclose(
+            self._explain(scaled, representation, [0, 4]).contributions,
+            result.contributions,
+            atol=2e-10,
+        )
+        self_pair = original.explain_spectrum(
+            ["a", "a"], bands=[0, 4], representation=representation
+        )
+        np.testing.assert_allclose(self_pair.scores, 1, atol=1e-12)
+        negative = self._fit(_irregular_points(values * [-1, 1, 1], coords, mode="2d"))
+        sign = -1 if representation == "coherency" else 1
+        np.testing.assert_allclose(
+            self._explain(negative, representation, [0, 4]).contributions,
+            sign * result.contributions,
+            atol=2e-10,
+        )
+
+    @pytest.mark.parametrize("mode", ["radial", "2d"])
+    def test_retained_bin_indices_and_total_normalization(self, make_comparator, mode):  # noqa: F811
+        values = np.random.default_rng(43).normal(size=(3, 16, 18))
+        edges = [0, 0.01, 0.1, 0.101, 0.3, 0.45, 0.8]
+        comparator = self._fit(make_comparator(values, mode=mode, freq_edges=edges))
+        assert not comparator._supported_frequency_bin_mask.all()
+        n_theta = 4 if mode == "2d" else 1
+        result = self._explain(comparator, "power_norm", [1])
+        np.testing.assert_allclose(result.scores, self._expected(comparator, "power_norm")[[1]])
+        np.testing.assert_array_equal(
+            result.metadata["frequency_bin_intervals"],
+            comparator.frequency_bin_intervals_[[1 // n_theta]],
+        )
+        assert result.scores[0] < 1
+
+    def test_no_refit_or_cache_mutation_and_subset(self, make_comparator):  # noqa: F811
+        rng = np.random.default_rng(27)
+        comparator = self._fit(
+            make_comparator([rng.normal(size=(3, 15, 17)) for _ in range(2)], mode="2d")
+        )
+        reference = comparator.spectra_.copy()
+        comparator.normalize_background()
+        cached = comparator.spectra_.copy()
+        cross = copy.deepcopy(comparator.cross_spectra_)
+        angles = comparator.rotation_angles_.copy()
+        with patch.object(comparator, "_ensure_alignment", side_effect=AssertionError("refit")):
+            maps = comparator.explain_spectrum("a", sample_index=1, bands=[1, 4])
+        np.testing.assert_allclose(maps.scores, reference[1, 0, [1, 4]])
+        np.testing.assert_array_equal(comparator.spectra_, cached)
+        np.testing.assert_array_equal(comparator.rotation_angles_, angles)
+        for name in ("cross_spectra", "auto_spectra", "coherency_valid"):
+            np.testing.assert_array_equal(
+                getattr(comparator.cross_spectra_, name), getattr(cross, name)
+            )
+        subset = comparator.subset([1])
+        np.testing.assert_allclose(
+            subset.explain_spectrum("a", bands=[1, 4]).contributions, maps.contributions
+        )
+        maps.filtered[:] = 0
+        maps.values[:] = 0
+        maps.coordinates[:] = 0
+        np.testing.assert_array_equal(comparator.spectra_, cached)
+
+    def test_cold_cross_fit_and_selected_sparse_layer(self):
+        rng = np.random.default_rng(6)
+        values, coords = rng.normal(size=(50, 3)), rng.uniform(0, 9, (50, 2))
+        base = _irregular_points(values, coords)
+        sample = base.samples[0]
+        sample.layers["counts"] = sp.csr_matrix(values * 2)
+        comparator = type(base)(
+            [sample],
+            grid_shape=(17, 19),
+            spacing=(1, 1),
+            freq_edges=EDGES,
+            eps=1e-12,
+            workers=1,
+            layer="counts",
+        )
+        comparator.compute_cross_spectra([("a", "b")], progress=False)
+        assert comparator.spectra_ is None
+        original = sp.csr_matrix.toarray
+        shapes = []
+
+        def record(matrix, *args, **kwargs):
+            shapes.append(matrix.shape)
+            return original(matrix, *args, **kwargs)
+
+        with patch.object(sp.csr_matrix, "toarray", record):
+            result = self._explain(comparator, "coherence", [0, 2])
+        assert all(shape[1] <= 2 for shape in shapes if shape[0] == 50)
+        np.testing.assert_allclose(result.values, values[:, :2] * 2)
+        np.testing.assert_allclose(
+            result.scores, comparator.cross_spectra_.coherence[0, 0, [0, 2]], atol=2e-10
+        )
+        assert comparator.spectra_ is None
+
+    @pytest.mark.parametrize(
+        "kwargs",
+        [
+            {"bands": []},
+            {"bands": [0.0]},
+            {"bands": [True]},
+            {"bands": [-1]},
+            {"bands": [0, 0]},
+            {"bands": [999]},
+            {"bands": [[0]]},
+            {"sample_index": -1},
+            {"sample_index": True},
+            {"sample_index": 2},
+            {"sample_index": 0.1},
+            {"features": []},
+            {"features": ["a", "b", "c"]},
+            {"features": ["missing"]},
+            {"representation": "coherence"},
+        ],
+    )
+    def test_invalid_requests(self, make_comparator, kwargs):  # noqa: F811
+        comparator = self._fit(make_comparator(np.random.default_rng(1).normal(size=(3, 9, 11))))
+        options = {"features": "a", "bands": [0], **kwargs}
+        with pytest.raises(ValueError):
+            comparator.explain_spectrum(**options)
+
+    def test_preconditions_budget_and_invalid_normalization(self, make_comparator):  # noqa: F811
+        values = np.random.default_rng(13).normal(size=(3, 9, 11))
+        values[1] = 1
+        comparator = make_comparator(values)
+        with pytest.raises(RuntimeError, match="compute_spectra"):
+            comparator.explain_spectrum("a", bands=[0])
+        self._fit(comparator)
+        with patch.object(comparator, "_batch_raster", side_effect=AssertionError("loaded values")):
+            with pytest.raises(MemoryError, match="budget"):
+                comparator.explain_spectrum("a", bands=[0], memory_budget_bytes=1)
+        for representation in ("coherency", "coherence"):
+            with pytest.raises(ValueError, match="invalid coherency"):
+                self._explain(comparator, representation, [0])
+        np.testing.assert_array_equal(
+            comparator.explain_spectrum("b", bands=[0], representation="power_norm").scores, [0]
+        )
+        np.testing.assert_array_equal(self._explain(comparator, "cross", [0]).scores, [0])
+        values[1, 0, 0] = np.nan
+        with pytest.raises(ValueError, match="identical finite support"):
+            self._explain(comparator, "cross", [0])
+
+    def test_even_nufft_nyquist_uses_real_radial_cross(self):
+        rng = np.random.default_rng(72)
+        coords = rng.uniform(size=(53, 2)) * [8, 10]
+        values = rng.normal(size=(53, 3))
+        comparator = self._fit(
+            _irregular_points(values, coords, shape=(8, 10), freq_edges=[0, 0.25, 0.5])
+        )
+        frequencies = np.stack(
+            np.meshgrid(np.fft.fftfreq(8), np.fft.fftfreq(10), indexing="ij"), axis=-1
+        ).reshape(-1, 2)
+        basis = np.exp(-2j * np.pi * coords @ frequencies.T).T
+        z = values[:, :2] - values[:, :2].mean(0)
+        coefficients = basis @ z / len(z)
+        radius = np.linalg.norm(frequencies, axis=1)
+        weights = ((radius >= 0.25) & (radius <= 0.5)).astype(float)
+        weights /= weights.sum()
+        cross = weights @ (coefficients[:, 0] * coefficients[:, 1].conj())
+        assert abs(cross.imag) > 1e-6  # Even NUFFT lattices have unpaired boundary modes.
+        response = basis.conj().T @ (weights[:, None] * coefficients) / len(z)
+        response -= response.mean(axis=0)
+        allocation = (z[:, 0] * response[:, 1].real + z[:, 1] * response[:, 0].real) / 2
+        np.testing.assert_allclose(
+            self._explain(comparator, "cross", [1]).contributions[0], allocation, atol=1e-10
+        )
+        coherence = self._explain(comparator, "coherence", [1])
+        np.testing.assert_allclose(
+            coherence.scores, self._expected(comparator, "coherence")[[1]], atol=1e-10
+        )
+
+    @pytest.mark.parametrize("reason", ["presence", "single_mode"])
+    def test_normalized_validity_matches_extraction(self, reason):
+        rng = np.random.default_rng(21)
+        values, coords = rng.normal(size=(41, 3)), rng.uniform(0, 5, (41, 2))
+        if reason == "presence":
+            values[2:, 0] = 0
+        comparator = self._fit(
+            _irregular_points(
+                values,
+                coords,
+                shape=(8, 10),
+                spacing=(0.7, 1.1),
+                presence_threshold=0.5,
+            )
+        )
+        band = 1 if reason == "presence" else 0
+        assert not comparator.cross_spectra_.coherency_valid[0, 0, band]
+        assert np.isfinite(self._explain(comparator, "cross", [band]).scores).all()
+        with pytest.raises(ValueError, match="invalid coherency"):
+            self._explain(comparator, "coherence", [band])
+
+    @pytest.mark.parametrize("representation", ["cross", "coherency", "coherence"])
+    def test_half_turn_preserves_real_maps(self, make_comparator, representation):  # noqa: F811
+        values = np.random.default_rng(22).normal(size=(3, 17, 19))
+        original = self._fit(make_comparator(values, mode="2d"), angle=17)
+        a = self._explain(original, representation, [0, 4, 10])
+        rotated = self._fit(make_comparator(values, mode="2d"), angle=197)
+        b = self._explain(rotated, representation, [0, 4, 10])
+        np.testing.assert_allclose(a.contributions, b.contributions, atol=1e-12)
+        np.testing.assert_array_equal(a.coordinates, b.coordinates)
+        np.testing.assert_allclose(
+            original.cross_spectra_.cross_spectra,
+            rotated.cross_spectra_.cross_spectra.conj(),
+            atol=1e-12,
+        )
+
+    @pytest.mark.parametrize("mode", ["radial", "2d"])
+    def test_nufft_budget_precedes_source_read(self, make_comparator, mode):  # noqa: F811
+        comparator = self._fit(
+            make_comparator(
+                np.random.default_rng(9).normal(size=(3, 9, 11)), backend="nufft", mode=mode
+            )
+        )
+        with patch.object(
+            type(comparator.samples[0]),
+            "X",
+            new_callable=PropertyMock,
+            side_effect=AssertionError("loaded source"),
+        ):
+            with pytest.raises(MemoryError, match="budget"):
+                comparator.explain_spectrum(["a", "b"], bands=[0], memory_budget_bytes=1)

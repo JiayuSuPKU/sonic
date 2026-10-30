@@ -25,6 +25,10 @@ class SpatialExplanation:
 
     Here x and y denote test-prepared features (``values`` after preparation),
     and L is the fitted real symmetric kernel operator, including its scaling.
+    Comparator maps have one map per selected bin. Their real ``filtered``
+    fields include observed normalization and, for polar coherence, the two
+    conjugate phase factors. The same elementwise allocation then applies;
+    metadata records the representation and retained bin indices.
 
     ``observation_indices`` maps rows back to the original AnnData passed to
     setup_data, or to the C-order flattened raster for grid detectors.
@@ -90,8 +94,10 @@ def _explanation_from_responses(  # noqa: C901 — array boundary validation and
     - One feature contributes x * Lx.
     - A pair contributes (x * Ly + y * Lx) / 2.
 
-    These products are elementwise. The pair formula requires a real symmetric
-    kernel. All centering, scaling and filtering happen before this call;
+    These products are elementwise. Detector pairs use a real symmetric kernel;
+    more generally the caller may supply matching adjoint responses for the
+    two features (as for polar coherence). All centering, scaling and filtering
+    happen before this call;
     ``values`` holds the original observed values for display.
 
     Parameters

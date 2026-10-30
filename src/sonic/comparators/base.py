@@ -92,6 +92,7 @@ from sonic.comparators.normalization import (
 if TYPE_CHECKING:
     from sonic.comparators.cross_spectrum import CrossSpectra
     from sonic.comparators.multisample import _AnalyticNullState
+    from sonic.explanation import SpatialExplanation
 
 __all__: list[str] = []
 
@@ -816,6 +817,77 @@ class _ComparatorBase:
         )
         self.__dict__.update(pending.__dict__)
         return self
+
+    # ------------------------------------------------------------------
+    def explain_spectrum(
+        self,
+        features: str | Sequence[str],
+        *,
+        sample_index: int = 0,
+        bands: Sequence[int],
+        representation: str | None = None,
+        memory_budget_bytes: int | str = _DEFAULT_CHUNK_BUDGET,
+    ) -> SpatialExplanation:
+        """Explain selected raw spectrum bins in one sample's spatial coordinates.
+
+        This function allocates the observed feature value in each selected frequency bin
+        to the source coordinates. It is not a derivative or a local significance test.
+
+        Parameters
+        ----------
+        features : str or sequence of one/two str
+            One feature for power, or an ordered pair for cross-spectrum maps.
+        sample_index : int, default 0
+            Sample in this comparator (or its subset).
+        bands : sequence of int
+            Distinct indices into the retained flattened spectrum, in output
+            order. Polar bins flatten radius then angle; these are not indices
+            into the original, potentially unsupported frequency intervals.
+        representation : str, optional
+            One feature: 'power' (default) or 'power_norm', which divides by
+            the sum of raw power across all retained bins. An all-zero power
+            profile remains zero. Pair: 'cross' (default, real co-spectrum),
+            'coherency' (real signed coherency), or 'coherence' (squared complex
+            magnitude). Invalid normalized pair bins raise ValueError.
+        memory_budget_bytes : int or str, default '2 GiB'
+            Estimated memory for returned maps, reducers and transform scratch.
+            Checked before loading selected features.
+
+        Returns
+        -------
+        sonic.explanation.SpatialExplanation
+            One map per requested bin band. Signed contributions sum to that bin's
+            **untransformed** feature (no log floor, test statistic or p-value is
+            attributed). When the selected representation requires scaling
+            (e.g., 'power_norm'), it is applied with observed normalization
+            factors held fixed, and no attribution from the denominator.
+
+        Notes
+        -----
+        Requires compute_spectra() or compute_cross_spectra() first. Recomputes
+        only the selected source features using the fitted grid, bin reducers
+        and alignment, without refitting or changing caches. Maps always explain
+        raw-source spectra, including after normalize_background/covariates.
+
+        For complex polar cross-spectrum S, let a_i be its complex allocation.
+        Coherence allocates Re(conj(S) * a_i) / (P_x * P_y). Thus phase contributes
+        to coherence maps, and local contributions can be negative.
+
+        NUFFT maps retain source coordinates and row indices. FFT maps contain
+        occupied raster cells, indexed in C order, with local (y, x) coordinates
+        from spacing and origin zero, not SpatialData world coordinates. Only
+        frequency weights are aligned; spatial coordinates are never rotated.
+        """
+        from sonic.comparators.explanation import _explain_spectrum
+
+        return _explain_spectrum(
+            self,
+            features,
+            sample_index=sample_index,
+            bands=bands,
+            representation=representation,
+            memory_budget_bytes=memory_budget_bytes,
+        )
 
     # ------------------------------------------------------------------
     def subset(self, indices: Sequence[int] | np.ndarray) -> _ComparatorBase:

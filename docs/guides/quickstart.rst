@@ -120,8 +120,64 @@ the raster prepared by ``setup_data``.
 Only the selected one/two features are densified. The memory budget estimates
 workspace and returned arrays; it excludes resident data, kernel storage, lazy
 factorization and library overhead. No Fourier coefficients or source-container
-references are retained. Plotting, crop selection and comparator band maps are
-not part of this initial interface.
+references are retained. Comparator band maps use the same container; see
+:doc:`multisample`.
+
+Plot maps and select zoom regions
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Plotting and region selection operate on the returned ``SpatialExplanation``
+for either detector Q/R or comparator bins. They do not rerun the kernel or
+Fourier transforms:
+
+.. code-block:: python
+
+   regions = r_map.select_regions(size=100.0, n_regions=2)
+   figure = r_map.plot(regions=regions)
+   figure.savefig("r_explanation.png", dpi=180)
+
+``size`` is the square window width in the explanation's **stored coordinate
+units**. Choose it for your dataset; no micrometre or millimetre conversion is
+assumed. Q/R maps require an explicit size. Graph-only explanations without
+coordinates cannot be plotted or searched for regions.
+
+Region candidates advance by one quarter of the width. By default they need
+at least 64 observations and 35% occupied tiles in a 20-by-20 subdivision.
+``min_observations`` and ``min_coverage`` adjust those eligibility checks.
+Occupancy is a coordinate diagnostic, not a tissue mask. Candidates must fit
+inside the coordinate bounding box; sparse tissue and holes can leave no
+eligible crop. The requested size is never silently reduced.
+
+``direction="absolute"`` ranks the absolute **signed sum** of contributions;
+``"positive"`` and ``"negative"`` select the respective direction. Opposite
+signs can cancel within a window. Greedy overlap suppression returns up to
+``n_regions`` windows. These are contribution-enriched examples, not unbiased
+samples or evidence of regional significance. Region selection does not infer
+which direction is associated with a condition; use your sample-level contrast
+to interpret it. ``memory_budget_bytes`` limits estimated tiling scratch;
+a very small window in a large coordinate domain can require more memory.
+
+The returned table records ``coord0_min``, ``coord1_min``, ``coord0_max`` and
+``coord1_max`` in original column order, plus occupancy, observation count and
+the exact signed contribution sum. Bounds are half-open: lower edges are
+included and upper edges excluded. Use these bounds with ``coordinates`` to
+select rows and ``observation_indices`` to map them to the source data.
+
+``plot()`` returns a Matplotlib figure. Columns show original values, filtered
+responses and signed contributions; the first row is an overview and each
+provided region adds a zoom row. Without ``regions``, only the overview is
+shown. Overview tiles contain observation means and leave empty tiles blank;
+zoom panels show every observation. All rows in a column share color limits.
+The default limits clip to the 1st/99th percentiles for original values and
+symmetric 99th-percentile absolute limits for signed fields. Pass ``limits``
+as one (low, high) pair per column to compare multiple samples consistently.
+Reported sums always use individual, unclipped contributions.
+
+Plots retain coordinate units. Known grid maps put column 1 horizontally and
+column 0 downward; other sources put column 0 horizontally and column 1 upward.
+``coordinate_order=(1, 0)`` or ``(0, 1)`` overrides the axis-column mapping.
+Axes label the source column numbers. Crops inherit full-sample filtering and
+normalization, including contributions from locations outside the crop.
 
 
 Which backend should I use?

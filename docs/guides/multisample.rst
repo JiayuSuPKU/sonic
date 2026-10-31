@@ -245,8 +245,31 @@ Only one/two genes are transformed, and requested bands are processed one at a
 time. The memory estimate includes returned maps and transform/reducer scratch,
 but excludes resident inputs, rasterization internals and library overhead.
 Invalid normalized pair bins raise an error instead of producing a misleading
-map; finite raw power and co-spectrum maps remain available. Plotting and
-region selection are separate from this computation API.
+map; finite raw power and co-spectrum maps remain available.
+
+Use the shared plotting and region-selection methods on any returned map:
+
+.. code-block:: python
+
+   # map_index is a position in the returned maps: 0 refers to bands[0].
+   regions = pair.select_regions(map_index=0, size=100.0, direction="absolute")
+   figure = pair.plot(map_index=0, regions=regions)
+
+When ``size`` is omitted and the band's lower frequency is positive, the
+suggested width is max(3 / lower_frequency, 1 / bandwidth), divided by
+``metadata["unit_scale"]`` to recover stored coordinate units. This heuristic
+includes several wavelengths and the inverse-bandwidth context; it does not
+remove ringing or boundary effects. Bands starting at zero require an explicit
+size. An explicit smaller window is allowed and reported as
+``context_limited=True``. Polar maps use their radial interval for this width;
+selection uses the original spatial coordinates and never rotates the tissue.
+
+``plot()`` shows the stored filtered responses, including fixed normalization
+and coherence phase factors, alongside the original values and contributions.
+These fields are not reconstructed expression intensities. Selection and
+plotting do not refilter the crop or recompute its normalization. See
+:doc:`quickstart` for eligibility checks, coordinate conventions, color limits
+and the returned region table.
 
 
 Regular grids

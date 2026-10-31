@@ -784,3 +784,292 @@ class TestComparatorExplanation:
         ):
             with pytest.raises(MemoryError, match="budget"):
                 comparator.explain_spectrum(["a", "b"], bands=[0], memory_budget_bytes=1)
+
+
+@pytest.fixture
+def plt():
+    import matplotlib
+
+    matplotlib.use("Agg", force=True)
+    import matplotlib.pyplot as pyplot
+
+    yield pyplot
+    pyplot.close("all")
+
+
+class TestExplanationRegions:
+    @staticmethod
+    def _map(contribution=None, *, metadata=None):
+        yy, xx = np.indices((61, 61))
+        coords = np.c_[yy.ravel(), xx.ravel()].astype(float)
+        if contribution is None:
+            contribution = np.exp(-((yy - 16) ** 2 + (xx - 16) ** 2) / 12)
+            contribution -= 2 * np.exp(-((yy - 46) ** 2 + (xx - 46) ** 2) / 12)
+        contribution = np.asarray(contribution).ravel()
+        return SpatialExplanation(
+            feature_names=("a",),
+            observation_indices=np.arange(len(coords)),
+            coordinates=coords,
+            values=np.ones((len(coords), 1)),
+            filtered=contribution[None, :, None].copy(),
+            contributions=contribution[None].copy(),
+            metadata={"statistic": "Q"} if metadata is None else metadata,
+        )
+
+    @pytest.mark.parametrize(
+        "direction,center,sign", [("absolute", 46, -1), ("positive", 16, 1), ("negative", 46, -1)]
+    )
+    def test_signed_ranking_nonoverlap_and_exact_totals(self, direction, center, sign):
+        result = self._map()
+        regions = result.select_regions(size=20, n_regions=2, direction=direction)
+        first = regions.iloc[0]
+        assert first.coord0_min <= center < first.coord0_max
+        assert first.coord1_min <= center < first.coord1_max
+        assert np.sign(first.contribution_sum) == sign
+        for row, region in enumerate(regions.itertuples(index=False)):
+            lower = np.array([region.coord0_min, region.coord1_min])
+            upper = np.array([region.coord0_max, region.coord1_max])
+            inside = ((result.coordinates >= lower) & (result.coordinates < upper)).all(axis=1)
+            assert region.n_observations == inside.sum()
+            assert region.contribution_sum == result.contributions[0, inside].sum()
+            assert region.coverage == 1
+            for previous in regions.iloc[:row].itertuples(index=False):
+                assert not (
+                    abs(region.coord0_min - previous.coord0_min) < 20
+                    and abs(region.coord1_min - previous.coord1_min) < 20
+                )
+        repeated = result.select_regions(size=20, n_regions=2, direction=direction)
+        pd.testing.assert_frame_equal(regions, repeated)
+
+    def test_translation_and_source_immutability(self):
+        result = self._map()
+        original = copy.deepcopy(result)
+        regions = result.select_regions(size=20)
+        shifted = copy.deepcopy(result)
+        shift = np.array([123.5, -71.25])
+        shifted.coordinates += shift
+        translated = shifted.select_regions(size=20)
+        for suffix in ("min", "max"):
+            np.testing.assert_allclose(
+                translated[[f"coord0_{suffix}", f"coord1_{suffix}"]],
+                regions[[f"coord0_{suffix}", f"coord1_{suffix}"]] + shift,
+            )
+        np.testing.assert_allclose(translated.contribution_sum, regions.contribution_sum)
+        for name in ("values", "filtered", "contributions", "coordinates", "observation_indices"):
+            np.testing.assert_array_equal(getattr(result, name), getattr(original, name))
+
+    def test_scale_heuristic_uses_returned_map_and_source_units(self):
+        result = self._map(
+            metadata={
+                "statistic": "coherency",
+                "bands": np.array([7, 12]),
+                "frequency_bin_intervals": np.array([[0.05, 0.1], [0.2, 0.21]]),
+                "unit_scale": 2.0,
+            }
+        )
+        result.contributions = np.repeat(result.contributions, 2, axis=0)
+        result.filtered = np.repeat(result.filtered, 2, axis=0)
+        first = result.select_regions(map_index=0, min_coverage=0.1)
+        second = result.select_regions(map_index=1, min_coverage=0.1)
+        np.testing.assert_allclose(first["size"], 30)
+        np.testing.assert_allclose(second["size"], 50)
+        assert not first.context_limited.any()
+        small = result.select_regions(map_index=1, size=20)
+        assert small.context_limited.all()
+        np.testing.assert_allclose(small.recommended_size, 50)
+        with pytest.raises(ValueError, match="map_index"):
+            result.select_regions(map_index=12, size=20)
+
+    def test_empty_low_coverage_cancellation_and_boundaries(self):
+        result = self._map(np.ones((61, 61)))
+        region = result.select_regions(size=60, min_coverage=1).iloc[0]
+        assert region.n_observations == 60**2  # Upper-bound points are excluded.
+        assert region.contribution_sum == 60**2
+        assert result.select_regions(size=61).empty
+        assert result.select_regions(size=20, min_observations=1000).empty
+        checker = (-1.0) ** np.indices((61, 61)).sum(axis=0)
+        assert self._map(checker).select_regions(size=20).empty
+        assert self._map(np.zeros((61, 61))).select_regions(size=20).empty
+        keep = np.arange(0, len(result.coordinates), 25)
+        sparse = SpatialExplanation(
+            result.feature_names,
+            result.observation_indices[keep],
+            result.coordinates[keep],
+            result.values[keep],
+            result.filtered[:, keep],
+            result.contributions[:, keep],
+            result.metadata,
+        )
+        assert sparse.select_regions(size=20, min_coverage=0.5, min_observations=1).empty
+
+    @pytest.mark.parametrize(
+        "kwargs",
+        [
+            {},
+            {"size": 0},
+            {"size": np.nan},
+            {"size": -2},
+            {"size": 20, "n_regions": 0},
+            {"size": 20, "n_regions": True},
+            {"size": 20, "min_observations": 1.5},
+            {"size": 20, "min_coverage": 0},
+            {"size": 20, "min_coverage": np.nan},
+            {"size": 20, "direction": "bad"},
+            {"size": 20, "map_index": True},
+            {"size": 20, "map_index": -1},
+        ],
+    )
+    def test_invalid_selection(self, kwargs):
+        with pytest.raises(ValueError):
+            self._map().select_regions(**kwargs)
+
+    def test_missing_coordinates_zero_edge_and_memory_limit(self):
+        result = self._map()
+        with patch("numpy.bincount", side_effect=AssertionError("allocated before guard")):
+            with pytest.raises(MemoryError, match="memory budget"):
+                result.select_regions(size=1e-4, memory_budget_bytes="1 MiB")
+        result.metadata["frequency_bin_intervals"] = np.array([[0, 0.2]])
+        with pytest.raises(ValueError, match="size"):
+            result.select_regions()
+        assert len(result.select_regions(size=20)) > 0
+        result.coordinates = None
+        with pytest.raises(ValueError, match="coordinates"):
+            result.select_regions(size=20)
+        with pytest.raises(ValueError, match="coordinates"):
+            result.plot()
+
+    @pytest.mark.parametrize("mode", ["radial", "2d"])
+    def test_comparator_local_motif(self, make_comparator, mode):  # noqa: F811
+        yy, xx = np.indices((65, 65))
+        motif = np.sin(2 * np.pi * 0.2 * xx) * np.exp(-((yy - 22) ** 2 + (xx - 22) ** 2) / 64)
+        comparator = make_comparator(np.stack([motif, motif, motif]), mode=mode)
+        if mode == "2d":
+            comparator.rotation_angles_ = np.array([0.0])
+        comparator.compute_spectra(progress=False, n_jobs=1)
+        result = comparator.explain_spectrum("a", bands=[1 if mode == "radial" else 4])
+        region = result.select_regions(size=15, n_regions=1).iloc[0]
+        assert region.coord0_min <= 22 < region.coord0_max
+        assert region.coord1_min <= 22 < region.coord1_max
+        assert region.context_limited
+
+
+class TestExplanationPlotting:
+    @pytest.mark.parametrize("kind", ["Q", "R", "power", "coherency", "coherence"])
+    def test_panels_shared_limits_and_zoom_data(self, plt, monkeypatch, make_comparator, kind):  # noqa: F811
+        values = np.random.default_rng(91).normal(size=(3, 25, 27))
+        values[:, 3:5, 6:8] = np.nan
+        if kind in ("Q", "R"):
+            result = _explain(_grid(monkeypatch, values), kind)
+        else:
+            comparator = make_comparator(values, mode="2d")
+            comparator.rotation_angles_ = np.array([19.0])
+            comparator.compute_cross_spectra([("a", "b")], progress=False, n_jobs=1)
+            result = comparator.explain_spectrum(
+                "a" if kind == "power" else ["a", "b"], bands=[4], representation=kind
+            )
+        before = copy.deepcopy(result)
+        regions = result.select_regions(size=10, n_regions=1, min_observations=10, min_coverage=0.1)
+        fig = result.plot(regions=regions, title="Synthetic example")
+        fig.canvas.draw()
+        ncols = 2 * len(result.feature_names) + 1
+        axes = fig.axes[: 2 * ncols]
+        assert len(axes) == 2 * ncols
+        box = regions.iloc[0]
+        lower, upper = [box.coord0_min, box.coord1_min], [box.coord0_max, box.coord1_max]
+        keep = ((result.coordinates >= lower) & (result.coordinates < upper)).all(axis=1)
+        arrays = [*result.values.T, *result.filtered[0].T, result.contributions[0]]
+        for column, array in enumerate(arrays):
+            image = axes[column].images[0]
+            scatter = axes[ncols + column].collections[0]
+            assert image.norm is scatter.norm
+            assert image.get_array().mask.any()  # Holes are not interpolated.
+            np.testing.assert_array_equal(scatter.get_array(), array[keep])
+            np.testing.assert_allclose(scatter.get_offsets(), result.coordinates[keep][:, [1, 0]])
+            assert axes[column].yaxis_inverted()
+            assert len(axes[column].patches) == 1
+        assert "sum =" in axes[-1].get_title()
+        assert "frequency" in fig._suptitle.get_text() if kind not in ("Q", "R") else True
+        for name in ("values", "filtered", "contributions", "coordinates"):
+            np.testing.assert_array_equal(getattr(result, name), getattr(before, name))
+        np.testing.assert_array_equal(result.scores, before.scores)
+
+    def test_source_coordinate_order_custom_limits_and_no_implicit_crops(self, plt):
+        result = TestExplanationRegions._map()
+        limits = [(0, 2), (-2, 2), (-3, 3)]
+        with patch.object(
+            result, "select_regions", side_effect=AssertionError("implicit selection")
+        ):
+            fig = result.plot(limits=limits)
+        assert len(fig.axes) == 6  # Three overview axes and colorbars.
+        overview = fig.axes[0]
+        assert overview.get_xlabel() == "Coordinate 0"
+        assert not overview.yaxis_inverted()
+        for axis, clim in zip(fig.axes[:3], limits, strict=True):
+            assert axis.images[0].get_clim() == clim
+        region = result.select_regions(size=20, n_regions=1)
+        fig = result.plot(regions=region, coordinate_order=(1, 0))
+        assert fig.axes[0].get_xlabel() == "Coordinate 1"
+        fig.canvas.draw()
+
+    def test_overview_is_bounded_observation_mean(self, plt):
+        result = TestExplanationRegions._map()
+        result.coordinates *= 1e6
+        result.coordinates[1] = result.coordinates[0]
+        result.values[0, 0], result.values[1, 0] = 1, 3
+        fig = result.plot()
+        image = fig.axes[0].images[0]
+        assert max(image.get_array().shape) <= 512
+        assert image.get_array()[0, 0] == 2
+        assert np.count_nonzero(~image.get_array().mask) <= len(result.coordinates)
+        fig.canvas.draw()
+
+    @pytest.mark.parametrize(
+        "kwargs",
+        [
+            {"limits": [(0, 1)]},
+            {"limits": [(0, 0)] * 3},
+            {"limits": [(0, np.nan)] * 3},
+            {"coordinate_order": (0, 0)},
+            {"coordinate_order": (0.0, 1.0)},
+            {"coordinate_order": (False, True)},
+            {"point_size": 0},
+            {"map_index": 1},
+        ],
+    )
+    def test_plot_validation_no_figure_leak(self, plt, kwargs):
+        with pytest.raises(ValueError):
+            TestExplanationRegions._map().plot(**kwargs)
+        assert not plt.get_fignums()
+
+    def test_empty_invalid_and_stale_region_summaries(self, plt):
+        result = TestExplanationRegions._map()
+        empty = result.select_regions(size=100)
+        fig = result.plot(regions=empty)
+        assert len(fig.axes) == 6
+        region = result.select_regions(size=20, n_regions=1)
+        region.loc[0, "contribution_sum"] = 99999
+        fig = result.plot(regions=region)
+        assert "99999" not in fig.axes[5].get_title()  # Recompute summaries from plotted rows.
+        for corruption in ("width", "nan", "empty"):
+            bad = region.copy()
+            if corruption == "width":
+                bad.loc[0, "coord0_max"] = bad.loc[0, "coord0_min"]
+            elif corruption == "nan":
+                bad.loc[0, "coord0_min"] = np.nan
+            else:
+                bad.loc[0, ["coord0_min", "coord1_min", "coord0_max", "coord1_max"]] = [
+                    100,
+                    100,
+                    110,
+                    110,
+                ]
+            with pytest.raises(ValueError):
+                result.plot(regions=bad)
+
+    def test_constant_large_values_and_zero_fields(self, plt):
+        result = TestExplanationRegions._map(np.zeros((61, 61)))
+        result.values[:] = 1e20
+        fig = result.plot()
+        fig.canvas.draw()
+        assert fig.axes[0].images[0].norm.vmin < 1e20 < fig.axes[0].images[0].norm.vmax
+        assert fig.axes[2].images[0].get_clim() == (-1, 1)

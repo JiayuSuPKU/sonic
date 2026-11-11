@@ -1165,6 +1165,7 @@ class _ComparatorBase:
         min_samples_per_group: int = 2,
         min_resid_df: int = 1,
         covariance: str | None = None,
+        n_rotations: int = 19999,
     ) -> Any:
         """Differential-frequency (DF) test on :attr:`spectra_`.
 
@@ -1172,22 +1173,11 @@ class _ComparatorBase:
         between conditions / along a contrast. The companion DE test is
         :meth:`test_diff_expr`.
 
-        Dispatches between four execution paths, picked from the
-        ``design`` argument's shape and the ``contrast=`` keyword:
-
-        - **Binary, analytic null** (1-D ``design``, ``null="analytic"`` (default),
-          ``contrast=None``): Liu mixture-χ² test on the binary indicator
-          via :func:`~sonic.comparators.multisample.compare_two_groups`
-          (or its masked variant when any ``presence_`` entry is
-          ``False``).
-        - **Binary, permutation null** (1-D ``design``,
-          ``null="permutation"``, ``contrast=None``): two-group
-          label-permutation test on the same dispatch target.
-        - **GLM analytic** (multi-column / continuous ``design`` **or**
-          explicit ``contrast=``): generalized Liu mixture-χ² test via
-          :func:`~sonic.comparators.multisample.compare_glm` (or
-          :func:`~sonic.comparators.multisample.compare_glm_masked`
-          when any ``presence_`` entry is ``False``).
+        Binary labels dispatch to :func:`~sonic.comparators.multisample.compare_two_groups`;
+        design-matrix contrasts dispatch to :func:`~sonic.comparators.multisample.compare_glm`.
+        Each uses its masked variant when any ``presence_`` entry is False.
+        Both support analytic Liu and conditional rotation calibration.
+        Label permutations are also available for binary comparisons.
 
         Supplying ``contrast=`` alongside a 1-D ``design`` switches to
         the GLM path on the single-column DataFrame that wraps the
@@ -1209,14 +1199,17 @@ class _ComparatorBase:
             Per-gene statistic. See
             :func:`~sonic.comparators.multisample.compare_two_groups`
             for the catalog.
-        null : {'analytic', 'permutation'}, default 'analytic'
-            Null-distribution method. ``'analytic'`` is the analytic
-            Liu-approximation null — the default on every dispatch
-            path. ``'permutation'`` is available on the binary path
-            only (raises on the GLM path).
-        n_perm, random_state, max_exact_permutations
-            Forwarded to the permutation path; ignored on the analytic
-            path.
+        null : str
+            ``'analytic'`` (default) uses the Liu approximation.
+            ``'rotation'`` conditions on each gene's nuisance-adjusted scatter.
+            ``'permutation'`` relabels samples on the binary path only.
+        n_perm, max_exact_permutations
+            Label-permutation controls; ignored by other null methods.
+        random_state : int, optional
+            Seed for label permutations or rotation draws.
+        n_rotations : int
+            Number of Monte Carlo rotations; default 19999. Used only with
+            ``null='rotation'``, which requires ``covariance=None``.
         freq_weights : np.ndarray, optional
             Per-bin reweighting (same semantics as on the standalone).
         normalize_shape : bool, default False
@@ -1234,7 +1227,7 @@ class _ComparatorBase:
             Ignored on the unmasked / GLM paths.
         covariance : {None, 'pooled', 'per_gene'}, optional
             For ``null='analytic'`` only. By default, residual covariance
-            are pooled across all tests genes (``None`` or ``'pooled'``).
+            is pooled across eligible genes (``None`` or ``'pooled'``).
             ``'per_gene'`` instead estimates a separate covariance for each gene.
         min_resid_df : int, default 1
             Minimum per-gene residual degrees of freedom required under
@@ -1242,9 +1235,11 @@ class _ComparatorBase:
 
         Notes
         -----
-        With numerically zero residual covariance, a nonzero contrast
-        has NaN p-values (including BH adjustment); a zero contrast has p=1.
-        Untestable features are excluded from BH correction.
+        For the analytic null, numerically zero residual covariance gives
+        NaN p-values for nonzero contrasts and p=1 for zero contrasts.
+        Untestable features are excluded from BH correction. Rotation assumptions,
+        Monte Carlo metadata, and perfect-fit behavior are described in
+        :func:`~sonic.comparators.multisample.compare_glm`.
 
         Use the ``normalize_shape`` keyword for a one-shot shape-only
         test that leaves :attr:`spectra_` untouched for further
@@ -1272,13 +1267,12 @@ class _ComparatorBase:
                     "contrast= is provided or `design` is a multi-column / "
                     f"continuous design, got statistic={statistic!r}."
                 )
-            if null != "analytic":
+            if null not in ("analytic", "rotation"):
                 raise NotImplementedError(
-                    "Only null='analytic' is supported when "
+                    "Only null='analytic' or 'rotation' is supported when "
                     "contrast= is provided or `design` is a multi-column / "
-                    "continuous design. Pass null='analytic' or pass a 1-D "
-                    "binary `design` (and omit `contrast=`) to take the "
-                    "permutation path."
+                    "continuous design. For label permutations, pass a 1-D "
+                    "binary `design` without `contrast=`."
                 )
             if contrast is None:
                 raise ValueError(
@@ -1294,7 +1288,10 @@ class _ComparatorBase:
                     gene_names=self.gene_names,
                     freq_weights=freq_weights,
                     normalize_shape=normalize_shape,
+                    null=null,
+                    random_state=random_state,
                     covariance=covariance,
+                    n_rotations=n_rotations,
                     min_resid_df=int(min_resid_df),
                 )
             return compare_glm(
@@ -1304,7 +1301,10 @@ class _ComparatorBase:
                 gene_names=self.gene_names,
                 freq_weights=freq_weights,
                 normalize_shape=normalize_shape,
+                null=null,
+                random_state=random_state,
                 covariance=covariance,
+                n_rotations=n_rotations,
             )
 
         # Binary path (1-D design, contrast is None).
@@ -1323,6 +1323,7 @@ class _ComparatorBase:
                 max_exact_permutations=max_exact_permutations,
                 normalize_shape=normalize_shape,
                 covariance=covariance,
+                n_rotations=n_rotations,
             )
         return compare_two_groups(
             self.spectra_,
@@ -1336,6 +1337,7 @@ class _ComparatorBase:
             max_exact_permutations=max_exact_permutations,
             normalize_shape=normalize_shape,
             covariance=covariance,
+            n_rotations=n_rotations,
         )
 
     def test_cross_diff_freq(
@@ -1352,6 +1354,7 @@ class _ComparatorBase:
         min_samples_per_group: int = 2,
         min_resid_df: int = 1,
         covariance: str | None = None,
+        n_rotations: int = 19999,
     ):
         """Test a condition-associated cross-spectrum profile change per pair.
 
@@ -1359,24 +1362,29 @@ class _ComparatorBase:
         ----------
         design, contrast
             Same binary labels or design-matrix contrast as :meth:`test_diff_freq`.
-            Unmasked analytic comparisons require positive residual degrees of
-            freedom; masked comparisons also apply the minimum group sizes.
+            Unmasked analytic and rotation comparisons require positive residual
+            degrees of freedom; masked comparisons also apply minimum group sizes.
         representation : {'coherence', 'coherency'}, default 'coherence'
             ``coherence`` compares ``log(max(abs(coherency)**2, 1e-12))``;
             ``coherency`` compares its signed real part without a transform.
             Both are invariant to conjugation under axial polar alignment.
-        null : {'analytic', 'permutation'}, default 'analytic'
-            Analytic DF Liu mixture null with residual covariance pooled by default across
-            eligible pairs with entrywise support, then PSD-corrected and subset
-            to each pair's valid bins. Label permutations are available only for
-            binary labels without an explicit contrast.
+        null : str
+            ``'analytic'`` (default) uses the Liu approximation with the selected
+            residual covariance. ``'rotation'`` conditions on each pair's
+            nuisance-adjusted scatter. ``'permutation'`` relabels samples on
+            the binary path only.
         covariance : {None, 'pooled', 'per_pair'}, optional
             For ``null='analytic'`` only. By default, residual covariance
-            are pooled across all tests gene pairs (``None`` or ``'pooled'``).
+            is pooled across eligible gene pairs (``None`` or ``'pooled'``).
             ``'per_pair'`` instead estimates a separate covariance for each gene pair
             on its retained samples and bins, including for signed coherency.
-        n_perm, random_state, max_exact_permutations
-            Same permutation controls as :meth:`test_diff_freq`.
+        n_perm, max_exact_permutations
+            Same label-permutation controls as :meth:`test_diff_freq`.
+        random_state : int, optional
+            Seed for label permutations or rotation draws.
+        n_rotations : int
+            Number of Monte Carlo rotations; default 19999. Used only with
+            ``null='rotation'``, which requires ``covariance=None``.
         freq_weights : ndarray, optional
             Nonnegative weights on the original flattened frequency bins.
             Zero-weight bins are excluded; weights are renormalized over each
@@ -1404,10 +1412,15 @@ class _ComparatorBase:
             for pooled fits. ``N_pairs_pooled`` is one for each eligible
             per-pair fit, zero for skipped pairs. With masked presence, permutation
             counts/exactness are recorded per pair; otherwise those settings are
-            shared scalars.
+            shared scalars. Rotation records the effective seed, draw count,
+            and minimum p-value in ``attrs`` as in :meth:`test_diff_freq`;
+            ``N_pairs_pooled`` is zero and ``Effective_rank`` describes the
+            conditional scatter.
 
         Notes
         -----
+        Rotation uses the same assumptions and calibration as
+        :func:`~sonic.comparators.multisample.compare_glm` on the chosen profile scale.
         As in :meth:`test_diff_freq`, missing expression excludes samples;
         both genes must be present for a pair's sample to be retained. Bins
         must be valid in every retained sample. Analytic calibration assumes
@@ -1435,6 +1448,7 @@ class _ComparatorBase:
             min_samples_per_group=min_samples_per_group,
             min_resid_df=min_resid_df,
             covariance=covariance,
+            n_rotations=n_rotations,
         )
 
     def estimate_null_covariance(

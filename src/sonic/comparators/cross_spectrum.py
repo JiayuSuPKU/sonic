@@ -22,6 +22,7 @@ from sonic.comparators.multisample import (
     _estimate_two_group_masked_null_covariance,
     _estimate_two_group_null_covariance,
     _fit_glm_profiles,
+    _iter_feature_blocks,
     _iter_mask_groups,
     _l2_pvalues_from_state,
     _make_label_permutations,
@@ -30,7 +31,9 @@ from sonic.comparators.multisample import (
     _profile_roundoff,
     _resolve_contrast,
     _resolve_freq_weights,
+    _rotation_metadata,
     _run_l2_permutations,
+    _run_l2_rotations,
     _weighted_covariance_eigensystem,
 )
 from sonic.kernels.fft import _fourier_coefficients_2d
@@ -868,6 +871,85 @@ def _run_cross_permutations(
     }
 
 
+def _run_cross_rotations(
+    result,
+    pair_presence,
+    common,
+    candidates,
+    weights,
+    *,
+    representation,
+    use_masked,
+    groups,
+    prepared_design,
+    min_samples_per_group,
+    min_resid_df,
+    n_rotations,
+    random_state,
+):
+    """Apply the shared rotation engine to each retained-bin support group."""
+    n_samples, n_pairs = pair_presence.shape
+    metadata = _rotation_metadata(n_rotations, random_state)
+    use_glm = prepared_design is not None
+    if use_glm:
+        matrix, _, vector, _, _ = prepared_design
+    else:
+        group_b = groups == np.unique(groups)[1]
+        matrix = np.column_stack([np.ones(n_samples), group_b])
+        vector = np.array([0.0, 1.0])
+    observed = np.full(n_pairs, np.nan)
+    pvals = np.full(n_pairs, np.nan)
+    effective_rank = np.full(n_pairs, np.nan)
+    df_resid = np.zeros(n_pairs, int)
+    status = np.full(n_pairs, "no_common_bins", dtype=object)
+    for keep, indices in _iter_mask_groups(common[candidates].T):
+        bins = np.flatnonzero(keep)
+        if not bins.size:
+            continue
+        for block in _iter_feature_blocks(n_samples, len(indices), len(bins)):
+            pairs = candidates[indices[block]]
+            group_presence = pair_presence[:, pairs]
+            profiles = _prepare_cross_profiles(result, pairs, bins, representation, group_presence)
+            if use_masked and not use_glm:
+                eligible = (group_presence[~group_b].sum(axis=0) >= min_samples_per_group) & (
+                    group_presence[group_b].sum(axis=0) >= min_samples_per_group
+                )
+                group_presence = group_presence & eligible[None, :]
+            rotation = _run_l2_rotations(
+                profiles,
+                matrix,
+                vector,
+                group_presence if use_masked else None,
+                freq_weights=weights[bins],
+                log_transform=representation == "coherence",
+                min_resid_df=min_resid_df if use_glm and use_masked else 1,
+                allow_empty=True,
+                n_rotations=metadata["n_rotations"],
+                random_state=metadata["random_state"],
+            )
+            observed[pairs] = rotation["observed"]
+            pvals[pairs] = rotation["pvals"]
+            effective_rank[pairs] = rotation["effective_rank"]
+            df_resid[pairs] = (
+                rotation["df_resid"]
+                if use_glm
+                else np.maximum(pair_presence[:, pairs].sum(axis=0) - 2, 1)
+            )
+            status[pairs] = "ineligible_design" if use_glm else "insufficient_samples"
+            status[pairs[rotation["eligible"]]] = "ok"
+    return {
+        "observed": observed,
+        "pvals": pvals,
+        "effective_rank": effective_rank,
+        "df_resid": df_resid,
+        "status": status,
+        "pooled_pairs": np.zeros(n_pairs, int),
+        "permutation_counts": np.zeros(n_pairs, int),
+        "exact_permutations": np.zeros(n_pairs, bool),
+        "metadata": metadata,
+    }
+
+
 def _cross_comparison_frame(
     result,
     inference,
@@ -937,6 +1019,8 @@ def _cross_comparison_frame(
         ),
         **design_metadata,
     )
+    if null == "rotation":
+        frame.attrs.update(inference["metadata"])
     return frame
 
 
@@ -955,6 +1039,7 @@ def _compare_cross_spectra(  # noqa: C901 — validation and dispatch over binar
     min_samples_per_group=2,
     min_resid_df=1,
     covariance=None,
+    n_rotations=19999,
 ):
     """Compare pairwise coupling profiles with the shared DF inference helpers.
 
@@ -981,9 +1066,10 @@ def _compare_cross_spectra(  # noqa: C901 — validation and dispatch over binar
         Let ``k = S_xy / sqrt(S_xx * S_yy)`` using matching binned products.
         ``coherence`` tests ``Y = log(max(abs(k)**2, 1e-12))``;
         ``coherency`` tests ``Y = real(k)`` without a transformation.
-    null : {'analytic', 'permutation'}, default 'analytic'
-        Analytic Liu mixture-chi-square tail, or binary sample-label
-        permutations. GLM contrasts support only the analytic null.
+    null : str
+        ``'analytic'`` (default) uses the Liu approximation; ``'rotation'``
+        conditions on each pair's nuisance-adjusted scatter. Both support
+        GLM contrasts. ``'permutation'`` relabels binary sample labels.
     covariance : {None, 'pooled', 'per_pair'}, optional
         ``None`` retains pooling across eligible pairs. ``'per_pair'`` uses
         each pair's residual covariance and Liu tail separately. An explicit
@@ -992,7 +1078,10 @@ def _compare_cross_spectra(  # noqa: C901 — validation and dispatch over binar
         Number of sampled relabellings when exact enumeration is too large.
         Ignored for analytic tests and overridden by exact enumeration.
     random_state : int, optional
-        Seed for sampled label permutations; ignored on the analytic path.
+        Seed for label permutations or rotation draws; ignored by analytic tests.
+    n_rotations : int
+        Number of Monte Carlo rotations; default 19999. Used only with
+        ``null='rotation'``, which requires ``covariance=None``.
     freq_weights : ndarray, optional
         Finite nonnegative weights for the original ``n_bins`` bins, with a
         positive sum. None means uniform weights. Zero-weight bins are
@@ -1014,14 +1103,16 @@ def _compare_cross_spectra(  # noqa: C901 — validation and dispatch over binar
         ``N_samples`` and ``N_bins`` record the support. ``DF_resid``,
         ``N_pairs_pooled`` and ``Effective_rank`` describe the analytic fit;
         per-pair fits count one contributor per eligible pair, while
-        permutations use zero pooled pairs and NaN effective rank.
+        permutations use zero pooled pairs and NaN effective rank. Rotation
+        uses zero pooled pairs and the conditional scatter's effective rank.
         ``Status`` is ``ok``, ``self_pair``, ``no_common_bins``,
         ``insufficient_samples``, ``ineligible_design`` or ``degenerate_null``.
         Untestable rows retain NaN p-values. Binary tests also return
         ``n_obs_A`` and ``n_obs_B``. ``attrs`` records original sample/bin
         indices, weights, representation, null and design metadata. Permutation
         counts/exactness are per-pair dictionaries when presence is masked;
-        otherwise they are shared scalars.
+        otherwise they are shared scalars. Rotation metadata contains the
+        effective seed, draw count, and minimum p-value as in ``compare_glm``.
 
     Notes
     -----
@@ -1056,6 +1147,10 @@ def _compare_cross_spectra(  # noqa: C901 — validation and dispatch over binar
     Liu approximations that ignore covariance-estimation uncertainty and assume
     comparable residual covariance across samples within a pair.
 
+    Rotation uses :func:`~sonic.comparators.multisample.compare_glm`'s conditional
+    null on the selected profile scale, separately for each retained-sample
+    and bin-support group.
+
     Masked permutations draw separately per pair in original order, as in DF;
     unmasked pairs share labels. Support and weights stay fixed. Exact tails count
     exceedances over all assignments,
@@ -1066,7 +1161,7 @@ def _compare_cross_spectra(  # noqa: C901 — validation and dispatch over binar
     if representation not in ("coherence", "coherency"):
         raise ValueError("representation must be 'coherence' or 'coherency'.")
     if null not in _NULL_OPTIONS:
-        raise ValueError("null must be 'analytic' or 'permutation'.")
+        raise ValueError("null must be 'analytic', 'permutation', or 'rotation'.")
     if covariance not in (None, "pooled", "per_pair"):
         raise ValueError("covariance must be None, 'pooled', or 'per_pair'.")
     if covariance is not None and null != "analytic":
@@ -1093,9 +1188,9 @@ def _compare_cross_spectra(  # noqa: C901 — validation and dispatch over binar
     count_columns = {}
     prepared_design = None
     if use_glm:
-        if null != "analytic":
+        if null not in ("analytic", "rotation"):
             raise NotImplementedError(
-                "Only null='analytic' is supported with a design matrix or explicit contrast; "
+                "Only null='analytic' or 'rotation' is supported with a design matrix or explicit contrast; "
                 "permutations require binary labels without contrast=."
             )
         if contrast is None:
@@ -1148,6 +1243,22 @@ def _compare_cross_spectra(  # noqa: C901 — validation and dispatch over binar
             n_perm=n_perm,
             max_exact_permutations=max_exact_permutations,
             rng=rng,
+        )
+    elif null == "rotation":
+        inference = _run_cross_rotations(
+            result,
+            pair_presence,
+            common,
+            candidates,
+            weights,
+            representation=representation,
+            use_masked=use_masked,
+            groups=groups,
+            prepared_design=prepared_design,
+            min_samples_per_group=min_samples_per_group,
+            min_resid_df=min_resid_df,
+            n_rotations=n_rotations,
+            random_state=random_state,
         )
     else:
         inference = _run_cross_analytic(

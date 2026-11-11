@@ -67,8 +67,9 @@ of Fourier modes for interpolation at the sampling Nyquist boundary. The
 original frequency bins and physical units stay unchanged. FFT spectra use
 their periodic frequency boundary.
 
-Both DF tests return NaN p-values for nonzero contrasts when the pooled
-residual covariance is numerically zero; zero contrasts return p=1.
+With the analytic null, DF tests return NaN p-values for nonzero contrasts
+when the selected residual covariance is numerically zero; zero contrasts
+return p=1.
 Untestable features are excluded from BH correction.
 
 
@@ -108,7 +109,8 @@ how to estimate the cross-bin residual covariance used by the Liu approximation:
    coupling = comparison.test_cross_diff_freq(groups, covariance="per_pair")
 
 Design matrices and continuous ``contrast=`` terms work as in ``test_diff_freq``.
-Binary comparisons also support ``null="permutation"``, described below.
+Both support ``null="rotation"``. Binary comparisons also support
+``null="permutation"``; both options are described below.
 
 Each pair uses samples where both genes are present and bins valid in all those
 samples. ``freq_weights`` sets bin weights in the original flattened bin order
@@ -271,6 +273,40 @@ fitted ``beta`` coefficients used by the test:
 
 The standalone binary and GLM comparison functions accept the same option.
 Cross-spectrum tests use ``covariance="per_pair"`` for separate pair estimates.
+
+
+Conditional rotation tests
+--------------------------
+
+``null="rotation"`` calibrates the same weighted L2 statistic by rotating
+profiles in the sample space after removing nuisance directions. This preserves
+each feature's cross-bin scatter and accounts for uncertainty without a
+plug-in covariance estimate.
+Use it for binary groups or an estimable scalar GLM contrast, including
+continuous predictors and missing samples:
+
+.. code-block:: python
+
+   pattern_results = comparison.test_diff_freq(
+       design, contrast="condition", normalize_shape=True,
+       null="rotation", n_rotations=19999, random_state=0,
+   )
+
+Leave ``covariance=None`` for rotation. The same controls work with
+``test_cross_diff_freq`` and the standalone comparison functions. Samples
+should be independent biological units. The conditional null assumes Gaussian
+errors on the tested profile scale with common covariance across samples within
+each feature; covariance may differ between features. DF-norm's nonlinear
+normalization does not generally preserve Gaussian errors.
+
+``n_rotations`` sets the draw count and ``random_state`` makes draws reproducible.
+The p-value is ``(1 + exceedances) / (n_rotations + 1)``, counting ties
+conservatively. With 19999 draws the minimum is 0.00005, which can limit BH
+resolution. Result ``attrs`` records ``n_rotations``, the effective
+``random_state``, and ``min_p_value``. Few residual degrees of freedom can limit
+power. Zero-information profiles receive p=1; nonzero perfect fits can reach
+the Monte Carlo floor. See :func:`~sonic.comparators.multisample.compare_glm`
+for the conditional statistic.
 
 
 Permutation tests

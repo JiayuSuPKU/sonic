@@ -46,9 +46,9 @@ __all__ = [
 logger = logging.getLogger(__name__)
 
 _AVAILABLE_STATISTICS = ("log_l2", "welch_t_cauchy")
-_NULL_OPTIONS = ("permutation", "analytic")
+_NULL_OPTIONS = ("permutation", "analytic", "rotation")
 
-# Bound analytic-comparison scratch space, allowing for eight float64 arrays.
+# Bound comparison scratch space, allowing for eight float64 arrays.
 # Inputs, returned diagnostics, and the n_bins² covariance are excluded; at
 # least one gene is processed even if it alone exceeds this workspace target.
 _COMPARISON_WORKSPACE_BYTES = 32 * (1 << 20)
@@ -544,6 +544,216 @@ def _l2_pvalues_from_state(state: _AnalyticNullState) -> np.ndarray:
     return pvals
 
 
+def _rotation_metadata(n_rotations, random_state):
+    """Validate rotation controls and retain the effective seed for replay."""
+    if (
+        isinstance(n_rotations, (bool, np.bool_))
+        or not isinstance(n_rotations, (int, np.integer))
+        or n_rotations < 1
+    ):
+        raise ValueError("n_rotations must be a positive integer.")
+    seed = np.random.SeedSequence(random_state).entropy
+    return {
+        "null": "rotation",
+        "covariance": None,
+        "n_rotations": int(n_rotations),
+        "random_state": int(seed),
+        "min_p_value": 1.0 / (int(n_rotations) + 1),
+    }
+
+
+def _rotation_tails(coordinates, basis, n_rotations, seed):
+    """Stream sphere draws for weighted conditional coordinates.
+
+    Parameters
+    ----------
+    coordinates : np.ndarray
+        Shape ``(residual_df + 1, n_features, n_bins)``. The first row is
+        the standardized contrast; the remaining rows are residual coordinates.
+    basis : np.ndarray
+        Orthonormal sample-space basis aligned with the coordinate rows.
+    n_rotations : int
+        Number of Monte Carlo draws.
+    seed : np.random.SeedSequence
+        Shared seed for this observation mask, reused across feature blocks.
+
+    Returns
+    -------
+    pvalues, effective_rank : tuple of np.ndarray
+        Plus-one upper tails and ranks of the conditioned scatter matrices.
+    """
+    # Per-feature rescaling leaves the tail unchanged and avoids squaring tiny values.
+    scale = np.max(np.abs(coordinates), axis=(0, 2))
+    coordinates = coordinates / np.where(scale > 0, scale, 1)[None, :, None]
+    rows = coordinates.transpose(1, 0, 2)
+    gram = rows @ rows.swapaxes(1, 2)
+    observed = gram[:, 0, 0]
+    trace = np.trace(gram, axis1=1, axis2=2)
+    squared = np.sum(gram**2, axis=(1, 2))
+    effective_rank = np.divide(
+        trace**2, squared, out=np.full(len(trace), np.nan), where=squared > 0
+    )
+    if not trace.any():
+        return np.ones(len(trace)), effective_rank
+    tolerance = 64 * np.finfo(float).eps * trace
+    counts = np.zeros(len(trace), dtype=np.int64)
+    n_samples, dimension = basis.shape
+    draw_block = max(
+        1, _COMPARISON_WORKSPACE_BYTES // (32 * (n_samples + dimension + dimension**2 + len(trace)))
+    )
+    rng = np.random.default_rng(seed)
+    for start in range(0, n_rotations, draw_block):
+        size = min(draw_block, n_rotations - start)
+        # Project sample-space Gaussian draws so basis changes do not change the draws.
+        directions = rng.standard_normal((size, n_samples)) @ basis
+        directions /= np.linalg.norm(directions, axis=1, keepdims=True)
+        products = (directions[:, :, None] * directions[:, None, :]).reshape(size, -1)
+        null = products @ gram.reshape(len(trace), -1).T
+        counts += np.count_nonzero(null >= observed - tolerance, axis=0)
+    return (counts + 1) / (n_rotations + 1), effective_rank
+
+
+def _run_l2_rotations(  # noqa: C901
+    profiles,
+    design,
+    contrast,
+    presence=None,
+    *,
+    freq_weights=None,
+    normalize_shape=False,
+    log_transform=True,
+    min_resid_df=1,
+    allow_empty=False,
+    n_rotations=19999,
+    random_state=None,
+):
+    """Calibrate L2 by rotating each feature's nuisance-adjusted sample scatter.
+
+    Parameters
+    ----------
+    profiles : np.ndarray
+        Shape ``(n_samples, n_features, n_bins)``, transformed block by block.
+    design, contrast
+        Design and scalar contrast accepted by ``compare_glm``.
+    presence : np.ndarray or None
+        Optional sample-by-feature observation mask. False cells are never read.
+    freq_weights, normalize_shape, log_transform
+        Bin weights and profile transformations used by the analytic estimators.
+    min_resid_df : int
+        Minimum residual degrees of freedom per observed design.
+    allow_empty : bool
+        Return skipped rows when no features qualify, for cross-spectrum callers.
+    n_rotations : int
+        Number of common sphere draws within each observation mask.
+    random_state : int or None
+        Seed. An automatically generated seed is retained in the metadata.
+
+    Returns
+    -------
+    dict
+        Statistics, Monte Carlo p-values, eligibility, counts, residual df,
+        conditional effective ranks, and rotation metadata.
+    """
+    metadata = _rotation_metadata(n_rotations, random_state)
+    if int(min_resid_df) < 1:
+        raise ValueError(f"min_resid_df must be >= 1, got {min_resid_df}.")
+    profiles = np.asarray(profiles)
+    if profiles.ndim != 3 or profiles.shape[0] == 0 or profiles.shape[2] == 0:
+        raise ValueError("Rotation profiles must be 3D with samples and frequency bins.")
+    n_samples, n_features, n_bins = profiles.shape
+    masked = presence is not None
+    presence = (
+        np.ones((n_samples, n_features), bool)
+        if presence is None
+        else np.asarray(presence, dtype=bool)
+    )
+    if presence.shape != (n_samples, n_features):
+        raise ValueError("presence must have shape (n_samples, n_features).")
+    matrix, columns = _build_design_matrix(design, n_samples)
+    vector = _resolve_contrast(contrast, columns)
+    inverse, rank, estimable = _decompose_glm_design(matrix, vector)
+    if not masked:
+        if n_samples - rank < int(min_resid_df):
+            raise ValueError("Rotation tests require positive residual degrees of freedom.")
+        if not estimable:
+            raise ValueError("contrast is not estimable from the supplied design matrix.")
+    weights = _resolve_freq_weights(freq_weights, n_bins)
+    sqrt_weights = np.sqrt(weights)
+    observed = np.full(n_features, np.nan)
+    pvals = np.full(n_features, np.nan)
+    effective_rank = np.full(n_features, np.nan)
+    eligible = np.zeros(n_features, bool)
+    df_resid = np.zeros(n_features, int)
+    n_obs = presence.sum(axis=0)
+    # Matching observation masks share a design fit and the same rotation draws.
+    for sample_mask, genes in _iter_mask_groups(presence):
+        rows = np.flatnonzero(sample_mask)
+        count = len(rows)
+        if not count:
+            continue
+        x = matrix[rows]
+        inverse, rank, estimable = _decompose_glm_design(x, vector)
+        df = count - rank
+        df_resid[genes] = df
+        if df < int(min_resid_df) or not estimable:
+            continue
+        # a = c^T X^+ gives sample weights for the fitted contrast: theta = a @ Y.
+        a = vector @ inverse
+        contrast_norm = np.linalg.norm(a)
+        if not np.isfinite(contrast_norm) or contrast_norm <= 0:
+            continue
+        # Unit contrast + residual axes span the sample space after nuisance removal.
+        residual_basis = np.linalg.svd(x, full_matrices=True)[0][:, rank:]
+        basis = np.column_stack([a / contrast_norm, residual_basis])
+        # Key draws by observed samples so feature blocking does not change p-values.
+        seed = np.random.SeedSequence(
+            metadata["random_state"], spawn_key=(n_samples, *map(int, rows))
+        )
+        # Bound workspace for both profile arrays and the (df + 1)-dimensional scatter.
+        for block in _iter_feature_blocks(count, len(genes), max(n_bins, df + 1), matrix.shape[1]):
+            cols = genes[block]
+            values = profiles[rows[:, None], cols]
+            if not np.isfinite(values).all():
+                raise ValueError("Rotation tests require finite profiles for observed samples.")
+            response = _prepare_profile_block(
+                values, normalize_shape, log_transform=log_transform
+            ).reshape(count, -1)
+            _, residuals, theta = _fit_glm_response(response, x, inverse, vector, rank)
+            # theta = c^T beta_hat; report its weighted L2 before geometric normalization.
+            observed[cols] = np.sqrt(np.sum(weights * theta.reshape(-1, n_bins) ** 2, axis=-1))
+            # Dividing by ||a|| makes the contrast axis unit length; it is not an SE.
+            coordinates = np.concatenate(
+                [theta[None, :] / contrast_norm, residual_basis.T @ residuals]
+            )
+            # C = B^T Y W^(1/2): one contrast row and df orthogonal residual rows.
+            coordinates = coordinates.reshape(df + 1, len(cols), n_bins) * sqrt_weights
+            # A unit sample direction can accumulate sqrt(n) times the profile roundoff.
+            roundoff = _profile_roundoff(
+                response.reshape(count, len(cols), n_bins) * sqrt_weights, per_gene=True
+            ) * np.sqrt(count)
+            # Remove numerical-zero scatter before rescaling can amplify fit roundoff.
+            zero_scatter = np.max(np.abs(coordinates), axis=(0, 2)) <= roundoff
+            coordinates[:, zero_scatter] = 0.0
+            # Compare first-row energy with random directions, holding cross-bin scatter fixed.
+            pvals[cols], effective_rank[cols] = _rotation_tails(
+                coordinates, basis, metadata["n_rotations"], seed
+            )
+        eligible[genes] = True
+    if not eligible.any() and not allow_empty:
+        raise ValueError(
+            "Rotation tests: no features have enough observed samples and an estimable contrast."
+        )
+    return {
+        "observed": observed,
+        "pvals": pvals,
+        "effective_rank": effective_rank,
+        "eligible": eligible,
+        "n_obs": n_obs,
+        "df_resid": df_resid,
+        "metadata": metadata,
+    }
+
+
 def _comparison_frame(
     n_genes: int,
     gene_names: Sequence[str] | None,
@@ -552,6 +762,7 @@ def _comparison_frame(
     *,
     extra: dict[str, Sequence[Any] | np.ndarray] | None = None,
     covariance: str | None = None,
+    attrs: dict[str, Any] | None = None,
 ) -> pd.DataFrame:
     """Build the common comparison result table and apply BH correction."""
     if gene_names is None:
@@ -570,6 +781,8 @@ def _comparison_frame(
     if covariance is not None:
         df.attrs["covariance"] = covariance
         df.attrs["null"] = "analytic"
+    if attrs is not None:
+        df.attrs.update(attrs)
     return df.sort_values("Statistic", ascending=False, na_position="last").reset_index(drop=True)
 
 
@@ -1290,6 +1503,7 @@ def compare_two_groups(  # noqa: C901
     normalize_shape: bool = False,
     *,
     covariance: str | None = None,
+    n_rotations: int = 19999,
 ) -> pd.DataFrame:
     """
     Test, for every gene, whether its spatial-pattern spectrum differs between two groups.
@@ -1321,19 +1535,13 @@ def compare_two_groups(  # noqa: C901
           an extra ``P_value_per_bin`` column. Requires at least two samples
           per arm. Bins constant across all samples are excluded from the
           combination; genes with no informative bins receive p=1.
-    null : {'analytic', 'permutation'}, default 'analytic'
-        Null-distribution method. ``'analytic'`` (the default) uses Liu's
-        mixture-χ² approximation for the L2 quadratic form:
-        under H₀ the statistic ``T² = D'WD`` is distributed as a
-        weighted sum of χ²₁ variables whose tail is integrated via Liu's
-        approximation (see :func:`sonic.statistics.liu_sf`). Requires positive
-        residual degrees of freedom (``n_a + n_b > 2``).
-        ``'permutation'`` uses the empirical sample-label permutation
-        null and is the only option that respects the
-        ``n_perm`` / ``random_state`` / ``max_exact_permutations`` arguments.
-        ``welch_t_cauchy`` carries its own analytic t-distribution null
-        and ignores this selector. For selector-controlled tests,
-        ``null='analytic'`` is supported with ``statistic='log_l2'``.
+    null : str
+        ``'analytic'`` (default) uses Liu's mixture-chi-square approximation
+        with the selected residual covariance. ``'rotation'`` conditions on
+        each gene's nuisance-adjusted scatter; see :func:`compare_glm`.
+        Both require positive residual degrees of freedom.
+        ``'permutation'`` relabels samples. Rotation requires ``'log_l2'``;
+        ``'welch_t_cauchy'`` otherwise uses its own analytic t-distribution null.
 
     n_perm : int, default 1000
         Number of label permutations for the null distribution.
@@ -1343,7 +1551,7 @@ def compare_two_groups(  # noqa: C901
         is enumerated (**exact permutation test**) and ``n_perm`` is
         overridden to the enumeration count.
     random_state : int, optional
-        Seed for the permutation RNG.
+        Seed for label permutations or rotation draws.
     freq_weights : np.ndarray, optional
         Only used by ``statistic='log_l2'``. Non-negative weights of length
         ``n_bins`` (the number of frequency bins); internally renormalized to
@@ -1364,6 +1572,10 @@ def compare_two_groups(  # noqa: C901
         ``'per_gene'`` estimates it separately for each gene. Supported for
         analytic log-L2 tests; recorded in ``result.attrs["covariance"]``.
 
+    n_rotations : int
+        Number of Monte Carlo rotations; default 19999. Used only for
+        ``null='rotation'``, which requires ``covariance=None``.
+
     Returns
     -------
     pd.DataFrame
@@ -1378,6 +1590,11 @@ def compare_two_groups(  # noqa: C901
     ValueError
         If ``statistic`` is unknown, ``groups`` does not contain exactly two values,
         or shapes are inconsistent.
+
+    Notes
+    -----
+    Rotation assumptions, Monte Carlo metadata, and degenerate-fit behavior
+    are described in :func:`compare_glm`.
     """
     if statistic not in _AVAILABLE_STATISTICS:
         raise ValueError(
@@ -1386,6 +1603,8 @@ def compare_two_groups(  # noqa: C901
     if null not in _NULL_OPTIONS:
         raise ValueError(f"Unknown null='{null}'. Options: {list(_NULL_OPTIONS)}.")
     _resolve_covariance(covariance, statistic=statistic, null=null)
+    if null == "rotation" and statistic != "log_l2":
+        raise ValueError("null='rotation' requires statistic='log_l2'.")
     spectra = np.asarray(spectra)
     if spectra.ndim != 3:
         raise ValueError(f"spectra must be 3D (n_samples, n_genes, n_bins), got {spectra.shape}.")
@@ -1397,6 +1616,24 @@ def compare_two_groups(  # noqa: C901
     if uniq.size != 2:
         raise ValueError(f"groups must contain exactly two distinct values, got {uniq}.")
     group_codes = (groups == uniq[1]).astype(int)  # 0 = first label sorted, 1 = second
+
+    if null == "rotation":
+        rotation = _run_l2_rotations(
+            spectra,
+            np.column_stack([np.ones(n_samples), group_codes]),
+            np.array([0.0, 1.0]),
+            freq_weights=freq_weights,
+            normalize_shape=normalize_shape,
+            n_rotations=n_rotations,
+            random_state=random_state,
+        )
+        return _comparison_frame(
+            n_genes,
+            gene_names,
+            rotation["observed"],
+            rotation["pvals"],
+            attrs=rotation["metadata"],
+        )
 
     if statistic != "log_l2" or null != "analytic":
         spectra = np.asarray(spectra, dtype=np.float64)
@@ -1475,12 +1712,13 @@ def compare_two_groups_masked(  # noqa: C901
     normalize_shape: bool = False,
     *,
     covariance: str | None = None,
+    n_rotations: int = 19999,
 ) -> pd.DataFrame:
     """
     Per-gene two-group pattern test with **incomplete data** across samples.
 
     For each gene, only the subset of samples with ``presence[:, g] == True``
-    contributes to the observed statistic and to the label-permutation null.
+    contributes to its fitted contrast and null calibration.
     Genes that fail to reach ``min_samples_per_group`` observations in at
     least one group are reported with ``NaN`` p-values and the number of
     observed samples per group, so the user sees why they were skipped.
@@ -1496,25 +1734,12 @@ def compare_two_groups_masked(  # noqa: C901
         in that sample (contributes); ``False`` = gene is absent (ignored).
     gene_names : sequence of str, optional
     statistic : {'log_l2', 'welch_t_cauchy'}, default 'log_l2'
-    null : {'analytic', 'permutation'}, default 'analytic'
-        Null-distribution method. ``'analytic'`` (the default) uses a
-        Liu mixture-χ² test adapted for the masked case by default
-        (``covariance=None`` or ``'pooled'``) via a
-        **mask-aware pooled-Σ** estimator: a single global ``(n_bins, n_bins)``
-        covariance is accumulated across every gene's present
-        (sample, gene) cells (each gene contributes ``n_g - 2``
-        residual degrees of freedom), and per-gene noncentrality
-        scaling ``v_{c,g} = 1/n_a_g + 1/n_b_g`` adjusts the eigenvalues
-        for that gene's specific cohort. Cross-bin correlation
-        structure is taken to be homogeneous across genes (the same
-        A3 assumption used in :func:`compare_two_groups` with the analytic null).
-        Empirical calibration on synthetic missingness up to 50%
-        matches the unmasked analytic path. Currently supported only with
-        ``statistic='log_l2'``.
-
-        ``'permutation'`` runs a per-gene permutation test,
-        exact-enumerated when ``C(n_g, n_a_g) <= max_exact_permutations``
-        (most genes at small samples).
+    null : str
+        ``'analytic'`` (default) uses a Liu mixture-chi-square tail with the
+        selected residual covariance and each gene's contrast scale.
+        ``'rotation'`` conditions on scatter within each gene's observed
+        samples; see :func:`compare_glm`. ``'permutation'`` relabels those
+        samples, enumerating all assignments when feasible.
     n_perm : int, default 1000
         Number of label permutations for the null distribution.
     max_exact_permutations : int, default 10000
@@ -1523,7 +1748,7 @@ def compare_two_groups_masked(  # noqa: C901
         is enumerated (**exact permutation test**) and ``n_perm`` is
         overridden to the enumeration count.
     random_state : int, optional
-        Seed for the permutation RNG.
+        Seed for label permutations or rotation draws.
     min_samples_per_group : int, default 2
         Minimum observed samples in each group for the gene to be tested.
     freq_weights : np.ndarray, optional
@@ -1541,6 +1766,10 @@ def compare_two_groups_masked(  # noqa: C901
         ``'per_gene'`` estimates it separately for each gene. Supported for
         analytic log-L2 tests; recorded in ``result.attrs["covariance"]``.
 
+    n_rotations : int
+        Number of Monte Carlo rotations; default 19999. Used only for
+        ``null='rotation'``, which requires ``covariance=None``.
+
     Returns
     -------
     pd.DataFrame
@@ -1548,6 +1777,11 @@ def compare_two_groups_masked(  # noqa: C901
         ``n_obs_A``, ``n_obs_B``. For ``'welch_t_cauchy'`` a
         ``P_value_per_bin`` column is also included (``None`` for skipped
         genes). BH-FDR is computed only over tested genes.
+
+    Notes
+    -----
+    Rotation assumptions, Monte Carlo metadata, and degenerate-fit behavior
+    are described in :func:`compare_glm`.
     """
     if statistic not in _AVAILABLE_STATISTICS:
         raise ValueError(
@@ -1556,6 +1790,8 @@ def compare_two_groups_masked(  # noqa: C901
     if null not in _NULL_OPTIONS:
         raise ValueError(f"Unknown null='{null}'. Options: {list(_NULL_OPTIONS)}.")
     _resolve_covariance(covariance, statistic=statistic, null=null)
+    if null == "rotation" and statistic != "log_l2":
+        raise ValueError("null='rotation' requires statistic='log_l2'.")
     spectra = np.asarray(spectra)
     if spectra.ndim != 3:
         raise ValueError(f"spectra must be 3D, got {spectra.shape}.")
@@ -1569,6 +1805,31 @@ def compare_two_groups_masked(  # noqa: C901
     if uniq.size != 2:
         raise ValueError("groups must contain exactly two distinct values.")
     group_codes = (groups == uniq[1]).astype(int)
+
+    if null == "rotation":
+        if int(min_samples_per_group) < 2:
+            raise ValueError("min_samples_per_group must be >= 2.")
+        n_a = presence[group_codes == 0].sum(axis=0)
+        n_b = presence[group_codes == 1].sum(axis=0)
+        eligible = (n_a >= min_samples_per_group) & (n_b >= min_samples_per_group)
+        rotation = _run_l2_rotations(
+            spectra,
+            np.column_stack([np.ones(n_samples), group_codes]),
+            np.array([0.0, 1.0]),
+            presence & eligible[None, :],
+            freq_weights=freq_weights,
+            normalize_shape=normalize_shape,
+            n_rotations=n_rotations,
+            random_state=random_state,
+        )
+        return _comparison_frame(
+            n_genes,
+            gene_names,
+            rotation["observed"],
+            rotation["pvals"],
+            extra={"n_obs_A": n_a, "n_obs_B": n_b},
+            attrs=rotation["metadata"],
+        )
 
     if statistic != "log_l2" or null != "analytic":
         spectra = np.asarray(spectra, dtype=np.float64)
@@ -1678,15 +1939,17 @@ def compare_glm(
     normalize_shape: bool = False,
     *,
     covariance: str | None = None,
+    null: str = "analytic",
+    n_rotations: int = 19999,
+    random_state: int | None = None,
 ) -> pd.DataFrame:
-    """Log-L2 analytic spectral comparison via a design matrix and contrast.
+    """Log-L2 spectral comparison via a design matrix and contrast.
 
     Generalises :func:`compare_two_groups` from binary group labels to an
     arbitrary GLM design matrix and a single-DOF linear contrast. The
     binary case is recovered exactly by passing
     ``design=pd.DataFrame({"group": groups})`` and ``contrast="group"``;
-    p-values match ``compare_two_groups(..., statistic="log_l2",
-    null="analytic")`` to machine precision.
+    both paths use the same L2 statistic and selected null calibration.
 
     Parameters
     ----------
@@ -1724,6 +1987,16 @@ def compare_glm(
         ``'per_gene'`` estimates it separately for each gene. Supported for
         analytic log-L2 tests; recorded in ``result.attrs["covariance"]``.
 
+    null : str
+        ``'analytic'`` (default) uses the selected covariance and Liu tail.
+        ``'rotation'`` conditions on each gene's nuisance-adjusted scatter.
+    n_rotations : int
+        Number of Monte Carlo rotations; default 19999. Used only for
+        ``null='rotation'``, which requires ``covariance=None``.
+
+    random_state : int, optional
+        Seed for rotation draws. Ignored by the analytic null.
+
     Returns
     -------
     pd.DataFrame
@@ -1734,7 +2007,50 @@ def compare_glm(
     ------
     ValueError
         If shapes are inconsistent or ``contrast`` cannot be resolved.
+
+    Notes
+    -----
+    For rotation, let ``a = contrast @ pinv(X)`` and let B contain ``a / ||a||``
+    followed by an orthonormal basis of the full-model residual space. With
+    transformed profiles Y and sum-one diagonal bin weights W, form
+    ``A = B.T @ Y @ W @ Y.T @ B`` and compare ``Statistic**2 / (a @ a)`` to
+    ``u.T @ A @ u`` for uniform sphere directions u. The rotations preserve
+    the nuisance-adjusted feature scatter ``Y.T @ B @ B.T @ Y``. This avoids
+    estimating a cross-bin covariance for calibration.
+
+    The conditional null assumes independent Gaussian errors on the tested
+    profile scale with common covariance across samples within each gene.
+    Covariance may differ across genes. DF-norm's nonlinear transformation
+    does not generally preserve Gaussian errors. Small residual df can limit
+    power. Constant zero-information profiles receive p=1; a nonzero perfect
+    fit can reach the Monte Carlo floor even when the analytic null is undefined.
+
+    Rotation tails use ``(1 + exceedances) / (n_rotations + 1)``, counting ties
+    conservatively. Draws are shared within observation masks and reproducible
+    across feature/draw block sizes. Result ``attrs`` contains ``null``,
+    ``covariance=None``, ``n_rotations``, the effective ``random_state``, and
+    ``min_p_value``. With 19999 draws the minimum p-value is 0.00005.
     """
+    if null not in ("analytic", "rotation"):
+        raise ValueError("GLM null must be 'analytic' or 'rotation'.")
+    _resolve_covariance(covariance, null=null)
+    if null == "rotation":
+        rotation = _run_l2_rotations(
+            spectra,
+            design,
+            contrast,
+            freq_weights=freq_weights,
+            normalize_shape=normalize_shape,
+            n_rotations=n_rotations,
+            random_state=random_state,
+        )
+        return _comparison_frame(
+            len(rotation["observed"]),
+            gene_names,
+            rotation["observed"],
+            rotation["pvals"],
+            attrs=rotation["metadata"],
+        )
     state = _estimate_glm_null_covariance(
         spectra,
         design,
@@ -1761,6 +2077,9 @@ def compare_glm_masked(  # noqa: C901
     min_resid_df: int = 1,
     *,
     covariance: str | None = None,
+    null: str = "analytic",
+    n_rotations: int = 19999,
+    random_state: int | None = None,
 ) -> pd.DataFrame:
     """Masked design-matrix contrast test for gene-specific missing spectra.
 
@@ -1795,12 +2114,50 @@ def compare_glm_masked(  # noqa: C901
         ``'per_gene'`` estimates it separately for each gene. Supported for
         analytic log-L2 tests; recorded in ``result.attrs["covariance"]``.
 
+    null : str
+        ``'analytic'`` (default) uses the selected covariance and Liu tail.
+        ``'rotation'`` conditions on each gene's nuisance-adjusted scatter.
+    n_rotations : int
+        Number of Monte Carlo rotations; default 19999. Used only for
+        ``null='rotation'``, which requires ``covariance=None``.
+
+    random_state : int, optional
+        Seed for rotation draws. Ignored by the analytic null.
+
     Returns
     -------
     pandas.DataFrame
         Columns ``Feature``, ``Statistic``, ``P_value``, ``n_obs``,
         ``df_resid``, and ``P_adj``. BH-FDR is computed over finite p-values.
+
+    Notes
+    -----
+    Rotation assumptions, Monte Carlo metadata, and degenerate-fit behavior
+    are described in :func:`compare_glm`.
     """
+    if null not in ("analytic", "rotation"):
+        raise ValueError("GLM null must be 'analytic' or 'rotation'.")
+    _resolve_covariance(covariance, null=null)
+    if null == "rotation":
+        rotation = _run_l2_rotations(
+            spectra,
+            design,
+            contrast,
+            presence,
+            min_resid_df=min_resid_df,
+            freq_weights=freq_weights,
+            normalize_shape=normalize_shape,
+            n_rotations=n_rotations,
+            random_state=random_state,
+        )
+        return _comparison_frame(
+            len(rotation["observed"]),
+            gene_names,
+            rotation["observed"],
+            rotation["pvals"],
+            extra={"n_obs": rotation["n_obs"], "df_resid": rotation["df_resid"]},
+            attrs=rotation["metadata"],
+        )
     state = _estimate_glm_masked_null_covariance(
         spectra,
         design,

@@ -611,14 +611,14 @@ class TestCompareGLM:
         with pytest.raises(ValueError, match="not estimable"):
             compare_glm(spectra, X, contrast=np.array([0.0, 1.0, 0.0]))
 
-    def test_glm_functions_do_not_expose_statistic_or_null_arguments(self):
-        """GLM primitives are fixed log-L2 analytic tests."""
+    def test_glm_functions_keep_log_l2_and_default_to_analytic(self):
+        """GLM primitives keep L2 fixed while allowing null calibration choices."""
         import inspect
 
         for fn in (compare_glm, compare_glm_masked):
             sig = inspect.signature(fn)
             assert "statistic" not in sig.parameters
-            assert "null" not in sig.parameters
+            assert sig.parameters["null"].default == "analytic"
 
     def test_masked_glm_matches_unmasked_when_complete(self):
         """A fully present mask should recover the ordinary GLM analytic result."""
@@ -1768,4 +1768,353 @@ class TestBinaryGLMAdapters:
         with pytest.raises(ValueError, match="freq_weights"):
             ms._estimate_two_group_masked_null_covariance(
                 spectra, groups, presence, freq_weights=-np.ones(5), allow_empty=True, **kwargs
+            )
+
+
+class TestConditionalRotation:
+    """Conditional L2 tails, model invariance, and deterministic streaming."""
+
+    @staticmethod
+    def _reference(y, x, c, weights, seed, draws, original_rows, total_samples):
+        inverse = np.linalg.pinv(x)
+        a = c @ inverse
+        scale = a @ a
+        theta = c @ inverse @ y
+        observed = np.sum(weights * theta**2)
+        nuisance = x @ inverse - np.outer(a, a) / scale
+        rng = np.random.default_rng(
+            np.random.SeedSequence(seed, spawn_key=(total_samples, *map(int, original_rows)))
+        )
+        directions = rng.normal(size=(draws, len(y)))
+        directions -= directions @ nuisance
+        directions /= np.linalg.norm(directions, axis=1, keepdims=True)
+        null = np.sum(weights * (directions @ y) ** 2, axis=1)
+        scatter_trace = np.sum(weights * (y - nuisance @ y) ** 2)
+        count = np.count_nonzero(
+            null >= observed / scale - 64 * np.finfo(float).eps * scatter_trace
+        )
+        return np.sqrt(observed), (count + 1) / (draws + 1)
+
+    @pytest.mark.parametrize(
+        "design_kind", ["binary", "continuous", "aliased", "intercept", "no_intercept"]
+    )
+    @pytest.mark.parametrize("shape_only", [False, True])
+    def test_matches_direct_sample_space_reference(self, design_kind, shape_only):
+        rng = np.random.default_rng(341)
+        n, genes, bins = 10, 4, 7
+        groups = np.repeat([0, 1], 5)
+        x = np.column_stack([np.ones(n), groups, rng.normal(size=n)])
+        c = np.array([0.0, 1.0, 0.0])
+        if design_kind == "binary":
+            x, c = x[:, :2], c[:2]
+        elif design_kind == "aliased":
+            x = np.column_stack([x, 2 * groups])
+            c = np.array([0.0, 1.0, 0.0, 2.0])
+        elif design_kind == "intercept":
+            c = np.array([1.0, 0.0, 0.0])
+        elif design_kind == "no_intercept":
+            x, c = x[:, 1:], c[1:]
+        else:
+            x[:, 1] = np.linspace(-1, 1, n)
+        values = rng.lognormal(size=(n, genes, bins))
+        presence = np.ones((n, genes), bool)
+        presence[0, 1:3] = False
+        presence[:, 3] = False
+        values[~presence] = np.nan
+        original = values.copy()
+        values.setflags(write=False)
+        weights = np.arange(bins, dtype=float)
+        weights /= weights.sum()
+        result = compare_glm_masked(
+            values,
+            x,
+            c,
+            presence,
+            freq_weights=weights,
+            normalize_shape=shape_only,
+            null="rotation",
+            n_rotations=499,
+            random_state=35,
+        )
+        result = result.set_index("Feature").sort_index()
+        expected = []
+        for gene in range(3):
+            rows = np.flatnonzero(presence[:, gene])
+            power = values[rows, gene]
+            if shape_only:
+                power = normalize_shape(power)
+            y = np.log(np.maximum(power, 1e-12))
+            expected.append(self._reference(y, x[rows], c, weights, 35, 499, rows, n))
+        np.testing.assert_allclose(result.iloc[:3][["Statistic", "P_value"]], expected, atol=1e-12)
+        assert np.isnan(result.loc["3", "P_value"])
+        np.testing.assert_array_equal(values, original)
+
+    @pytest.mark.parametrize("masked", [False, True])
+    @pytest.mark.parametrize("shape_only", [False, True])
+    def test_binary_glm_equivalence_and_unchanged_statistic(self, masked, shape_only):
+        from sonic.comparators import multisample as ms
+
+        groups = np.repeat([0, 1], 5)
+        values = np.random.default_rng(34).lognormal(size=(10, 5, 9))
+        presence = np.ones((10, 5), bool)
+        if masked:
+            presence[0, :2] = False
+            presence[:4, -1] = False  # GLM-estimable, but binary threshold fails.
+        kwargs = {"freq_weights": np.arange(9), "normalize_shape": shape_only}
+        binary = ms.compare_two_groups_masked if masked else ms.compare_two_groups
+        args = [values, groups, presence] if masked else [values, groups]
+        result = binary(*args, null="rotation", n_rotations=199, random_state=4, **kwargs)
+        analytic = binary(*args, covariance="per_gene", **kwargs)
+        pd.testing.assert_series_equal(
+            result.set_index("Feature").Statistic.sort_index(),
+            analytic.set_index("Feature").Statistic.sort_index(),
+        )
+        glm = ms.compare_glm_masked if masked else ms.compare_glm
+        glm_args = [values, np.c_[np.ones(10), groups], np.array([0.0, 1.0])]
+        if masked:
+            glm_args.append(presence & (presence[:5].sum(0) >= 2))
+        reference = glm(*glm_args, null="rotation", n_rotations=199, random_state=4, **kwargs)
+        np.testing.assert_allclose(
+            result[["Statistic", "P_value", "P_adj"]],
+            reference[["Statistic", "P_value", "P_adj"]],
+            equal_nan=True,
+        )
+        assert result.attrs == {
+            "null": "rotation",
+            "covariance": None,
+            "n_rotations": 199,
+            "random_state": 4,
+            "min_p_value": 0.005,
+        }
+        if masked:
+            assert result.set_index("Feature").loc["4", "n_obs_A"] == 1
+
+    @pytest.mark.parametrize("n", [4, 12])
+    def test_rank_one_matches_exact_t_and_beta(self, n):
+        from scipy.stats import beta, t
+
+        rng = np.random.default_rng(19)
+        x = np.c_[np.ones(n), np.linspace(-1, 1, n)]
+        y = rng.normal(size=(n, 24)) + x[:, 1, None] * np.linspace(0, 2, 24)
+        inverse = np.linalg.pinv(x)
+        coefficients = inverse @ y
+        residuals = y - x @ coefficients
+        df = n - 2
+        q = coefficients[1] ** 2 / np.sum(inverse[1] ** 2)
+        ss = np.sum(residuals**2, axis=0)
+        exact = 2 * t.sf(np.sqrt(q * df / ss), df)
+        np.testing.assert_allclose(exact, beta.sf(q / (q + ss), 0.5, df / 2))
+        result = compare_glm(
+            np.exp(y[..., None]),
+            x,
+            np.array([0.0, 1.0]),
+            null="rotation",
+            n_rotations=49999,
+            random_state=77,
+            gene_names=list(map(str, range(24))),
+        )
+        actual = result.set_index("Feature").loc[list(map(str, range(24))), "P_value"].to_numpy()
+        assert np.all(
+            np.abs(actual - exact) <= 6 * np.sqrt(exact * (1 - exact) / 50000) + 3 / 50000
+        )
+
+    def test_nuisance_units_and_contrast_scaling(self):
+        rng = np.random.default_rng(28)
+        x = np.c_[np.ones(14), np.linspace(-1, 1, 14), rng.normal(size=14)]
+        c = np.array([0.0, 1.0, 0.0])
+        y = rng.normal(size=(14, 6, 9))
+        kwargs = {"null": "rotation", "n_rotations": 999, "random_state": 11}
+        reference = compare_glm(np.exp(y), x, c, **kwargs).set_index("Feature").sort_index()
+        nuisance = rng.normal(size=(3, 54))
+        nuisance[1] = 0
+        shifted_y = y + (x @ nuisance).reshape(y.shape)
+        shifted_x = x.copy()
+        shifted_x[:, 2] = 10000 + 100 * x[:, 2]
+        actual = (
+            compare_glm(np.exp(shifted_y), shifted_x, c, **kwargs).set_index("Feature").sort_index()
+        )
+        np.testing.assert_allclose(actual, reference, atol=1e-10)
+        for scale in (-3.0, 1e-12, 1e12):
+            actual = (
+                compare_glm(np.exp(y), x, c * scale, **kwargs).set_index("Feature").sort_index()
+            )
+            np.testing.assert_allclose(
+                actual.Statistic, reference.Statistic * abs(scale), rtol=1e-10
+            )
+            np.testing.assert_array_equal(actual.P_value, reference.P_value)
+
+    @pytest.mark.parametrize("masked", [False, True])
+    @pytest.mark.parametrize("contrast_scale", [1.0, 1e-12])
+    def test_nuisance_only_profiles_and_nonzero_perfect_fits(self, masked, contrast_scale):
+        rng = np.random.default_rng(1)
+        z = rng.normal(size=10)
+        x = np.c_[np.ones(10), np.linspace(-1, 1, 10), z]
+        c = np.array([0.0, contrast_scale, 0.0])
+        y = np.repeat((3 + z)[:, None, None] * np.array([1.0, 0.5, -0.2]), 3, axis=1)
+        y[:, 1] += x[:, 1, None] * np.array([0.8, -0.3, 0.4])
+        y[:, 2] += rng.normal(scale=0.1, size=(10, 3))
+        # An ignored bin must not set the numerical-zero threshold.
+        y[:, :, -1] = 100 * x[:, 1, None]
+        presence = np.ones((10, 3), bool)
+        if masked:
+            presence[0, 0] = False
+            y[~presence] = np.nan
+        values = np.exp(y)
+        kwargs = {
+            "null": "rotation",
+            "n_rotations": 999,
+            "random_state": 20,
+            "freq_weights": np.array([0.8, 0.2, 0.0]),
+        }
+        if masked:
+            result = compare_glm_masked(values, x, c, presence, **kwargs)
+        else:
+            result = compare_glm(values, x, c, **kwargs)
+        result = result.set_index("Feature")
+        assert result.loc["0", "P_value"] == 1.0
+        assert result.loc["1", "P_value"] == 0.001
+        assert result.loc["1", "Statistic"] > 0
+        reference = compare_glm(values[:, 2:3], x, c, **kwargs)
+        assert result.loc["2", "P_value"] == reference.P_value.iloc[0]
+
+    def test_roundoff_guard_preserves_tiny_and_large_profile_scales(self):
+        from sonic.comparators import multisample as ms
+
+        rng = np.random.default_rng(52)
+        x = np.c_[np.ones(10), np.linspace(-1, 1, 10), rng.normal(size=10)]
+        y = rng.normal(size=(10, 1, 4)) + x[:, 1, None, None]
+        scales = np.array([1e-100, 1.0, 1e100])
+        profiles = y * scales[None, :, None]
+        profiles[:, :, -1] = 1e100 * x[:, 1, None]
+        result = ms._run_l2_rotations(
+            profiles,
+            x,
+            np.array([0.0, 1.0, 0.0]),
+            log_transform=False,
+            freq_weights=np.array([0.2, 0.3, 0.5, 0.0]),
+            n_rotations=999,
+            random_state=20,
+        )
+        np.testing.assert_array_equal(result["pvals"], np.repeat(result["pvals"][1], 3))
+        assert result["pvals"][1] < 1
+        np.testing.assert_allclose(result["observed"] / scales, result["observed"][1])
+        assert np.isfinite(result["effective_rank"]).all()
+
+    def test_chunking_feature_order_and_shared_draws(self, monkeypatch):
+        from sonic.comparators import multisample as ms
+
+        rng = np.random.default_rng(51)
+        x = np.c_[np.ones(10), np.linspace(-1, 1, 10)]
+        values = rng.lognormal(size=(10, 9, 13))
+        values[:, 1] = values[:, 0]
+        presence = np.ones((10, 9), bool)
+        presence[0, 3:7] = False
+        kwargs = {
+            "null": "rotation",
+            "n_rotations": 499,
+            "random_state": 5,
+            "gene_names": list(map(str, range(9))),
+        }
+
+        def run(v, mask, names):
+            return (
+                compare_glm_masked(
+                    v, x, np.array([0.0, 1.0]), mask, **(kwargs | {"gene_names": names})
+                )
+                .set_index("Feature")
+                .sort_index()
+            )
+
+        expected = run(values, presence, kwargs["gene_names"])
+        monkeypatch.setattr(ms, "_COMPARISON_WORKSPACE_BYTES", 4096)
+        actual = run(values, presence, kwargs["gene_names"])
+        np.testing.assert_allclose(actual, expected, atol=1e-12)
+        np.testing.assert_array_equal(actual.P_value, expected.P_value)
+        assert actual.loc["0", "P_value"] == actual.loc["1", "P_value"]
+        order = rng.permutation(9)
+        reordered = run(values[:, order], presence[:, order], [str(i) for i in order])
+        np.testing.assert_allclose(reordered, expected, atol=1e-12)
+
+    def test_constant_ties_perfect_fit_and_zero_weight_bins(self):
+        groups = np.repeat([0, 1], 3)
+        x = np.c_[np.ones(6), groups]
+        a = np.linalg.pinv(x)[1]
+        basis = np.c_[a / np.linalg.norm(a), np.linalg.svd(x, full_matrices=True)[0][:, 2:]]
+        y = np.zeros((6, 4, 6))
+        y[:, 0] = 4.2
+        y[:, 1, :5] = groups[:, None]
+        y[:, 2, :5] = np.sqrt(5) * basis
+        y[:, 3, -1] = np.arange(6)
+        result = compare_two_groups(
+            np.exp(y),
+            groups,
+            null="rotation",
+            n_rotations=199,
+            random_state=17,
+            freq_weights=np.r_[np.ones(5), 0],
+        ).set_index("Feature")
+        np.testing.assert_array_equal(
+            result.loc[["0", "1", "2", "3"], "P_value"], [1.0, 0.005, 1.0, 1.0]
+        )
+        low_df = compare_two_groups(
+            np.exp(y[:3]), np.array([0, 1, 1]), null="rotation", n_rotations=19, random_state=1
+        )
+        assert low_df.P_value.between(0.05, 1).all()
+
+    def test_generated_seed_can_be_replayed(self):
+        values = np.random.default_rng(14).lognormal(size=(8, 3, 5))
+        groups = np.repeat([0, 1], 4)
+        result = compare_two_groups(values, groups, null="rotation", n_rotations=99)
+        replay = compare_two_groups(
+            values,
+            groups,
+            null="rotation",
+            n_rotations=99,
+            random_state=result.attrs["random_state"],
+        )
+        pd.testing.assert_frame_equal(result, replay)
+        assert result.attrs == replay.attrs
+
+
+class TestRotationValidation:
+    @pytest.mark.parametrize("draws", [0, -1, 2.5, True])
+    def test_invalid_draw_count(self, draws):
+        with pytest.raises(ValueError, match="n_rotations must be a positive integer"):
+            compare_two_groups(
+                np.ones((6, 2, 3)), np.repeat([0, 1], 3), null="rotation", n_rotations=draws
+            )
+
+    @pytest.mark.parametrize("covariance", ["pooled", "per_gene"])
+    @pytest.mark.parametrize("glm", [False, True])
+    @pytest.mark.parametrize("masked", [False, True])
+    def test_explicit_covariance_is_rejected(self, covariance, glm, masked):
+        from sonic.comparators import multisample as ms
+
+        values = np.ones((6, 2, 3))
+        groups = np.repeat([0, 1], 3)
+        name = "compare_" + ("glm" if glm else "two_groups") + ("_masked" if masked else "")
+        args = (
+            [values, np.c_[np.ones(6), groups], np.array([0.0, 1.0])] if glm else [values, groups]
+        )
+        if masked:
+            args.append(np.ones((6, 2), bool))
+        with pytest.raises(ValueError, match="covariance is only supported"):
+            getattr(ms, name)(*args, null="rotation", covariance=covariance)
+
+    def test_inapplicable_statistic_design_and_observations(self):
+        values = np.ones((6, 2, 3))
+        groups = np.repeat([0, 1], 3)
+        with pytest.raises(ValueError, match="requires statistic"):
+            compare_two_groups(values, groups, null="rotation", statistic="welch_t_cauchy")
+        with pytest.raises(ValueError, match="residual degrees"):
+            compare_glm(values, np.eye(6), np.ones(6), null="rotation")
+        with pytest.raises(ValueError, match="not estimable"):
+            compare_glm(
+                values, np.c_[np.ones(6), np.ones(6)], np.array([1.0, 0.0]), null="rotation"
+            )
+        with pytest.raises(ValueError, match="finite profiles"):
+            compare_two_groups(np.full_like(values, np.nan), groups, null="rotation", n_rotations=9)
+        with pytest.raises(ValueError, match="no features"):
+            compare_two_groups_masked(
+                values, groups, np.zeros((6, 2), bool), null="rotation", n_rotations=9
             )

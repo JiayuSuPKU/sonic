@@ -1763,3 +1763,35 @@ def test_per_gene_covariance_public_dispatch_and_diagnostics(glm, masked, shape_
     np.testing.assert_array_equal(cmp.spectra_, original)
     with pytest.raises(ValueError, match="covariance must be"):
         cmp.estimate_null_covariance(design, **(kwargs | {"covariance": "typo"}))
+
+
+class TestComparatorRotation:
+    @pytest.mark.parametrize("glm", [False, True])
+    @pytest.mark.parametrize("masked", [False, True])
+    @pytest.mark.parametrize("shape_only", [False, True])
+    def test_dispatch_matches_standalone(self, glm, masked, shape_only):
+        from sonic.comparators import multisample as ms
+
+        spectra = np.random.default_rng(16).lognormal(size=(10, 4, 5))
+        groups = np.repeat([0, 1], 5)
+        presence = np.ones((10, 4), bool)
+        if masked:
+            presence[0, :2] = False
+            spectra[~presence] = np.nan
+        comparator = _comparator_from_spectra(spectra, presence=presence)
+        x = pd.DataFrame({"age": np.arange(10.0)}) if glm else groups
+        kwargs = {
+            "null": "rotation",
+            "n_rotations": 199,
+            "random_state": 15,
+            "normalize_shape": shape_only,
+            "freq_weights": np.arange(5),
+        }
+        actual = comparator.test_diff_freq(x, **kwargs, **({"contrast": "age"} if glm else {}))
+        method = "compare_" + ("glm" if glm else "two_groups") + ("_masked" if masked else "")
+        args = [spectra, x, "age"] if glm else [spectra, x]
+        if masked:
+            args.append(presence)
+        expected = getattr(ms, method)(*args, gene_names=comparator.gene_names, **kwargs)
+        pd.testing.assert_frame_equal(actual, expected)
+        assert actual.attrs == expected.attrs

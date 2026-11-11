@@ -61,15 +61,6 @@ runs before testing.
 scales after removing total spectrum amplitude. Leave it off when amplitude is
 part of the pattern you want to compare. Every nonzero spectrum is normalized
 to unit total, including very small powers; all-zero spectra remain zero.
-Comparisons and normalization use float64 calculations even when cached
-spectra were stored as float32.
-
-Comparison spectra use squared Fourier averages: raw power is divided by
-the square of the number of observations (occupied bins for FFT grids,
-points for NUFFT). This removes the amplitude inflation from denser sampling
-of the same physical field while preserving expression-amplitude differences.
-It does not correct differences in spatial coverage or nonuniform sampling
-within a sample. DC expression means are unchanged.
 
 For 2D NUFFT features and rotation landmarks, SONIC evaluates an extra border
 of Fourier modes for interpolation at the sampling Nyquist boundary. The
@@ -80,22 +71,12 @@ Both DF tests return NaN p-values for nonzero contrasts when the pooled
 residual covariance is numerically zero; zero contrasts return p=1.
 Untestable features are excluded from BH correction.
 
-NUFFT spectra retain approximation error controlled by ``eps``. With very small
-nonzero within-group variation, a tiny difference between computed spectra
-can still receive a very small analytic p-value. Count normalization does not remove
-this numerical limitation. ``compute_spectra()`` warns when a fully observed
-gene has nonzero between-sample spectral differences below the requested
-transform accuracy. This diagnostic leaves spectra and p-values unchanged;
-recompute with smaller ``eps`` and check effect-size stability before
-interpreting significance in such degenerate comparisons.
-
 
 Compare coupling between genes
------------------------------
+------------------------------
 
-Cross-spectrum tests ask whether two genes change their spatial coupling
-across conditions, even when their individual auto-spectra stay unchanged.
-Compute the requested pairs once, then test either representation:
+Cross-spectrum tests compare the spatial coupling of gene pairs across
+conditions. Compute the requested pairs once, then select a representation:
 
 .. code-block:: python
 
@@ -109,94 +90,43 @@ Compute the requested pairs once, then test either representation:
        groups, representation="coherency",
    )
 
-``representation="coherence"`` uses ``log(max(C, 1e-12))``, where
-``C = abs(S_xy / sqrt(S_xx * S_yy))**2``. ``representation="coherency"``
-uses the real part of ``S_xy / sqrt(S_xx * S_yy)`` without a transformation.
-A radial sign reversal can change coherency while leaving coherence unchanged.
-For polar bins, coherence also includes the magnitude of the imaginary part;
-both tests are unaffected by the half-turn ambiguity of axial alignment.
-There is no signed L1 normalization or asinh transformation.
+- ``representation="coherence"`` (default) compares coupling strength using
+  log squared-magnitude coherence.
+- ``representation="coherency"`` compares the real part of normalized
+  cross-spectra, retaining the sign of in-phase coupling.
 
-Each test returns one aggregate p-value per pair. The statistic is the weighted
-L2 distance between mean profiles (or the specified GLM contrast). The analytic
-null follows DF: fit each pair's retained-sample design, pool residual
-cross-products into one shared covariance, then use each pair's supported
-covariance submatrix in the Liu mixture-chi-square approximation. There is no covariance inversion;
-the number of bins can exceed the number of samples. A larger pair panel does
-not increase the number of independent biological samples.
+Both use a weighted L2 statistic. For the default ``null="analytic"``, choose
+how to estimate the cross-bin residual covariance used by the Liu approximation:
 
-As in ``test_diff_freq``, expression presence determines which samples are
-used, requiring both genes in a pair to be present. Only bins valid in every
-retained sample for that pair are tested. Invalid auto-power is never converted
-into valid zero coherence by the log floor. ``freq_weights`` refers to the
-original flattened bins (radius then angle for polar features); zero weights
-exclude bins, and weights are
-renormalized over retained bins. Support is fixed before inference and remains
-fixed across label permutations. ``attrs["bin_indices"]`` records the retained
-bin indices for each pair; ``attrs["sample_indices"]`` records retained samples.
-Different bin support sets share covariance estimates. For each covariance
-entry, residual cross-products are summed over eligible pairs supporting both
-bins and divided by those pairs' total residual degrees of freedom. Entries
-with no joint support start at zero. Because these entrywise estimates can
-form an indefinite matrix, negative eigenvalues of its correlation matrix are
-clipped, then its diagonal is rescaled to restore the pooled marginal variances.
-This PSD correction is applied once before taking each pair's principal
-submatrix and may change supported off-diagonal entries. Each test retains its
-own sample-dependent contrast scale and normalized bin weights.
-``N_pairs_pooled`` counts all eligible pairs in the shared pool; the number of
-contributors to individual entries varies with bin overlap. A singleton pool
-has no cross-pair covariance borrowing. The existing small-residual-df warnings
-are unchanged for both auto-spectrum and cross-spectrum DF; PSD correction
-does not establish finite-sample calibration.
+- ``covariance=None`` or ``"pooled"`` (default) shares covariance across eligible
+  pairs to stabilize estimation when their covariance is similar.
+- ``covariance="per_pair"`` estimates covariance separately for each pair,
+  retaining pair-specific variance and cross-bin correlation.
 
-The output includes ``Feature_1``, ``Feature_2``, ``Statistic``, ``P_value``,
-``P_adj``, ``N_samples``, ``N_bins``, ``N_pairs_pooled``, ``DF_resid``,
-``Effective_rank``, and ``Status``. Self-pairs, pairs with no common supported
-bins, pairs with insufficient observations or an ineligible retained-sample
-design, and nonzero effects with a numerically zero pooled residual covariance
-have NaN p-values and an explanatory status. Constant null profiles have p=1.
-BH correction follows DF and applies separately to each call using only finite
-p-values. Untestable pairs and self-pairs are excluded.
-Running both representations does not automatically correct across both calls.
+.. code-block:: python
 
-Design matrices and ``contrast=`` follow ``test_diff_freq``. Binary comparisons
-require ``min_samples_per_group=2`` observed samples per arm on the masked
-path; masked GLMs require ``min_resid_df=1`` and an estimable contrast.
-Unmasked binary tests allow singleton arms: analytic inference requires positive
-residual degrees of freedom, while permutations need both labels to be present.
-These controls follow ``test_diff_freq``. Binary output includes ``n_obs_A`` and
-``n_obs_B``. Binary tests optionally support ``null="permutation"`` with
-``n_perm``, ``random_state``, and ``max_exact_permutations``. These are unrestricted
-sample-label permutations within each pair's retained samples. As in DF,
-masked pairs draw separately in original feature order, even when sample masks
-match. Unmasked pairs share relabellings. With masked presence, ``n_permutations``
-and ``exact_permutations`` in ``attrs`` are dictionaries keyed by pair.
-There are no residual or blocked permutations.
-Use independent biological samples, not repeated specimens as independent rows.
+   coupling = comparison.test_cross_diff_freq(groups, covariance="per_pair")
 
-The Liu approximation can accumulate large p-values at 1 when covariance has
-a dominant eigenvalue; it is an upper-tail approximation, not an exact
-finite-sample p-value calculation.
+Design matrices and continuous ``contrast=`` terms work as in ``test_diff_freq``.
+Binary comparisons also support ``null="permutation"``, described below.
 
-The analytic null assumes approximately Gaussian contrasts and comparable
-residual covariance among pooled pairs. Log coherence is not a guaranteed
-variance-stabilizing transformation; very small coherence values, heterogeneous
-pair noise, small samples and small covariance pools require calibration checks.
-Pairs sharing a gene are dependent, and BH does not guarantee control under
-arbitrary dependence. Normalization removes multiplicative amplitude scaling,
-but does not eliminate all abundance, composition or sampling effects.
+Each pair uses samples where both genes are present and bins valid in all those
+samples. ``freq_weights`` sets bin weights in the original flattened bin order
+(radius then angle for polar features); zero weights exclude bins. For missing
+data, ``min_samples_per_group`` sets the minimum per arm in binary tests, and
+``min_resid_df`` sets the minimum residual degrees of freedom in GLMs.
 
-Testing leaves cached auto- and cross-spectra unchanged. It materializes one
-support group's binned profiles at a time and uses bounded DF residual scratch
-blocks. The bin-by-bin covariance still uses quadratic memory in the number of
-retained bins; no Fourier coefficient cache is created.
+Results include pair names, the statistic, raw and BH-adjusted p-values, and
+sample/bin counts. ``Status`` identifies skipped pairs; ``N_pairs_pooled``
+reports the covariance pool size. Retained bins and samples are recorded in
+``attrs["bin_indices"]`` and ``attrs["sample_indices"]``.
 
 
 Explain selected frequency bins
 -------------------------------
 
-After selecting a feature and frequency bins, reconstruct their spatial
-contributions in an individual sample:
+Use ``explain_spectrum`` to reconstruct selected frequency bins from an
+individual sample's source data:
 
 .. code-block:: python
 
@@ -207,69 +137,28 @@ contributions in an individual sample:
        ["CD8", "FoxP3"], sample_index=0, bands=[1, 2],
        representation="coherency", memory_budget_bytes="512 MiB",
    )
-   pair.scores  # pair.contributions.sum(axis=1)
 
-This uses the same ``SpatialExplanation`` container as detector Q/R maps.
-``values`` contains the selected original observations, ``filtered`` contains
-one field per bin and feature, and ``contributions`` contains one signed map
-per bin. ``observation_indices`` and ``coordinates`` locate the rows in the
-source sample. FFT indices address C-order raster cells; coordinates are local
-(y, x) positions with origin zero and the fitted spacing. NUFFT coordinates
-retain their source column order and units; ``metadata["unit_scale"]`` gives
-the conversion used for the frequency grid. No spatial coordinates are rotated.
+- ``sample_index`` selects the sample; ``bands`` selects retained spectrum bins.
+- For one gene, ``representation="power"`` shows raw power contributions;
+  ``"power_norm"`` scales them by total power across retained bins.
+- For a pair, ``"cross"`` shows the real co-spectrum, ``"coherency"`` shows
+  signed normalized coupling, and ``"coherence"`` shows squared-magnitude coupling.
+- ``memory_budget_bytes`` sets the reconstruction memory budget.
 
-``bands`` indexes retained spectrum columns, including any removal of
-unsupported radial intervals. Polar columns flatten radius then angle.
-``metadata`` records these indices, corresponding radial intervals and angular
-centers, the sample alignment angle, and the representation. The fitted radial
-or interpolated polar reducer is reused without changing alignment or caches.
-
-One feature supports ``power`` and ``power_norm``; the latter divides by total
-raw power over **all retained bins**, not just the displayed bins. Pairs support
-``cross`` (real co-spectrum), ``coherency`` (real signed coherency), and
-``coherence`` (squared magnitude, including polar phase). For coherency, the
-observed denominator sqrt(P_x P_y) is fixed during allocation. For coherence,
-a complex cross-spectrum allocation a_i is mapped to
-Re(conj(S_xy) a_i) / (P_x P_y). This sums to coherence but may be negative locally.
-``filtered`` includes these fixed normalization and phase factors so that the
-shared elementwise contribution formula still applies.
-
-Scores reconstruct the **untransformed raw-source feature**. They do not
-attribute log profiles, aggregate DF statistics, p-values, or background- or
-covariate-adjusted caches. Raw features are recomputed even if such adjustments
-were previously applied to ``spectra_``; metadata labels this
-``spectrum_source="recomputed_raw"``. Use the same unchanged source data as the
-fit. These are descriptive allocations, not derivatives or local significance.
-
-Only one/two genes are transformed, and requested bands are processed one at a
-time. The memory estimate includes returned maps and transform/reducer scratch,
-but excludes resident inputs, rasterization internals and library overhead.
-Invalid normalized pair bins raise an error instead of producing a misleading
-map; finite raw power and co-spectrum maps remain available.
-
-Use the shared plotting and region-selection methods on any returned map:
+The returned ``SpatialExplanation`` contains source ``values``, per-bin
+``filtered`` fields, and ``contributions`` whose sums reproduce the selected
+raw-source feature. Use its plotting and region-selection methods to inspect
+local patterns:
 
 .. code-block:: python
 
-   # map_index is a position in the returned maps: 0 refers to bands[0].
    regions = pair.select_regions(map_index=0, size=100.0, direction="absolute")
    figure = pair.plot(map_index=0, regions=regions)
 
-When ``size`` is omitted and the band's lower frequency is positive, the
-suggested width is max(3 / lower_frequency, 1 / bandwidth), divided by
-``metadata["unit_scale"]`` to recover stored coordinate units. This heuristic
-includes several wavelengths and the inverse-bandwidth context; it does not
-remove ringing or boundary effects. Bands starting at zero require an explicit
-size. An explicit smaller window is allowed and reported as
-``context_limited=True``. Polar maps use their radial interval for this width;
-selection uses the original spatial coordinates and never rotates the tissue.
-
-``plot()`` shows the stored filtered responses, including fixed normalization
-and coherence phase factors, alongside the original values and contributions.
-These fields are not reconstructed expression intensities. Selection and
-plotting do not refilter the crop or recompute its normalization. See
-:doc:`quickstart` for eligibility checks, coordinate conventions, color limits
-and the returned region table.
+``map_index`` selects a returned band, ``size`` sets region width in source
+coordinate units, and ``direction="absolute"`` selects large contributions of
+either sign. Omit ``size`` for an automatic frequency-based width when the
+band's lower frequency is positive. See :doc:`quickstart` for plotting options.
 
 
 Regular grids
@@ -313,10 +202,7 @@ For ``AnnData``, SONIC looks for each name in ``obs`` first and then in
 ``SpatialData`` table fields. You can also pass one pre-rasterized covariate
 array per sample; see the API reference for the expected shapes.
 
-The covariate design, including its intercept, must leave at least one residual
-frequency dimension. SONIC raises ``ValueError`` if its rank reaches the number
-of retained feature bins. Use fewer independent covariates or more supported
-bins; no samples are modified when this check fails.
+The covariate design must leave at least one residual frequency dimension.
 
 
 Multi-factor and continuous designs
@@ -351,11 +237,48 @@ For a NumPy design matrix, include any intercept yourself and pass a contrast
 vector.
 
 
+Choose the analytic DF covariance
+---------------------------------
+
+For analytic DF and DF-norm tests, ``covariance`` controls how cross-bin
+residual covariance is estimated:
+
+- ``None`` or ``"pooled"`` (default) shares covariance across eligible genes to
+  stabilize estimation when their covariance is similar.
+- ``"per_gene"`` estimates covariance separately for each gene, retaining
+  gene-specific variance and cross-bin correlation.
+
+Both use the same weighted L2 statistic and Liu null approximation. The options
+support binary groups, continuous contrasts, and gene-specific missing samples.
+
+.. code-block:: python
+
+   pattern_results = comparison.test_diff_freq(
+       groups, covariance="per_gene", normalize_shape=True,
+   )
+   adjusted_results = comparison.test_diff_freq(
+       design, contrast="condition", covariance="per_gene", normalize_shape=True,
+   )
+
+Use ``estimate_null_covariance`` to inspect the covariance, eigenvalues, and
+fitted ``beta`` coefficients used by the test:
+
+.. code-block:: python
+
+   diagnostics = comparison.estimate_null_covariance(
+       groups, covariance="per_gene", normalize_shape=True,
+   )
+
+The standalone binary and GLM comparison functions accept the same option.
+Cross-spectrum tests use ``covariance="per_pair"`` for separate pair estimates.
+
+
 Permutation tests
 -----------------
 
-The analytic test is the default. For a binary comparison, request a label
-permutation test explicitly:
+``null="analytic"`` (default) uses the Liu approximation. For exchangeable
+binary groups, ``null="permutation"`` calibrates the statistic by relabeling
+samples:
 
 .. code-block:: python
 
@@ -366,9 +289,9 @@ permutation test explicitly:
        random_state=0,
    )
 
-Permutation tests are not available for multi-column designs. With very few
-samples, the number of distinct label assignments also limits attainable
-p-values.
+``n_perm`` sets the number of sampled relabelings, and ``random_state`` makes
+them reproducible. When the number of possible assignments is at most
+``max_exact_permutations``, SONIC enumerates them all.
 
 
 Keep physical units consistent

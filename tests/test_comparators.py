@@ -891,6 +891,7 @@ class TestComparatorNullCovariance:
     """Covariance diagnostics should reproduce analytic ``test_diff_freq`` p-values."""
 
     common_state_keys = {
+        "beta",
         "mode",
         "masked",
         "observed",
@@ -1726,3 +1727,39 @@ def test_2d_schedule_uses_transform_workspace(backend, monkeypatch):
         comparator.compute_spectra(
             n_jobs=2, progress=False, memory_budget_bytes=int(2 * per_feature - 1)
         )
+
+
+@pytest.mark.parametrize("glm", [False, True])
+@pytest.mark.parametrize("masked", [False, True])
+@pytest.mark.parametrize("shape_only", [False, True])
+def test_per_gene_covariance_public_dispatch_and_diagnostics(glm, masked, shape_only):
+    rng = np.random.default_rng(77)
+    spectra = rng.lognormal(size=(8, 5, 11))
+    presence = np.ones((8, 5), bool)
+    if masked:
+        presence[0, :2] = False
+        presence[1:, -1] = False
+        spectra[~presence] = np.nan
+    cmp = _comparator_from_spectra(spectra, presence=presence)
+    original = cmp.spectra_.copy()
+    design = pd.DataFrame({"time": np.linspace(0, 1, 8)}) if glm else np.repeat([0, 1], 4)
+    kwargs = {
+        "covariance": "per_gene",
+        "normalize_shape": shape_only,
+        "freq_weights": np.arange(11),
+    }
+    if glm:
+        kwargs["contrast"] = "time"
+    diag = cmp.estimate_null_covariance(design, **kwargs)
+    result = cmp.test_diff_freq(design, **kwargs)
+    TestComparatorNullCovariance._assert_diag_reproduces_pvalues(cmp, result, diag)
+    assert result.attrs["covariance"] == diag["covariance"] == "per_gene"
+    assert diag["sigma_log"].shape == diag["weighted_cov"].shape == (5, 11, 11)
+    assert diag["eigenvalues"].shape == (5, 11)
+    assert diag["effective_rank"].shape == diag["roundoff"].shape == (5,)
+    if masked:
+        assert np.isnan(diag["sigma_log"][-1]).all()
+        assert not diag["eligible"][-1]
+    np.testing.assert_array_equal(cmp.spectra_, original)
+    with pytest.raises(ValueError, match="covariance must be"):
+        cmp.estimate_null_covariance(design, **(kwargs | {"covariance": "typo"}))

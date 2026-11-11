@@ -211,8 +211,9 @@ class TestAnalyticNull:
     @pytest.mark.parametrize("glm", [False, True])
     @pytest.mark.parametrize("masked", [False, True])
     @pytest.mark.parametrize("retained", [4, 6])
+    @pytest.mark.parametrize("covariance", [None, "per_pair"])
     def test_cross_small_df_warning_policy_is_unchanged(
-        self, representation, glm, masked, retained
+        self, representation, glm, masked, retained, covariance
     ):
         n = retained + 2 * masked
         comparator = _comparison(np.random.default_rng(225).uniform(0.1, 0.8, (n, 2, 3)))
@@ -226,7 +227,9 @@ class TestAnalyticNull:
         kwargs = {"contrast": "condition"} if glm else {}
         with warnings.catch_warnings(record=True) as caught:
             warnings.simplefilter("always", UserWarning)
-            comparator.test_cross_diff_freq(design, representation=representation, **kwargs)
+            comparator.test_cross_diff_freq(
+                design, representation=representation, covariance=covariance, **kwargs
+            )
         messages = [str(w.message) for w in caught if "at residual df=" in str(w.message)]
         if retained == 4:
             assert messages
@@ -235,18 +238,25 @@ class TestAnalyticNull:
         else:
             assert not messages
 
-    def test_covariance_chunking_and_readonly_caches(self, monkeypatch, representation):
+    @pytest.mark.parametrize("covariance", [None, "per_pair"])
+    def test_covariance_chunking_and_readonly_caches(self, monkeypatch, representation, covariance):
         rng = np.random.default_rng(73)
         comparator = _comparison(rng.uniform(0.1, 0.9, (10, 13, 9)))
         original = copy.deepcopy(comparator.cross_spectra_)
         for name in ("cross_spectra", "auto_spectra", "coherency_valid"):
             getattr(comparator.cross_spectra_, name).setflags(write=False)
         groups = np.repeat([0, 1], 5)
-        expected = _ordered(comparator.test_cross_diff_freq(groups, representation=representation))
+        expected = _ordered(
+            comparator.test_cross_diff_freq(
+                groups, representation=representation, covariance=covariance
+            )
+        )
         monkeypatch.setattr(ms, "_COMPARISON_WORKSPACE_BYTES", 8 * 8 * 10 * 9 * 2)
         with patch.object(ms, "_prepare_profile_block", wraps=ms._prepare_profile_block) as blocks:
             actual = _ordered(
-                comparator.test_cross_diff_freq(groups, representation=representation)
+                comparator.test_cross_diff_freq(
+                    groups, representation=representation, covariance=covariance
+                )
             )
             assert (
                 max(c.args[0].shape[1] for c in blocks.call_args_list if c.args[0].ndim == 3) <= 2
@@ -557,7 +567,8 @@ class TestSamplePresence:
             np.testing.assert_array_equal(getattr(cross, name), getattr(original, name))
 
     @pytest.mark.parametrize("glm", [False, True])
-    def test_empty_masked_pool_does_not_abort_other_bin_groups(self, glm):
+    @pytest.mark.parametrize("covariance", [None, "per_pair"])
+    def test_empty_masked_pool_does_not_abort_other_bin_groups(self, glm, covariance):
         comparator = _comparison(np.random.default_rng(28).uniform(0.1, 0.8, (10, 2, 4)))
         cross = comparator.cross_spectra_
         cross.presence[:5, 0] = False
@@ -566,6 +577,7 @@ class TestSamplePresence:
         groups = np.repeat([0, 1], 5)
         design = pd.DataFrame({"condition": groups}) if glm else groups
         kwargs = {"contrast": "condition"} if glm else {}
+        kwargs["covariance"] = covariance
         actual = _ordered(comparator.test_cross_diff_freq(design, **kwargs))
         assert np.isnan(actual.P_value.iloc[0])
         assert actual.N_pairs_pooled.iloc[0] == 0
@@ -736,6 +748,10 @@ class TestValidation:
         [
             ({"representation": "cross"}, ValueError, "representation"),
             ({"null": "foo"}, ValueError, "null"),
+            ({"covariance": "per_gene"}, ValueError, "covariance"),
+            ({"covariance": "typo"}, ValueError, "covariance"),
+            ({"null": "permutation", "covariance": "per_pair"}, ValueError, "analytic"),
+            ({"null": "permutation", "covariance": "pooled"}, ValueError, "analytic"),
             ({"freq_weights": [0, 0, 0]}, ValueError, "positive finite sum"),
             ({"freq_weights": [1, np.nan, 1]}, ValueError, "finite"),
             ({"null": "permutation", "n_perm": 0}, ValueError, "positive integer"),
@@ -943,3 +959,167 @@ def test_unmasked_singleton_groups_follow_df(sizes, null):
             pair[["Statistic", "P_value", "P_adj"]],
             atol=1e-12,
         )
+
+
+@pytest.mark.parametrize("representation", ["coherence", "coherency"])
+@pytest.mark.parametrize("glm", [False, True])
+@pytest.mark.parametrize("masked", [False, True])
+def test_per_pair_matches_independent_ols_with_sample_and_bin_masks(representation, glm, masked):
+    rng = np.random.default_rng(711)
+    n, p, b = 12, 5, 19
+    values = rng.uniform(0.1, 0.8, (n, p, b)) * np.exp(1j * rng.uniform(-np.pi, np.pi, (n, p, b)))
+    comparator = _comparison(values)
+    cross = comparator.cross_spectra_
+    cross.coherency_valid[0, :2, 1] = False
+    cross.coherency_valid[1, 2:4, 2:4] = False
+    if masked:
+        cross.presence[0, :2] = False
+        cross.presence[8, 2:4] = False
+        cross.presence[:, -2:] = False
+    presence = _mask_missing_pairs(cross)
+    weights = np.arange(b, dtype=float)  # Exclude bin zero.
+    support = (cross.coherency_valid | ~presence[..., None]).all(0) & (weights > 0)
+    support &= presence.any(0)[:, None]
+    groups = np.repeat([0, 1], n // 2)
+    design = pd.DataFrame({"group": groups, "age": rng.normal(size=n)}) if glm else groups
+    matrix = (
+        np.column_stack([np.ones(n), design.to_numpy()])
+        if glm
+        else np.column_stack([np.ones(n), groups])
+    )
+    contrast = np.array([0.0, 0.0, 1.0]) if glm else np.array([0.0, 1.0])
+    kwargs = {"contrast": "age"} if glm else {}
+    # Per-pair mode never constructs or repairs the entrywise pooled matrix.
+    with patch(
+        "sonic.comparators.cross_spectrum._stabilize_cross_covariance",
+        side_effect=AssertionError("unexpected pooling"),
+    ):
+        with patch.object(
+            ms, "_init_per_gene_covariance", wraps=ms._init_per_gene_covariance
+        ) as init:
+            frame = comparator.test_cross_diff_freq(
+                design,
+                representation=representation,
+                covariance="per_pair",
+                freq_weights=weights,
+                **kwargs,
+            )
+            assert init.call_count
+            assert all(call.args[2] is False for call in init.call_args_list)
+    assert frame.attrs["covariance"] == "per_pair"
+    assert frame.attrs["null"] == "analytic"
+    actual = _ordered(frame).loc[list(cross.pairs)]
+    profiles = _profiles(values, representation)
+    for j, pair in enumerate(cross.pairs):
+        row = actual.loc[pair]
+        keep = presence[:, j]
+        bins = np.flatnonzero(support[j])
+        assert actual.attrs["sample_indices"][pair] == tuple(np.flatnonzero(keep))
+        assert actual.attrs["bin_indices"][pair] == tuple(bins)
+        if not keep.any():
+            assert np.isnan(row.P_value)
+            assert row.N_pairs_pooled == 0
+            continue
+        x = matrix[keep]
+        y = profiles[keep, j][:, bins]
+        fit = np.linalg.lstsq(x, y, rcond=None)[0]
+        residual = y - x @ fit
+        df = len(x) - np.linalg.matrix_rank(x)
+        covariance = residual.T @ residual / df
+        w = weights[bins] / weights[bins].sum()
+        eigen = np.maximum(np.linalg.eigvalsh(np.sqrt(w[:, None] * w) * covariance), 0)
+        scale = np.sum((contrast @ np.linalg.pinv(x)) ** 2)
+        expected_stat = np.sqrt(np.sum(w * (contrast @ fit) ** 2))
+        np.testing.assert_allclose(row.Statistic, expected_stat, atol=1e-12)
+        np.testing.assert_allclose(row.P_value, liu_sf(expected_stat**2, scale * eigen), atol=1e-12)
+        np.testing.assert_allclose(
+            row.Effective_rank, eigen.sum() ** 2 / np.sum(eigen**2), atol=1e-12
+        )
+        assert row.DF_resid == df
+        assert row.N_samples == keep.sum()
+        assert row.N_bins == len(bins)
+        assert row.N_pairs_pooled == 1
+        assert row.Status == "ok"
+    np.testing.assert_allclose(actual.P_adj, apply_bh_correction(actual.P_value), equal_nan=True)
+    # Adding the selector must not change the established pooled default or metadata.
+    default = comparator.test_cross_diff_freq(
+        design, representation=representation, freq_weights=weights, **kwargs
+    )
+    explicit = comparator.test_cross_diff_freq(
+        design, representation=representation, covariance="pooled", freq_weights=weights, **kwargs
+    )
+    pd.testing.assert_frame_equal(default, explicit)
+    assert explicit.attrs["covariance"] == "pooled_across_valid_bins_psd"
+
+
+@pytest.mark.parametrize("representation", ["coherence", "coherency"])
+@pytest.mark.parametrize("glm", [False, True])
+def test_per_pair_degeneracy_and_ineligible_statuses(representation, glm):
+    rng = np.random.default_rng(518)
+    groups = np.repeat([0, 1], 4)
+    values = rng.uniform(0.1, 0.8, (8, 8, 5))
+    values[:, 1] = 0.4  # Zero residual covariance and zero effect.
+    values[:, 2] = np.where(groups[:, None] == 0, 0.2, 0.6)  # Perfect nonzero fit.
+    comparator = _comparison(values)
+    cross = comparator.cross_spectra_
+    pairs = list(cross.pairs)
+    pairs[3] = ("g6", "g6")
+    cross.pairs = tuple(pairs)
+    cross.pair_indices[3] = [6, 6]
+    cross.coherency_valid[:, 4] = False
+    cross.presence[:4, 10] = False  # No control arm; GLM contrast unestimable.
+    cross.presence[1:, 12] = False  # No residual df.
+    cross.presence[:, 14] = False  # No observed samples.
+    _mask_missing_pairs(cross)
+    design = pd.DataFrame({"group": groups}) if glm else groups
+    kwargs = {"contrast": "group"} if glm else {}
+    actual = _ordered(
+        comparator.test_cross_diff_freq(
+            design, representation=representation, covariance="per_pair", **kwargs
+        )
+    ).loc[list(cross.pairs)]
+    skipped = "ineligible_design" if glm else "insufficient_samples"
+    assert list(actual.Status) == [
+        "ok",
+        "ok",
+        "degenerate_null",
+        "self_pair",
+        "no_common_bins",
+        skipped,
+        skipped,
+        skipped,
+    ]
+    assert np.isfinite(actual.P_value.iloc[0])
+    assert actual.P_value.iloc[1] == 1.0
+    assert actual.P_value.iloc[2:].isna().all()
+    assert actual.P_adj.iloc[2:].isna().all()
+    np.testing.assert_array_equal(actual.N_pairs_pooled, [1, 1, 1, 0, 0, 0, 0, 0])
+
+
+@pytest.mark.parametrize("representation", ["coherence", "coherency"])
+@pytest.mark.parametrize("glm", [False, True])
+def test_per_pair_raw_results_do_not_borrow_from_other_pairs(representation, glm):
+    rng = np.random.default_rng(831)
+    comparator = _comparison(rng.uniform(0.1, 0.8, (10, 4, 13)))
+    cross = comparator.cross_spectra_
+    cross.coherency_valid[0, 0, :2] = False
+    cross.presence[0, 0] = False
+    _mask_missing_pairs(cross)
+    groups = np.repeat([0, 1], 5)
+    design = pd.DataFrame({"group": groups, "age": rng.normal(size=10)}) if glm else groups
+    kwargs = {"contrast": "age"} if glm else {}
+    kwargs.update(representation=representation, covariance="per_pair")
+    full = _ordered(comparator.test_cross_diff_freq(design, **kwargs))
+    # Retain the same pair's samples, bins, and design while removing the rest.
+    cross.cross_spectra = cross.cross_spectra[:, :1]
+    cross.coherency_valid = cross.coherency_valid[:, :1]
+    cross.pairs = cross.pairs[:1]
+    cross.pair_indices = cross.pair_indices[:1]
+    alone = _ordered(comparator.test_cross_diff_freq(design, **kwargs))
+    columns = ["Statistic", "P_value", "Effective_rank", "DF_resid"]
+    np.testing.assert_allclose(alone[columns], full.loc[alone.index, columns], atol=1e-12)
+    # A singleton pooled fit uses the same covariance as the per-pair fit.
+    pooled = _ordered(
+        comparator.test_cross_diff_freq(design, **(kwargs | {"covariance": "pooled"}))
+    )
+    np.testing.assert_allclose(alone[columns], pooled[columns], atol=1e-12)

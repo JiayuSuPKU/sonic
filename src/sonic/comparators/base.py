@@ -1164,6 +1164,7 @@ class _ComparatorBase:
         normalize_shape: bool = False,
         min_samples_per_group: int = 2,
         min_resid_df: int = 1,
+        covariance: str | None = None,
     ) -> Any:
         """Differential-frequency (DF) test on :attr:`spectra_`.
 
@@ -1231,13 +1232,17 @@ class _ComparatorBase:
             the masked path (forwarded to
             :func:`~sonic.comparators.multisample.compare_two_groups_masked`).
             Ignored on the unmasked / GLM paths.
+        covariance : {None, 'pooled', 'per_gene'}, optional
+            For ``null='analytic'`` only. By default, residual covariance
+            are pooled across all tests genes (``None`` or ``'pooled'``).
+            ``'per_gene'`` instead estimates a separate covariance for each gene.
         min_resid_df : int, default 1
             Minimum per-gene residual degrees of freedom required under
             the masked GLM path. Ignored on the unmasked and binary paths.
 
         Notes
         -----
-        With numerically zero pooled residual covariance, a nonzero contrast
+        With numerically zero residual covariance, a nonzero contrast
         has NaN p-values (including BH adjustment); a zero contrast has p=1.
         Untestable features are excluded from BH correction.
 
@@ -1289,6 +1294,7 @@ class _ComparatorBase:
                     gene_names=self.gene_names,
                     freq_weights=freq_weights,
                     normalize_shape=normalize_shape,
+                    covariance=covariance,
                     min_resid_df=int(min_resid_df),
                 )
             return compare_glm(
@@ -1298,6 +1304,7 @@ class _ComparatorBase:
                 gene_names=self.gene_names,
                 freq_weights=freq_weights,
                 normalize_shape=normalize_shape,
+                covariance=covariance,
             )
 
         # Binary path (1-D design, contrast is None).
@@ -1315,6 +1322,7 @@ class _ComparatorBase:
                 freq_weights=freq_weights,
                 max_exact_permutations=max_exact_permutations,
                 normalize_shape=normalize_shape,
+                covariance=covariance,
             )
         return compare_two_groups(
             self.spectra_,
@@ -1327,6 +1335,7 @@ class _ComparatorBase:
             freq_weights=freq_weights,
             max_exact_permutations=max_exact_permutations,
             normalize_shape=normalize_shape,
+            covariance=covariance,
         )
 
     def test_cross_diff_freq(
@@ -1342,6 +1351,7 @@ class _ComparatorBase:
         max_exact_permutations: int = 10000,
         min_samples_per_group: int = 2,
         min_resid_df: int = 1,
+        covariance: str | None = None,
     ):
         """Test a condition-associated cross-spectrum profile change per pair.
 
@@ -1356,10 +1366,15 @@ class _ComparatorBase:
             ``coherency`` compares its signed real part without a transform.
             Both are invariant to conjugation under axial polar alignment.
         null : {'analytic', 'permutation'}, default 'analytic'
-            Analytic DF Liu mixture null with residual covariance pooled across
+            Analytic DF Liu mixture null with residual covariance pooled by default across
             eligible pairs with entrywise support, then PSD-corrected and subset
             to each pair's valid bins. Label permutations are available only for
             binary labels without an explicit contrast.
+        covariance : {None, 'pooled', 'per_pair'}, optional
+            For ``null='analytic'`` only. By default, residual covariance
+            are pooled across all tests gene pairs (``None`` or ``'pooled'``).
+            ``'per_pair'`` instead estimates a separate covariance for each gene pair
+            on its retained samples and bins, including for signed coherency.
         n_perm, random_state, max_exact_permutations
             Same permutation controls as :meth:`test_diff_freq`.
         freq_weights : ndarray, optional
@@ -1384,16 +1399,22 @@ class _ComparatorBase:
             Binary tests also include ``n_obs_A`` and ``n_obs_B``.
             Untestable rows have NaN p-values and are excluded from BH correction.
             ``attrs`` records retained sample/bin indices, transformation, design
-            and permutation settings. With masked presence, permutation counts/exactness
-            are recorded per pair; otherwise those settings are shared scalars.
+            and permutation settings. ``attrs["covariance"]`` is ``"per_pair"``
+            for per-pair fits or the existing ``"pooled_across_valid_bins_psd"``
+            for pooled fits. ``N_pairs_pooled`` is one for each eligible
+            per-pair fit, zero for skipped pairs. With masked presence, permutation
+            counts/exactness are recorded per pair; otherwise those settings are
+            shared scalars.
 
         Notes
         -----
         As in :meth:`test_diff_freq`, missing expression excludes samples;
         both genes must be present for a pair's sample to be retained. Bins
         must be valid in every retained sample. Analytic calibration assumes
-        approximately Gaussian contrast and comparable residual covariance (estimated by pooling
-        across pairs). Self-pairs are descriptive only and excluded from pooling.
+        approximately Gaussian contrasts and comparable residual covariance
+        across samples within a pair. Pooled calibration additionally assumes
+        covariance is shared across pairs. Self-pairs remain descriptive only
+        and are excluded from testing and covariance estimation.
         """
         from sonic.comparators.cross_spectrum import _compare_cross_spectra
 
@@ -1413,6 +1434,7 @@ class _ComparatorBase:
             max_exact_permutations=max_exact_permutations,
             min_samples_per_group=min_samples_per_group,
             min_resid_df=min_resid_df,
+            covariance=covariance,
         )
 
     def estimate_null_covariance(
@@ -1424,6 +1446,7 @@ class _ComparatorBase:
         normalize_shape: bool = False,
         min_samples_per_group: int = 2,
         min_resid_df: int = 1,
+        covariance: str | None = None,
     ) -> _AnalyticNullState:
         """Estimate the analytic ``log_l2`` null covariance for inspection.
 
@@ -1448,6 +1471,10 @@ class _ComparatorBase:
             covariance, matching :meth:`test_diff_freq(normalize_shape=True)`.
         min_samples_per_group : int, default 2
             Minimum observed samples per arm for masked binary designs.
+        covariance : {None, 'pooled', 'per_gene'}, optional
+            By default, residual covariance are pooled across all tests genes
+            (``None``or ``'pooled'``). ``'per_gene'`` instead estimates a separate
+            covariance for each gene.
         min_resid_df : int, default 1
             Minimum per-gene residual df for masked GLM designs.
 
@@ -1455,13 +1482,22 @@ class _ComparatorBase:
         -------
         dict
             Analytic-null state with common keys ``mode``, ``masked``,
-            ``observed``, ``sigma_log``, ``freq_weights``, ``weighted_cov``,
+            ``observed``, ``beta``, ``sigma_log``, ``freq_weights``, ``weighted_cov``,
             ``eigenvalues``, ``effective_rank``, ``contrast_scale``,
-            ``df_resid``, and ``eligible``.
+            ``df_resid``, ``eligible``, and the effective ``covariance`` choice.
+            With ``covariance="per_gene"``, ``sigma_log`` and ``weighted_cov``
+            have shape ``(n_genes, n_bins, n_bins)``, ``eigenvalues`` has shape
+            ``(n_genes, n_bins)``, and ``effective_rank`` and ``roundoff`` are
+            per-gene vectors. Ineligible covariance/eigenvalue rows are NaN.
+            Full per-gene covariance storage is only allocated by this diagnostic
+            method; tests retain eigenvalues without storing all matrices.
 
+            Fitted ``beta`` coefficients always have shape
+            ``(n_terms, n_genes, n_bins)`` on the tested profile scale. Binary
+            tests return two rows: the group-A mean and B-minus-A difference,
+            with groups ordered by ``np.unique``. Skipped genes retain NaNs.
             Two-group-only metadata: ``n_obs_A`` and ``n_obs_B``.
-            GLM-only metadata: ``design_columns``, ``contrast_vector``,
-            fitted ``beta`` coefficients, and ``n_obs``.
+            GLM-only metadata: ``design_columns``, ``contrast_vector``, and ``n_obs``.
         """
         if self.spectra_ is None:
             raise RuntimeError("Call .compute_spectra() before .estimate_null_covariance().")
@@ -1487,6 +1523,7 @@ class _ComparatorBase:
                     self.presence_,
                     freq_weights=freq_weights,
                     normalize_shape=normalize_shape,
+                    covariance=covariance,
                     min_resid_df=int(min_resid_df),
                 )
             return _estimate_glm_null_covariance(
@@ -1495,6 +1532,7 @@ class _ComparatorBase:
                 contrast,
                 freq_weights=freq_weights,
                 normalize_shape=normalize_shape,
+                covariance=covariance,
             )
 
         if use_masked:
@@ -1504,6 +1542,7 @@ class _ComparatorBase:
                 self.presence_,
                 freq_weights=freq_weights,
                 normalize_shape=normalize_shape,
+                covariance=covariance,
                 min_samples_per_group=int(min_samples_per_group),
             )
         return _estimate_two_group_null_covariance(
@@ -1511,6 +1550,7 @@ class _ComparatorBase:
             groups,
             freq_weights=freq_weights,
             normalize_shape=normalize_shape,
+            covariance=covariance,
         )
 
     def test_diff_expr(

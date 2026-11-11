@@ -71,7 +71,7 @@ test every pair between two feature sets.
 
 
 Explain an observed Q or R score
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
 After ``setup_data``, request a spatial explanation for one feature or pair:
 

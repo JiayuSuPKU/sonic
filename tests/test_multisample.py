@@ -72,10 +72,10 @@ def test_analytic_null_metadata_stays_optional_on_python_310():
         "n_obs_B",
         "design_columns",
         "contrast_vector",
-        "beta",
         "n_obs",
+        "zero_covariance",
     }
-    assert {"observed", "eigenvalues", "eligible"} <= _AnalyticNullState.__required_keys__
+    assert {"observed", "beta", "eigenvalues", "eligible"} <= _AnalyticNullState.__required_keys__
 
 
 class TestTwoGroupNullCalibration:
@@ -332,9 +332,18 @@ class TestLogL2AnalyticNull:
         assert df["P_value"].between(0, 1).all()
 
 
-@pytest.mark.parametrize("path", ["spectral", "masked", "scalar"])
+@pytest.mark.parametrize(
+    "path,covariance_mode",
+    [
+        ("spectral", None),
+        ("masked", None),
+        ("scalar", None),
+        ("spectral", "per_gene"),
+        ("masked", "per_gene"),
+    ],
+)
 @pytest.mark.parametrize("offset,scale", [(1e4, 1.0), (0.0, 1e8)])
-def test_glm_nuisance_offset_and_units_preserve_contrast(path, offset, scale):
+def test_glm_nuisance_offset_and_units_preserve_contrast(path, covariance_mode, offset, scale):
     rng = np.random.default_rng(673)
     n, n_genes, n_bins = 24, 8, 6
     group = np.repeat([0.0, 1.0], n // 2)
@@ -351,17 +360,26 @@ def test_glm_nuisance_offset_and_units_preserve_contrast(path, offset, scale):
         if path == "scalar":
             frame = compare_glm_scalar(values, x, contrast)
         elif path == "masked":
-            frame = compare_glm_masked(spectra, x, contrast, presence)
+            frame = compare_glm_masked(spectra, x, contrast, presence, covariance=covariance_mode)
         else:
-            frame = compare_glm(spectra, x, contrast)
+            frame = compare_glm(spectra, x, contrast, covariance=covariance_mode)
         return frame.sort_values("Feature").drop(columns="Feature").to_numpy()
 
     np.testing.assert_allclose(compare(shifted), compare(design), rtol=2e-6, atol=1e-10)
     np.testing.assert_array_equal(design[:, 2], covariate)
 
 
-@pytest.mark.parametrize("path", ["spectral", "masked", "scalar"])
-def test_glm_contrast_scale_preserves_pvalues_and_estimability(path):
+@pytest.mark.parametrize(
+    "path,covariance_mode",
+    [
+        ("spectral", None),
+        ("masked", None),
+        ("scalar", None),
+        ("spectral", "per_gene"),
+        ("masked", "per_gene"),
+    ],
+)
+def test_glm_contrast_scale_preserves_pvalues_and_estimability(path, covariance_mode):
     rng = np.random.default_rng(33)
     groups = np.repeat([0, 1], 6)
     design = np.column_stack([np.ones(12), groups])
@@ -374,9 +392,11 @@ def test_glm_contrast_scale_preserves_pvalues_and_estimability(path):
         if path == "scalar":
             result = compare_glm_scalar(values, matrix, contrast)
         elif path == "masked":
-            result = compare_glm_masked(spectra, matrix, contrast, presence)
+            result = compare_glm_masked(
+                spectra, matrix, contrast, presence, covariance=covariance_mode
+            )
         else:
-            result = compare_glm(spectra, matrix, contrast)
+            result = compare_glm(spectra, matrix, contrast, covariance=covariance_mode)
         return result.set_index("Feature").sort_index()
 
     expected = compare(design, np.array([0.0, 1.0]))
@@ -1173,7 +1193,8 @@ def test_masked_liu_reuses_fits_without_changing_tails(mode, amplitude):
             np.unique(state["contrast_scale"][state["eligible"]]).size if amplitude else 0
         )
         assert fitted.call_count == expected_fits
-    np.testing.assert_array_equal(actual, expected)
+    # Batched and scalar tail evaluation can differ by floating-point roundoff.
+    np.testing.assert_allclose(actual, expected, rtol=1e-14, atol=0, equal_nan=True)
 
 
 @pytest.mark.parametrize("path", ["glm", "masked_glm", "scalar"])
@@ -1298,17 +1319,19 @@ def test_welch_cauchy_excludes_only_constant_bins(masked):
 @pytest.mark.parametrize("masked", [False, True])
 @pytest.mark.parametrize("glm", [False, True])
 @pytest.mark.parametrize("shape_only", [False, True])
+@pytest.mark.parametrize("covariance_mode", [None, "per_gene"])
+@pytest.mark.parametrize("n_bins", [7, 17])
 def test_blocked_covariance_matches_independent_per_gene_fits(  # noqa: C901
-    monkeypatch, masked, glm, shape_only
+    monkeypatch, masked, glm, shape_only, covariance_mode, n_bins
 ):
     from sonic.comparators import multisample as ms
 
     rng = np.random.default_rng(42)
-    spectra = rng.lognormal(size=(12, 23, 7)).astype(np.float32)
+    spectra = rng.lognormal(size=(12, 23, n_bins)).astype(np.float32)
     labels = np.tile([0, 1], 6)
     design = np.column_stack([np.ones(12), labels, rng.normal(size=12)])
     contrast = np.array([0.0, 1.0, 0.0])
-    weights = np.arange(7, dtype=float)
+    weights = np.arange(n_bins, dtype=float)
     weights /= weights.sum()
     presence = np.ones((12, 23), bool)
     if masked:
@@ -1322,8 +1345,9 @@ def test_blocked_covariance_matches_independent_per_gene_fits(  # noqa: C901
     spectra.setflags(write=False)
     observed = np.full(23, np.nan)
     scales = np.full(23, np.nan)
-    beta = np.full((3, 23, 7), np.nan)
-    covariance = np.zeros((7, 7))
+    beta = np.full((3 if glm else 2, 23, n_bins), np.nan)
+    covariance = np.zeros((n_bins, n_bins))
+    gene_covariances = np.full((23, n_bins, n_bins), np.nan)
     pooled_df = 0
     for j in range(23):
         keep = presence[:, j]
@@ -1350,26 +1374,36 @@ def test_blocked_covariance_matches_independent_per_gene_fits(  # noqa: C901
             if a.sum() < 2 or b.sum() < 2:
                 continue
             ma, mb = logs[a].mean(axis=0), logs[b].mean(axis=0)
+            beta[:, j] = [ma, mb - ma]
             effect = ma - mb
             residuals = logs - np.where(a[:, None], ma, mb)
             scale = 1 / a.sum() + 1 / b.sum()
             df = len(x) - 2
         observed[j] = np.sqrt(np.sum(weights * effect**2))
         scales[j] = scale
+        gene_covariances[j] = residuals.T @ residuals / df
         covariance += residuals.T @ residuals
         pooled_df += df
     covariance /= pooled_df
     weighted = np.sqrt(weights[:, None] * weights) * covariance
     eigenvalues = np.maximum(np.linalg.eigvalsh(weighted), 0)
+    if covariance_mode == "per_gene":
+        covariance = gene_covariances
+        eigenvalues = np.full((23, n_bins), np.nan)
+        for j in np.flatnonzero(np.isfinite(observed)):
+            weighted = np.sqrt(weights[:, None] * weights) * covariance[j]
+            eigenvalues[j] = np.maximum(np.linalg.eigvalsh(weighted), 0)
+    else:
+        eigenvalues = np.broadcast_to(eigenvalues, (23, n_bins))
     pvalues = np.array(
         [
-            liu_sf(t**2, eigenvalues * s) if np.isfinite(t) else np.nan
-            for t, s in zip(observed, scales, strict=True)
+            liu_sf(t**2, eig * s) if np.isfinite(t) else np.nan
+            for t, s, eig in zip(observed, scales, eigenvalues, strict=True)
         ]
     )
 
     # Force small blocks so both grouping and within-group chunk boundaries run.
-    monkeypatch.setattr(ms, "_COMPARISON_WORKSPACE_BYTES", 8 * 8 * 12 * 7 * 2)
+    monkeypatch.setattr(ms, "_COMPARISON_WORKSPACE_BYTES", 8 * 8 * 12 * n_bins * 2)
     name = "_estimate_" + ("glm" if glm else "two_group")
     name += "_masked_null_covariance" if masked else "_null_covariance"
     args = [spectra, design, contrast] if glm else [spectra, labels]
@@ -1377,20 +1411,45 @@ def test_blocked_covariance_matches_independent_per_gene_fits(  # noqa: C901
         args.append(presence)
     with patch.object(ms, "_decompose_glm_design", wraps=ms._decompose_glm_design) as decompose:
         with patch.object(ms, "_prepare_profile_block", wraps=ms._prepare_profile_block) as blocks:
-            state = getattr(ms, name)(*args, freq_weights=weights, normalize_shape=shape_only)
+            state = getattr(ms, name)(
+                *args, freq_weights=weights, normalize_shape=shape_only, covariance=covariance_mode
+            )
             assert max(call.args[0].shape[1] for call in blocks.call_args_list) <= 3
         if glm:
             expected = sum(mask.any() for mask in np.unique(presence.T, axis=0))
             assert decompose.call_count == expected
     np.testing.assert_allclose(state["observed"], observed, atol=1e-12, equal_nan=True)
-    np.testing.assert_allclose(state["sigma_log"], covariance, atol=1e-12)
+    np.testing.assert_allclose(state["sigma_log"], covariance, atol=1e-12, equal_nan=True)
     np.testing.assert_allclose(
         ms._l2_pvalues_from_state(state), pvalues, atol=1e-12, equal_nan=True
     )
     np.testing.assert_array_equal(state["eligible"], np.isfinite(observed))
-    if glm:
-        np.testing.assert_allclose(state["beta"], beta, atol=1e-12, equal_nan=True)
+    np.testing.assert_allclose(state["beta"], beta, atol=1e-12, equal_nan=True)
     np.testing.assert_array_equal(spectra, original)
+
+    comparison = "compare_" + ("glm" if glm else "two_groups") + ("_masked" if masked else "")
+    result = (
+        getattr(ms, comparison)(
+            *args, freq_weights=weights, normalize_shape=shape_only, covariance=covariance_mode
+        )
+        .set_index("Feature")
+        .loc[[str(i) for i in range(23)]]
+    )
+    np.testing.assert_allclose(result.P_value, pvalues, atol=1e-12, equal_nan=True)
+    np.testing.assert_allclose(
+        result.P_adj, ms.apply_bh_correction(pvalues), atol=1e-12, equal_nan=True
+    )
+    assert result.attrs["covariance"] == (covariance_mode or "pooled")
+    assert result.attrs["null"] == "analytic"
+    monkeypatch.setattr(ms, "_COMPARISON_WORKSPACE_BYTES", 32 * (1 << 20))
+    whole = (
+        getattr(ms, comparison)(
+            *args, freq_weights=weights, normalize_shape=shape_only, covariance=covariance_mode
+        )
+        .set_index("Feature")
+        .loc[result.index]
+    )
+    np.testing.assert_allclose(whole, result, atol=1e-12, equal_nan=True)
 
 
 @pytest.mark.parametrize("glm", [False, True])
@@ -1407,3 +1466,306 @@ def test_scalar_result_builder_preserves_column_order_and_feature_names(glm):
     assert list(result.columns) == ["Feature", "Statistic", effect_column, "P_value", "P_adj"]
     assert set(result.Feature) == {"0", "1", "2", "3"}
     assert result.Statistic.is_monotonic_decreasing
+
+
+class TestPerGeneCovariance:
+    """Per-gene covariance equivalence, independence, and edge cases."""
+
+    @pytest.mark.parametrize("masked", [False, True])
+    @pytest.mark.parametrize("shape_only", [False, True])
+    def test_per_gene_binary_glm_equivalence_and_contrast_scaling(self, masked, shape_only):
+        rng = np.random.default_rng(31)
+        groups = np.repeat([0, 1], 5)
+        spectra = rng.lognormal(size=(10, 6, 17))
+        presence = np.ones((10, 6), bool)
+        presence[0, :3] = False
+        kwargs = {
+            "covariance": "per_gene",
+            "normalize_shape": shape_only,
+            "freq_weights": np.arange(17),
+        }
+        binary = (
+            compare_two_groups_masked(spectra, groups, presence, **kwargs)
+            if masked
+            else compare_two_groups(spectra, groups, **kwargs)
+        )
+        design = np.column_stack([np.ones(10), groups, 2 * groups])  # Estimable despite aliasing.
+        contrast = np.array([0.0, 1.0, 2.0])
+
+        def glm(values, c):
+            result = (
+                compare_glm_masked(values, design, c, presence, **kwargs)
+                if masked
+                else compare_glm(values, design, c, **kwargs)
+            )
+            return result.set_index("Feature").sort_index()
+
+        reference = glm(spectra, contrast)
+        columns = ["Statistic", "P_value", "P_adj"]
+        np.testing.assert_allclose(
+            reference[columns], binary.set_index("Feature").sort_index()[columns], atol=1e-12
+        )
+        scaled = glm(spectra, -3 * contrast)
+        np.testing.assert_allclose(scaled.Statistic, 3 * reference.Statistic, atol=1e-12)
+        np.testing.assert_allclose(scaled.P_value, reference.P_value, atol=1e-12)
+        if not shape_only:
+            # A shared bin offset is absorbed by the intercept on the log scale.
+            shifted = glm(spectra * np.linspace(1, 2, 17), contrast)
+            np.testing.assert_allclose(shifted[columns], reference[columns], atol=1e-12)
+
+    @pytest.mark.parametrize("glm", [False, True])
+    @pytest.mark.parametrize("masked", [False, True])
+    def test_per_gene_degenerate_profiles_and_feature_independence(self, glm, masked):
+        from sonic.comparators import multisample as ms
+
+        rng = np.random.default_rng(19)
+        groups = np.repeat([0, 1], 4)
+        logs = rng.normal(size=(8, 5, 11))
+        logs[:, 0] = 0.0
+        logs[:, 1] = groups[:, None] * np.linspace(0, 1, 11)  # Perfect nonzero contrast.
+        logs[:, 2] = 0.0
+        logs[:, 2, 0] = rng.normal(size=8)  # Variation only in a zero-weight bin.
+        logs[:, 3] = 1e-7 + 1e-14 * rng.normal(size=(8, 11))
+        spectra = np.exp(logs)
+        weights = np.ones(11)
+        weights[0] = 0
+        presence = np.ones((8, 5), bool)
+        presence[0, :] = not masked
+        design = np.column_stack([np.ones(8), groups])
+        method = "compare_" + ("glm" if glm else "two_groups") + ("_masked" if masked else "")
+
+        def run(values, masks):
+            args = [values, design, np.array([0.0, 1.0])] if glm else [values, groups]
+            if masked:
+                args.append(masks)
+            return (
+                getattr(ms, method)(*args, covariance="per_gene", freq_weights=weights)
+                .set_index("Feature")
+                .sort_index()
+            )
+
+        result = run(spectra, presence)
+        assert result.loc["0", "P_value"] == 1.0
+        assert np.isnan(result.loc["1", "P_value"])
+        assert np.isnan(result.loc["1", "P_adj"])
+        assert result.loc["2", "P_value"] == 1.0
+        assert np.isfinite(result.loc["3", "P_value"])
+        # Other genes must not supply either covariance or numerical tolerance.
+        for j in [3, 4]:
+            alone = run(spectra[:, j : j + 1], presence[:, j : j + 1])
+            np.testing.assert_allclose(
+                result.loc[str(j), ["Statistic", "P_value"]],
+                alone.loc["0", ["Statistic", "P_value"]],
+                atol=1e-12,
+            )
+        enlarged = np.concatenate([spectra, np.exp(100 + rng.normal(size=(8, 1, 11)))], axis=1)
+        together = run(enlarged, np.column_stack([presence, presence[:, 0]]))
+        np.testing.assert_allclose(
+            together.loc[result.index, ["Statistic", "P_value"]],
+            result[["Statistic", "P_value"]],
+            atol=1e-12,
+            equal_nan=True,
+        )
+
+    def test_per_gene_low_df_retains_analytic_warning(self):
+        rng = np.random.default_rng(5)
+        with pytest.warns(UserWarning, match="residual df=2"):
+            result = compare_two_groups(
+                rng.lognormal(size=(4, 5, 29)), np.repeat([0, 1], 2), covariance="per_gene"
+            )
+        assert result.P_value.between(0, 1).all()
+
+
+class TestCovarianceOptions:
+    """Covariance selection, defaults, validation, and storage."""
+
+    @pytest.mark.parametrize("masked", [False, True])
+    @pytest.mark.parametrize("covariance", ["pooled", "per_gene"])
+    @pytest.mark.parametrize("kwargs", [{"null": "permutation"}, {"statistic": "welch_t_cauchy"}])
+    def test_covariance_selector_rejects_inapplicable_binary_tests(
+        self, masked, covariance, kwargs
+    ):
+        values = np.ones((8, 2, 3))
+        args = [values, np.repeat([0, 1], 4)]
+        fn = compare_two_groups
+        if masked:
+            fn = compare_two_groups_masked
+            args.append(np.ones((8, 2), bool))
+        with pytest.raises(ValueError, match="covariance is only supported"):
+            fn(*args, covariance=covariance, **kwargs)
+
+    @pytest.mark.parametrize("glm", [False, True])
+    @pytest.mark.parametrize("masked", [False, True])
+    def test_covariance_choice_validation_default_and_storage(self, glm, masked):
+        from sonic.comparators import multisample as ms
+
+        rng = np.random.default_rng(62)
+        values = rng.lognormal(size=(8, 3, 19))
+        groups = np.repeat([0, 1], 4)
+        args = [values, pd.DataFrame({"group": groups}), "group"] if glm else [values, groups]
+        if masked:
+            args.append(np.ones((8, 3), bool))
+        suffix = "_masked" if masked else ""
+        fn = getattr(ms, "compare_" + ("glm" if glm else "two_groups") + suffix)
+        with pytest.raises(ValueError, match="covariance must be"):
+            fn(*args, covariance="typo")
+        pd.testing.assert_frame_equal(fn(*args), fn(*args, covariance="pooled"))
+        estimate = getattr(
+            ms, "_estimate_" + ("glm" if glm else "two_group") + suffix + "_null_covariance"
+        )
+        state = estimate(*args, covariance="per_gene", store_covariance=False)
+        assert state["sigma_log"] is None
+        assert state["weighted_cov"] is None
+        with patch.object(ms.np.linalg, "eigvalsh", wraps=np.linalg.eigvalsh) as eig:
+            fn(*args, covariance="per_gene")
+        assert all(call.args[0].shape == (8, 8) for call in eig.call_args_list)
+
+
+class TestBinaryGLMAdapters:
+    """Binary GLM fits preserve coefficients, metadata, and per-arm eligibility."""
+
+    @pytest.mark.parametrize("covariance", ["pooled", "per_gene"])
+    @pytest.mark.parametrize("sizes", [(1, 7), (7, 1), (3, 5)])
+    @pytest.mark.parametrize("profile_scale", ["df", "df_norm", "signed"])
+    def test_binary_glm_adapter_preserves_null_and_metadata(self, covariance, sizes, profile_scale):
+        from sonic.comparators import multisample as ms
+
+        rng = np.random.default_rng(25)
+        n = sum(sizes)
+        groups = np.repeat(["control", "treated"], sizes)
+        indicator = (groups == "treated").astype(float)
+        values = rng.normal(size=(n, 4, 17))
+        values[:, 0] = 0.0
+        values[:, 1] = indicator[:, None] * np.linspace(0, 1, 17)
+        values[:, 2] *= 1e-10
+        spectra = values if profile_scale == "signed" else np.exp(values)
+        original = spectra.copy()
+        spectra.setflags(write=False)
+        kwargs = {
+            "covariance": covariance,
+            "freq_weights": np.arange(17),
+            "normalize_shape": profile_scale == "df_norm",
+            "log_transform": profile_scale != "signed",
+        }
+        binary = ms._estimate_two_group_null_covariance(spectra, groups, **kwargs)
+        glm = ms._estimate_glm_null_covariance(
+            spectra, np.column_stack([np.ones(n), indicator]), np.array([0.0, 1.0]), **kwargs
+        )
+        for key in (
+            "observed",
+            "beta",
+            "sigma_log",
+            "weighted_cov",
+            "eigenvalues",
+            "effective_rank",
+        ):
+            np.testing.assert_allclose(binary[key], glm[key], atol=1e-12, equal_nan=True)
+        np.testing.assert_allclose(
+            ms._l2_pvalues_from_state(binary),
+            ms._l2_pvalues_from_state(glm),
+            atol=1e-12,
+            equal_nan=True,
+        )
+        assert binary["mode"] == "two_group"
+        assert not binary["masked"]
+        assert (binary["n_obs_A"], binary["n_obs_B"]) == sizes
+        assert binary["df_resid"] == n - 2
+        assert binary["contrast_scale"] == pytest.approx(1 / sizes[0] + 1 / sizes[1])
+        assert {"design_columns", "contrast_vector", "n_obs"}.isdisjoint(binary)
+        assert binary["beta"].shape == (2, 4, 17)
+        np.testing.assert_array_equal(spectra, original)
+
+    @pytest.mark.parametrize("covariance", ["pooled", "per_gene"])
+    @pytest.mark.parametrize("minimum", [2, 3])
+    @pytest.mark.parametrize("profile_scale", ["df", "df_norm", "signed"])
+    def test_masked_binary_glm_adapter_enforces_each_arm(self, covariance, minimum, profile_scale):
+        from sonic.comparators import multisample as ms
+
+        groups = np.repeat([0, 1], 6)
+        n_a = np.array([6, 3, 2, 1, 4, 6, 0, 0, 1, 3])
+        n_b = np.array([6, 3, 4, 5, 1, 0, 6, 0, 1, 3])
+        presence = np.concatenate([np.arange(6)[:, None] < n_a, np.arange(6)[:, None] < n_b])
+        presence[:, -1] = presence[::-1, -1]  # Same counts, different observed rows.
+        eligible = (n_a >= minimum) & (n_b >= minimum)
+        values = np.random.default_rng(27).normal(size=(12, len(n_a), 17))
+        spectra = values if profile_scale == "signed" else np.exp(values)
+        spectra[~presence] = np.nan
+        # Some rejected contrasts are estimable; they must still never enter fitting or pooling.
+        spectra[:, ~eligible] = np.nan
+        original = spectra.copy()
+        spectra.setflags(write=False)
+        presence.setflags(write=False)
+        kwargs = {
+            "covariance": covariance,
+            "freq_weights": np.arange(17),
+            "normalize_shape": profile_scale == "df_norm",
+            "log_transform": profile_scale != "signed",
+        }
+        binary = ms._estimate_two_group_masked_null_covariance(
+            spectra, groups, presence, min_samples_per_group=minimum, **kwargs
+        )
+        glm = ms._estimate_glm_masked_null_covariance(
+            spectra[:, eligible],
+            np.column_stack([np.ones(12), groups]),
+            np.array([0.0, 1.0]),
+            presence[:, eligible],
+            **kwargs,
+        )
+        assert binary["beta"].shape == (2, len(n_a), 17)
+        np.testing.assert_allclose(binary["beta"][:, eligible], glm["beta"], atol=1e-12)
+        assert np.isnan(binary["beta"][:, ~eligible]).all()
+        for key in ("observed", "eigenvalues", "contrast_scale"):
+            np.testing.assert_allclose(binary[key][eligible], glm[key], atol=1e-12)
+            assert np.isnan(binary[key][~eligible]).all()
+        for key in ("sigma_log", "weighted_cov", "effective_rank"):
+            actual = binary[key][eligible] if covariance == "per_gene" else binary[key]
+            np.testing.assert_allclose(actual, glm[key], atol=1e-12)
+        pvalues = ms._l2_pvalues_from_state(binary)
+        np.testing.assert_allclose(pvalues[eligible], ms._l2_pvalues_from_state(glm), atol=1e-12)
+        assert np.isnan(pvalues[~eligible]).all()
+        assert binary["mode"] == "two_group" and binary["masked"]
+        assert {"design_columns", "contrast_vector", "n_obs"}.isdisjoint(binary)
+        np.testing.assert_array_equal(binary["eligible"], eligible)
+        np.testing.assert_array_equal(binary["n_obs_A"], n_a)
+        np.testing.assert_array_equal(binary["n_obs_B"], n_b)
+        np.testing.assert_array_equal(binary["df_resid"], np.maximum(n_a + n_b - 2, 1))
+        np.testing.assert_allclose(
+            binary["contrast_scale"][eligible], 1 / n_a[eligible] + 1 / n_b[eligible]
+        )
+        np.testing.assert_array_equal(spectra, original)
+
+    @pytest.mark.parametrize("covariance", ["pooled", "per_gene"])
+    @pytest.mark.parametrize("store_covariance", [False, True])
+    def test_masked_binary_glm_adapter_preserves_empty_pool(self, covariance, store_covariance):
+        from sonic.comparators import multisample as ms
+
+        groups = np.repeat([0, 1], 4)
+        presence = np.zeros((8, 3), bool)
+        presence[:4, 1:] = True
+        presence[4, 2] = True  # Estimable with residual df, but only one observation in arm B.
+        spectra = np.full((8, 3, 5), np.nan)
+        kwargs = {"covariance": covariance, "store_covariance": store_covariance}
+        with pytest.raises(ValueError, match="no genes meet min_samples_per_group=2 per arm"):
+            ms._estimate_two_group_masked_null_covariance(spectra, groups, presence, **kwargs)
+        state = ms._estimate_two_group_masked_null_covariance(
+            spectra, groups, presence, allow_empty=True, **kwargs
+        )
+        assert not state["eligible"].any()
+        assert state["beta"].shape == (2, 3, 5)
+        for key in ("observed", "beta", "contrast_scale", "eigenvalues"):
+            assert np.isnan(state[key]).all()
+        assert np.isnan(ms._l2_pvalues_from_state(state)).all()
+        np.testing.assert_array_equal(state["n_obs_A"], [0, 4, 4])
+        np.testing.assert_array_equal(state["n_obs_B"], [0, 0, 1])
+        np.testing.assert_array_equal(state["df_resid"], [1, 2, 3])
+        for key in ("sigma_log", "weighted_cov"):
+            if covariance == "pooled":
+                np.testing.assert_array_equal(state[key], np.zeros((5, 5)))
+            elif store_covariance:
+                assert np.isnan(state[key]).all()
+            else:
+                assert state[key] is None
+        with pytest.raises(ValueError, match="freq_weights"):
+            ms._estimate_two_group_masked_null_covariance(
+                spectra, groups, presence, freq_weights=-np.ones(5), allow_empty=True, **kwargs
+            )

@@ -52,7 +52,7 @@ class CrossSpectra:
         even when coherency is masked.
     auto_spectra : ndarray, shape (n_samples, n_genes, n_bins)
         Matching raw powers for the selected genes, in gene_names order.
-        These agree with the corresponding unnormalized comparator.spectra_
+        These agree with the corresponding unnormalized ``comparator.spectra_``
         within numerical tolerance. They are recomputed from source values
         and do not follow later background or covariate normalization.
     pairs : tuple of (str, str)
@@ -73,7 +73,7 @@ class CrossSpectra:
         These are geometric support counts, not independent observations.
     frequency_bin_intervals : ndarray, shape (n_radius, 2)
         Retained radial intervals in cycles per spatial unit, matching the
-        comparator's frequency_bin_intervals_. Polar arrays flatten radius
+        comparator's ``frequency_bin_intervals_``. Polar arrays flatten radius
         then angle, with angle varying fastest.
     angle_centers_rad : ndarray, shape (n_theta,)
         Polar sector centers in radians over [0, pi); empty for radial bins.
@@ -528,7 +528,7 @@ def _cross_pvalues_from_covariance(observed, scales, covariance, weights, roundo
     return pvals, effective_rank, np.where(np.isnan(pvals), "degenerate_null", "ok")
 
 
-def _run_cross_analytic(
+def _run_cross_analytic(  # noqa: C901 — shared fits across covariance modes and design paths
     result,
     pair_presence,
     common,
@@ -536,13 +536,14 @@ def _run_cross_analytic(
     weights,
     *,
     representation,
+    covariance_mode,
     use_masked,
     groups,
     prepared_design,
     min_samples_per_group,
     min_resid_df,
 ):
-    """Fit eligible pairs and test submatrices of one shared PSD covariance.
+    """Fit eligible pairs with pooled or per-pair residual covariance.
 
     Parameters
     ----------
@@ -567,6 +568,8 @@ def _run_cross_analytic(
     representation : {'coherence', 'coherency'}
         Test log magnitude-squared coherency for ``coherence``, or its
         untransformed signed real part for ``coherency``.
+    covariance_mode : {'pooled', 'per_pair'}
+        Pool across eligible pairs or use each pair's residual covariance.
     use_masked : bool
         Whether any pair in the complete panel has an absent sample.
         This is a global dispatch decision.
@@ -595,16 +598,20 @@ def _run_cross_analytic(
         is zero and ``exact_permutations`` is False on this analytic path.
         ``pooled_pairs`` counts all eligible contributors to the shared matrix;
         the contributors to each individual entry depend on bin overlap.
+        Per-pair fits count one contributor for each eligible pair, zero otherwise.
 
     Notes
     -----
-    Bin masks only batch the existing DF fits; they no longer partition the
-    covariance pool. Each entry pools residual cross-products from eligible
+    With pooled covariance, bin masks only batch the DF fits; they do not partition
+    the covariance pool. Each entry pools residual cross-products from eligible
     pairs that support both bins, divided by their summed residual df. Entries
     with no joint support start at zero. One PSD correction of the shared
     matrix precedes subsetting and frequency weighting for each test.
+    Per-pair mode instead uses the shared per-feature estimator and Liu tails
+    directly. Its covariance is PSD by construction, without cross-pair repair.
     The existing DF fitting helpers retain their small-residual-df warnings.
     """
+    per_pair = covariance_mode == "per_pair"
     n_samples, n_pairs, _ = result.cross_spectra.shape
     n_observed = pair_presence.sum(axis=0)
     use_glm = prepared_design is not None
@@ -620,14 +627,14 @@ def _run_cross_analytic(
     pooled_pairs = np.zeros(n_pairs, dtype=int)
     effective_rank = np.full(n_pairs, np.nan)
     status = np.full(n_pairs, "no_common_bins", dtype=object)
-    contrast_scale = np.full(n_pairs, np.nan)
-    roundoff = np.zeros(n_pairs)
-    pooled_bins = np.flatnonzero(common[candidates].any(axis=0))
-    covariance = np.zeros((len(pooled_bins), len(pooled_bins)))
-    covariance_df = np.zeros_like(covariance)
-    n_covariance_groups = 0
-    # Batch fits by bin support, then pool their residual sums on the shared axis.
-    # Pairs with partial bin support (masks) only contribute to the covariance entries they support.
+    if not per_pair:
+        contrast_scale = np.full(n_pairs, np.nan)
+        roundoff = np.zeros(n_pairs)
+        pooled_bins = np.flatnonzero(common[candidates].any(axis=0))
+        covariance = np.zeros((len(pooled_bins), len(pooled_bins)))
+        covariance_df = np.zeros_like(covariance)
+        n_covariance_groups = 0
+    # Batch fits by bin support; pooled mode combines shared covariance entries afterward.
     for keep, indices in _iter_mask_groups(common[candidates].T):
         pairs = candidates[indices]
         bins = np.flatnonzero(keep)
@@ -638,6 +645,8 @@ def _run_cross_analytic(
         group_weights = weights[bins]
         log_transform = representation == "coherence"
         kwargs = {"freq_weights": group_weights, "log_transform": log_transform}
+        if per_pair:
+            kwargs.update(covariance="per_gene", store_covariance=False)
         if use_masked:
             if use_glm:
                 state = _estimate_glm_masked_null_covariance(
@@ -663,13 +672,19 @@ def _run_cross_analytic(
         else:
             state = _estimate_two_group_null_covariance(profiles, groups, **kwargs)
 
-        # Update the pooled covariance and residual df for this bin group.
+        # Record fit eligibility before calibrating this bin group.
         eligible = state["eligible"]
         selected = pairs[eligible]
         observed[pairs] = state["observed"]
         df_resid[pairs] = state["df_resid"]
         status[pairs] = "ineligible_design" if use_glm else "insufficient_samples"
         if not eligible.any():
+            continue
+        if per_pair:
+            pvals[pairs] = _l2_pvalues_from_state(state)
+            effective_rank[selected] = state["effective_rank"][eligible]
+            pooled_pairs[selected] = 1
+            status[selected] = np.where(np.isnan(pvals[selected]), "degenerate_null", "ok")
             continue
         contrast_scale[selected] = np.broadcast_to(state["contrast_scale"], (len(pairs),))[eligible]
         positions = np.searchsorted(pooled_bins, bins)
@@ -691,27 +706,28 @@ def _run_cross_analytic(
             _prepare_profile_block(extremes, False, log_transform=log_transform)
         )
 
-    np.divide(covariance, covariance_df, out=covariance, where=covariance_df > 0)
-    if n_covariance_groups > 1:
-        covariance = _stabilize_cross_covariance(covariance)
-    eligible_pairs = np.flatnonzero(status == "ok")
-    pooled_pairs[eligible_pairs] = len(eligible_pairs)
-    # Subset only after PSD correction, so every test uses the same covariance.
-    for keep, indices in _iter_mask_groups(common[eligible_pairs].T):
-        pairs = eligible_pairs[indices]
-        bins = np.flatnonzero(keep)
-        positions = np.searchsorted(pooled_bins, bins)
-        # subset the shared covariance to the current bin group and compute p-values.
-        pair_covariance = covariance[np.ix_(positions, positions)]
-        group_weights = _resolve_freq_weights(weights[bins], len(bins))
-        pvals[pairs], effective_rank[pairs], status[pairs] = _cross_pvalues_from_covariance(
-            observed[pairs],
-            contrast_scale[pairs],
-            pair_covariance,
-            group_weights,
-            roundoff[pairs[0]],
-            n_observed[pairs],
-        )
+    if not per_pair:
+        np.divide(covariance, covariance_df, out=covariance, where=covariance_df > 0)
+        if n_covariance_groups > 1:
+            covariance = _stabilize_cross_covariance(covariance)
+        eligible_pairs = np.flatnonzero(status == "ok")
+        pooled_pairs[eligible_pairs] = len(eligible_pairs)
+        # Subset only after PSD correction, so every test uses the same covariance.
+        for keep, indices in _iter_mask_groups(common[eligible_pairs].T):
+            pairs = eligible_pairs[indices]
+            bins = np.flatnonzero(keep)
+            positions = np.searchsorted(pooled_bins, bins)
+            # subset the shared covariance to the current bin group and compute p-values.
+            pair_covariance = covariance[np.ix_(positions, positions)]
+            group_weights = _resolve_freq_weights(weights[bins], len(bins))
+            pvals[pairs], effective_rank[pairs], status[pairs] = _cross_pvalues_from_covariance(
+                observed[pairs],
+                contrast_scale[pairs],
+                pair_covariance,
+                group_weights,
+                roundoff[pairs[0]],
+                n_observed[pairs],
+            )
     return {
         "observed": observed,
         "pvals": pvals,
@@ -861,6 +877,7 @@ def _cross_comparison_frame(
     *,
     representation,
     null,
+    covariance_mode,
     use_masked,
     design_metadata,
     count_columns,
@@ -898,7 +915,11 @@ def _cross_comparison_frame(
         representation=representation,
         transformation="log(max(C, 1e-12))" if representation == "coherence" else "real(coherency)",
         null=null,
-        covariance="pooled_across_valid_bins_psd" if null == "analytic" else None,
+        covariance=(
+            ("per_pair" if covariance_mode == "per_pair" else "pooled_across_valid_bins_psd")
+            if null == "analytic"
+            else None
+        ),
         bin_indices={p: tuple(np.flatnonzero(common[i])) for i, p in enumerate(result.pairs)},
         freq_weights=tuple(weights),
         sample_indices={
@@ -933,6 +954,7 @@ def _compare_cross_spectra(  # noqa: C901 — validation and dispatch over binar
     max_exact_permutations=10000,
     min_samples_per_group=2,
     min_resid_df=1,
+    covariance=None,
 ):
     """Compare pairwise coupling profiles with the shared DF inference helpers.
 
@@ -962,6 +984,10 @@ def _compare_cross_spectra(  # noqa: C901 — validation and dispatch over binar
     null : {'analytic', 'permutation'}, default 'analytic'
         Analytic Liu mixture-chi-square tail, or binary sample-label
         permutations. GLM contrasts support only the analytic null.
+    covariance : {None, 'pooled', 'per_pair'}, optional
+        ``None`` retains pooling across eligible pairs. ``'per_pair'`` uses
+        each pair's residual covariance and Liu tail separately. An explicit
+        choice is supported only with ``null='analytic'``.
     n_perm : int, default 1000
         Number of sampled relabellings when exact enumeration is too large.
         Ignored for analytic tests and overridden by exact enumeration.
@@ -987,6 +1013,7 @@ def _compare_cross_spectra(  # noqa: C901 — validation and dispatch over binar
         the weighted L2 contrast, with ``P_value`` and BH-adjusted ``P_adj``.
         ``N_samples`` and ``N_bins`` record the support. ``DF_resid``,
         ``N_pairs_pooled`` and ``Effective_rank`` describe the analytic fit;
+        per-pair fits count one contributor per eligible pair, while
         permutations use zero pooled pairs and NaN effective rank.
         ``Status`` is ``ok``, ``self_pair``, ``no_common_bins``,
         ``insufficient_samples``, ``ineligible_design`` or ``degenerate_null``.
@@ -1005,8 +1032,8 @@ def _compare_cross_spectra(  # noqa: C901 — validation and dispatch over binar
     For transformed profiles Y, let d_p be the difference of group means or
     the fitted GLM contrast for pair p. The reported statistic is
     ``T_p = sqrt(d_p.T @ W @ d_p)``, with sum-one diagonal bin weights W.
-    The shared estimators fit each pair's retained-sample condition/nuisance
-    design and pool each covariance entry as
+    By default, the shared estimators fit each pair's retained-sample
+    condition/nuisance design and pool each covariance entry as
     ``Sigma[j,k] = sum_p(E_p[:,j].T @ E_p[:,k]) / sum_p(nu_p)``, including
     only eligible pairs supporting both j and k in those sums.
 
@@ -1022,6 +1049,13 @@ def _compare_cross_spectra(  # noqa: C901 — validation and dispatch over binar
     and ``v_p = 1/n_Ap + 1/n_Bp``
     or ``sum((contrast @ pinv(X_p))**2)`` for that pair's retained design.
 
+    With ``covariance='per_pair'``, use ``S_p = E_p.T @ E_p / nu_p`` on
+    each pair's retained samples and bins instead of ``Sigma[B_p,B_p]``.
+    These matrices are PSD and may be singular; no covariance inverse or
+    cross-pair PSD correction is needed. Both covariance choices are plug-in
+    Liu approximations that ignore covariance-estimation uncertainty and assume
+    comparable residual covariance across samples within a pair.
+
     Masked permutations draw separately per pair in original order, as in DF;
     unmasked pairs share labels. Support and weights stay fixed. Exact tails count
     exceedances over all assignments,
@@ -1033,6 +1067,11 @@ def _compare_cross_spectra(  # noqa: C901 — validation and dispatch over binar
         raise ValueError("representation must be 'coherence' or 'coherency'.")
     if null not in _NULL_OPTIONS:
         raise ValueError("null must be 'analytic' or 'permutation'.")
+    if covariance not in (None, "pooled", "per_pair"):
+        raise ValueError("covariance must be None, 'pooled', or 'per_pair'.")
+    if covariance is not None and null != "analytic":
+        raise ValueError("covariance is only supported with null='analytic'.")
+    covariance_mode = "pooled" if covariance is None else covariance
     n_samples, _, n_bins = result.cross_spectra.shape
     if n_samples == 0 or n_bins == 0:
         raise ValueError("Cross-spectrum tests require samples and frequency bins.")
@@ -1118,6 +1157,7 @@ def _compare_cross_spectra(  # noqa: C901 — validation and dispatch over binar
             candidates,
             weights,
             representation=representation,
+            covariance_mode=covariance_mode,
             use_masked=use_masked,
             groups=groups,
             prepared_design=prepared_design,
@@ -1136,6 +1176,7 @@ def _compare_cross_spectra(  # noqa: C901 — validation and dispatch over binar
         weights,
         representation=representation,
         null=null,
+        covariance_mode=covariance_mode,
         use_masked=use_masked,
         design_metadata=design_metadata,
         count_columns=count_columns,

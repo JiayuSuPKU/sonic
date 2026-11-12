@@ -8,16 +8,8 @@ import numpy as np
 import pandas as pd
 from scipy.sparse import issparse
 
-from sonic.comparators.base import _run_per_sample
-from sonic.comparators.binning import (
-    _mode_pair_counts,
-    _polar_bin_reducer,
-    _radial_bin_reducer,
-)
-from sonic.comparators.multisample import (
+from sonic.comparators._inference import (
     _NULL_OPTIONS,
-    _build_design_matrix,
-    _decompose_glm_design,
     _estimate_glm_masked_null_covariance,
     _estimate_two_group_masked_null_covariance,
     _estimate_two_group_null_covariance,
@@ -26,15 +18,25 @@ from sonic.comparators.multisample import (
     _iter_mask_groups,
     _l2_pvalues_from_state,
     _make_label_permutations,
-    _prepare_glm_design,
     _prepare_profile_block,
     _profile_roundoff,
-    _resolve_contrast,
     _resolve_freq_weights,
     _rotation_metadata,
     _run_l2_permutations,
     _run_l2_rotations,
     _weighted_covariance_eigensystem,
+)
+from sonic.comparators._regression import (
+    _build_design_matrix,
+    _decompose_glm_design,
+    _prepare_glm_design,
+    _resolve_contrast,
+)
+from sonic.comparators.base import _run_per_sample
+from sonic.comparators.binning import (
+    _mode_pair_counts,
+    _polar_bin_reducer,
+    _radial_bin_reducer,
 )
 from sonic.kernels.fft import _fourier_coefficients_2d
 from sonic.kernels.nufft import _fourier_coefficients_2d_nufft
@@ -1069,7 +1071,8 @@ def _compare_cross_spectra(  # noqa: C901 — validation and dispatch over binar
     null : str
         ``'analytic'`` (default) uses the Liu approximation; ``'rotation'``
         conditions on each pair's nuisance-adjusted scatter. Both support
-        GLM contrasts. ``'permutation'`` relabels binary sample labels.
+        GLM contrasts. ``'permutation'`` is available only for binary
+        comparisons with group labels and no explicit contrast.
     covariance : {None, 'pooled', 'per_pair'}, optional
         ``None`` retains pooling across eligible pairs. ``'per_pair'`` uses
         each pair's residual covariance and Liu tail separately. An explicit

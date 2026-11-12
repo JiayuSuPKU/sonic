@@ -57,6 +57,12 @@ from sonic.utils import _DEFAULT_CHUNK_BUDGET, _FFT_CHUNK_CAP, _parse_memory_bud
 warnings.filterwarnings("ignore", category=FutureWarning, message=".*legacy Dask DataFrame.*")
 warnings.filterwarnings("ignore", category=UserWarning, message=".*pkg_resources is deprecated.*")
 
+from sonic.comparators._inference import (
+    _estimate_glm_masked_null_covariance,
+    _estimate_glm_null_covariance,
+    _estimate_two_group_masked_null_covariance,
+    _estimate_two_group_null_covariance,
+)
 from sonic.comparators.features import (
     _ALIGNMENT_N_RADIUS,
     _ALIGNMENT_N_THETA,
@@ -68,10 +74,6 @@ from sonic.comparators.features import (
     gene_pattern_diversity as _gene_pattern_diversity,
 )
 from sonic.comparators.multisample import (
-    _estimate_glm_masked_null_covariance,
-    _estimate_glm_null_covariance,
-    _estimate_two_group_masked_null_covariance,
-    _estimate_two_group_null_covariance,
     compare_glm,
     compare_glm_masked,
     compare_glm_scalar,
@@ -90,8 +92,8 @@ from sonic.comparators.normalization import (
 )
 
 if TYPE_CHECKING:
+    from sonic.comparators._inference import _AnalyticNullState
     from sonic.comparators.cross_spectrum import CrossSpectra
-    from sonic.comparators.multisample import _AnalyticNullState
     from sonic.explanation import SpatialExplanation
 
 __all__: list[str] = []
@@ -1167,88 +1169,86 @@ class _ComparatorBase:
         covariance: str | None = None,
         n_rotations: int = 19999,
     ) -> Any:
-        """Differential-frequency (DF) test on :attr:`spectra_`.
-
-        Tests whether each gene's radial-frequency power profile differs
-        between conditions / along a contrast. The companion DE test is
-        :meth:`test_diff_expr`.
-
-        Binary labels dispatch to :func:`~sonic.comparators.multisample.compare_two_groups`;
-        design-matrix contrasts dispatch to :func:`~sonic.comparators.multisample.compare_glm`.
-        Each uses its masked variant when any ``presence_`` entry is False.
-        Both support analytic Liu and conditional rotation calibration.
-        Label permutations are also available for binary comparisons.
-
-        Supplying ``contrast=`` alongside a 1-D ``design`` switches to
-        the GLM path on the single-column DataFrame that wraps the
-        binary groups (so the same contrast-resolution rules apply).
+        """Test differential frequency (DF) on the fitted gene spectra.
 
         Parameters
         ----------
-        design : 1-D array, 2-D ndarray, or pandas.DataFrame
-            Sample-level contrast specification. Length / first
-            dimension must equal ``len(samples)``. See
-            :func:`_validate_design` for the accepted forms; can differ
-            across calls on the same fitted comparator (fit once, test
-            many).
+        design : 1-D array, pandas.DataFrame, or 2-D np.ndarray
+            Binary labels select the two-group path. A DataFrame or 2D array
+            selects a GLM; supplying ``contrast`` also selects a GLM.
+            Rows must match the fitted sample order. DataFrames add an intercept;
+            numeric matrices are used as supplied.
         contrast : str, dict, or np.ndarray, optional
-            Required when ``design`` is multi-column / continuous;
-            redundant for 1-D binary ``design`` (the binary indicator
-            *is* the contrast).
-        statistic : str, default 'log_l2'
-            Per-gene statistic. See
-            :func:`~sonic.comparators.multisample.compare_two_groups`
-            for the catalog.
+            One linear contrast, required on the GLM path. Names, coefficient
+            dictionaries, and arrays follow :func:`~sonic.comparators.multisample.compare_glm`.
+        statistic : str
+            ``'log_l2'`` (default) is the weighted L2 contrast of log spectra.
+            ``'welch_t_cauchy'`` combines per-bin Welch p-values by Cauchy
+            combination and reports the largest absolute per-bin t statistic.
+            Welch requires two observations per arm and excludes constant bins.
         null : str
-            ``'analytic'`` (default) uses the Liu approximation.
-            ``'rotation'`` conditions on each gene's nuisance-adjusted scatter.
-            ``'permutation'`` relabels samples on the binary path only.
-        n_perm, max_exact_permutations
-            Label-permutation controls; ignored by other null methods.
+            ``'analytic'`` (default) uses the selected covariance and Liu tail.
+            ``'rotation'`` conditions on each feature's nuisance-adjusted scatter.
+            ``'permutation'`` is available only for binary comparisons: pass
+            one-dimensional group labels without ``contrast``. GLM tests support
+            ``'analytic'`` and ``'rotation'``.
+            Welch-Cauchy uses its own analytic null; rotation requires L2.
+        n_perm : int
+            Number of sampled label permutations; default 1000. Ignored when
+            all assignments are enumerated or another null is selected.
         random_state : int, optional
-            Seed for label permutations or rotation draws.
-        n_rotations : int
-            Number of Monte Carlo rotations; default 19999. Used only with
-            ``null='rotation'``, which requires ``covariance=None``.
+            Seed for resampling. Ignored by analytic tests.
         freq_weights : np.ndarray, optional
-            Per-bin reweighting (same semantics as on the standalone).
-        normalize_shape : bool, default False
-            If True, divide each per-(sample, gene) spectrum by its sum
-            along the trailing (frequency) axis before the statistic is
-            computed (delegated to the dispatch target's
-            ``normalize_shape=`` keyword). Use to isolate **shape-only**
-            redistribution of power across radial frequencies,
-            independent of overall amplitude. Non-destructive —
-            :attr:`spectra_` is unchanged after the call.
-        min_samples_per_group : int, default 2
-            Minimum per-group sample count required to keep a gene under
-            the masked path (forwarded to
-            :func:`~sonic.comparators.multisample.compare_two_groups_masked`).
-            Ignored on the unmasked / GLM paths.
-        covariance : {None, 'pooled', 'per_gene'}, optional
-            For ``null='analytic'`` only. By default, residual covariance
-            is pooled across eligible genes (``None`` or ``'pooled'``).
-            ``'per_gene'`` instead estimates a separate covariance for each gene.
-        min_resid_df : int, default 1
-            Minimum per-gene residual degrees of freedom required under
-            the masked GLM path. Ignored on the unmasked and binary paths.
+            Nonnegative weights in the fitted frequency-bin order, normalized
+            to sum to one. None gives uniform weights. Used only by L2 tests.
+        max_exact_permutations : int
+            Enumerate all binary label assignments when their number is at
+            most this threshold; default 10000. Zero forces sampling.
+        normalize_shape : bool
+            If True, divide each sample/feature spectrum by its total power
+            before logging to test spectral shape (DF-norm). Default False.
+        min_samples_per_group : int
+            Minimum observations per arm in masked binary tests; default 2.
+            Ignored for unmasked or GLM comparisons.
+        min_resid_df : int
+            Minimum residual degrees of freedom in masked GLM tests; default 1.
+            Ignored for unmasked or binary comparisons.
+        covariance : str or None
+            ``None`` (default) or ``'pooled'`` shares residual covariance across
+            eligible genes. ``'per_gene'`` estimates it separately for each gene.
+            An explicit choice requires an analytic L2 test.
+        n_rotations : int
+            Number of rotation draws; default 19999. Used only with
+            ``null='rotation'``, which requires ``covariance=None``.
+
+        Returns
+        -------
+        pandas.DataFrame
+            ``Feature``, ``Statistic``, ``P_value`` and ``P_adj``, sorted by
+            descending statistic. Masked binary tests include ``n_obs_A`` and
+            ``n_obs_B``; masked GLMs include ``n_obs`` and ``df_resid``.
+            Welch-Cauchy adds ``P_value_per_bin``. Skipped genes retain NaNs;
+            BH uses finite p-values.
+            Analytic L2 results record ``null`` and ``covariance`` in ``attrs``.
+            Rotation also records ``n_rotations``, the effective ``random_state``,
+            and ``min_p_value``.
+
+        Raises
+        ------
+        RuntimeError
+            If the required spectra have not been computed.
+        ValueError
+            If shapes, options, or the contrast are invalid.
+        NotImplementedError
+            If a GLM permutation null is requested.
 
         Notes
         -----
-        For the analytic null, numerically zero residual covariance gives
-        NaN p-values for nonzero contrasts and p=1 for zero contrasts.
-        Untestable features are excluded from BH correction. Rotation assumptions,
-        Monte Carlo metadata, and perfect-fit behavior are described in
-        :func:`~sonic.comparators.multisample.compare_glm`.
-
-        Use the ``normalize_shape`` keyword for a one-shot shape-only
-        test that leaves :attr:`spectra_` untouched for further
-        analysis. For a permanent preprocessing transform that affects
-        every downstream operation on the same comparator, use the
-        chainable :meth:`normalize_background` and
-        :meth:`normalize_covariates` methods (no chainable equivalent
-        for sum-1 normalisation — call this kwarg or the standalone
-        :func:`~sonic.comparators.normalization.normalize_shape`).
+        Uses :func:`~sonic.comparators.multisample.compare_two_groups` or
+        :func:`~sonic.comparators.multisample.compare_glm` and their masked
+        variants. ``normalize_shape`` leaves the cached spectra unchanged.
+        For calibration assumptions and zero-variance behavior, see
+        :doc:`/guides/multisample`.
         """
         if self.spectra_ is None:
             raise RuntimeError("Call .compute_spectra() before .test_diff_freq().")
@@ -1258,6 +1258,16 @@ class _ComparatorBase:
             raise ValueError(f"min_resid_df must be >= 1, got {min_resid_df}.")
         groups, design_obj = _validate_design(design, len(self.samples))
         use_masked = self.presence_ is not None and not self.presence_.all()
+
+        options = {
+            "gene_names": self.gene_names,
+            "freq_weights": freq_weights,
+            "normalize_shape": normalize_shape,
+            "null": null,
+            "random_state": random_state,
+            "covariance": covariance,
+            "n_rotations": n_rotations,
+        }
 
         use_glm = (contrast is not None) or (groups is None)
         if use_glm:
@@ -1285,26 +1295,14 @@ class _ComparatorBase:
                     design_obj,
                     contrast,
                     self.presence_,
-                    gene_names=self.gene_names,
-                    freq_weights=freq_weights,
-                    normalize_shape=normalize_shape,
-                    null=null,
-                    random_state=random_state,
-                    covariance=covariance,
-                    n_rotations=n_rotations,
                     min_resid_df=int(min_resid_df),
+                    **options,
                 )
             return compare_glm(
                 self.spectra_,
                 design_obj,
                 contrast,
-                gene_names=self.gene_names,
-                freq_weights=freq_weights,
-                normalize_shape=normalize_shape,
-                null=null,
-                random_state=random_state,
-                covariance=covariance,
-                n_rotations=n_rotations,
+                **options,
             )
 
         # Binary path (1-D design, contrast is None).
@@ -1313,31 +1311,19 @@ class _ComparatorBase:
                 self.spectra_,
                 groups,
                 self.presence_,
-                gene_names=self.gene_names,
                 statistic=statistic,
-                null=null,
                 n_perm=n_perm,
-                random_state=random_state,
                 min_samples_per_group=int(min_samples_per_group),
-                freq_weights=freq_weights,
                 max_exact_permutations=max_exact_permutations,
-                normalize_shape=normalize_shape,
-                covariance=covariance,
-                n_rotations=n_rotations,
+                **options,
             )
         return compare_two_groups(
             self.spectra_,
             groups,
-            gene_names=self.gene_names,
             statistic=statistic,
-            null=null,
             n_perm=n_perm,
-            random_state=random_state,
-            freq_weights=freq_weights,
             max_exact_permutations=max_exact_permutations,
-            normalize_shape=normalize_shape,
-            covariance=covariance,
-            n_rotations=n_rotations,
+            **options,
         )
 
     def test_cross_diff_freq(
@@ -1356,78 +1342,86 @@ class _ComparatorBase:
         covariance: str | None = None,
         n_rotations: int = 19999,
     ):
-        """Test a condition-associated cross-spectrum profile change per pair.
+        """Test differential frequency in the coupling profiles of gene pairs.
 
         Parameters
         ----------
-        design, contrast
-            Same binary labels or design-matrix contrast as :meth:`test_diff_freq`.
-            Unmasked analytic and rotation comparisons require positive residual
-            degrees of freedom; masked comparisons also apply minimum group sizes.
-        representation : {'coherence', 'coherency'}, default 'coherence'
-            ``coherence`` compares ``log(max(abs(coherency)**2, 1e-12))``;
-            ``coherency`` compares its signed real part without a transform.
-            Both are invariant to conjugation under axial polar alignment.
+        design : 1-D array, pandas.DataFrame, or 2-D np.ndarray
+            Binary labels select the two-group path. A DataFrame or 2D array
+            selects a GLM; supplying ``contrast`` also selects a GLM.
+            Rows must match the fitted sample order. DataFrames add an intercept;
+            numeric matrices are used as supplied.
+        contrast : str, dict, or np.ndarray, optional
+            One linear contrast, required on the GLM path. Names, coefficient
+            dictionaries, and arrays follow :func:`~sonic.comparators.multisample.compare_glm`.
+        representation : str
+            ``'coherence'`` (default) tests log squared-magnitude coherency.
+            ``'coherency'`` tests its signed real part without logging.
         null : str
-            ``'analytic'`` (default) uses the Liu approximation with the selected
-            residual covariance. ``'rotation'`` conditions on each pair's
-            nuisance-adjusted scatter. ``'permutation'`` relabels samples on
-            the binary path only.
-        covariance : {None, 'pooled', 'per_pair'}, optional
-            For ``null='analytic'`` only. By default, residual covariance
-            is pooled across eligible gene pairs (``None`` or ``'pooled'``).
-            ``'per_pair'`` instead estimates a separate covariance for each gene pair
-            on its retained samples and bins, including for signed coherency.
-        n_perm, max_exact_permutations
-            Same label-permutation controls as :meth:`test_diff_freq`.
+            ``'analytic'`` (default) uses the selected covariance and Liu tail.
+            ``'rotation'`` conditions on each feature's nuisance-adjusted scatter.
+            ``'permutation'`` is available only for binary comparisons: pass
+            one-dimensional group labels without ``contrast``. GLM tests support
+            ``'analytic'`` and ``'rotation'``.
+        n_perm : int
+            Number of sampled label permutations; default 1000. Ignored when
+            all assignments are enumerated or another null is selected.
         random_state : int, optional
-            Seed for label permutations or rotation draws.
+            Seed for resampling. Ignored by analytic tests.
+        freq_weights : np.ndarray, optional
+            Nonnegative weights on the original flattened bins (radius then
+            angle for polar features). Zero weights exclude bins; retained
+            weights are normalized to sum to one for each pair.
+        max_exact_permutations : int
+            Enumerate all binary label assignments when their number is at
+            most this threshold; default 10000. Zero forces sampling.
+        min_samples_per_group : int
+            Minimum observations per arm in masked binary tests; default 2.
+            Ignored for unmasked or GLM comparisons.
+        min_resid_df : int
+            Minimum residual degrees of freedom in masked GLM tests; default 1.
+            Ignored for unmasked or binary comparisons.
+        covariance : str or None
+            ``None`` (default) or ``'pooled'`` shares residual covariance across
+            eligible pairs and PSD-corrects the pooled matrix. ``'per_pair'``
+            estimates it separately on each pair's retained samples and bins.
+            An explicit choice requires ``null='analytic'``.
         n_rotations : int
-            Number of Monte Carlo rotations; default 19999. Used only with
+            Number of rotation draws; default 19999. Used only with
             ``null='rotation'``, which requires ``covariance=None``.
-        freq_weights : ndarray, optional
-            Nonnegative weights on the original flattened frequency bins.
-            Zero-weight bins are excluded; weights are renormalized over each
-            pair's common valid bins. Polar order is radius then angle.
-        min_samples_per_group : int, default 2
-            Minimum observed samples per group under masked binary testing,
-            as in :meth:`test_diff_freq`. Ignored on unmasked and GLM paths.
-        min_resid_df : int, default 1
-            Minimum residual degrees of freedom under masked GLM testing,
-            as in :meth:`test_diff_freq`. Ignored on unmasked and binary paths.
 
         Returns
         -------
         pandas.DataFrame
-            One aggregate row per requested pair, with ``Feature_1``,
-            ``Feature_2``, ``Statistic`` (weighted L2 distance), ``P_value``,
-            ``P_adj`` (BH), sample/bin counts and covariance diagnostics.
-            ``Status`` is ``ok``, ``self_pair``, ``no_common_bins``,
-            ``insufficient_samples``, ``ineligible_design`` or ``degenerate_null``.
-            Binary tests also include ``n_obs_A`` and ``n_obs_B``.
-            Untestable rows have NaN p-values and are excluded from BH correction.
-            ``attrs`` records retained sample/bin indices, transformation, design
-            and permutation settings. ``attrs["covariance"]`` is ``"per_pair"``
-            for per-pair fits or the existing ``"pooled_across_valid_bins_psd"``
-            for pooled fits. ``N_pairs_pooled`` is one for each eligible
-            per-pair fit, zero for skipped pairs. With masked presence, permutation
-            counts/exactness are recorded per pair; otherwise those settings are
-            shared scalars. Rotation records the effective seed, draw count,
-            and minimum p-value in ``attrs`` as in :meth:`test_diff_freq`;
-            ``N_pairs_pooled`` is zero and ``Effective_rank`` describes the
-            conditional scatter.
+            ``Feature_1``, ``Feature_2``, ``Statistic`` (weighted L2), ``P_value``
+            and ``P_adj``, sorted by descending statistic. Includes sample/bin
+            counts, ``DF_resid``, ``Effective_rank``, ``N_pairs_pooled`` and
+            ``Status``. Binary tests also return ``n_obs_A`` and ``n_obs_B``.
+            Skipped and self-pair rows have NaN p-values; BH uses finite values.
+
+            ``attrs`` records retained sample/bin indices, weights, representation
+            and design. ``covariance`` is ``'pooled_across_valid_bins_psd'``,
+            ``'per_pair'``, or None. Per-pair fits have one pooled contributor;
+            skipped and resampled pairs have zero. Rotation effective ranks
+            describe the conditional scatter. Rotation records ``n_rotations``,
+            the effective ``random_state`` and ``min_p_value``. Permutation
+            counts/exactness are per-pair when masked, otherwise shared.
+
+        Raises
+        ------
+        RuntimeError
+            If the required spectra have not been computed.
+        ValueError
+            If shapes, options, or the contrast are invalid.
+        NotImplementedError
+            If a GLM permutation null is requested.
 
         Notes
         -----
-        Rotation uses the same assumptions and calibration as
-        :func:`~sonic.comparators.multisample.compare_glm` on the chosen profile scale.
-        As in :meth:`test_diff_freq`, missing expression excludes samples;
-        both genes must be present for a pair's sample to be retained. Bins
-        must be valid in every retained sample. Analytic calibration assumes
-        approximately Gaussian contrasts and comparable residual covariance
-        across samples within a pair. Pooled calibration additionally assumes
-        covariance is shared across pairs. Self-pairs remain descriptive only
-        and are excluded from testing and covariance estimation.
+        Each pair retains samples where both genes are present, and bins
+        valid in every retained sample. Self-pairs are descriptive only.
+        For calibration assumptions and zero-variance behavior, see
+        :doc:`/guides/multisample`.
         """
         from sonic.comparators.cross_spectrum import _compare_cross_spectra
 
@@ -1462,35 +1456,34 @@ class _ComparatorBase:
         min_resid_df: int = 1,
         covariance: str | None = None,
     ) -> _AnalyticNullState:
-        """Estimate the analytic ``log_l2`` null covariance for inspection.
-
-        This method follows the same binary-vs-GLM and masked-vs-unmasked
-        dispatch rules as :meth:`test_diff_freq`, but returns the covariance
-        diagnostics used by the analytic Liu mixture null instead of running a
-        test. It is intentionally call-scoped: different designs, contrasts,
-        masks, frequency weights, or ``normalize_shape`` choices imply different
-        covariance estimates.
+        """Estimate the analytic L2 null covariance and fitted coefficients.
 
         Parameters
         ----------
-        design : 1-D array, 2-D ndarray, or pandas.DataFrame
-            Same design argument accepted by :meth:`test_diff_freq`.
-        contrast : str, dict, or ndarray, optional
-            Required for GLM designs, or to force a 1-D binary design through
-            the GLM path.
+        design : 1-D array, pandas.DataFrame, or 2-D np.ndarray
+            Binary labels select the two-group path. A DataFrame or 2D array
+            selects a GLM; supplying ``contrast`` also selects a GLM.
+            Rows must match the fitted sample order. DataFrames add an intercept;
+            numeric matrices are used as supplied.
+        contrast : str, dict, or np.ndarray, optional
+            One linear contrast, required on the GLM path. Names, coefficient
+            dictionaries, and arrays follow :func:`~sonic.comparators.multisample.compare_glm`.
         freq_weights : np.ndarray, optional
-            Per-bin weights used to form ``weighted_cov = W^1/2 Sigma W^1/2``.
-        normalize_shape : bool, default False
-            Apply non-destructive shape normalization before estimating
-            covariance, matching :meth:`test_diff_freq(normalize_shape=True)`.
-        min_samples_per_group : int, default 2
-            Minimum observed samples per arm for masked binary designs.
-        covariance : {None, 'pooled', 'per_gene'}, optional
-            By default, residual covariance are pooled across all tests genes
-            (``None``or ``'pooled'``). ``'per_gene'`` instead estimates a separate
-            covariance for each gene.
-        min_resid_df : int, default 1
-            Minimum per-gene residual df for masked GLM designs.
+            Nonnegative bin weights, normalized to sum to one.
+            None gives uniform weights.
+        normalize_shape : bool
+            If True, divide each sample/feature spectrum by its total power
+            before logging to test spectral shape (DF-norm). Default False.
+        min_samples_per_group : int
+            Minimum observations per arm in masked binary tests; default 2.
+            Ignored for unmasked or GLM comparisons.
+        min_resid_df : int
+            Minimum residual degrees of freedom in masked GLM tests; default 1.
+            Ignored for unmasked or binary comparisons.
+        covariance : str or None
+            ``None`` (default) or ``'pooled'`` shares residual covariance across
+            eligible genes. ``'per_gene'`` estimates it separately for each gene.
+            An explicit choice requires an analytic L2 test.
 
         Returns
         -------
@@ -1512,6 +1505,18 @@ class _ComparatorBase:
             with groups ordered by ``np.unique``. Skipped genes retain NaNs.
             Two-group-only metadata: ``n_obs_A`` and ``n_obs_B``.
             GLM-only metadata: ``design_columns``, ``contrast_vector``, and ``n_obs``.
+
+        Raises
+        ------
+        RuntimeError
+            If the required spectra have not been computed.
+        ValueError
+            If shapes, options, or the contrast are invalid.
+
+        Notes
+        -----
+        This diagnostic stores full covariance matrices. Comparison tests
+        retain eigenvalues without storing all per-gene covariance matrices.
         """
         if self.spectra_ is None:
             raise RuntimeError("Call .compute_spectra() before .estimate_null_covariance().")
@@ -1522,6 +1527,12 @@ class _ComparatorBase:
 
         groups, design_obj = _validate_design(design, len(self.samples))
         use_masked = self.presence_ is not None and not self.presence_.all()
+        options = {
+            "freq_weights": freq_weights,
+            "normalize_shape": normalize_shape,
+            "covariance": covariance,
+        }
+
         use_glm = (contrast is not None) or (groups is None)
         if use_glm:
             if contrast is None:
@@ -1535,18 +1546,14 @@ class _ComparatorBase:
                     design_obj,
                     contrast,
                     self.presence_,
-                    freq_weights=freq_weights,
-                    normalize_shape=normalize_shape,
-                    covariance=covariance,
                     min_resid_df=int(min_resid_df),
+                    **options,
                 )
             return _estimate_glm_null_covariance(
                 self.spectra_,
                 design_obj,
                 contrast,
-                freq_weights=freq_weights,
-                normalize_shape=normalize_shape,
-                covariance=covariance,
+                **options,
             )
 
         if use_masked:
@@ -1554,17 +1561,13 @@ class _ComparatorBase:
                 self.spectra_,
                 groups,
                 self.presence_,
-                freq_weights=freq_weights,
-                normalize_shape=normalize_shape,
-                covariance=covariance,
                 min_samples_per_group=int(min_samples_per_group),
+                **options,
             )
         return _estimate_two_group_null_covariance(
             self.spectra_,
             groups,
-            freq_weights=freq_weights,
-            normalize_shape=normalize_shape,
-            covariance=covariance,
+            **options,
         )
 
     def test_diff_expr(
@@ -1575,34 +1578,45 @@ class _ComparatorBase:
         log_expression: bool = False,
         eps: float = 1e-12,
     ) -> Any:
-        """Differential-expression (DE) test on the DC component.
-
-        Per-gene two-sided test on the per-sample DC scalars (the grid
-        mean of each sample's per-gene expression), routed through
-        :func:`~sonic.comparators.multisample.compare_two_groups_scalar`
-        for 1-D binary designs, or through
-        :func:`~sonic.comparators.multisample.compare_glm_scalar` when
-        ``contrast=`` is supplied or ``design`` is a DataFrame / 2-D matrix.
-        The binary path uses Welch t statistics with Welch-Satterthwaite
-        t-distribution p-values; the GLM path uses OLS contrast t statistics
-        with Student t-distribution p-values. The companion DF test is
-        :meth:`test_diff_freq`.
+        """Test differential expression (DE) on the fitted sample-level DC means.
 
         Parameters
         ----------
-        design : 1-D array, pandas.Series, pandas.DataFrame, or 2-D ndarray
-            Binary group labels for the two-group path, or a GLM design matrix
-            when ``contrast=`` is supplied.
-        contrast : str, dict, or ndarray, optional
-            Linear contrast for a multi-column / continuous design. Required
-            unless ``design`` is a 1-D binary vector and the two-group path is
-            desired.
-        log_expression : bool, default False
-            If True, run the scalar test on ``log(dc + eps)`` rather than raw
-            DC means. Applies to both the binary two-group path and the GLM
-            path.
-        eps : float, default 1e-12
-            Additive offset used only when ``log_expression=True``.
+        design : 1-D array, pandas.DataFrame, or 2-D np.ndarray
+            Binary labels select the two-group path. A DataFrame or 2D array
+            selects a GLM; supplying ``contrast`` also selects a GLM.
+            Rows must match the fitted sample order. DataFrames add an intercept;
+            numeric matrices are used as supplied.
+        contrast : str, dict, or np.ndarray, optional
+            One linear contrast, required on the GLM path. Names, coefficient
+            dictionaries, and arrays follow :func:`~sonic.comparators.multisample.compare_glm`.
+        log_expression : bool
+            If True, fit ``log(dc + eps)`` instead of raw DC means.
+            Default False; reported effects use the fitted response scale.
+        eps : float
+            Positive additive offset used only with ``log_expression=True``;
+            default 1e-12.
+
+        Returns
+        -------
+        pandas.DataFrame
+            ``Feature``, ``Statistic`` (absolute t), ``P_value`` and ``P_adj``,
+            plus ``Mean_diff`` (group A minus B) for binary comparisons or
+            ``Estimate`` (signed contrast) for GLMs. Rows are sorted by
+            descending statistic; BH uses finite p-values.
+
+        Raises
+        ------
+        RuntimeError
+            If the required spectra have not been computed.
+        ValueError
+            If shapes, options, or the contrast are invalid.
+
+        Notes
+        -----
+        Binary comparisons use :func:`~sonic.comparators.multisample.compare_two_groups_scalar`
+        and Welch-Satterthwaite tails. GLMs use
+        :func:`~sonic.comparators.multisample.compare_glm_scalar` and Student t tails.
         """
         if self.dc_ is None:
             raise RuntimeError("Call .compute_spectra() before .test_diff_expr().")

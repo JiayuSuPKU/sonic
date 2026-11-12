@@ -109,8 +109,9 @@ how to estimate the cross-bin residual covariance used by the Liu approximation:
    coupling = comparison.test_cross_diff_freq(groups, covariance="per_pair")
 
 Design matrices and continuous ``contrast=`` terms work as in ``test_diff_freq``.
-Both support ``null="rotation"``. Binary comparisons also support
-``null="permutation"``; both options are described below.
+Both support ``null="analytic"`` and ``null="rotation"``.
+``null="permutation"`` is available only for binary comparisons, as described
+below.
 
 Each pair uses samples where both genes are present and bins valid in all those
 samples. ``freq_weights`` sets bin weights in the original flattened bin order
@@ -305,16 +306,25 @@ conservatively. With 19999 draws the minimum is 0.00005, which can limit BH
 resolution. Result ``attrs`` records ``n_rotations``, the effective
 ``random_state``, and ``min_p_value``. Few residual degrees of freedom can limit
 power. Zero-information profiles receive p=1; nonzero perfect fits can reach
-the Monte Carlo floor. See :func:`~sonic.comparators.multisample.compare_glm`
-for the conditional statistic.
+the Monte Carlo floor.
+
+For contrast weights ``a = c @ pinv(X)``, let B contain the unit contrast
+axis and an orthonormal full-model residual basis. With transformed profiles Y
+and diagonal bin weights W, rotation compares ``L2**2 / (a @ a)`` with
+``u.T @ (B.T @ Y @ W @ Y.T @ B) @ u`` for uniform sphere directions u.
+The nuisance-adjusted cross-bin scatter stays fixed.
 
 
 Permutation tests
 -----------------
 
-``null="analytic"`` (default) uses the Liu approximation. For exchangeable
-binary groups, ``null="permutation"`` calibrates the statistic by relabeling
-samples:
+``null="permutation"`` is available only for binary comparisons in
+``test_diff_freq`` and ``test_cross_diff_freq``, including masked comparisons.
+Pass one-dimensional labels for two exchangeable groups and omit ``contrast``.
+GLM designs, including continuous predictors, nuisance covariates, or an explicit
+contrast, support ``null="analytic"`` (default) and ``null="rotation"``.
+
+For a binary comparison, permutation calibration relabels samples:
 
 .. code-block:: python
 

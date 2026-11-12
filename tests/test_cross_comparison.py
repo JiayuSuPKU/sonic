@@ -11,6 +11,8 @@ import pytest
 from scipy.stats import kstest
 
 from sonic import ComparatorIrregular
+from sonic.comparators import _inference as l2
+from sonic.comparators import _regression as lm
 from sonic.comparators import multisample as ms
 from sonic.comparators.cross_spectrum import CrossSpectra, _stabilize_cross_covariance
 from sonic.statistics import apply_bh_correction, liu_sf
@@ -155,7 +157,7 @@ class TestAnalyticNull:
         cross.coherency_valid[0, :2, 0] = False
         cross.coherency_valid[1, 2:4, 1:3] = False
         design = pd.DataFrame({"condition": np.repeat([0, 1], 6), "age": rng.normal(size=12)})
-        with patch.object(ms, "_decompose_glm_design", wraps=ms._decompose_glm_design) as decompose:
+        with patch.object(lm, "_decompose_glm_design", wraps=lm._decompose_glm_design) as decompose:
             actual = _ordered(
                 comparator.test_cross_diff_freq(
                     design,
@@ -251,8 +253,8 @@ class TestAnalyticNull:
                 groups, representation=representation, covariance=covariance
             )
         )
-        monkeypatch.setattr(ms, "_COMPARISON_WORKSPACE_BYTES", 8 * 8 * 10 * 9 * 2)
-        with patch.object(ms, "_prepare_profile_block", wraps=ms._prepare_profile_block) as blocks:
+        monkeypatch.setattr(l2, "_COMPARISON_WORKSPACE_BYTES", 8 * 8 * 10 * 9 * 2)
+        with patch.object(l2, "_prepare_profile_block", wraps=l2._prepare_profile_block) as blocks:
             actual = _ordered(
                 comparator.test_cross_diff_freq(
                     groups, representation=representation, covariance=covariance
@@ -711,7 +713,7 @@ class TestPermutations:
         groups = np.repeat([0, 1], 4)
         with patch(
             "sonic.comparators.cross_spectrum._make_label_permutations",
-            wraps=ms._make_label_permutations,
+            wraps=l2._make_label_permutations,
         ) as permute:
             actual = _ordered(
                 comparator.test_cross_diff_freq(
@@ -995,7 +997,7 @@ def test_per_pair_matches_independent_ols_with_sample_and_bin_masks(representati
         side_effect=AssertionError("unexpected pooling"),
     ):
         with patch.object(
-            ms, "_init_per_gene_covariance", wraps=ms._init_per_gene_covariance
+            l2, "_init_per_gene_covariance", wraps=l2._init_per_gene_covariance
         ) as init:
             frame = comparator.test_cross_diff_freq(
                 design,
@@ -1148,7 +1150,7 @@ class TestCrossRotation:
             return prepare(result, pairs, *args)
 
         monkeypatch.setattr(cs, "_prepare_cross_profiles", record)
-        monkeypatch.setattr(ms, "_COMPARISON_WORKSPACE_BYTES", 4096)
+        monkeypatch.setattr(l2, "_COMPARISON_WORKSPACE_BYTES", 4096)
         actual = comparator.test_cross_diff_freq(design, min_resid_df=100, **kwargs)
         pd.testing.assert_frame_equal(actual, expected)
         assert max(prepared_sizes) == 1
@@ -1190,7 +1192,7 @@ class TestCrossRotation:
             if masked and i == 2:
                 assert np.isnan(result.loc[pair, "P_value"])
                 continue
-            reference = ms._run_l2_rotations(
+            reference = l2._run_l2_rotations(
                 transformed[:, i : i + 1, bins],
                 x,
                 c,

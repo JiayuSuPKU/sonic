@@ -114,18 +114,21 @@ def apply_bh_correction(p_values: np.ndarray | pd.Series | Sequence[float]) -> n
 
 
 def cauchy_combine(
-    pvals: np.ndarray, axis: int = -1, *, where: np.ndarray | None = None
+    pvals: np.ndarray,
+    axis: int = -1,
+    *,
+    where: np.ndarray | None = None,
+    weights: np.ndarray | None = None,
 ) -> np.ndarray:
     """
-    Cauchy combination test.
+    Weighted Cauchy combination test.
 
-    For p-values :math:`p_1, \\dots, p_K`, forms
-    :math:`T = \\frac{1}{K}\\sum_k \\cot(\\pi p_k)` and returns
-    the analytic upper-tail probability under the standard Cauchy null,
-    :math:`p = \\arctan2(1, T) / \\pi`. Robust to arbitrary dependence
-    between the input p-values — that is the whole point of Cauchy
-    combination — so it is safe to apply over correlated frequency bins
-    without decorrelating them first.
+    Forms :math:`T = \\sum_k w_k \\cot(\\pi p_k)` with nonnegative weights
+    normalized over selected tests, and returns
+    :math:`p = \\arctan2(1, T) / \\pi`. The Cauchy reference is exact for
+    independent uniform p-values; under dependence it is a tail approximation
+    with distributional assumptions. Weighting does not correct invalid
+    individual p-values.
 
     Parameters
     ----------
@@ -137,6 +140,12 @@ def cauchy_combine(
     where : np.ndarray of bool, optional
         Broadcastable mask selecting informative tests. Slices with no
         selected tests return 1. Unselected tests receive no weight.
+    weights : np.ndarray, optional
+        One-dimensional finite nonnegative weights along ``axis``, with a
+        positive finite sum. None gives equal weights. Weights are normalized
+        over selected tests; zero weights exclude tests. Slices with no positive
+        selected weight return 1. Choose weights independently of the observed
+        test statistics.
 
     Returns
     -------
@@ -148,7 +157,25 @@ def cauchy_combine(
     # cot(pi * p) is equivalent to tan(pi * (0.5 - p)) but avoids precision
     # loss for the ultra-small p-values produced by analytic Welch tests.
     cot = 1.0 / np.tan(np.pi * clipped)
-    if where is None:
+    if weights is not None:
+        weights = np.asarray(weights, dtype=float)
+        if weights.ndim != 1 or len(weights) != pvals.shape[axis]:
+            raise ValueError("weights must be one-dimensional and match the combination axis.")
+        if not np.isfinite(weights).all() or np.any(weights < 0):
+            raise ValueError("weights must be finite and nonnegative.")
+        total = weights.sum()
+        if not np.isfinite(total) or total <= 0:
+            raise ValueError("weights must have a positive finite sum.")
+        shape = [1] * pvals.ndim
+        shape[axis] = len(weights)
+        selected = np.broadcast_to((weights / total).reshape(shape), pvals.shape)
+        if where is not None:
+            selected = np.where(where, selected, 0.0)
+        total = selected.sum(axis=axis, keepdims=True)
+        selected = np.divide(selected, total, out=np.zeros_like(selected), where=total > 0)
+        terms = np.multiply(cot, selected, out=np.zeros_like(cot), where=selected > 0)
+        T = np.where(np.squeeze(total, axis=axis) > 0, terms.sum(axis=axis), -np.inf)
+    elif where is None:
         T = np.mean(cot, axis=axis)
     else:
         where = np.broadcast_to(where, pvals.shape)

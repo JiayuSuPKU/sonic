@@ -96,7 +96,7 @@ conditions. Compute the requested pairs once, then select a representation:
 - ``representation="coherency"`` compares the real part of normalized
   cross-spectra, retaining the sign of in-phase coupling.
 
-Both use a weighted L2 statistic. For the default ``null="analytic"``, choose
+Both default to ``statistic="l2"``. For ``null="analytic"``, choose
 how to estimate the cross-bin residual covariance used by the Liu approximation:
 
 - ``covariance=None`` or ``"pooled"`` (default) shares covariance across eligible
@@ -109,9 +109,19 @@ how to estimate the cross-bin residual covariance used by the Liu approximation:
    coupling = comparison.test_cross_diff_freq(groups, covariance="per_pair")
 
 Design matrices and continuous ``contrast=`` terms work as in ``test_diff_freq``.
-Both support ``null="analytic"`` and ``null="rotation"``.
-``null="permutation"`` is available only for binary comparisons, as described
-below.
+L2 supports ``null="analytic"`` and ``null="rotation"`` for either design;
+``null="permutation"`` is available only for binary comparisons. To also
+localize the best bin, use ``statistic="t_cauchy"`` with ``null="analytic"``:
+
+.. code-block:: python
+
+   pair_bins = comparison.test_cross_diff_freq(groups, statistic="t_cauchy")
+   signed_pair_bins = comparison.test_cross_diff_freq(
+       design, contrast="condition", representation="coherency", statistic="t_cauchy",
+   )
+
+This applies binwise Welch or OLS tests to log coherence or real coherency,
+respectively, and combines the p-values with Cauchy's rule as described below.
 
 Each pair uses samples where both genes are present and bins valid in all those
 samples. ``freq_weights`` sets bin weights in the original flattened bin order
@@ -240,10 +250,85 @@ For a NumPy design matrix, include any intercept yourself and pass a contrast
 vector.
 
 
+Binwise t tests and Cauchy combination
+--------------------------------------
+
+Use ``statistic="log_t_cauchy"`` to test each frequency bin separately and
+combine its p-values into a feature-level result, while retaining per-bin
+p-values to localize the best bin:
+
+.. code-block:: python
+
+   bin_results = comparison.test_diff_freq(groups, statistic="log_t_cauchy")
+   adjusted_bin_results = comparison.test_diff_freq(
+       design, contrast="condition", statistic="log_t_cauchy",
+       normalize_shape=True,
+   )
+
+``log_t_cauchy`` uses the same ``log(max(profile, 1e-12))`` transformation as
+``log_l2``. Binary labels select per-bin Welch tests; a design matrix or
+explicit contrast selects per-bin OLS t tests, including nuisance covariates.
+``normalize_shape=True`` divides each spectrum by its total before logging.
+
+Welch permits different variances between groups and requires two observations
+per arm. OLS uses each bin's residual variance and ``n_samples - rank(design)``
+degrees of freedom, assuming constant residual variance across samples. Thus
+an explicit binary GLM differs from the Welch path. Masked tests fit only
+observed samples and apply the same eligibility thresholds as the L2 tests.
+Log-scale effects concern mean log power, or mean log power share for DF-norm.
+
+Both DF ``log_t_cauchy`` and cross-spectrum ``t_cauchy`` require
+``null="analytic"`` and ``covariance=None``.
+``freq_weights`` controls the Cauchy combination: None gives equal weights;
+nonnegative weights are renormalized over each feature's informative bins.
+Zero weights exclude bins from combination, the statistic summary and
+``Best_bin``. Choose
+weights independently of the observed signal, for example to emphasize
+prespecified spatial scales. Per-bin p-values remain unchanged.
+
+The combined statistic is ``sum(w[k] * cot(pi * p[k]))``, with retained weights
+summing to one. Its p-value uses the standard Cauchy tail, without estimating
+a cross-bin covariance. The Cauchy
+reference is an approximation for dependent bin p-values; log transformation
+and shape normalization do not guarantee calibration at small sample sizes.
+Low residual degrees of freedom or unequal sample variances can inflate the
+combined rejection rate even when marginal bin tests look well calibrated.
+
+Both Cauchy tests return the usual feature or pair identifiers, ``Statistic``,
+``P_value`` and ``P_adj``, plus these binwise outputs:
+
+- ``Estimate_per_bin``: mean A minus mean B (sorted binary labels), or the fitted
+  GLM contrast, on the tested profile scale.
+- ``T_per_bin``: signed t statistics.
+- ``P_value_per_bin``: unadjusted two-sided bin p-values.
+- ``Best_bin``: nullable, zero-based index of the smallest p-value among
+  informative, positive-weight bins. Ties use the first original index;
+  no eligible bin gives a missing value.
+
+Arrays preserve the original bin order, including valid zero-weight bins.
+Cross-spectrum arrays use the original flattened radius/angle order, with
+NaNs for unsupported bins. ``Statistic`` is the maximum absolute t over
+positive-weight bins; ``P_value`` is the Cauchy-combined tail and ``P_adj`` is
+BH-adjusted across features or pairs. ``Best_bin`` is descriptive: feature-level
+significance does not establish significance of the selected bin.
+Cross-spectrum ``DF_resid`` reports design residual degrees of freedom, not
+the Welch degrees of freedom, which vary by bin.
+
+Constant bins with a zero contrast are excluded from combination; a feature
+with no informative bins receives p=1. Exact zero standard error gives p=1
+for a zero effect and a limiting zero tail for a nonzero effect. Binary Welch
+tails are clipped to the smallest positive float. Skipped features keep NaN
+feature results, NaN per-bin arrays and missing ``Best_bin``. Cauchy result
+``attrs`` records ``statistic``, ``null`` and ``per_bin_test`` (``welch`` or ``ols``).
+
+The standalone ``compare_two_groups``, ``compare_glm``, and their masked
+variants accept ``statistic="log_t_cauchy"`` with the same binwise outputs.
+
+
 Choose the analytic DF covariance
 ---------------------------------
 
-For analytic DF and DF-norm tests, ``covariance`` controls how cross-bin
+For analytic L2 DF and DF-norm tests, ``covariance`` controls how cross-bin
 residual covariance is estimated:
 
 - ``None`` or ``"pooled"`` (default) shares covariance across eligible genes to
@@ -322,7 +407,8 @@ Permutation tests
 ``test_diff_freq`` and ``test_cross_diff_freq``, including masked comparisons.
 Pass one-dimensional labels for two exchangeable groups and omit ``contrast``.
 GLM designs, including continuous predictors, nuisance covariates, or an explicit
-contrast, support ``null="analytic"`` (default) and ``null="rotation"``.
+contrast, support ``null="analytic"`` (default) and ``null="rotation"`` for L2.
+Log t-Cauchy supports its analytic calibration only.
 
 For a binary comparison, permutation calibration relabels samples:
 

@@ -8,7 +8,7 @@ from unittest.mock import patch
 import numpy as np
 import pandas as pd
 import pytest
-from scipy.stats import kstest
+from scipy.stats import kstest, t, ttest_ind
 
 from sonic import ComparatorIrregular
 from sonic.comparators import _inference as l2
@@ -1278,3 +1278,278 @@ class TestCrossRotation:
             comparator.test_cross_diff_freq(
                 np.repeat([0, 1], 3), null="rotation", covariance=covariance
             )
+
+
+class TestCrossTCauchy:
+    """Weighted binwise inference on both cross-spectrum representations."""
+
+    @pytest.mark.parametrize("representation", ["coherence", "coherency"])
+    @pytest.mark.parametrize("glm", [False, True])
+    @pytest.mark.parametrize("masked", [False, True])
+    def test_matches_independent_binwise_fits(self, representation, glm, masked):
+        rng = np.random.default_rng(143)
+        values = rng.uniform(-0.6, 0.6, (16, 4, 6)) + 0.2j
+        comparator = _comparison(values)
+        cross = comparator.cross_spectra_
+        cross.coherency_valid[0, 0, 1] = False
+        cross.coherency_valid[2, 1, 3] = False
+        groups = np.repeat(["A", "B"], [5, 11])
+        age = np.linspace(-1, 1, 16)
+        nuisance = age + rng.normal(size=16)
+        design = pd.DataFrame({"age": age, "batch": nuisance})
+        matrix = np.c_[np.ones(16), age, nuisance]
+        if masked:
+            cross.presence[0, :2] = False
+            cross.presence[6:8, 2:6] = False
+        presence = _mask_missing_pairs(cross)
+        original = copy.deepcopy(cross)
+        weights = np.array([0, 1, 2, 3, 0, 4.0])
+        args = {"contrast": "age"} if glm else {}
+        result = _ordered(
+            comparator.test_cross_diff_freq(
+                design if glm else groups,
+                representation=representation,
+                statistic="t_cauchy",
+                freq_weights=weights,
+                **args,
+            )
+        )
+        expected_p = []
+        profiles = _profiles(values, representation)
+        for pair, row in enumerate(result.itertuples()):
+            mask = presence[:, pair]
+            supported = (cross.coherency_valid[:, pair] | ~mask[:, None]).all(0)
+            bins = np.flatnonzero(supported)
+            y = profiles[mask, pair][:, bins]
+            if glm:
+                x = matrix[mask]
+                beta = np.linalg.lstsq(x, y, rcond=None)[0]
+                df = len(x) - np.linalg.matrix_rank(x)
+                variance = ((y - x @ beta) ** 2).sum(0) / df
+                estimate = beta[1]
+                signed_t = estimate / np.sqrt(variance * np.sum(np.linalg.pinv(x)[1] ** 2))
+                per_bin_p = 2 * t.sf(np.abs(signed_t), df)
+            else:
+                a, b = y[groups[mask] == "A"], y[groups[mask] == "B"]
+                estimate = a.mean(0) - b.mean(0)
+                signed_t, per_bin_p = ttest_ind(a, b, equal_var=False, axis=0)
+                df = mask.sum() - 2
+            for column, expected in zip(
+                ("Estimate_per_bin", "T_per_bin", "P_value_per_bin"),
+                (estimate, signed_t, per_bin_p),
+                strict=True,
+            ):
+                actual = getattr(row, column)
+                assert actual.shape == (6,)
+                assert np.isnan(actual[~supported]).all()
+                np.testing.assert_allclose(actual[bins], expected, rtol=1e-11, atol=1e-14)
+            selected = weights[bins] > 0
+            w = weights[bins][selected] / weights[bins][selected].sum()
+            combined = np.sum(w / np.tan(np.pi * per_bin_p[selected]))
+            p = 0.5 - np.arctan(combined) / np.pi
+            expected_p.append(p)
+            np.testing.assert_allclose(row.P_value, p, rtol=1e-10)
+            np.testing.assert_allclose(row.Statistic, np.abs(signed_t[selected]).max())
+            assert row.Best_bin == bins[selected][np.argmin(per_bin_p[selected])]
+            assert row.DF_resid == df
+            assert row.N_bins == selected.sum()
+            assert row.Status == "ok"
+            assert result.attrs["bin_indices"][row.Index] == tuple(bins[selected])
+        np.testing.assert_allclose(result.P_adj, apply_bh_correction(expected_p), rtol=1e-10)
+        assert result.Best_bin.dtype == pd.Int64Dtype()
+        assert result.attrs["statistic"] == "t_cauchy"
+        assert result.attrs["per_bin_test"] == ("ols" if glm else "welch")
+        assert result.attrs["covariance"] is None
+        assert (result.N_pairs_pooled == 0).all()
+        assert result.Effective_rank.isna().all()
+        for name in ("cross_spectra", "auto_spectra", "coherency_valid", "presence"):
+            np.testing.assert_array_equal(getattr(cross, name), getattr(original, name))
+
+    @pytest.mark.parametrize("representation", ["coherence", "coherency"])
+    @pytest.mark.parametrize("glm", [False, True])
+    def test_best_bin_keeps_original_index_and_first_tie(self, representation, glm):
+        values = np.random.default_rng(144).uniform(0.1, 0.8, (12, 1, 6))
+        values[:, :, 2:] = values[:, :, 2:3]
+        comparator = _comparison(values)
+        comparator.cross_spectra_.coherency_valid[:, :, :2] = False
+        comparator.cross_spectra_.feature_mode = "polar"
+        comparator.cross_spectra_.angle_centers_rad = np.array([0, np.pi / 2])
+        groups = np.repeat([0, 1], 6)
+        design = pd.DataFrame({"x": np.arange(12.0)})
+        args = {"contrast": "x"} if glm else {}
+        row = comparator.test_cross_diff_freq(
+            design if glm else groups,
+            statistic="t_cauchy",
+            representation=representation,
+            freq_weights=[1, 1, 0, 2, 5, 1],
+            **args,
+        ).iloc[0]
+        assert row.Best_bin == 3
+        assert np.isnan(row.P_value_per_bin[:2]).all()
+        assert np.isfinite(row.P_value_per_bin[2:]).all()
+        np.testing.assert_allclose(row.P_value, row.P_value_per_bin[3])
+
+    @pytest.mark.parametrize("glm", [False, True])
+    def test_uninformative_and_zero_weight_bins(self, glm):
+        groups = np.repeat([0, 1], 6)
+        values = np.full((12, 3, 3), 0.5)
+        values[:, 1, 0] = 0.25 * groups
+        values[:, 2, :] = 0.25 * groups[:, None]
+        comparator = _comparison(values)
+        design = pd.DataFrame({"group": groups})
+        args = {"contrast": "group"} if glm else {}
+        result = _ordered(
+            comparator.test_cross_diff_freq(
+                design if glm else groups,
+                statistic="t_cauchy",
+                representation="coherency",
+                freq_weights=[0, 1, 2],
+                **args,
+            )
+        )
+        assert (result.P_value.iloc[:2] == 1).all()
+        assert (result.Statistic.iloc[:2] == 0).all()
+        assert result.Best_bin.iloc[:2].isna().all()
+        assert result.P_value_per_bin.iloc[1][0] < 1e-100
+        assert result.P_value.iloc[2] < 1e-100
+        assert result.Best_bin.iloc[2] == 1
+        assert result.Statistic.iloc[2] > 1e14
+
+    @pytest.mark.parametrize("glm", [False, True])
+    def test_skipped_pairs_keep_nan_outputs_and_bh_family(self, glm):
+        comparator = _comparison(np.random.default_rng(145).uniform(0.1, 0.8, (8, 6, 4)))
+        cross = comparator.cross_spectra_
+        cross.pairs = (("g0", "g0"),) + cross.pairs[1:]
+        cross.pair_indices[0] = [0, 0]
+        cross.coherency_valid[:, 1] = False
+        cross.presence[4:, 4:6] = False  # only one group, nonestimable GLM
+        cross.presence[1:4, 6:8] = False
+        cross.presence[5:, 6:8] = False  # two samples, no GLM residual df
+        cross.presence[:, 8:10] = False
+        _mask_missing_pairs(cross)
+        groups = np.repeat([0, 1], 4)
+        args = {"contrast": "group"} if glm else {}
+        result = (
+            comparator.test_cross_diff_freq(
+                pd.DataFrame({"group": groups}) if glm else groups,
+                statistic="t_cauchy",
+                **args,
+            )
+            .set_index("Feature_1")
+            .loc[[f"g{i}" for i in range(0, 12, 2)]]
+        )
+        ineligible = "ineligible_design" if glm else "insufficient_samples"
+        assert result.Status.tolist() == [
+            "self_pair",
+            "no_common_bins",
+            ineligible,
+            ineligible,
+            ineligible,
+            "ok",
+        ]
+        for column in ("Estimate_per_bin", "T_per_bin", "P_value_per_bin"):
+            assert np.isnan(np.stack(result[column].iloc[:5])).all()
+        assert result.Best_bin.iloc[:5].isna().all()
+        assert result.P_value.iloc[:5].isna().all()
+        assert result.P_adj.iloc[:5].isna().all()
+        assert result.P_value.iloc[-1] == result.P_adj.iloc[-1]
+
+    @pytest.mark.parametrize("representation", ["coherence", "coherency"])
+    def test_unmasked_glm_reuses_design_across_bin_support_groups(self, representation):
+        comparator = _comparison(np.random.default_rng(146).uniform(0.1, 0.8, (12, 3, 4)))
+        comparator.cross_spectra_.coherency_valid[0, 0, 0] = False
+        comparator.cross_spectra_.coherency_valid[0, 1, 1] = False
+        with patch.object(lm, "_decompose_glm_design", wraps=lm._decompose_glm_design) as decompose:
+            comparator.test_cross_diff_freq(
+                pd.DataFrame({"x": np.arange(12.0)}),
+                contrast="x",
+                statistic="t_cauchy",
+                representation=representation,
+            )
+            assert decompose.call_count == 1
+
+    @pytest.mark.parametrize(
+        "options",
+        [
+            {"statistic": "log_t_cauchy"},
+            {"statistic": "invalid"},
+            {"null": "rotation"},
+            {"null": "permutation"},
+            {"covariance": "pooled"},
+            {"covariance": "per_pair"},
+            {"freq_weights": [1, -1, 1]},
+            {"freq_weights": [0, 0, 0]},
+            {"freq_weights": [1, np.nan, 1]},
+            {"freq_weights": [1, 1]},
+        ],
+    )
+    def test_invalid_options_raise(self, options):
+        comparator = _comparison(np.full((8, 1, 3), 0.5))
+        with pytest.raises(ValueError):
+            comparator.test_cross_diff_freq(
+                np.repeat([0, 1], 4), **{"statistic": "t_cauchy", **options}
+            )
+
+    def test_unmasked_welch_requires_two_samples_per_arm(self):
+        comparator = _comparison(np.full((5, 1, 3), 0.5))
+        with pytest.raises(ValueError, match="at least two"):
+            comparator.test_cross_diff_freq([0, 1, 1, 1, 1], statistic="t_cauchy")
+
+    @pytest.mark.parametrize("representation", ["coherence", "coherency"])
+    def test_default_remains_l2(self, representation):
+        comparator = _comparison(np.random.default_rng(147).uniform(0.1, 0.8, (12, 3, 4)))
+        groups = np.repeat([0, 1], 6)
+        default = comparator.test_cross_diff_freq(groups, representation=representation)
+        explicit = comparator.test_cross_diff_freq(
+            groups, statistic="l2", representation=representation
+        )
+        pd.testing.assert_frame_equal(default, explicit)
+        assert "Best_bin" not in default
+
+    @pytest.mark.parametrize("glm", [False, True])
+    def test_masked_eligibility_thresholds(self, glm):
+        comparator = _comparison(np.random.default_rng(148).uniform(0.1, 0.8, (8, 2, 3)))
+        comparator.cross_spectra_.presence[:2, :2] = False
+        _mask_missing_pairs(comparator.cross_spectra_)
+        groups = np.repeat([0, 1], 4)
+        options = {"contrast": "group", "min_resid_df": 5} if glm else {"min_samples_per_group": 3}
+        result = _ordered(
+            comparator.test_cross_diff_freq(
+                pd.DataFrame({"group": groups}) if glm else groups,
+                statistic="t_cauchy",
+                **options,
+            )
+        )
+        assert np.isnan(result.P_value.iloc[0])
+        assert pd.isna(result.Best_bin.iloc[0])
+        assert np.isfinite(result.P_value.iloc[1])
+
+    def test_no_positive_supported_weights_skips_pair(self):
+        comparator = _comparison(np.random.default_rng(149).uniform(0.1, 0.8, (8, 1, 3)))
+        comparator.cross_spectra_.coherency_valid[:, :, 2] = False
+        result = comparator.test_cross_diff_freq(
+            np.repeat([0, 1], 4),
+            statistic="t_cauchy",
+            freq_weights=[0, 0, 1],
+        ).iloc[0]
+        assert result.Status == "no_common_bins"
+        assert result.N_bins == 0
+        assert np.isnan(result.P_value)
+        assert np.isnan(result.P_value_per_bin).all()
+        assert pd.isna(result.Best_bin)
+
+    def test_cross_and_df_share_coherence_bin_outputs_with_default_weights(self):
+        values = np.random.default_rng(150).uniform(0.1, 0.8, (12, 4, 3))
+        comparator = _comparison(values)
+        groups = np.repeat([0, 1], 6)
+        actual = _ordered(comparator.test_cross_diff_freq(groups, statistic="t_cauchy"))
+        expected = (
+            ms.compare_two_groups(values**2, groups, statistic="log_t_cauchy")
+            .set_index("Feature")
+            .sort_index()
+        )
+        for name in ("Estimate_per_bin", "T_per_bin", "P_value_per_bin"):
+            np.testing.assert_allclose(np.stack(actual[name]), np.stack(expected[name]))
+        for name in ("Statistic", "P_value", "P_adj"):
+            np.testing.assert_allclose(actual[name], expected[name])
+        np.testing.assert_array_equal(actual.Best_bin, expected.Best_bin)

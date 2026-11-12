@@ -6,6 +6,7 @@ from collections.abc import Sequence
 
 import numpy as np
 import pandas as pd
+from scipy.stats import t as _t_dist
 
 
 def _build_design_matrix(
@@ -227,3 +228,38 @@ def _fit_glm_response(
     effect = contrast @ beta + offset_effect * offset
     beta += offset_beta[:, None] * offset
     return beta, residual, effect
+
+
+def _test_glm_response(response, design, inverse, contrast, rank):
+    """Compute ordinary OLS contrast t tests for a transformed response block.
+
+    Parameters
+    ----------
+    response : np.ndarray
+        Finite responses, shape ``(n_samples, n_responses)``.
+    design, inverse, contrast, rank
+        Validated design and estimable contrast, as in ``_fit_glm_response``.
+        The design must have positive residual degrees of freedom.
+
+    Returns
+    -------
+    t_stat, pvals, estimate : tuple of np.ndarray
+        Signed t statistics, two-sided t tails, and signed contrasts, each
+        of shape ``(n_responses,)``. Each response uses its own residual
+        variance and ``n_samples - rank`` degrees of freedom.
+    """
+    _, residuals, estimate = _fit_glm_response(response, design, inverse, contrast, rank)
+    df_resid = len(response) - rank
+    sigma2 = np.sum(residuals**2, axis=0) / df_resid
+    contrast_var = float(np.sum((contrast @ inverse) ** 2))
+    if not np.isfinite(contrast_var) or contrast_var <= 0:
+        raise ValueError("contrast has zero or nonfinite variance under the supplied design.")
+    se = np.sqrt(np.maximum(sigma2, 0.0) * contrast_var)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        t_stat = estimate / se
+    zero_se = se == 0.0
+    t_stat[zero_se & (estimate == 0.0)] = 0.0
+    perfect_effect = zero_se & (estimate != 0.0)
+    t_stat[perfect_effect] = np.sign(estimate[perfect_effect]) * np.inf
+    pvals = 2.0 * _t_dist.sf(np.abs(t_stat), df_resid)
+    return t_stat, pvals, estimate

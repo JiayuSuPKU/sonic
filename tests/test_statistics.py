@@ -194,6 +194,47 @@ class TestMultipleTestingHelpers(unittest.TestCase):
         combined = cauchy_combine(np.array([[1e-300, 1e-250, 0.5]]), axis=1)
         assert 0.0 < combined[0] < np.finfo(float).eps
 
+    def test_weighted_cauchy_matches_formula_and_axis(self):
+        p = np.array([[0.01, 0.2, 0.5], [0.4, 0.8, 0.9]])
+        weights = np.array([4.0, 1.0, 2.0])
+        expected = (
+            0.5
+            - np.arctan(np.sum(weights * np.tan(np.pi * (0.5 - p)), axis=1) / weights.sum()) / np.pi
+        )
+        np.testing.assert_allclose(cauchy_combine(p, weights=weights), expected, rtol=1e-12)
+        np.testing.assert_allclose(
+            cauchy_combine(p.T, axis=0, weights=weights), expected, rtol=1e-12
+        )
+        np.testing.assert_allclose(cauchy_combine(p, weights=weights * 10), expected, rtol=1e-12)
+        np.testing.assert_allclose(
+            cauchy_combine(p, weights=np.ones(3)), cauchy_combine(p), rtol=1e-12
+        )
+
+    def test_weighted_cauchy_renormalizes_masks_and_ignores_zero_weights(self):
+        p = np.array([[0.02, 0.2, np.nan], [0.01, 0.7, np.nan], [np.nan, np.nan, np.nan]])
+        where = np.array([[True, True, True], [False, True, True], [False, False, False]])
+        weights = np.array([3.0, 1.0, 0.0])
+        expected_first = (
+            0.5 - np.arctan((3 * np.tan(np.pi * 0.48) + np.tan(np.pi * 0.3)) / 4) / np.pi
+        )
+        actual = cauchy_combine(p, where=where, weights=weights)
+        np.testing.assert_allclose(actual, [expected_first, 0.7, 1.0], rtol=1e-12)
+        np.testing.assert_allclose(cauchy_combine([0.2, 1e-100], weights=[1, 0]), 0.2, rtol=1e-12)
+
+    def test_weighted_cauchy_handles_tiny_and_endpoint_pvalues(self):
+        p = np.array([[1e-300, 0.5], [0.0, 0.5], [1.0, 1.0]])
+        actual = cauchy_combine(p, weights=[1, 3])
+        assert np.isfinite(actual).all()
+        assert (actual >= 0).all() and (actual <= 1).all()
+        np.testing.assert_allclose(actual[0], 4e-300, rtol=1e-12, atol=0)
+        assert actual[1] < 1e-300
+        assert actual[2] > 0.99
+
+    def test_weighted_cauchy_rejects_invalid_weights(self):
+        for weights in ([0, 0], [1, -1], [1, np.nan], [1, np.inf], [1], [[1, 1]]):
+            with self.subTest(weights=weights), self.assertRaises(ValueError):
+                cauchy_combine([0.1, 0.2], weights=weights)
+
 
 class TestStatisticalFunctions(unittest.TestCase):
     """Test cases for statistical functions."""

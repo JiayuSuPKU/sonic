@@ -71,12 +71,12 @@ class TestLiuCalibration:
             )
             assert p_analytic < 1.0 / 71.0, f"gene {g}: analytic={p_analytic:.3g} above perm floor"
 
-    def test_analytic_argument_is_ignored_for_welch_t_cauchy(self):
-        """``welch_t_cauchy`` ignores ``null`` and still returns its schema."""
+    def test_log_t_cauchy_analytic_schema(self):
+        """Analytic log t-Cauchy retains the feature and per-bin result schema."""
         rng = np.random.default_rng(3)
         spectra = np.exp(rng.standard_normal((6, 50, 20)))
         groups = np.array([0, 0, 0, 1, 1, 1])
-        df = compare_two_groups(spectra, groups, statistic="welch_t_cauchy", null="analytic")
+        df = compare_two_groups(spectra, groups, statistic="log_t_cauchy", null="analytic")
         assert "P_value_per_bin" in df.columns
         assert df["P_value"].between(0, 1).all()
 
@@ -220,8 +220,8 @@ class TestLiuCalibration:
                 min_samples_per_group=2,
             )
 
-    def test_masked_analytic_argument_is_ignored_for_welch_t_cauchy(self):
-        """Masked ``welch_t_cauchy`` ignores ``null`` like the unmasked path."""
+    def test_masked_log_t_cauchy_analytic_schema(self):
+        """Masked log t-Cauchy includes per-bin p-values for eligible features."""
         rng = np.random.default_rng(9)
         n_samples, n_genes, K = 6, 10, 12
         spectra = np.exp(rng.standard_normal((n_samples, n_genes, K)))
@@ -231,7 +231,7 @@ class TestLiuCalibration:
             spectra,
             groups,
             presence,
-            statistic="welch_t_cauchy",
+            statistic="log_t_cauchy",
             null="analytic",
         )
         assert "P_value_per_bin" in df.columns
@@ -563,7 +563,7 @@ class TestCovarianceEstimation:
 
     @pytest.mark.parametrize("masked", [False, True])
     @pytest.mark.parametrize("covariance", ["pooled", "per_gene"])
-    @pytest.mark.parametrize("kwargs", [{"null": "permutation"}, {"statistic": "welch_t_cauchy"}])
+    @pytest.mark.parametrize("kwargs", [{"null": "permutation"}, {"statistic": "log_t_cauchy"}])
     def test_covariance_selector_rejects_inapplicable_binary_tests(
         self, masked, covariance, kwargs
     ):
@@ -573,7 +573,7 @@ class TestCovarianceEstimation:
         if masked:
             fn = compare_two_groups_masked
             args.append(np.ones((8, 2), bool))
-        with pytest.raises(ValueError, match="covariance is only supported"):
+        with pytest.raises(ValueError, match="covariance"):
             fn(*args, covariance=covariance, **kwargs)
 
     @pytest.mark.parametrize("glm", [False, True])
@@ -1239,8 +1239,8 @@ class TestConditionalRotation:
     def test_inapplicable_statistic_design_and_observations(self):
         values = np.ones((6, 2, 3))
         groups = np.repeat([0, 1], 3)
-        with pytest.raises(ValueError, match="requires statistic"):
-            compare_two_groups(values, groups, null="rotation", statistic="welch_t_cauchy")
+        with pytest.raises(ValueError, match="requires null='analytic'"):
+            compare_two_groups(values, groups, null="rotation", statistic="log_t_cauchy")
         with pytest.raises(ValueError, match="residual degrees"):
             compare_glm(values, np.eye(6), np.ones(6), null="rotation")
         with pytest.raises(ValueError, match="not estimable"):
@@ -1253,3 +1253,24 @@ class TestConditionalRotation:
             compare_two_groups_masked(
                 values, groups, np.zeros((6, 2), bool), null="rotation", n_rotations=9
             )
+
+
+class TestTCauchyCalibration:
+    @pytest.mark.parametrize("glm", [False, True])
+    @pytest.mark.parametrize("weights", [None, np.array([4.0, 2.0, 1.0, 0.0, 0.0])])
+    def test_independent_gaussian_log_errors_have_calibrated_tails(self, glm, weights):
+        rng = np.random.default_rng(907)
+        spectra = np.exp(rng.normal(size=(20, 6000, 5)))
+        if glm:
+            design = pd.DataFrame({"x": np.linspace(-1, 1, 20), "batch": np.tile([0, 1], 10)})
+            result = compare_glm(
+                spectra, design, "x", statistic="log_t_cauchy", freq_weights=weights
+            )
+        else:
+            result = compare_two_groups(
+                spectra, np.repeat([0, 1], 10), statistic="log_t_cauchy", freq_weights=weights
+            )
+        assert 0.035 < np.mean(result.P_value <= 0.05) < 0.065
+        assert 0.004 < np.mean(result.P_value <= 0.01) < 0.018
+        per_bin = np.stack(result.P_value_per_bin)
+        assert 0.04 < np.mean(per_bin <= 0.05) < 0.06

@@ -334,7 +334,7 @@ class TestComparatorGrid:
         assert cmp.dc_.shape == (len(samples), 3)
         assert cmp.presence_.shape == (len(samples), 3)
         # Pattern test runs without error and returns a frame with a row per gene.
-        df = cmp.test_diff_freq(groups, statistic="welch_t_cauchy")
+        df = cmp.test_diff_freq(groups, statistic="log_t_cauchy")
         assert df.shape[0] == 3
         assert df["P_value"].between(0, 1).all()
 
@@ -873,7 +873,7 @@ class TestComparatorIrregularWorkflow:
         with pytest.raises(RuntimeError, match=r"\.compute_spectra\(\)"):
             cmp.test_diff_freq(np.array([0, 1]))
 
-    def test_diff_freq_glm_rejects_binary_only_selectors(self):
+    def test_diff_freq_glm_rejects_removed_statistic_and_permutation(self):
         gene_names = ["a", "b"]
         samples = [np.ones((2, 4, 4)) * (i + 1.0) for i in range(4)]
         cmp = ComparatorIrregular(
@@ -1793,5 +1793,39 @@ class TestComparatorRotation:
         if masked:
             args.append(presence)
         expected = getattr(ms, method)(*args, gene_names=comparator.gene_names, **kwargs)
+        pd.testing.assert_frame_equal(actual, expected)
+        assert actual.attrs == expected.attrs
+
+
+class TestComparatorLogTCauchy:
+    @pytest.mark.parametrize("glm", [False, True])
+    @pytest.mark.parametrize("masked", [False, True])
+    @pytest.mark.parametrize("shape_only", [False, True])
+    def test_dispatch_matches_standalone(self, glm, masked, shape_only):
+        from sonic.comparators import multisample as ms
+
+        spectra = np.random.default_rng(19).lognormal(size=(12, 4, 5))
+        groups = np.repeat([0, 1], 6)
+        presence = np.ones((12, 4), bool)
+        if masked:
+            presence[0, :2] = False
+            spectra[~presence] = np.nan
+        comparator = _comparator_from_spectra(spectra, presence=presence)
+        design = (
+            pd.DataFrame({"age": np.arange(12.0), "batch": np.tile([0, 1], 6)}) if glm else groups
+        )
+        options = {
+            "statistic": "log_t_cauchy",
+            "normalize_shape": shape_only,
+            "freq_weights": np.array([4.0, 2.0, 1.0, 0.0, 0.0]),
+        }
+        actual = comparator.test_diff_freq(
+            design, **options, **({"contrast": "age"} if glm else {})
+        )
+        method = "compare_" + ("glm" if glm else "two_groups") + ("_masked" if masked else "")
+        args = [spectra, design, "age"] if glm else [spectra, design]
+        if masked:
+            args.append(presence)
+        expected = getattr(ms, method)(*args, gene_names=comparator.gene_names, **options)
         pd.testing.assert_frame_equal(actual, expected)
         assert actual.attrs == expected.attrs

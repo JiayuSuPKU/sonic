@@ -38,6 +38,7 @@ from sonic.comparators.binning import (
     _polar_bin_reducer,
     _radial_bin_reducer,
 )
+from sonic.comparators.multisample import _BINWISE_COLUMNS, _run_t_cauchy_test
 from sonic.kernels.fft import _fourier_coefficients_2d
 from sonic.kernels.nufft import _fourier_coefficients_2d_nufft
 from sonic.statistics import apply_bh_correction
@@ -760,63 +761,40 @@ def _run_cross_permutations(
     max_exact_permutations,
     rng,
 ):
-    """Test binary contrasts with DF's masked per-feature label permutations.
+    """Calibrate binary L2 contrasts by permuting sample labels.
+
+    Shared input shapes, sample/bin masks, representations and masked
+    eligibility thresholds follow :func:`_run_cross_analytic`. Unmasked
+    permutations require at least one sample per arm, without a residual-df
+    requirement. Support and weights stay fixed across relabellings.
 
     Parameters
     ----------
-    result : CrossSpectra
-        Cached spectra in original sample, pair, and bin order. The cross
-        array has shape ``(n_samples, n_pairs, n_bins)``. Inputs are not modified.
-    pair_presence : ndarray of bool, shape (n_samples, n_pairs)
-        Sample inclusion mask: ``pair_presence[s, p]`` is True when both
-        genes in pair p pass the expression-presence threshold in sample s.
-    common : ndarray of bool, shape (n_pairs, n_bins)
-        Retained-bin mask on the original flattened frequency axis.
-        ``common[p, b]`` is True when bin b has valid coherency in every
-        sample retained for pair p and its frequency weight is positive.
-        A pair with no retained samples has an all-False row. Polar bins
-        retain the original radius-then-angle order.
-    candidates : ndarray of int, shape (n_candidates,)
-        Indices of requested non-self pairs on the original pair axis of
-        ``result``, ``pair_presence``, and ``common``.
-    weights : ndarray, shape (n_bins,)
-        Validated nonnegative frequency weights on the original bin axis.
-        The DF helpers renormalize these weights over each retained bin set.
     group_codes : ndarray of int, shape (n_samples,)
         Validated binary labels encoded as 0 and 1, in original sample order.
         Labels are subset by each pair's sample mask before permutation.
-    representation : {'coherence', 'coherency'}
-        Test log magnitude-squared coherency for ``coherence``, or its
-        untransformed signed real part for ``coherency``.
-    use_masked : bool
-        Whether any pair in the complete panel has an absent sample.
-        Preserve this global decision across groups: masked tests use
-        ``min_samples_per_group``; unmasked tests require both labels to be present.
-    min_samples_per_group : int
-        Minimum retained samples per arm when ``use_masked`` is True.
-        Ignored on the unmasked path, matching ``test_diff_freq``.
     n_perm : int
         Positive number of sampled label permutations when exact enumeration
-        is not selected. Ignored when all possible assignments are enumerated.
+        is not selected. Ignored when all assignments are enumerated.
     max_exact_permutations : int
         Enumerate all assignments when their count for the retained samples
         is at most this threshold. Zero forces sampling.
     rng : numpy.random.Generator
         Generator used for sampled relabellings. Masked pairs draw separately
-        in original pair order, matching DF. Unmasked pairs share one label
-        matrix across bin groups.
+        in original pair order; unmasked pairs share one label matrix across
+        bin groups, matching DF.
 
     Returns
     -------
     dict of ndarray
-        Owned arrays of shape ``(n_pairs,)`` in original pair order:
-        ``observed`` (weighted L2 statistic), ``pvals``, ``status``, and
-        per-pair ``permutation_counts`` and ``exact_permutations``.
-        ``df_resid`` records the retained binary-design degrees of freedom;
-        ``pooled_pairs`` is zero and ``effective_rank`` is NaN because this
-        path does not estimate a pooled covariance. Untestable entries
-        retain NaN statistics/p-values. The caller assigns final statuses
-        for self-pairs and entirely absent pairs before table assembly.
+        Arrays of shape ``(n_pairs,)`` in original pair order, with the same
+        keys as :func:`_run_cross_analytic`. ``observed`` is weighted L2;
+        ``pvals`` uses exact exceedance fractions or sampled tails with a +1
+        correction. ``permutation_counts`` and ``exact_permutations`` record
+        each pair's calibration. ``df_resid`` records binary-design residual df;
+        ``pooled_pairs`` is zero and ``effective_rank`` is NaN. Skipped pairs
+        retain NaN statistics and p-values. The caller assigns final statuses
+        for self-pairs and entirely absent pairs.
     """
     n_pairs = result.cross_spectra.shape[1]
     n_a = pair_presence[group_codes == 0].sum(axis=0)
@@ -889,7 +867,41 @@ def _run_cross_rotations(
     n_rotations,
     random_state,
 ):
-    """Apply the shared rotation engine to each retained-bin support group."""
+    """Calibrate weighted L2 contrasts with the conditional rotation null.
+
+    Shared input shapes, sample/bin masks, representations and eligibility
+    thresholds follow :func:`_run_cross_analytic`. ``prepared_design`` supplies
+    the GLM matrix and contrast; the rotation engine refits retained-sample
+    designs. Binary labels use an intercept and a group indicator.
+
+    Parameters
+    ----------
+    n_rotations : int
+        Positive number of Monte Carlo sphere draws. Pairs with the same
+        retained samples share draws across bin groups and feature blocks.
+    random_state : int or None
+        Seed for the draws. An automatically generated seed is retained in
+        the returned metadata so the result can be reproduced.
+
+    Returns
+    -------
+    dict
+        Arrays of shape ``(n_pairs,)`` in original pair order, with the same
+        keys as :func:`_run_cross_analytic`. ``observed`` is weighted L2 and
+        ``pvals`` contains Monte Carlo tails with a +1 correction.
+        ``effective_rank`` describes each pair's nuisance-adjusted scatter.
+        ``pooled_pairs`` and ``permutation_counts`` are zero;
+        ``exact_permutations`` is False. Skipped pairs retain NaN statistics
+        and p-values. ``metadata`` contains the effective seed, draw count,
+        minimum p-value, and null/covariance labels.
+
+    Notes
+    -----
+    Each bin-support group delegates to
+    :func:`~sonic.comparators._inference._run_l2_rotations`, conditioning on
+    each pair's nuisance-adjusted scatter without pooling across pairs.
+    The caller assigns final statuses for self-pairs and entirely absent pairs.
+    """
     n_samples, n_pairs = pair_presence.shape
     metadata = _rotation_metadata(n_rotations, random_state)
     use_glm = prepared_design is not None
@@ -952,6 +964,122 @@ def _run_cross_rotations(
     }
 
 
+def _run_cross_t_cauchy(
+    result,
+    pair_presence,
+    support,
+    candidates,
+    weights,
+    *,
+    representation,
+    use_masked,
+    groups,
+    prepared_design,
+    min_samples_per_group,
+    min_resid_df,
+):
+    """Fit binwise t tests and combine their p-values for each pair.
+
+    Shared input shapes, sample masks, representations and design eligibility
+    follow :func:`_run_cross_analytic`. Binary labels select Welch tests;
+    ``prepared_design`` selects OLS contrast t tests. Both use the shared
+    :func:`~sonic.comparators.multisample._run_t_cauchy_test` engine.
+
+    Parameters
+    ----------
+    support : ndarray of bool, shape (n_pairs, n_bins)
+        Bins valid in every retained sample, in original flattened bin order.
+        Unlike ``common`` in :func:`_run_cross_analytic`, this mask includes
+        valid zero-weight bins so their per-bin diagnostics remain available.
+        Pairs with no positive-weight supported bins are skipped.
+    weights : ndarray, shape (n_bins,)
+        Validated nonnegative weights on the original bin axis. Cauchy
+        combination renormalizes them over each pair's informative bins.
+        Zero weights exclude bins from combination, the statistic summary,
+        and best-bin selection, without changing their individual t tests.
+
+    Returns
+    -------
+    dict
+        Arrays in original pair order, with the same keys as
+        :func:`_run_cross_analytic`. ``observed`` is the maximum absolute t
+        over positive-weight bins; ``pvals`` contains Cauchy-combined tails.
+        ``df_resid`` records design residual df, not the bin-specific Welch df.
+        ``pooled_pairs`` and ``permutation_counts`` are zero,
+        ``effective_rank`` is NaN, and ``exact_permutations`` is False.
+
+        ``extra`` contains ``Estimate_per_bin``, signed ``T_per_bin``, and
+        raw ``P_value_per_bin`` arrays of length ``n_bins`` for each pair.
+        Unsupported bins and skipped pairs have NaN entries. ``Best_bin`` is
+        a nullable, zero-based original bin index: the smallest p-value among
+        informative, positive-weight bins, with ties taking the first index.
+        It is missing when no bin qualifies. Skipped pair statistics and
+        p-values remain NaN; the caller assigns final statuses for self-pairs
+        and entirely absent pairs.
+    """
+    n_samples, n_pairs = pair_presence.shape
+    n_bins = support.shape[1]
+    use_glm = prepared_design is not None
+    if use_glm:
+        matrix, _, vector, _, rank = prepared_design
+    else:
+        codes = (groups == np.unique(groups)[1]).astype(int)
+    observed = np.full(n_pairs, np.nan)
+    pvals = np.full(n_pairs, np.nan)
+    df_resid = np.zeros(n_pairs, int)
+    status = np.full(n_pairs, "no_common_bins", dtype=object)
+    binwise = {name: np.full((n_pairs, n_bins), np.nan) for name in _BINWISE_COLUMNS}
+    best_bin = np.full(n_pairs, np.nan)
+    for keep, indices in _iter_mask_groups(support[candidates].T):
+        bins = np.flatnonzero(keep)
+        if not bins.size or not np.any(weights[bins] > 0):
+            continue
+        for block in _iter_feature_blocks(n_samples, len(indices), len(bins)):
+            pairs = candidates[indices[block]]
+            presence = pair_presence[:, pairs]
+            profiles = _prepare_cross_profiles(result, pairs, bins, representation, presence)
+            observed[pairs], pvals[pairs], extra = _run_t_cauchy_test(
+                profiles,
+                groups=None if use_glm else codes,
+                design=matrix if use_glm else None,
+                contrast=vector if use_glm else None,
+                prepared_design=prepared_design if not use_masked else None,
+                presence=presence if use_masked else None,
+                log_transform=representation == "coherence",
+                freq_weights=weights[bins],
+                min_samples_per_group=min_samples_per_group,
+                min_resid_df=min_resid_df if use_masked else 1,
+            )
+            if use_glm:
+                df_resid[pairs] = extra["df_resid"] if use_masked else n_samples - rank
+            else:
+                df_resid[pairs] = np.maximum(presence.sum(axis=0) - 2, 0)
+            status[pairs] = np.where(
+                np.isfinite(pvals[pairs]),
+                "ok",
+                "ineligible_design" if use_glm else "insufficient_samples",
+            )
+            for name in _BINWISE_COLUMNS:
+                binwise[name][np.ix_(pairs, bins)] = np.stack(extra[name])
+            local_best = extra["Best_bin"].to_numpy(dtype=float, na_value=np.nan)
+            eligible = np.isfinite(local_best)
+            best_bin[pairs[eligible]] = bins[local_best[eligible].astype(int)]
+    return {
+        "observed": observed,
+        "pvals": pvals,
+        "df_resid": df_resid,
+        "status": status,
+        "pooled_pairs": np.zeros(n_pairs, int),
+        "effective_rank": np.full(n_pairs, np.nan),
+        "permutation_counts": np.zeros(n_pairs, int),
+        "exact_permutations": np.zeros(n_pairs, bool),
+        "extra": {
+            **{name: list(values) for name, values in binwise.items()},
+            "Best_bin": pd.array(best_bin, dtype="Int64"),
+        },
+    }
+
+
 def _cross_comparison_frame(
     result,
     inference,
@@ -960,6 +1088,7 @@ def _cross_comparison_frame(
     weights,
     *,
     representation,
+    statistic,
     null,
     covariance_mode,
     use_masked,
@@ -988,6 +1117,7 @@ def _cross_comparison_frame(
                 "Effective_rank": inference["effective_rank"],
                 "Status": inference["status"],
                 **count_columns,
+                **inference.get("extra", {}),
             },
         )
         .sort_values("Statistic", ascending=False, na_position="last")
@@ -997,11 +1127,12 @@ def _cross_comparison_frame(
     # Keep original bin indices so downstream plots can recover each tested frequency range.
     frame.attrs.update(
         representation=representation,
+        statistic=statistic,
         transformation="log(max(C, 1e-12))" if representation == "coherence" else "real(coherency)",
         null=null,
         covariance=(
             ("per_pair" if covariance_mode == "per_pair" else "pooled_across_valid_bins_psd")
-            if null == "analytic"
+            if null == "analytic" and statistic == "l2"
             else None
         ),
         bin_indices={p: tuple(np.flatnonzero(common[i])) for i, p in enumerate(result.pairs)},
@@ -1021,6 +1152,8 @@ def _cross_comparison_frame(
         ),
         **design_metadata,
     )
+    if statistic == "t_cauchy":
+        frame.attrs["per_bin_test"] = "ols" if "contrast_vector" in design_metadata else "welch"
     if null == "rotation":
         frame.attrs.update(inference["metadata"])
     return frame
@@ -1033,6 +1166,7 @@ def _compare_cross_spectra(  # noqa: C901 — validation and dispatch over binar
     groups=None,
     contrast=None,
     representation="coherence",
+    statistic="l2",
     null="analytic",
     n_perm=1000,
     random_state=None,
@@ -1068,15 +1202,20 @@ def _compare_cross_spectra(  # noqa: C901 — validation and dispatch over binar
         Let ``k = S_xy / sqrt(S_xx * S_yy)`` using matching binned products.
         ``coherence`` tests ``Y = log(max(abs(k)**2, 1e-12))``;
         ``coherency`` tests ``Y = real(k)`` without a transformation.
+    statistic : {'l2', 't_cauchy'}, default 'l2'
+        Weighted L2 contrast or binwise t tests with Cauchy combination.
+        t-Cauchy uses Welch for binary labels and OLS for a GLM, requires
+        ``null='analytic'`` and ``covariance=None``, and returns bin diagnostics
+        as documented in ``test_cross_diff_freq``.
     null : str
-        ``'analytic'`` (default) uses the Liu approximation; ``'rotation'``
+        For L2, ``'analytic'`` (default) uses Liu; ``'rotation'``
         conditions on each pair's nuisance-adjusted scatter. Both support
         GLM contrasts. ``'permutation'`` is available only for binary
         comparisons with group labels and no explicit contrast.
     covariance : {None, 'pooled', 'per_pair'}, optional
         ``None`` retains pooling across eligible pairs. ``'per_pair'`` uses
         each pair's residual covariance and Liu tail separately. An explicit
-        choice is supported only with ``null='analytic'``.
+        choice requires an analytic L2 test.
     n_perm : int, default 1000
         Number of sampled relabellings when exact enumeration is too large.
         Ignored for analytic tests and overridden by exact enumeration.
@@ -1088,7 +1227,9 @@ def _compare_cross_spectra(  # noqa: C901 — validation and dispatch over binar
     freq_weights : ndarray, optional
         Finite nonnegative weights for the original ``n_bins`` bins, with a
         positive sum. None means uniform weights. Zero-weight bins are
-        excluded, and weights are renormalized over each retained bin set.
+        excluded from the test; t-Cauchy retains their binwise diagnostics.
+        Weights are renormalized over retained bins (informative bins for
+        t-Cauchy). Choose weights independently of the observed signal.
     max_exact_permutations : int, default 10000
         Enumerate all binary label assignments if their number is at most
         this threshold. Zero forces sampling. Ignored on the analytic path.
@@ -1102,13 +1243,15 @@ def _compare_cross_spectra(  # noqa: C901 — validation and dispatch over binar
     pandas.DataFrame
         One row per requested pair, sorted by descending ``Statistic``.
         ``Feature_1`` and ``Feature_2`` identify the pair; ``Statistic`` is
-        the weighted L2 contrast, with ``P_value`` and BH-adjusted ``P_adj``.
+        the weighted L2 contrast or maximum absolute t, with ``P_value`` and
+        BH-adjusted ``P_adj``. t-Cauchy adds per-bin estimates, signed t
+        statistics, p-values, and the original ``Best_bin`` index.
         ``N_samples`` and ``N_bins`` record the support. ``DF_resid``,
         ``N_pairs_pooled`` and ``Effective_rank`` describe the analytic fit;
         per-pair fits count one contributor per eligible pair, while
-        permutations use zero pooled pairs and NaN effective rank. Rotation
-        uses zero pooled pairs and the conditional scatter's effective rank.
-        ``Status`` is ``ok``, ``self_pair``, ``no_common_bins``,
+        permutations and t-Cauchy use zero pooled pairs and NaN effective rank.
+        Rotation uses zero pooled pairs and the conditional scatter's effective
+        rank. ``Status`` is ``ok``, ``self_pair``, ``no_common_bins``,
         ``insufficient_samples``, ``ineligible_design`` or ``degenerate_null``.
         Untestable rows retain NaN p-values. Binary tests also return
         ``n_obs_A`` and ``n_obs_B``. ``attrs`` records original sample/bin
@@ -1124,7 +1267,7 @@ def _compare_cross_spectra(  # noqa: C901 — validation and dispatch over binar
     Bins must be valid in every retained sample.
 
     For transformed profiles Y, let d_p be the difference of group means or
-    the fitted GLM contrast for pair p. The reported statistic is
+    the fitted GLM contrast for pair p. For L2, the reported statistic is
     ``T_p = sqrt(d_p.T @ W @ d_p)``, with sum-one diagonal bin weights W.
     By default, the shared estimators fit each pair's retained-sample
     condition/nuisance design and pool each covariance entry as
@@ -1161,6 +1304,10 @@ def _compare_cross_spectra(  # noqa: C901 — validation and dispatch over binar
     blocked permutation scheme here. BH is applied once across finite pair
     p-values in this call, excluding untestable and self-pairs as in DF.
     """
+    if statistic not in ("l2", "t_cauchy"):
+        raise ValueError("statistic must be 'l2' or 't_cauchy'.")
+    if statistic == "t_cauchy" and (null != "analytic" or covariance is not None):
+        raise ValueError("statistic='t_cauchy' requires null='analytic' and covariance=None.")
     if representation not in ("coherence", "coherency"):
         raise ValueError("representation must be 'coherence' or 'coherency'.")
     if null not in _NULL_OPTIONS:
@@ -1228,11 +1375,26 @@ def _compare_cross_spectra(  # noqa: C901 — validation and dispatch over binar
             raise ValueError("max_exact_permutations must be a nonnegative integer.")
 
     # Missing expression excludes samples; unsupported frequencies still exclude bins.
-    common = (result.coherency_valid | ~pair_presence[..., None]).all(axis=0)
-    common &= (weights > 0) & pair_presence.any(axis=0)[:, None]
+    support = (result.coherency_valid | ~pair_presence[..., None]).all(axis=0)
+    support &= pair_presence.any(axis=0)[:, None]
+    common = support & (weights > 0)
     self_pairs = np.array([a == b for a, b in result.pairs], dtype=bool)
     candidates = np.flatnonzero(~self_pairs)
-    if null == "permutation":
+    if statistic == "t_cauchy":
+        inference = _run_cross_t_cauchy(
+            result,
+            pair_presence,
+            support,
+            candidates,
+            weights,
+            representation=representation,
+            use_masked=use_masked,
+            groups=groups,
+            prepared_design=prepared_design,
+            min_samples_per_group=min_samples_per_group,
+            min_resid_df=min_resid_df,
+        )
+    elif null == "permutation":
         inference = _run_cross_permutations(
             result,
             pair_presence,
@@ -1289,6 +1451,7 @@ def _compare_cross_spectra(  # noqa: C901 — validation and dispatch over binar
         common,
         weights,
         representation=representation,
+        statistic=statistic,
         null=null,
         covariance_mode=covariance_mode,
         use_masked=use_masked,

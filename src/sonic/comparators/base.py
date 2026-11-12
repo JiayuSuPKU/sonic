@@ -1183,16 +1183,18 @@ class _ComparatorBase:
             dictionaries, and arrays follow :func:`~sonic.comparators.multisample.compare_glm`.
         statistic : str
             ``'log_l2'`` (default) is the weighted L2 contrast of log spectra.
-            ``'welch_t_cauchy'`` combines per-bin Welch p-values by Cauchy
-            combination and reports the largest absolute per-bin t statistic.
-            Welch requires two observations per arm and excludes constant bins.
+            ``'log_t_cauchy'`` combines per-bin p-values on log profiles using
+            Welch for binary labels or OLS contrast t tests for a GLM. It also
+            supports localizing the best bin by its smallest per-bin p-value
+            among positive-weight bins.
         null : str
-            ``'analytic'`` (default) uses the selected covariance and Liu tail.
-            ``'rotation'`` conditions on each feature's nuisance-adjusted scatter.
-            ``'permutation'`` is available only for binary comparisons: pass
-            one-dimensional group labels without ``contrast``. GLM tests support
-            ``'analytic'`` and ``'rotation'``.
-            Welch-Cauchy uses its own analytic null; rotation requires L2.
+            Null calibration (default ``'analytic'``), selected by ``statistic``:
+
+            - ``'log_l2'``: ``'analytic'`` (selected covariance and Liu tail),
+              ``'rotation'`` (conditional on nuisance-adjusted scatter), or
+              ``'permutation'`` (binary labels only, without ``contrast``).
+            - ``'log_t_cauchy'``: ``'analytic'`` only (per-bin t tails and
+              Cauchy combination).
         n_perm : int
             Number of sampled label permutations; default 1000. Ignored when
             all assignments are enumerated or another null is selected.
@@ -1200,7 +1202,10 @@ class _ComparatorBase:
             Seed for resampling. Ignored by analytic tests.
         freq_weights : np.ndarray, optional
             Nonnegative weights in the fitted frequency-bin order, normalized
-            to sum to one. None gives uniform weights. Used only by L2 tests.
+            to sum to one. None gives uniform weights. Log t-Cauchy renormalizes
+            over informative bins; zero weights exclude bins from combination,
+            the statistic summary, and ``Best_bin``. Per-bin outputs are unchanged.
+            Choose weights independently of the observed signal.
         max_exact_permutations : int
             Enumerate all binary label assignments when their number is at
             most this threshold; default 10000. Zero forces sampling.
@@ -1227,8 +1232,15 @@ class _ComparatorBase:
             ``Feature``, ``Statistic``, ``P_value`` and ``P_adj``, sorted by
             descending statistic. Masked binary tests include ``n_obs_A`` and
             ``n_obs_B``; masked GLMs include ``n_obs`` and ``df_resid``.
-            Welch-Cauchy adds ``P_value_per_bin``. Skipped genes retain NaNs;
-            BH uses finite p-values.
+            Log t-Cauchy reports the largest absolute t over positive-weight
+            bins and adds ``Estimate_per_bin``, signed ``T_per_bin``, and raw
+            ``P_value_per_bin`` in original bin order. Estimates are mean A
+            minus mean B for binary labels, or the GLM contrast, on log profiles.
+            ``Best_bin`` is the zero-based index with the smallest p-value among
+            informative, positive-weight bins (first index on ties), or missing
+            if none. Skipped genes have NaN per-bin arrays. Feature-level
+            significance does not establish the selected bin's significance.
+            BH uses finite feature p-values.
             Analytic L2 results record ``null`` and ``covariance`` in ``attrs``.
             Rotation also records ``n_rotations``, the effective ``random_state``,
             and ``min_p_value``.
@@ -1261,6 +1273,7 @@ class _ComparatorBase:
 
         options = {
             "gene_names": self.gene_names,
+            "statistic": statistic,
             "freq_weights": freq_weights,
             "normalize_shape": normalize_shape,
             "null": null,
@@ -1271,13 +1284,13 @@ class _ComparatorBase:
 
         use_glm = (contrast is not None) or (groups is None)
         if use_glm:
-            if statistic != "log_l2":
+            if statistic not in ("log_l2", "log_t_cauchy"):
                 raise ValueError(
-                    "Only statistic='log_l2' is supported when "
+                    "Only statistic='log_l2' or 'log_t_cauchy' is supported when "
                     "contrast= is provided or `design` is a multi-column / "
                     f"continuous design, got statistic={statistic!r}."
                 )
-            if null not in ("analytic", "rotation"):
+            if statistic == "log_l2" and null not in ("analytic", "rotation"):
                 raise NotImplementedError(
                     "Only null='analytic' or 'rotation' is supported when "
                     "contrast= is provided or `design` is a multi-column / "
@@ -1311,7 +1324,6 @@ class _ComparatorBase:
                 self.spectra_,
                 groups,
                 self.presence_,
-                statistic=statistic,
                 n_perm=n_perm,
                 min_samples_per_group=int(min_samples_per_group),
                 max_exact_permutations=max_exact_permutations,
@@ -1320,7 +1332,6 @@ class _ComparatorBase:
         return compare_two_groups(
             self.spectra_,
             groups,
-            statistic=statistic,
             n_perm=n_perm,
             max_exact_permutations=max_exact_permutations,
             **options,
@@ -1332,6 +1343,7 @@ class _ComparatorBase:
         *,
         contrast: str | dict[str, float] | np.ndarray | None = None,
         representation: str = "coherence",
+        statistic: str = "l2",
         null: str = "analytic",
         n_perm: int = 1000,
         random_state: int | None = None,
@@ -1357,12 +1369,19 @@ class _ComparatorBase:
         representation : str
             ``'coherence'`` (default) tests log squared-magnitude coherency.
             ``'coherency'`` tests its signed real part without logging.
+        statistic : str
+            ``'l2'`` (default) is the weighted L2 contrast on the selected scale.
+            ``'t_cauchy'`` combines per-bin p-values using Welch for binary
+            labels or OLS contrast t tests for a GLM. It also localizes the
+            best bin by its smallest p-value among positive-weight bins.
         null : str
-            ``'analytic'`` (default) uses the selected covariance and Liu tail.
-            ``'rotation'`` conditions on each feature's nuisance-adjusted scatter.
-            ``'permutation'`` is available only for binary comparisons: pass
-            one-dimensional group labels without ``contrast``. GLM tests support
-            ``'analytic'`` and ``'rotation'``.
+            Null calibration (default ``'analytic'``), selected by ``statistic``:
+
+            - ``'l2'``: ``'analytic'`` (selected covariance and Liu tail),
+              ``'rotation'`` (conditional on nuisance-adjusted scatter), or
+              ``'permutation'`` (binary labels only, without ``contrast``).
+            - ``'t_cauchy'``: ``'analytic'`` only (per-bin t tails and
+              Cauchy combination).
         n_perm : int
             Number of sampled label permutations; default 1000. Ignored when
             all assignments are enumerated or another null is selected.
@@ -1370,8 +1389,11 @@ class _ComparatorBase:
             Seed for resampling. Ignored by analytic tests.
         freq_weights : np.ndarray, optional
             Nonnegative weights on the original flattened bins (radius then
-            angle for polar features). Zero weights exclude bins; retained
-            weights are normalized to sum to one for each pair.
+            angle for polar features); None gives uniform weights. Weights are
+            normalized over retained bins, and over informative bins for
+            t-Cauchy. Zero weights exclude bins from the test and ``Best_bin``;
+            valid per-bin outputs are retained. Choose weights independently
+            of the observed signal.
         max_exact_permutations : int
             Enumerate all binary label assignments when their number is at
             most this threshold; default 10000. Zero forces sampling.
@@ -1385,7 +1407,7 @@ class _ComparatorBase:
             ``None`` (default) or ``'pooled'`` shares residual covariance across
             eligible pairs and PSD-corrects the pooled matrix. ``'per_pair'``
             estimates it separately on each pair's retained samples and bins.
-            An explicit choice requires ``null='analytic'``.
+            An explicit choice requires an analytic L2 test.
         n_rotations : int
             Number of rotation draws; default 19999. Used only with
             ``null='rotation'``, which requires ``covariance=None``.
@@ -1393,17 +1415,31 @@ class _ComparatorBase:
         Returns
         -------
         pandas.DataFrame
-            ``Feature_1``, ``Feature_2``, ``Statistic`` (weighted L2), ``P_value``
-            and ``P_adj``, sorted by descending statistic. Includes sample/bin
-            counts, ``DF_resid``, ``Effective_rank``, ``N_pairs_pooled`` and
-            ``Status``. Binary tests also return ``n_obs_A`` and ``n_obs_B``.
-            Skipped and self-pair rows have NaN p-values; BH uses finite values.
+            ``Feature_1``, ``Feature_2``, ``Statistic``, ``P_value`` and ``P_adj``,
+            sorted by descending statistic. L2 reports the weighted distance;
+            t-Cauchy reports the largest absolute t over positive-weight bins.
+            Includes sample/bin counts, ``DF_resid`` (design residual df),
+            ``Effective_rank``, ``N_pairs_pooled`` and ``Status``. Binary tests
+            also return ``n_obs_A`` and ``n_obs_B``. Skipped and self-pair rows
+            have NaN p-values; BH uses finite pair p-values.
+
+            t-Cauchy adds ``Estimate_per_bin``, signed ``T_per_bin``, and raw
+            ``P_value_per_bin`` in original bin order, with NaNs for unsupported
+            bins or skipped pairs. Estimates are mean A minus mean B for binary
+            labels, or the GLM contrast, on the selected representation's scale.
+            ``Best_bin`` is the zero-based index with the smallest p-value among
+            informative, positive-weight bins (first index on ties), or missing
+            if none. Pair-level significance does not establish the selected
+            bin's significance. Welch degrees of freedom vary by bin;
+            ``DF_resid`` is not the df used for its tails.
 
             ``attrs`` records retained sample/bin indices, weights, representation
             and design. ``covariance`` is ``'pooled_across_valid_bins_psd'``,
             ``'per_pair'``, or None. Per-pair fits have one pooled contributor;
-            skipped and resampled pairs have zero. Rotation effective ranks
-            describe the conditional scatter. Rotation records ``n_rotations``,
+            skipped, resampled and t-Cauchy pairs have zero. t-Cauchy has no
+            covariance or effective rank and records ``per_bin_test`` as
+            ``welch`` or ``ols``. Rotation effective ranks describe the
+            conditional scatter. Rotation records ``n_rotations``,
             the effective ``random_state`` and ``min_p_value``. Permutation
             counts/exactness are per-pair when masked, otherwise shared.
 
@@ -1434,6 +1470,7 @@ class _ComparatorBase:
             groups=groups,
             contrast=contrast,
             representation=representation,
+            statistic=statistic,
             null=null,
             n_perm=n_perm,
             random_state=random_state,

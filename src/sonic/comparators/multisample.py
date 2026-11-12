@@ -6,7 +6,6 @@ Spectral L2 inference lives in ``_inference``; shared OLS fits live in
 
 from __future__ import annotations
 
-import logging
 from collections.abc import Sequence
 from typing import Any
 
@@ -17,7 +16,6 @@ from scipy.stats import t as _t_dist
 
 from sonic.comparators import _inference as _l2
 from sonic.comparators import _regression as _lm
-from sonic.comparators.normalization import _normalize_shape_apply
 from sonic.statistics import apply_bh_correction, cauchy_combine
 
 __all__ = [
@@ -36,8 +34,8 @@ _estimate_two_group_masked_null_covariance = _l2._estimate_two_group_masked_null
 _estimate_two_group_null_covariance = _l2._estimate_two_group_null_covariance
 _l2_pvalues_from_state = _l2._l2_pvalues_from_state
 
-logger = logging.getLogger(__name__)
-_AVAILABLE_STATISTICS = ("log_l2", "welch_t_cauchy")
+_AVAILABLE_STATISTICS = ("log_l2", "log_t_cauchy")
+_BINWISE_COLUMNS = ("Estimate_per_bin", "T_per_bin", "P_value_per_bin")
 
 
 def _welch_test(
@@ -78,38 +76,6 @@ def _welch_test(
     # Clip the floor to the smallest representable positive float so
     # Cauchy's tan(pi(0.5 - p)) stays finite.
     return t_stat, np.clip(pvals, np.finfo(float).tiny, 1.0), mean_diff
-
-
-def _run_welch_t_cauchy_analytic(
-    spectra: np.ndarray,
-    group_codes: np.ndarray,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """Per-bin Welch t test + Cauchy-combined gene-level p-value.
-
-    Both the per-bin significance and the gene-level combination are
-    **analytic**: per-bin p-values come from the Welch t-distribution
-    and the gene-level p comes from the Cauchy combination.
-
-    Returns
-    -------
-    observed_abs_t : np.ndarray
-        ``(n_genes, n_bins)`` observed per-bin ``|t|`` — used as the reported
-        statistic summary (the max across bins sorts the output table
-        sensibly, same convention as before).
-    combined_pvals : np.ndarray
-        ``(n_genes,)`` Cauchy-combined gene-level p-values built from per-bin
-        analytic Welch p-values.
-    per_bin_pvals : np.ndarray
-        ``(n_genes, n_bins)`` per-bin analytic Welch two-sided p-values.
-    """
-    a_mask = group_codes == 0
-    t_stat, per_bin_pvals, _ = _welch_test(spectra[a_mask], spectra[~a_mask])
-    abs_t = np.abs(t_stat)
-    # A bin constant across all samples has no information about the contrast.
-    # Its p=1 would otherwise dominate the Cauchy sum and suppress other bins.
-    informative = np.any(spectra != spectra[:1], axis=0)
-    combined = cauchy_combine(per_bin_pvals, axis=-1, where=informative)
-    return abs_t, combined, per_bin_pvals
 
 
 def _comparison_frame(
@@ -185,9 +151,10 @@ def _compare_two_group_profiles(  # noqa: C901 — input validation and statisti
         )
     if null not in _l2._NULL_OPTIONS:
         raise ValueError(f"Unknown null='{null}'. Options: {list(_l2._NULL_OPTIONS)}.")
-    _l2._resolve_covariance(covariance, statistic=statistic, null=null)
-    if null == "rotation" and statistic != "log_l2":
-        raise ValueError("null='rotation' requires statistic='log_l2'.")
+    if statistic == "log_t_cauchy":
+        _validate_log_t_cauchy_options(null, covariance)
+    else:
+        _l2._resolve_covariance(covariance, statistic=statistic, null=null)
     spectra = np.asarray(spectra)
     if spectra.ndim != 3:
         raise ValueError(f"spectra must be 3D (n_samples, n_genes, n_bins), got {spectra.shape}.")
@@ -205,13 +172,16 @@ def _compare_two_group_profiles(  # noqa: C901 — input validation and statisti
         if presence.shape != spectra.shape[:2]:
             raise ValueError("presence must have shape (n_samples, n_genes).")
 
-    if statistic == "welch_t_cauchy":
-        if freq_weights is not None:
-            logger.debug("freq_weights is ignored by statistic='welch_t_cauchy'.")
-        observed, pvals, extra = _run_welch_profiles(
-            spectra, groups, presence, normalize_shape, min_samples_per_group
+    if statistic == "log_t_cauchy":
+        observed, pvals, extra = _run_t_cauchy_test(
+            spectra,
+            groups=groups,
+            presence=presence,
+            normalize_shape=normalize_shape,
+            freq_weights=freq_weights,
+            min_samples_per_group=min_samples_per_group,
         )
-        metadata = {}
+        metadata = {"null": "analytic", "statistic": statistic, "per_bin_test": "welch"}
     else:
         observed, pvals, extra, metadata = _l2._run_l2_test(
             spectra,
@@ -230,36 +200,189 @@ def _compare_two_group_profiles(  # noqa: C901 — input validation and statisti
     result = _comparison_frame(
         spectra.shape[1], gene_names, observed, pvals, extra=extra, attrs=metadata
     )
-    if presence is not None and (statistic == "welch_t_cauchy" or null == "permutation"):
+    if presence is not None and (statistic != "log_l2" or null == "permutation"):
         # Keep the historical masked permutation/Welch column order.
         columns = ["Feature", "n_obs_A", "n_obs_B", "Statistic", "P_value"]
-        if statistic == "welch_t_cauchy":
-            columns.append("P_value_per_bin")
+        if statistic != "log_l2":
+            columns.extend([*_BINWISE_COLUMNS, "Best_bin"])
         result = result[[*columns, "P_adj"]]
     return result
 
 
-def _run_welch_profiles(spectra, groups, presence, normalize_shape, min_samples_per_group):
-    """Apply Welch-Cauchy to complete profiles or each feature's observed samples."""
-    spectra = np.asarray(spectra, dtype=np.float64)
-    if normalize_shape:
-        spectra = _normalize_shape_apply(spectra)
-    if presence is None:
-        statistic, pvals, per_bin = _run_welch_t_cauchy_analytic(spectra, groups)
-        return statistic.max(axis=-1), pvals, {"P_value_per_bin": list(per_bin)}
+def _validate_log_t_cauchy_options(null, covariance):
+    """Log t-Cauchy uses analytic binwise tests without cross-bin covariance."""
+    if null != "analytic":
+        raise ValueError("statistic='log_t_cauchy' requires null='analytic'.")
+    if covariance is not None:
+        raise ValueError("statistic='log_t_cauchy' requires covariance=None.")
 
-    n_a = presence[groups == 0].sum(axis=0)
-    n_b = presence[groups == 1].sum(axis=0)
-    observed = np.full(spectra.shape[1], np.nan)
-    pvals = np.full(spectra.shape[1], np.nan)
-    per_bin = [None] * spectra.shape[1]
-    for gene in np.flatnonzero((n_a >= min_samples_per_group) & (n_b >= min_samples_per_group)):
-        mask = presence[:, gene]
-        statistic, tail, bins = _run_welch_t_cauchy_analytic(
-            spectra[mask, gene : gene + 1], groups[mask]
-        )
-        observed[gene], pvals[gene], per_bin[gene] = float(statistic.max()), tail[0], bins[0]
-    return observed, pvals, {"n_obs_A": n_a, "n_obs_B": n_b, "P_value_per_bin": per_bin}
+
+def _run_t_cauchy_test(  # noqa: C901 — binary/GLM eligibility and masked fits
+    spectra,
+    *,
+    groups=None,
+    design=None,
+    contrast=None,
+    prepared_design=None,
+    presence=None,
+    normalize_shape=False,
+    log_transform=True,
+    freq_weights=None,
+    min_samples_per_group=2,
+    min_resid_df=1,
+):
+    """Fit binwise t tests and combine them on each feature's observed samples.
+
+    Parameters
+    ----------
+    spectra : np.ndarray
+        Profiles of shape ``(n_samples, n_features, n_bins)``.
+    groups : np.ndarray, optional
+        Validated binary codes (0 or 1). Selects Welch tests; otherwise use OLS.
+    design, contrast
+        GLM design and one linear contrast, used when ``groups`` is None.
+    prepared_design : tuple, optional
+        Validated unmasked GLM design from ``_prepare_glm_design``. Avoids
+        repeating its decomposition across cross-spectrum bin-support groups.
+    presence : np.ndarray, optional
+        Sample-by-feature observation mask. Missing entries are never fitted.
+    normalize_shape : bool
+        Normalize total power before applying the L2 log transformation.
+    log_transform : bool
+        Apply the L2 log floor; False retains signed cross-spectrum profiles.
+    freq_weights : np.ndarray, optional
+        Fixed bin weights, renormalized over each feature's informative bins.
+    min_samples_per_group, min_resid_df : int
+        Masked binary and GLM eligibility thresholds, respectively.
+
+    Returns
+    -------
+    observed, pvals, extra : tuple
+        Maximum absolute t, Cauchy-combined p-values, and per-bin estimates,
+        signed t statistics, p-values and best-bin indices, with masked sample
+        counts. Skipped features retain NaN arrays and a missing best bin.
+    """
+    spectra = np.asarray(spectra)
+    if spectra.ndim != 3:
+        raise ValueError(f"spectra must be 3D (n_samples, n_genes, n_bins), got {spectra.shape}.")
+    n_samples, n_genes, n_bins = spectra.shape
+    if n_samples == 0 or n_bins == 0:
+        raise ValueError("Binwise tests require samples and frequency bins.")
+    weights = _l2._resolve_freq_weights(freq_weights, n_bins)
+    masked = presence is not None
+    if masked:
+        presence = np.asarray(presence, dtype=bool)
+        if presence.shape != spectra.shape[:2]:
+            raise ValueError("presence must have shape (n_samples, n_genes).")
+    extra = {}
+    binary = groups is not None
+    if binary:
+        if masked and int(min_samples_per_group) < 2:
+            raise ValueError("min_samples_per_group must be >= 2.")
+        if masked:
+            extra = {
+                "n_obs_A": presence[groups == 0].sum(axis=0),
+                "n_obs_B": presence[groups == 1].sum(axis=0),
+            }
+    else:
+        if masked and int(min_resid_df) < 1:
+            raise ValueError("min_resid_df must be >= 1.")
+        if masked:
+            matrix, columns = _lm._build_design_matrix(design, n_samples)
+            vector = _lm._resolve_contrast(contrast, columns)
+            inverse, rank, full_estimable = _lm._decompose_glm_design(matrix, vector)
+            extra = {"n_obs": presence.sum(axis=0), "df_resid": np.zeros(n_genes, dtype=int)}
+        else:
+            matrix, _, vector, inverse, rank = (
+                prepared_design
+                if prepared_design is not None
+                else _lm._prepare_glm_design(design, contrast, n_samples)
+            )
+            full_estimable = True
+
+    observed = np.full(n_genes, np.nan)
+    pvals = np.full(n_genes, np.nan)
+    binwise = {name: np.full((n_genes, n_bins), np.nan) for name in _BINWISE_COLUMNS}
+    best_bin = np.full(n_genes, np.nan)
+    mask_groups = (
+        _l2._iter_mask_groups(presence)
+        if masked
+        else [(np.ones(n_samples, dtype=bool), np.arange(n_genes))]
+    )
+    for sample_mask, genes in mask_groups:
+        count = int(sample_mask.sum())
+        if count == 0:
+            continue
+        if binary:
+            codes = groups[sample_mask]
+            if masked and min(np.sum(codes == 0), np.sum(codes == 1)) < int(min_samples_per_group):
+                continue
+            n_terms = 0
+        else:
+            x = matrix[sample_mask]
+            inv, rank_gene, estimable = (
+                (inverse, rank, full_estimable)
+                if sample_mask.all()
+                else _lm._decompose_glm_design(x, vector)
+            )
+            df_resid = count - rank_gene
+            if masked:
+                extra["df_resid"][genes] = df_resid
+            scale = float(np.sum((vector @ inv) ** 2))
+            if (
+                df_resid < int(min_resid_df)
+                or not estimable
+                or not np.isfinite(scale)
+                or scale <= 0
+            ):
+                continue
+            n_terms = x.shape[1]
+
+        rows = np.flatnonzero(sample_mask)
+        for block in _l2._iter_feature_blocks(count, len(genes), n_bins, n_terms):
+            cols = genes[block]
+            values = spectra[rows[:, None], cols]
+            if not np.isfinite(values).all():
+                raise ValueError("Observed profiles must contain finite values.")
+            response = _l2._prepare_profile_block(
+                values, normalize_shape, log_transform=log_transform
+            )
+            if binary:
+                t_stat, bins, effect = _welch_test(response[codes == 0], response[codes == 1])
+            else:
+                t_stat, bins, effect = _lm._test_glm_response(
+                    response.reshape(count, -1), x, inv, vector, rank_gene
+                )
+            t_stat = t_stat.reshape(-1, n_bins)
+            effect = effect.reshape(-1, n_bins)
+            abs_t = np.abs(t_stat)
+            bins = bins.reshape(-1, n_bins)
+            # A constant response can still test a nonzero intercept contrast.
+            informative = np.any(response != response[:1], axis=0) | (effect != 0)
+            tail = cauchy_combine(
+                bins,
+                axis=-1,
+                where=informative,
+                weights=weights if freq_weights is not None else None,
+            )
+            observed[cols] = np.max(abs_t, axis=-1, where=weights > 0, initial=0.0)
+            pvals[cols] = tail
+            binwise["Estimate_per_bin"][cols] = effect
+            binwise["T_per_bin"][cols] = t_stat
+            binwise["P_value_per_bin"][cols] = bins
+            selected = informative & (weights > 0) & np.isfinite(bins)
+            best_bin[cols] = np.where(
+                selected.any(axis=-1), np.argmin(np.where(selected, bins, np.inf), axis=-1), np.nan
+            )
+    return (
+        observed,
+        pvals,
+        {
+            **extra,
+            **{name: list(values) for name, values in binwise.items()},
+            "Best_bin": pd.array(best_bin, dtype="Int64"),
+        },
+    )
 
 
 def compare_two_groups(
@@ -291,14 +414,18 @@ def compare_two_groups(
         Feature names. Defaults to stringified zero-based indices.
     statistic : str
         ``'log_l2'`` (default) is the weighted L2 contrast of log spectra.
-        ``'welch_t_cauchy'`` combines per-bin Welch p-values by Cauchy
-        combination and reports the largest absolute per-bin t statistic.
-        Welch requires two observations per arm and excludes constant bins.
+        ``'log_t_cauchy'`` combines per-bin Welch p-values on log profiles
+        and also supports localizing the best bin by its smallest p-value
+        among positive-weight bins.
+        It requires two observations per arm and excludes constant bins.
     null : str
-        ``'analytic'`` (default) uses the selected covariance and Liu tail.
-        ``'rotation'`` conditions on each feature's nuisance-adjusted scatter.
-        ``'permutation'`` relabels samples. Welch-Cauchy uses its own analytic
-        null with either analytic or permutation selection; rotation requires L2.
+        Null calibration (default ``'analytic'``), selected by ``statistic``:
+
+        - ``'log_l2'``: ``'analytic'`` (selected covariance and Liu tail),
+          ``'rotation'`` (conditional on nuisance-adjusted scatter), or
+          ``'permutation'`` (shuffled binary labels).
+        - ``'log_t_cauchy'``: ``'analytic'`` only (per-bin t tails and
+          Cauchy combination).
     n_perm : int
         Number of sampled label permutations; default 1000. Ignored when
         all assignments are enumerated or another null is selected.
@@ -309,7 +436,10 @@ def compare_two_groups(
         Seed for resampling. Ignored by analytic tests.
     freq_weights : np.ndarray, optional
         Finite nonnegative weights of length ``n_bins``, normalized to sum
-        to one. None gives uniform weights. Used only by L2 tests.
+        to one. None gives uniform weights. Log t-Cauchy renormalizes weights
+        over informative bins; zero weights exclude bins from combination and
+        the statistic summary. Per-bin p-values remain unchanged. Choose
+        weights independently of the observed signal.
     normalize_shape : bool
         If True, divide each sample/feature spectrum by its total power
         before logging to test spectral shape (DF-norm). Default False.
@@ -326,7 +456,13 @@ def compare_two_groups(
     pandas.DataFrame
         Columns ``Feature``, ``Statistic``, ``P_value`` and ``P_adj``.
         L2 tests report the weighted distance on log spectra.
-        Welch-Cauchy also returns ``P_value_per_bin``.
+        Log t-Cauchy reports the largest absolute t over positive-weight bins.
+        It adds ``Estimate_per_bin`` (mean A minus mean B on log profiles),
+        signed ``T_per_bin``, and unadjusted ``P_value_per_bin`` in original
+        bin order. ``Best_bin`` is the zero-based index with the smallest
+        p-value among informative, positive-weight bins (first index on ties),
+        or missing if none. Skipped features have NaN per-bin arrays.
+        Feature-level significance does not establish the selected bin's significance.
         Rows are sorted by descending statistic; BH uses finite p-values.
         Analytic L2 results record ``null`` and ``covariance`` in ``attrs``.
         Rotation also records ``n_rotations``, the effective ``random_state``,
@@ -393,14 +529,18 @@ def compare_two_groups_masked(
         Feature names. Defaults to stringified zero-based indices.
     statistic : str
         ``'log_l2'`` (default) is the weighted L2 contrast of log spectra.
-        ``'welch_t_cauchy'`` combines per-bin Welch p-values by Cauchy
-        combination and reports the largest absolute per-bin t statistic.
-        Welch requires two observations per arm and excludes constant bins.
+        ``'log_t_cauchy'`` combines per-bin Welch p-values on log profiles
+        and also supports localizing the best bin by its smallest p-value
+        among positive-weight bins.
+        It requires two observations per arm and excludes constant bins.
     null : str
-        ``'analytic'`` (default) uses the selected covariance and Liu tail.
-        ``'rotation'`` conditions on each feature's nuisance-adjusted scatter.
-        ``'permutation'`` relabels samples. Welch-Cauchy uses its own analytic
-        null with either analytic or permutation selection; rotation requires L2.
+        Null calibration (default ``'analytic'``), selected by ``statistic``:
+
+        - ``'log_l2'``: ``'analytic'`` (selected covariance and Liu tail),
+          ``'rotation'`` (conditional on nuisance-adjusted scatter), or
+          ``'permutation'`` (shuffled binary labels).
+        - ``'log_t_cauchy'``: ``'analytic'`` only (per-bin t tails and
+          Cauchy combination).
     n_perm : int
         Number of sampled label permutations; default 1000. Ignored when
         all assignments are enumerated or another null is selected.
@@ -414,7 +554,10 @@ def compare_two_groups_masked(
         default 2. Features below either threshold receive NaN results.
     freq_weights : np.ndarray, optional
         Finite nonnegative weights of length ``n_bins``, normalized to sum
-        to one. None gives uniform weights. Used only by L2 tests.
+        to one. None gives uniform weights. Log t-Cauchy renormalizes weights
+        over informative bins; zero weights exclude bins from combination and
+        the statistic summary. Per-bin p-values remain unchanged. Choose
+        weights independently of the observed signal.
     normalize_shape : bool
         If True, divide each sample/feature spectrum by its total power
         before logging to test spectral shape (DF-norm). Default False.
@@ -431,7 +574,13 @@ def compare_two_groups_masked(
     pandas.DataFrame
         Columns ``Feature``, ``Statistic``, ``P_value`` and ``P_adj``.
         L2 tests report the weighted distance on log spectra.
-        Welch-Cauchy also returns ``P_value_per_bin``.
+        Log t-Cauchy reports the largest absolute t over positive-weight bins.
+        It adds ``Estimate_per_bin`` (mean A minus mean B on log profiles),
+        signed ``T_per_bin``, and unadjusted ``P_value_per_bin`` in original
+        bin order. ``Best_bin`` is the zero-based index with the smallest
+        p-value among informative, positive-weight bins (first index on ties),
+        or missing if none. Skipped features have NaN per-bin arrays.
+        Feature-level significance does not establish the selected bin's significance.
         Includes ``n_obs_A`` and ``n_obs_B``; skipped genes retain NaN results.
         Rows are sorted by descending statistic; BH uses finite p-values.
         Analytic L2 results record ``null`` and ``covariance`` in ``attrs``.
@@ -474,6 +623,7 @@ def compare_glm(
     freq_weights: np.ndarray | None = None,
     normalize_shape: bool = False,
     *,
+    statistic: str = "log_l2",
     covariance: str | None = None,
     null: str = "analytic",
     n_rotations: int = 19999,
@@ -498,18 +648,29 @@ def compare_glm(
         Feature names. Defaults to stringified zero-based indices.
     freq_weights : np.ndarray, optional
         Finite nonnegative weights of length ``n_bins``, normalized to sum
-        to one. None gives uniform weights. Used only by L2 tests.
+        to one. None gives uniform weights. Log t-Cauchy renormalizes weights
+        over informative bins; zero weights exclude bins from combination and
+        the statistic summary. Per-bin p-values remain unchanged. Choose
+        weights independently of the observed signal.
     normalize_shape : bool
         If True, divide each sample/feature spectrum by its total power
         before logging to test spectral shape (DF-norm). Default False.
+    statistic : str
+        ``'log_l2'`` (default) tests the weighted L2 contrast of log spectra.
+        ``'log_t_cauchy'`` combines per-bin OLS contrast t-test p-values
+        and also supports localizing the best bin by its smallest p-value
+        among positive-weight bins.
     covariance : str or None
         ``None`` (default) or ``'pooled'`` shares residual covariance across
         eligible genes. ``'per_gene'`` estimates it separately for each gene.
         An explicit choice requires an analytic L2 test.
     null : str
-        ``'analytic'`` (default) uses the selected covariance and Liu tail.
-        ``'rotation'`` conditions on each feature's nuisance-adjusted scatter.
-        Permutation calibration is available only for binary comparisons.
+        Null calibration (default ``'analytic'``), selected by ``statistic``:
+
+        - ``'log_l2'``: ``'analytic'`` (selected covariance and Liu tail),
+          ``'rotation'`` (conditional on nuisance-adjusted scatter).
+        - ``'log_t_cauchy'``: ``'analytic'`` only (per-bin t tails and
+          Cauchy combination).
     n_rotations : int
         Number of rotation draws; default 19999. Used only with
         ``null='rotation'``, which requires ``covariance=None``.
@@ -521,6 +682,13 @@ def compare_glm(
     pandas.DataFrame
         Columns ``Feature``, ``Statistic``, ``P_value`` and ``P_adj``.
         L2 tests report the weighted distance on log spectra.
+        Log t-Cauchy reports the largest absolute t over positive-weight bins.
+        It adds ``Estimate_per_bin`` (fitted contrast on log profiles), signed
+        ``T_per_bin``, and unadjusted ``P_value_per_bin`` in original bin order.
+        ``Best_bin`` is the zero-based index with the smallest p-value among
+        informative, positive-weight bins (first index on ties), or missing
+        if none. Skipped features have NaN per-bin arrays.
+        Feature-level significance does not establish the selected bin's significance.
         Rows are sorted by descending statistic; BH uses finite p-values.
         Analytic L2 results record ``null`` and ``covariance`` in ``attrs``.
         Rotation also records ``n_rotations``, the effective ``random_state``,
@@ -538,17 +706,30 @@ def compare_glm(
     For calibration assumptions and zero-variance behavior, see
     :doc:`/guides/multisample`.
     """
-    observed, pvals, extra, metadata = _l2._run_l2_test(
-        spectra,
-        design=design,
-        contrast=contrast,
-        null=null,
-        covariance=covariance,
-        freq_weights=freq_weights,
-        normalize_shape=normalize_shape,
-        n_rotations=n_rotations,
-        random_state=random_state,
-    )
+    if statistic == "log_t_cauchy":
+        _validate_log_t_cauchy_options(null, covariance)
+        observed, pvals, extra = _run_t_cauchy_test(
+            spectra,
+            design=design,
+            contrast=contrast,
+            normalize_shape=normalize_shape,
+            freq_weights=freq_weights,
+        )
+        metadata = {"null": "analytic", "statistic": statistic, "per_bin_test": "ols"}
+    elif statistic == "log_l2":
+        observed, pvals, extra, metadata = _l2._run_l2_test(
+            spectra,
+            design=design,
+            contrast=contrast,
+            null=null,
+            covariance=covariance,
+            freq_weights=freq_weights,
+            normalize_shape=normalize_shape,
+            n_rotations=n_rotations,
+            random_state=random_state,
+        )
+    else:
+        raise ValueError("GLM statistic must be 'log_l2' or 'log_t_cauchy'.")
     return _comparison_frame(
         len(observed), gene_names, observed, pvals, extra=extra, attrs=metadata
     )
@@ -564,6 +745,7 @@ def compare_glm_masked(
     normalize_shape: bool = False,
     min_resid_df: int = 1,
     *,
+    statistic: str = "log_l2",
     covariance: str | None = None,
     null: str = "analytic",
     n_rotations: int = 19999,
@@ -591,21 +773,32 @@ def compare_glm_masked(
         Feature names. Defaults to stringified zero-based indices.
     freq_weights : np.ndarray, optional
         Finite nonnegative weights of length ``n_bins``, normalized to sum
-        to one. None gives uniform weights. Used only by L2 tests.
+        to one. None gives uniform weights. Log t-Cauchy renormalizes weights
+        over informative bins; zero weights exclude bins from combination and
+        the statistic summary. Per-bin p-values remain unchanged. Choose
+        weights independently of the observed signal.
     normalize_shape : bool
         If True, divide each sample/feature spectrum by its total power
         before logging to test spectral shape (DF-norm). Default False.
     min_resid_df : int
         Minimum residual degrees of freedom for a masked GLM test;
         default 1. Ineligible or unestimable features receive NaN results.
+    statistic : str
+        ``'log_l2'`` (default) tests the weighted L2 contrast of log spectra.
+        ``'log_t_cauchy'`` combines per-bin OLS contrast t-test p-values
+        and also supports localizing the best bin by its smallest p-value
+        among positive-weight bins.
     covariance : str or None
         ``None`` (default) or ``'pooled'`` shares residual covariance across
         eligible genes. ``'per_gene'`` estimates it separately for each gene.
         An explicit choice requires an analytic L2 test.
     null : str
-        ``'analytic'`` (default) uses the selected covariance and Liu tail.
-        ``'rotation'`` conditions on each feature's nuisance-adjusted scatter.
-        Permutation calibration is available only for binary comparisons.
+        Null calibration (default ``'analytic'``), selected by ``statistic``:
+
+        - ``'log_l2'``: ``'analytic'`` (selected covariance and Liu tail),
+          ``'rotation'`` (conditional on nuisance-adjusted scatter).
+        - ``'log_t_cauchy'``: ``'analytic'`` only (per-bin t tails and
+          Cauchy combination).
     n_rotations : int
         Number of rotation draws; default 19999. Used only with
         ``null='rotation'``, which requires ``covariance=None``.
@@ -617,6 +810,13 @@ def compare_glm_masked(
     pandas.DataFrame
         Columns ``Feature``, ``Statistic``, ``P_value`` and ``P_adj``.
         L2 tests report the weighted distance on log spectra.
+        Log t-Cauchy reports the largest absolute t over positive-weight bins.
+        It adds ``Estimate_per_bin`` (fitted contrast on log profiles), signed
+        ``T_per_bin``, and unadjusted ``P_value_per_bin`` in original bin order.
+        ``Best_bin`` is the zero-based index with the smallest p-value among
+        informative, positive-weight bins (first index on ties), or missing
+        if none. Skipped features have NaN per-bin arrays.
+        Feature-level significance does not establish the selected bin's significance.
         Includes ``n_obs`` and ``df_resid``; skipped genes retain NaN results.
         Rows are sorted by descending statistic; BH uses finite p-values.
         Analytic L2 results record ``null`` and ``covariance`` in ``attrs``.
@@ -635,19 +835,34 @@ def compare_glm_masked(
     For calibration assumptions and zero-variance behavior, see
     :doc:`/guides/multisample`.
     """
-    observed, pvals, extra, metadata = _l2._run_l2_test(
-        spectra,
-        design=design,
-        contrast=contrast,
-        presence=presence,
-        null=null,
-        covariance=covariance,
-        freq_weights=freq_weights,
-        normalize_shape=normalize_shape,
-        n_rotations=n_rotations,
-        random_state=random_state,
-        min_resid_df=min_resid_df,
-    )
+    if statistic == "log_t_cauchy":
+        _validate_log_t_cauchy_options(null, covariance)
+        observed, pvals, extra = _run_t_cauchy_test(
+            spectra,
+            design=design,
+            contrast=contrast,
+            presence=presence,
+            min_resid_df=min_resid_df,
+            normalize_shape=normalize_shape,
+            freq_weights=freq_weights,
+        )
+        metadata = {"null": "analytic", "statistic": statistic, "per_bin_test": "ols"}
+    elif statistic == "log_l2":
+        observed, pvals, extra, metadata = _l2._run_l2_test(
+            spectra,
+            design=design,
+            contrast=contrast,
+            presence=presence,
+            null=null,
+            covariance=covariance,
+            freq_weights=freq_weights,
+            normalize_shape=normalize_shape,
+            n_rotations=n_rotations,
+            random_state=random_state,
+            min_resid_df=min_resid_df,
+        )
+    else:
+        raise ValueError("GLM statistic must be 'log_l2' or 'log_t_cauchy'.")
     return _comparison_frame(
         len(observed), gene_names, observed, pvals, extra=extra, attrs=metadata
     )
@@ -790,27 +1005,10 @@ def compare_glm_scalar(
         raise ValueError("Scalar GLM responses must be finite.")
     prepared_design = _lm._prepare_glm_design(design, contrast, n_samples)
     design_matrix, _, contrast_vector, design_inverse, rank = prepared_design
-    df_resid = n_samples - rank
-
-    # Fit the OLS model
-    _, resid, estimate = _lm._fit_glm_response(
+    t_stat, pvals, estimate = _lm._test_glm_response(
         values, design_matrix, design_inverse, contrast_vector, rank
     )
-    sigma2 = np.sum(resid**2, axis=0) / df_resid
-    contrast_var = float(np.sum((contrast_vector @ design_inverse) ** 2))
-    if contrast_var <= 0:
-        raise ValueError("contrast has zero estimated variance under the supplied design.")
-
-    # Compute the OLS contrast t statistic and p-value.
-    se = np.sqrt(np.maximum(sigma2, 0.0) * contrast_var)
-    with np.errstate(divide="ignore", invalid="ignore"):
-        t_stat = estimate / se
-    zero_se = se == 0.0
-    t_stat[zero_se & (estimate == 0.0)] = 0.0
-    perfect_effect = zero_se & (estimate != 0.0)
-    t_stat[perfect_effect] = np.sign(estimate[perfect_effect]) * np.inf
     observed = np.abs(t_stat)
-    pvals = 2.0 * _t_dist.sf(observed, df_resid)
 
     frame = _comparison_frame(
         n_genes,

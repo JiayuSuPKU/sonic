@@ -30,7 +30,7 @@ def _stub_spectra_groups(seed: int = 0, n_a: int = 4, n_b: int = 4, n_genes: int
 class TestComparisonOptions:
     """Public options, result schemas, and spectrum transformations."""
 
-    @pytest.mark.parametrize("stat", ["log_l2", "welch_t_cauchy"])
+    @pytest.mark.parametrize("stat", ["log_l2", "log_t_cauchy"])
     def test_each_statistic_runs(self, stat):
         rng = np.random.default_rng(0)
         spectra = rng.uniform(0.1, 5.0, size=(6, 8, 6))
@@ -39,7 +39,7 @@ class TestComparisonOptions:
         assert df.shape[0] == 8
         assert {"Feature", "Statistic", "P_value", "P_adj"} <= set(df.columns)
         assert df["P_value"].between(0, 1).all()
-        if stat == "welch_t_cauchy":
+        if stat != "log_l2":
             assert "P_value_per_bin" in df.columns
             per_bin = np.stack(df["P_value_per_bin"].to_numpy())
             assert per_bin.shape == (8, 6)
@@ -160,7 +160,7 @@ class TestComparisonOptions:
         [
             ("log_l2", "analytic"),
             ("log_l2", "permutation"),
-            ("welch_t_cauchy", "permutation"),
+            ("log_t_cauchy", "analytic"),
         ],
     )
     def test_two_groups_option_matches_manual_normalization(self, statistic, null):
@@ -188,7 +188,7 @@ class TestComparisonOptions:
         [
             ("log_l2", "analytic"),
             ("log_l2", "permutation"),
-            ("welch_t_cauchy", "permutation"),
+            ("log_t_cauchy", "analytic"),
         ],
     )
     def test_masked_two_groups_option_matches_manual_normalization(self, statistic, null):
@@ -416,13 +416,14 @@ class TestGLMComparison:
         with pytest.raises(ValueError, match="not estimable"):
             compare_glm(spectra, X, contrast=np.array([0.0, 1.0, 0.0]))
 
-    def test_glm_functions_keep_log_l2_and_default_to_analytic(self):
-        """GLM primitives keep L2 fixed while allowing null calibration choices."""
+    def test_glm_functions_default_to_log_l2_and_analytic(self):
+        """The new statistic is keyword-only and leaves existing defaults intact."""
         import inspect
 
         for fn in (compare_glm, compare_glm_masked):
             sig = inspect.signature(fn)
-            assert "statistic" not in sig.parameters
+            assert sig.parameters["statistic"].default == "log_l2"
+            assert sig.parameters["statistic"].kind == inspect.Parameter.KEYWORD_ONLY
             assert sig.parameters["null"].default == "analytic"
 
     def test_masked_glm_matches_unmasked_when_complete(self):
@@ -642,7 +643,7 @@ class TestGLMComparison:
 class TestWelchComparison:
     """Welch replication, constant-bin handling, and scale invariance."""
 
-    def test_welch_cauchy_is_invariant_to_spectral_units(
+    def test_log_t_cauchy_is_invariant_to_spectral_units_above_floor(
         self,
     ):
         rng = np.random.default_rng(25)
@@ -653,7 +654,7 @@ class TestWelchComparison:
         for mask in (None, presence):
             results = []
             for scale in (1.0, 1e-8):
-                kwargs = {"statistic": "welch_t_cauchy"}
+                kwargs = {"statistic": "log_t_cauchy"}
                 result = (
                     compare_two_groups(spectra * scale, groups, **kwargs)
                     if mask is None
@@ -669,20 +670,20 @@ class TestWelchComparison:
         groups = np.r_[0, np.ones(n_b)]
         with pytest.raises(ValueError, match="at least two samples in each group"):
             if spectral:
-                compare_two_groups(values[..., None], groups, statistic="welch_t_cauchy")
+                compare_two_groups(values[..., None], groups, statistic="log_t_cauchy")
             else:
                 compare_two_groups_scalar(values, groups)
 
     @pytest.mark.parametrize("masked", [False, True])
-    def test_welch_cauchy_excludes_only_constant_bins(self, masked):
+    def test_log_t_cauchy_excludes_only_constant_bins(self, masked):
         values = np.r_[np.arange(1.0, 7.0), np.arange(9.0, 15.0)]
         groups = np.repeat([0, 1], 6)
-        spectra = np.stack([values, np.ones(12), 1 + groups], axis=1)[..., None]
+        spectra = np.exp(np.stack([values, np.ones(12), 1 + groups], axis=1)[..., None])
         presence = np.ones((12, 3), dtype=bool)
         presence[0, 0] = False
 
         def compare(array):
-            kwargs = {"statistic": "welch_t_cauchy"}
+            kwargs = {"statistic": "log_t_cauchy"}
             result = (
                 compare_two_groups_masked(array, groups, presence, **kwargs)
                 if masked
@@ -887,3 +888,369 @@ class TestScalarGLMComparison:
         {"response": values, "design": design, "contrast": contrast}[target].flat[0] = value
         with pytest.raises(ValueError, match="finite"):
             compare_glm_scalar(values, design, contrast)
+
+
+class TestLogTCauchy:
+    """Direct references for log-profile binwise inference and masked designs."""
+
+    @pytest.mark.parametrize("glm", [False, True])
+    @pytest.mark.parametrize("masked", [False, True])
+    def test_removed_raw_statistic_is_rejected(self, glm, masked):
+        spectra = np.ones((8, 2, 3))
+        groups = np.repeat([0, 1], 4)
+        if glm:
+            fn = compare_glm_masked if masked else compare_glm
+            args = [spectra, pd.DataFrame({"group": groups}), "group"]
+        else:
+            fn = compare_two_groups_masked if masked else compare_two_groups
+            args = [spectra, groups]
+        if masked:
+            args.append(np.ones((8, 2), bool))
+        with pytest.raises(ValueError, match="log_t_cauchy"):
+            fn(*args, statistic="welch_t_cauchy")
+
+    @pytest.mark.parametrize("shape_only", [False, True])
+    def test_binary_matches_scipy_welch(self, shape_only):
+        from scipy.stats import ttest_ind
+
+        from sonic.statistics import apply_bh_correction, cauchy_combine
+
+        spectra = np.random.default_rng(83).lognormal(size=(11, 4, 5))
+        spectra[0, 0, 0] = 0
+        spectra[1, 0, 0] = 1e-15
+        original = spectra.copy()
+        groups = np.r_[np.zeros(4), np.ones(7)]
+        response = normalize_shape(spectra) if shape_only else spectra
+        response = np.log(np.maximum(response, 1e-12))
+        expected = ttest_ind(response[:4], response[4:], equal_var=False, axis=0)
+        result = (
+            compare_two_groups(
+                spectra, groups, statistic="log_t_cauchy", normalize_shape=shape_only
+            )
+            .set_index("Feature")
+            .loc[[str(i) for i in range(4)]]
+        )
+        np.testing.assert_allclose(np.stack(result.P_value_per_bin), expected.pvalue, rtol=1e-12)
+        np.testing.assert_allclose(np.stack(result.T_per_bin), expected.statistic, rtol=1e-12)
+        np.testing.assert_allclose(
+            np.stack(result.Estimate_per_bin), response[:4].mean(0) - response[4:].mean(0)
+        )
+        np.testing.assert_array_equal(result.Best_bin, np.argmin(expected.pvalue, axis=-1))
+        assert result.Best_bin.dtype == pd.Int64Dtype()
+        np.testing.assert_allclose(result.Statistic, np.max(np.abs(expected.statistic), axis=-1))
+        np.testing.assert_allclose(result.P_value, cauchy_combine(expected.pvalue))
+        np.testing.assert_allclose(result.P_adj, apply_bh_correction(result.P_value))
+        np.testing.assert_array_equal(spectra, original)
+
+    @pytest.mark.parametrize("shape_only", [False, True])
+    @pytest.mark.parametrize("aliased", [False, True])
+    def test_glm_matches_direct_ols_with_nuisance(self, shape_only, aliased):
+        from scipy.stats import t
+
+        from sonic.statistics import cauchy_combine
+
+        rng = np.random.default_rng(84)
+        x = np.linspace(-1, 1, 13)
+        nuisance = 0.7 * x + rng.normal(size=13)
+        matrix = np.c_[np.ones(13), x, nuisance]
+        contrast = np.array([0.0, 1.0, 0.0])
+        if aliased:
+            matrix = np.c_[matrix, x]
+            contrast = np.r_[contrast, 1.0]
+        spectra = np.exp(rng.normal(size=(13, 4, 5)) + 2 * nuisance[:, None, None])
+        values = normalize_shape(spectra) if shape_only else spectra
+        response = np.log(np.maximum(values, 1e-12)).reshape(13, -1)
+        beta = np.linalg.lstsq(matrix, response, rcond=None)[0]
+        residual = response - matrix @ beta
+        df = 13 - np.linalg.matrix_rank(matrix)
+        se = np.sqrt(
+            (residual**2).sum(axis=0) / df * np.sum((contrast @ np.linalg.pinv(matrix)) ** 2)
+        )
+        abs_t = np.abs(contrast @ beta / se).reshape(4, 5)
+        expected_p = 2 * t.sf(abs_t, df)
+        result = compare_glm(
+            spectra, matrix, contrast, statistic="log_t_cauchy", normalize_shape=shape_only
+        )
+        result = result.set_index("Feature").loc[[str(i) for i in range(4)]]
+        np.testing.assert_allclose(np.stack(result.P_value_per_bin), expected_p, rtol=1e-11)
+        np.testing.assert_allclose(
+            np.stack(result.Estimate_per_bin), (contrast @ beta).reshape(4, 5), rtol=1e-11
+        )
+        np.testing.assert_allclose(
+            np.stack(result.T_per_bin), (contrast @ beta / se).reshape(4, 5), rtol=1e-11
+        )
+        np.testing.assert_array_equal(result.Best_bin, np.argmin(expected_p, axis=-1))
+        np.testing.assert_allclose(result.Statistic, abs_t.max(axis=-1), rtol=1e-11)
+        np.testing.assert_allclose(result.P_value, cauchy_combine(expected_p), rtol=1e-11)
+        assert result.attrs["per_bin_test"] == "ols"
+
+    @pytest.mark.parametrize("glm", [False, True])
+    @pytest.mark.parametrize("shape_only", [False, True])
+    def test_masked_matches_separately_subsetted_fits(self, glm, shape_only):
+        rng = np.random.default_rng(85)
+        spectra = rng.lognormal(size=(12, 5, 4))
+        groups = np.repeat([0, 1], 6)
+        design = pd.DataFrame({"age": np.arange(12.0), "batch": np.tile([0, 1], 6)})
+        presence = np.ones((12, 5), bool)
+        presence[0, :2] = False
+        presence[7:9, 2:4] = False
+        spectra[~presence] = np.nan
+        options = {"statistic": "log_t_cauchy", "normalize_shape": shape_only}
+        if glm:
+            result = compare_glm_masked(spectra, design, "age", presence, **options)
+        else:
+            result = compare_two_groups_masked(spectra, groups, presence, **options)
+        result = result.set_index("Feature")
+        for gene in range(5):
+            mask = presence[:, gene]
+            values = spectra[mask, gene : gene + 1]
+            expected = (
+                compare_glm(values, design.loc[mask], "age", **options)
+                if glm
+                else compare_two_groups(values, groups[mask], **options)
+            ).iloc[0]
+            actual = result.loc[str(gene)]
+            np.testing.assert_allclose(actual.Statistic, expected.Statistic, rtol=1e-12)
+            np.testing.assert_allclose(actual.P_value, expected.P_value, rtol=1e-12)
+            np.testing.assert_allclose(actual.P_value_per_bin, expected.P_value_per_bin, rtol=1e-12)
+            np.testing.assert_allclose(actual.T_per_bin, expected.T_per_bin, rtol=1e-12)
+            np.testing.assert_allclose(
+                actual.Estimate_per_bin, expected.Estimate_per_bin, rtol=1e-12
+            )
+            assert actual.Best_bin == expected.Best_bin
+            if glm:
+                assert actual.n_obs == mask.sum()
+                assert actual.df_resid == mask.sum() - 3
+            else:
+                assert actual.n_obs_A == np.sum(mask & (groups == 0))
+                assert actual.n_obs_B == np.sum(mask & (groups == 1))
+
+    @pytest.mark.parametrize("glm", [False, True])
+    def test_masked_ineligible_rows_keep_nan_and_counts(self, glm):
+        spectra = np.random.default_rng(86).lognormal(size=(8, 4, 3))
+        groups = np.repeat([0, 1], 4)
+        presence = np.ones((8, 4), bool)
+        presence[4:, 0] = False
+        presence[2:, 1] = False
+        presence[:, 2] = False
+        spectra[~presence] = np.nan
+        if glm:
+            result = compare_glm_masked(
+                spectra,
+                pd.DataFrame({"group": groups}),
+                "group",
+                presence,
+                statistic="log_t_cauchy",
+                min_resid_df=2,
+            ).set_index("Feature")
+            np.testing.assert_array_equal(result.loc[["0", "1", "2"], "df_resid"], [3, 1, 0])
+        else:
+            result = compare_two_groups_masked(
+                spectra, groups, presence, statistic="log_t_cauchy"
+            ).set_index("Feature")
+        assert result.loc[["0", "1", "2"], ["Statistic", "P_value", "P_adj"]].isna().all().all()
+        for column in ("Estimate_per_bin", "T_per_bin", "P_value_per_bin"):
+            values = np.stack(result.loc[["0", "1", "2"], column])
+            assert values.shape == (3, 3)
+            assert np.isnan(values).all()
+        assert result.loc[["0", "1", "2"], "Best_bin"].isna().all()
+        assert np.isfinite(result.loc["3", "P_value"])
+        assert result.loc["3", "P_adj"] == result.loc["3", "P_value"]
+
+    @pytest.mark.parametrize("glm", [False, True])
+    def test_constant_bins_and_perfect_effects(self, glm):
+        groups = np.repeat([0, 1], 6)
+        response = np.c_[np.zeros(12), np.ones(12), groups * 2.0]
+        spectra = np.exp(response)[:, :, None]
+        args = (pd.DataFrame({"group": groups}), "group") if glm else (groups,)
+        compare = compare_glm if glm else compare_two_groups
+        expected = compare(spectra, *args, statistic="log_t_cauchy").set_index("Feature")
+        padded = np.concatenate([spectra, np.ones_like(spectra), np.zeros_like(spectra)], axis=-1)
+        actual = compare(padded, *args, statistic="log_t_cauchy").set_index("Feature")
+        np.testing.assert_allclose(actual.P_value, expected.P_value, atol=1e-14)
+        assert actual.loc["0", "P_value"] == actual.loc["1", "P_value"] == 1
+        assert actual.loc["2", "P_value"] < 1e-100
+        assert actual.loc[["0", "1"], "Best_bin"].isna().all()
+        assert actual.loc["2", "Best_bin"] == 0
+        # Constant log responses still carry an intercept contrast.
+        if glm:
+            intercept = compare_glm(
+                np.exp(np.ones((8, 1, 2))), np.ones((8, 1)), np.ones(1), statistic="log_t_cauchy"
+            )
+            assert intercept.P_value.iloc[0] < 1e-100
+
+    @pytest.mark.parametrize("masked", [False, True])
+    @pytest.mark.parametrize("glm", [False, True])
+    @pytest.mark.parametrize(
+        "options,match",
+        [
+            ({"null": "permutation"}, "analytic"),
+            ({"null": "rotation"}, "analytic"),
+            ({"covariance": "pooled"}, "covariance"),
+        ],
+    )
+    def test_invalid_options_are_rejected(self, masked, glm, options, match):
+        spectra = np.ones((8, 2, 3))
+        groups = np.repeat([0, 1], 4)
+        presence = np.ones((8, 2), bool)
+        if glm:
+            fn = compare_glm_masked if masked else compare_glm
+            args = [spectra, pd.DataFrame({"group": groups}), "group"]
+        else:
+            fn = compare_two_groups_masked if masked else compare_two_groups
+            args = [spectra, groups]
+        if masked:
+            args.append(presence)
+        with pytest.raises(ValueError, match=match):
+            fn(*args, statistic="log_t_cauchy", **options)
+
+    def test_explicit_binary_glm_uses_ols_not_welch(self):
+        from scipy.stats import ttest_ind
+
+        response = np.random.default_rng(3).normal(size=(16, 2, 3))
+        response[:4] *= 3
+        groups = np.r_[np.zeros(4), np.ones(12)]
+        spectra = np.exp(response)
+        glm = (
+            compare_glm(spectra, pd.DataFrame({"group": groups}), "group", statistic="log_t_cauchy")
+            .set_index("Feature")
+            .sort_index()
+        )
+        binary = (
+            compare_two_groups(spectra, groups, statistic="log_t_cauchy")
+            .set_index("Feature")
+            .sort_index()
+        )
+        expected = ttest_ind(response[:4], response[4:], axis=0, equal_var=True)
+        np.testing.assert_allclose(np.stack(glm.P_value_per_bin), expected.pvalue, rtol=1e-12)
+        assert not np.allclose(np.stack(glm.P_value_per_bin), np.stack(binary.P_value_per_bin))
+
+    @pytest.mark.parametrize("bad", [np.nan, np.inf, -np.inf])
+    @pytest.mark.parametrize("glm", [False, True])
+    def test_observed_nonfinite_values_raise_before_logging(self, bad, glm):
+        spectra = np.ones((8, 2, 3))
+        spectra[0, 0, 0] = bad
+        with pytest.raises(ValueError, match="finite"):
+            if glm:
+                compare_glm(
+                    spectra, pd.DataFrame({"age": np.arange(8.0)}), "age", statistic="log_t_cauchy"
+                )
+            else:
+                compare_two_groups(spectra, np.repeat([0, 1], 4), statistic="log_t_cauchy")
+
+    def test_masked_nonestimable_full_design_skips_without_fitting(self):
+        x = np.arange(8.0)
+        result = compare_glm_masked(
+            np.ones((8, 2, 3)),
+            np.c_[np.ones(8), x, x],
+            np.array([0.0, 1.0, 0.0]),
+            np.ones((8, 2), bool),
+            statistic="log_t_cauchy",
+        )
+        assert result.P_value.isna().all()
+        assert (result.df_resid == 6).all()
+        with pytest.raises(ValueError, match="not estimable"):
+            compare_glm(
+                np.ones((8, 2, 3)),
+                np.c_[np.ones(8), x, x],
+                np.array([0.0, 1.0, 0.0]),
+                statistic="log_t_cauchy",
+            )
+
+    @pytest.mark.parametrize("glm", [False, True])
+    @pytest.mark.parametrize("masked", [False, True])
+    @pytest.mark.parametrize("shape_only", [False, True])
+    def test_weights_match_formula_and_preserve_bin_pvalues(self, glm, masked, shape_only):
+        rng = np.random.default_rng(23)
+        spectra = rng.lognormal(size=(12, 3, 4))
+        spectra[:, :, 1] = 1.0
+        groups = np.repeat([0, 1], 6)
+        design = pd.DataFrame({"x": np.arange(12.0)})
+        presence = np.ones((12, 3), bool)
+        if masked:
+            presence[0, 0] = False
+            presence[6, 1] = False
+        if glm:
+            fn = compare_glm_masked if masked else compare_glm
+            args = [spectra, design, "x"]
+        else:
+            fn = compare_two_groups_masked if masked else compare_two_groups
+            args = [spectra, groups]
+        if masked:
+            args.append(presence)
+        options = {"statistic": "log_t_cauchy", "normalize_shape": shape_only}
+        original = fn(*args, **options).set_index("Feature").sort_index()
+        weights = np.array([1.0, 10.0, 3.0, 0.0])
+        actual = fn(*args, **options, freq_weights=weights).set_index("Feature").sort_index()
+        uniform = fn(*args, **options, freq_weights=np.ones(4)).set_index("Feature").sort_index()
+        np.testing.assert_allclose(uniform.P_value, original.P_value, rtol=1e-12)
+        np.testing.assert_allclose(uniform.Statistic, original.Statistic, rtol=1e-12)
+        np.testing.assert_array_equal(
+            np.stack(actual.P_value_per_bin), np.stack(original.P_value_per_bin)
+        )
+        for gene in range(3):
+            values = spectra[presence[:, gene], gene : gene + 1]
+            if shape_only:
+                values = normalize_shape(values)
+            response = np.log(np.maximum(values[:, 0], 1e-12))
+            selected = np.any(response != response[:1], axis=0) & (weights > 0)
+            assert (
+                actual.loc[str(gene), "Best_bin"]
+                == np.flatnonzero(selected)[
+                    np.argmin(original.loc[str(gene), "P_value_per_bin"][selected])
+                ]
+            )
+            p = original.loc[str(gene), "P_value_per_bin"][selected]
+            w = weights[selected] / weights[selected].sum()
+            expected = 0.5 - np.arctan(np.sum(w * np.tan(np.pi * (0.5 - p)))) / np.pi
+            np.testing.assert_allclose(actual.loc[str(gene), "P_value"], expected, rtol=1e-11)
+
+    @pytest.mark.parametrize("glm", [False, True])
+    def test_zero_weight_signal_does_not_enter_feature_test(self, glm):
+        groups = np.repeat([0, 1], 6)
+        spectra = np.exp(np.stack([groups * 2.0, np.zeros(12)], axis=-1))[:, None, :]
+        result = (
+            compare_glm(
+                spectra,
+                pd.DataFrame({"group": groups}),
+                "group",
+                statistic="log_t_cauchy",
+                freq_weights=[0, 1],
+            )
+            if glm
+            else compare_two_groups(spectra, groups, statistic="log_t_cauchy", freq_weights=[0, 1])
+        ).iloc[0]
+        assert result.P_value == 1.0
+        assert result.Statistic == 0.0
+        assert result.P_value_per_bin[0] < 1e-100
+        assert pd.isna(result.Best_bin)
+
+    @pytest.mark.parametrize("glm", [False, True])
+    @pytest.mark.parametrize(
+        "weights", [np.zeros(3), [1, -1, 1], [1, np.nan, 1], [1, np.inf, 1], [1, 1]]
+    )
+    def test_invalid_bin_weights_raise(self, glm, weights):
+        spectra = np.ones((8, 2, 3))
+        with pytest.raises(ValueError, match="weights"):
+            if glm:
+                compare_glm(
+                    spectra,
+                    np.c_[np.ones(8), np.arange(8)],
+                    np.array([0.0, 1.0]),
+                    statistic="log_t_cauchy",
+                    freq_weights=weights,
+                )
+            else:
+                compare_two_groups(
+                    spectra, np.repeat([0, 1], 4), statistic="log_t_cauchy", freq_weights=weights
+                )
+
+    def test_best_bin_uses_smallest_welch_p_not_largest_absolute_t(self):
+        groups = np.r_[np.zeros(3), np.ones(12)]
+        response = np.zeros((15, 1, 2))
+        response[:3, 0, 0] = np.array([-1, 0, 1]) + 2.2 / np.sqrt(3)
+        variation = np.linspace(-1, 1, 12)
+        response[3:, 0, 1] = variation - 2 * variation.std(ddof=1) / np.sqrt(12)
+        result = compare_two_groups(np.exp(response), groups, statistic="log_t_cauchy").iloc[0]
+        assert np.argmax(np.abs(result.T_per_bin)) == 0
+        assert result.Best_bin == np.argmin(result.P_value_per_bin) == 1

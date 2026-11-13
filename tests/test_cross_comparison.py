@@ -1192,7 +1192,7 @@ class TestCrossRotation:
             if masked and i == 2:
                 assert np.isnan(result.loc[pair, "P_value"])
                 continue
-            reference = l2._run_l2_rotations(
+            reference = l2._run_l2_conditional(
                 transformed[:, i : i + 1, bins],
                 x,
                 c,
@@ -1207,6 +1207,22 @@ class TestCrossRotation:
                 [reference["observed"][0], reference["pvals"][0]],
                 atol=1e-12,
             )
+            # Independent sample-space draws guard the shared Monte Carlo route.
+            rows = np.flatnonzero(presence[:, i])
+            y = transformed[rows, i][:, bins]
+            inverse = np.linalg.pinv(x[rows])
+            a = c @ inverse
+            nuisance = x[rows] @ inverse - np.outer(a, a) / (a @ a)
+            seed = np.random.SeedSequence(39, spawn_key=(len(x), *map(int, rows)))
+            directions = np.random.default_rng(seed).normal(size=(499, len(rows)))
+            directions -= directions @ nuisance
+            directions /= np.linalg.norm(directions, axis=1, keepdims=True)
+            w = weights[bins] / weights[bins].sum()
+            null = np.sum(w * (directions @ y) ** 2, axis=1)
+            observed = np.sum(w * (a @ y) ** 2) / (a @ a)
+            trace = np.sum(w * (y - nuisance @ y) ** 2)
+            count = np.count_nonzero(null >= observed - 64 * np.finfo(float).eps * trace)
+            assert result.loc[pair, "P_value"] == (count + 1) / 500
         assert result.attrs["null"] == "rotation"
         assert result.attrs["covariance"] is None
         assert result.attrs["n_rotations"] == 499

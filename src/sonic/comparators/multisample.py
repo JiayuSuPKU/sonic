@@ -141,7 +141,7 @@ def _compare_two_group_profiles(  # noqa: C901 — input validation and statisti
     min_samples_per_group=2,
     n_perm=1000,
     max_exact_permutations=10000,
-    n_rotations=19999,
+    integration_tol=1e-10,
     random_state=None,
 ):
     """Validate binary inputs, select the statistic, and build one result table."""
@@ -194,7 +194,7 @@ def _compare_two_group_profiles(  # noqa: C901 — input validation and statisti
             min_samples_per_group=min_samples_per_group,
             n_perm=n_perm,
             max_exact_permutations=max_exact_permutations,
-            n_rotations=n_rotations,
+            integration_tol=integration_tol,
             random_state=random_state,
         )
     result = _comparison_frame(
@@ -398,7 +398,7 @@ def compare_two_groups(
     normalize_shape: bool = False,
     *,
     covariance: str | None = None,
-    n_rotations: int = 19999,
+    integration_tol: float = 1e-10,
 ) -> pd.DataFrame:
     """Test a spectral difference between two groups for each gene.
 
@@ -422,7 +422,7 @@ def compare_two_groups(
         Null calibration (default ``'analytic'``), selected by ``statistic``:
 
         - ``'log_l2'``: ``'analytic'`` (selected covariance and Liu tail),
-          ``'rotation'`` (conditional on nuisance-adjusted scatter), or
+          ``'rotation'`` (deterministic conditional integration), or
           ``'permutation'`` (shuffled binary labels).
         - ``'log_t_cauchy'``: ``'analytic'`` only (per-bin t tails and
           Cauchy combination).
@@ -433,7 +433,7 @@ def compare_two_groups(
         Enumerate all binary label assignments when their number is at
         most this threshold; default 10000. Zero forces sampling.
     random_state : int, optional
-        Seed for resampling. Ignored by analytic tests.
+        Seed for binary label permutations; ignored by other nulls.
     freq_weights : np.ndarray, optional
         Finite nonnegative weights of length ``n_bins``, normalized to sum
         to one. None gives uniform weights. Log t-Cauchy renormalizes weights
@@ -447,9 +447,11 @@ def compare_two_groups(
         ``None`` (default) or ``'pooled'`` shares residual covariance across
         eligible genes. ``'per_gene'`` estimates it separately for each gene.
         An explicit choice requires an analytic L2 test.
-    n_rotations : int
-        Number of rotation draws; default 19999. Used only with
-        ``null='rotation'``, which requires ``covariance=None``.
+    integration_tol : float
+        Target absolute p-value error for ``null='rotation'``; default 1e-10.
+        Requires ``statistic='log_l2'`` and ``covariance=None``. Small tails
+        also require estimated relative error <= 0.001; unresolved tails raise
+        RuntimeError. Ignored by other nulls.
 
     Returns
     -------
@@ -465,13 +467,17 @@ def compare_two_groups(
         Feature-level significance does not establish the selected bin's significance.
         Rows are sorted by descending statistic; BH uses finite p-values.
         Analytic L2 results record ``null`` and ``covariance`` in ``attrs``.
-        Rotation also records ``n_rotations``, the effective ``random_state``,
-        and ``min_p_value``.
+        Rotation adds ``P_value_error``, a numerical absolute error estimate
+        (not statistical uncertainty), NaN for skipped features. Its ``attrs``
+        records ``null``, ``covariance=None``, ``method="imhof"`` (with exact
+        beta special cases), and ``integration_tol``.
 
     Raises
     ------
     ValueError
         If input shapes or options are invalid, or the test cannot be fitted.
+    RuntimeError
+        If conditional integration cannot resolve a tail to the requested accuracy.
 
     Notes
     -----
@@ -490,7 +496,7 @@ def compare_two_groups(
         freq_weights=freq_weights,
         n_perm=n_perm,
         max_exact_permutations=max_exact_permutations,
-        n_rotations=n_rotations,
+        integration_tol=integration_tol,
         random_state=random_state,
     )
 
@@ -510,7 +516,7 @@ def compare_two_groups_masked(
     normalize_shape: bool = False,
     *,
     covariance: str | None = None,
-    n_rotations: int = 19999,
+    integration_tol: float = 1e-10,
 ) -> pd.DataFrame:
     """Test a spectral difference between two groups using observed samples.
 
@@ -537,7 +543,7 @@ def compare_two_groups_masked(
         Null calibration (default ``'analytic'``), selected by ``statistic``:
 
         - ``'log_l2'``: ``'analytic'`` (selected covariance and Liu tail),
-          ``'rotation'`` (conditional on nuisance-adjusted scatter), or
+          ``'rotation'`` (deterministic conditional integration), or
           ``'permutation'`` (shuffled binary labels).
         - ``'log_t_cauchy'``: ``'analytic'`` only (per-bin t tails and
           Cauchy combination).
@@ -548,7 +554,7 @@ def compare_two_groups_masked(
         Enumerate all binary label assignments when their number is at
         most this threshold; default 10000. Zero forces sampling.
     random_state : int, optional
-        Seed for resampling. Ignored by analytic tests.
+        Seed for binary label permutations; ignored by other nulls.
     min_samples_per_group : int
         Minimum observed samples per group for a masked binary test;
         default 2. Features below either threshold receive NaN results.
@@ -565,9 +571,11 @@ def compare_two_groups_masked(
         ``None`` (default) or ``'pooled'`` shares residual covariance across
         eligible genes. ``'per_gene'`` estimates it separately for each gene.
         An explicit choice requires an analytic L2 test.
-    n_rotations : int
-        Number of rotation draws; default 19999. Used only with
-        ``null='rotation'``, which requires ``covariance=None``.
+    integration_tol : float
+        Target absolute p-value error for ``null='rotation'``; default 1e-10.
+        Requires ``statistic='log_l2'`` and ``covariance=None``. Small tails
+        also require estimated relative error <= 0.001; unresolved tails raise
+        RuntimeError. Ignored by other nulls.
 
     Returns
     -------
@@ -584,13 +592,17 @@ def compare_two_groups_masked(
         Includes ``n_obs_A`` and ``n_obs_B``; skipped genes retain NaN results.
         Rows are sorted by descending statistic; BH uses finite p-values.
         Analytic L2 results record ``null`` and ``covariance`` in ``attrs``.
-        Rotation also records ``n_rotations``, the effective ``random_state``,
-        and ``min_p_value``.
+        Rotation adds ``P_value_error``, a numerical absolute error estimate
+        (not statistical uncertainty), NaN for skipped features. Its ``attrs``
+        records ``null``, ``covariance=None``, ``method="imhof"`` (with exact
+        beta special cases), and ``integration_tol``.
 
     Raises
     ------
     ValueError
         If input shapes or options are invalid, or the test cannot be fitted.
+    RuntimeError
+        If conditional integration cannot resolve a tail to the requested accuracy.
 
     Notes
     -----
@@ -609,7 +621,7 @@ def compare_two_groups_masked(
         freq_weights=freq_weights,
         n_perm=n_perm,
         max_exact_permutations=max_exact_permutations,
-        n_rotations=n_rotations,
+        integration_tol=integration_tol,
         random_state=random_state,
         min_samples_per_group=min_samples_per_group,
     )
@@ -626,8 +638,7 @@ def compare_glm(
     statistic: str = "log_l2",
     covariance: str | None = None,
     null: str = "analytic",
-    n_rotations: int = 19999,
-    random_state: int | None = None,
+    integration_tol: float = 1e-10,
 ) -> pd.DataFrame:
     """Test one spectral linear-model contrast for each gene.
 
@@ -668,14 +679,14 @@ def compare_glm(
         Null calibration (default ``'analytic'``), selected by ``statistic``:
 
         - ``'log_l2'``: ``'analytic'`` (selected covariance and Liu tail),
-          ``'rotation'`` (conditional on nuisance-adjusted scatter).
+          ``'rotation'`` (deterministic conditional integration).
         - ``'log_t_cauchy'``: ``'analytic'`` only (per-bin t tails and
           Cauchy combination).
-    n_rotations : int
-        Number of rotation draws; default 19999. Used only with
-        ``null='rotation'``, which requires ``covariance=None``.
-    random_state : int, optional
-        Seed for resampling. Ignored by analytic tests.
+    integration_tol : float
+        Target absolute p-value error for ``null='rotation'``; default 1e-10.
+        Requires ``statistic='log_l2'`` and ``covariance=None``. Small tails
+        also require estimated relative error <= 0.001; unresolved tails raise
+        RuntimeError. Ignored by other nulls.
 
     Returns
     -------
@@ -691,13 +702,17 @@ def compare_glm(
         Feature-level significance does not establish the selected bin's significance.
         Rows are sorted by descending statistic; BH uses finite p-values.
         Analytic L2 results record ``null`` and ``covariance`` in ``attrs``.
-        Rotation also records ``n_rotations``, the effective ``random_state``,
-        and ``min_p_value``.
+        Rotation adds ``P_value_error``, a numerical absolute error estimate
+        (not statistical uncertainty), NaN for skipped features. Its ``attrs``
+        records ``null``, ``covariance=None``, ``method="imhof"`` (with exact
+        beta special cases), and ``integration_tol``.
 
     Raises
     ------
     ValueError
         If input shapes or options are invalid, or the test cannot be fitted.
+    RuntimeError
+        If conditional integration cannot resolve a tail to the requested accuracy.
     TypeError
         If the design or contrast has an unsupported type.
 
@@ -725,8 +740,7 @@ def compare_glm(
             covariance=covariance,
             freq_weights=freq_weights,
             normalize_shape=normalize_shape,
-            n_rotations=n_rotations,
-            random_state=random_state,
+            integration_tol=integration_tol,
         )
     else:
         raise ValueError("GLM statistic must be 'log_l2' or 'log_t_cauchy'.")
@@ -748,8 +762,7 @@ def compare_glm_masked(
     statistic: str = "log_l2",
     covariance: str | None = None,
     null: str = "analytic",
-    n_rotations: int = 19999,
-    random_state: int | None = None,
+    integration_tol: float = 1e-10,
 ) -> pd.DataFrame:
     """Test one spectral linear-model contrast using each gene's observed samples.
 
@@ -796,14 +809,14 @@ def compare_glm_masked(
         Null calibration (default ``'analytic'``), selected by ``statistic``:
 
         - ``'log_l2'``: ``'analytic'`` (selected covariance and Liu tail),
-          ``'rotation'`` (conditional on nuisance-adjusted scatter).
+          ``'rotation'`` (deterministic conditional integration).
         - ``'log_t_cauchy'``: ``'analytic'`` only (per-bin t tails and
           Cauchy combination).
-    n_rotations : int
-        Number of rotation draws; default 19999. Used only with
-        ``null='rotation'``, which requires ``covariance=None``.
-    random_state : int, optional
-        Seed for resampling. Ignored by analytic tests.
+    integration_tol : float
+        Target absolute p-value error for ``null='rotation'``; default 1e-10.
+        Requires ``statistic='log_l2'`` and ``covariance=None``. Small tails
+        also require estimated relative error <= 0.001; unresolved tails raise
+        RuntimeError. Ignored by other nulls.
 
     Returns
     -------
@@ -820,13 +833,17 @@ def compare_glm_masked(
         Includes ``n_obs`` and ``df_resid``; skipped genes retain NaN results.
         Rows are sorted by descending statistic; BH uses finite p-values.
         Analytic L2 results record ``null`` and ``covariance`` in ``attrs``.
-        Rotation also records ``n_rotations``, the effective ``random_state``,
-        and ``min_p_value``.
+        Rotation adds ``P_value_error``, a numerical absolute error estimate
+        (not statistical uncertainty), NaN for skipped features. Its ``attrs``
+        records ``null``, ``covariance=None``, ``method="imhof"`` (with exact
+        beta special cases), and ``integration_tol``.
 
     Raises
     ------
     ValueError
         If input shapes or options are invalid, or the test cannot be fitted.
+    RuntimeError
+        If conditional integration cannot resolve a tail to the requested accuracy.
     TypeError
         If the design or contrast has an unsupported type.
 
@@ -857,8 +874,7 @@ def compare_glm_masked(
             covariance=covariance,
             freq_weights=freq_weights,
             normalize_shape=normalize_shape,
-            n_rotations=n_rotations,
-            random_state=random_state,
+            integration_tol=integration_tol,
             min_resid_df=min_resid_df,
         )
     else:

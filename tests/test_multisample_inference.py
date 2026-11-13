@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import itertools
+import warnings
 from unittest.mock import patch
 
 import numpy as np
@@ -913,6 +914,96 @@ class TestCovarianceEstimation:
 class TestConditionalRotation:
     """Conditional tails, invariance, eligibility, and deterministic streaming."""
 
+    def test_conditional_scatter_retains_zero_directions_and_profile_scales(self):
+        coordinates = np.random.default_rng(86).normal(size=(8, 1, 2))
+        scales = np.array([1e-100, 1.0, 1e100, 0.0])
+        coordinates = coordinates * scales[None, :, None]
+        original = coordinates.copy()
+        scatter, rank = l2._conditional_scatter(coordinates)
+
+        assert scatter.shape == (4, 8, 8)
+        np.testing.assert_allclose(scatter[:3], np.repeat(scatter[1:2], 3, axis=0))
+        eigenvalues = np.linalg.eigvalsh(scatter)
+        assert eigenvalues.shape == (4, 8)
+        np.testing.assert_allclose(eigenvalues[:3, :6], 0, atol=1e-14)
+        np.testing.assert_allclose(rank[:3], rank[1])
+        assert 1 <= rank[1] <= 2
+        np.testing.assert_array_equal(scatter[3], 0)
+        assert np.isnan(rank[3])
+        np.testing.assert_array_equal(coordinates, original)
+
+    @pytest.mark.parametrize("bins", [2, 13])
+    @pytest.mark.parametrize("shape_only", [False, True])
+    @pytest.mark.parametrize("log_transform", [False, True])
+    def test_shared_construction_matches_nuisance_projection(
+        self, bins, shape_only, log_transform, monkeypatch
+    ):
+        rng = np.random.default_rng(87)
+        n, genes = 10, 6
+        x = np.c_[np.ones(n), np.linspace(-1, 1, n), rng.normal(size=n)]
+        c = np.array([0.0, 1.0, 0.0])
+        values = rng.lognormal(size=(n, genes, bins))
+        values[:, 0] = 1.0
+        presence = np.ones((n, genes), bool)
+        presence[0, 1:3] = False
+        presence[:, 4] = False
+        presence[2:, 5] = False  # No residual df for the retained design.
+        values[~presence] = np.nan
+        original = values.copy()
+        values.setflags(write=False)
+        weights = np.arange(bins, dtype=float)
+        weights /= weights.sum()
+        expected_statistic = np.full(genes, np.nan)
+        seen = []
+
+        def evaluate_tail(scatter, basis, n_rotations, seed):
+            rows = np.array(seed.spawn_key[1:])
+            mask = np.zeros(n, bool)
+            mask[rows] = True
+            cols = np.flatnonzero(np.all(presence == mask[:, None], axis=0))
+            seen.extend(cols)
+            y = values[rows[:, None], cols]
+            if shape_only:
+                y = normalize_shape(y)
+            if log_transform:
+                y = np.log(np.maximum(y, 1e-12))
+            inverse = np.linalg.pinv(x[rows])
+            a = c @ inverse
+            dimension = len(rows) - np.linalg.matrix_rank(x[rows]) + 1
+            assert scatter.shape == (len(cols), dimension, dimension)
+            np.testing.assert_allclose(basis.T @ basis, np.eye(dimension), atol=1e-12)
+            projection = np.eye(len(rows)) - x[rows] @ inverse + np.outer(a, a) / (a @ a)
+            np.testing.assert_allclose(basis @ basis.T, projection, atol=1e-12)
+            np.testing.assert_allclose(basis[:, 0], a / np.linalg.norm(a), atol=1e-12)
+            coordinates = np.einsum("sd,sfb->dfb", basis, y) * np.sqrt(weights)
+            coordinates[:, cols == 0] = 0  # The constant feature has zero conditional scatter.
+            scale = np.max(np.abs(coordinates), axis=(0, 2))
+            coordinates /= np.where(scale > 0, scale, 1)[None, :, None]
+            expected = np.einsum("ifb,jfb->fij", coordinates, coordinates)
+            np.testing.assert_allclose(scatter, expected, atol=1e-12)
+            theta = (a @ y.reshape(len(rows), -1)).reshape(len(cols), bins)
+            expected_statistic[cols] = np.sqrt(np.sum(weights * theta**2, axis=1))
+            return np.where(np.trace(scatter, axis1=1, axis2=2) > 0, 0.25, 1.0)
+
+        monkeypatch.setattr(l2, "_rotation_tails", evaluate_tail)
+        state = l2._run_l2_conditional(
+            values,
+            x,
+            c,
+            presence,
+            n_rotations=1,
+            random_state=0,
+            freq_weights=weights,
+            normalize_shape=shape_only,
+            log_transform=log_transform,
+        )
+        assert sorted(seen) == [0, 1, 2, 3]
+        np.testing.assert_array_equal(state["eligible"], [True, True, True, True, False, False])
+        np.testing.assert_allclose(state["observed"], expected_statistic, atol=1e-12)
+        np.testing.assert_allclose(state["pvals"], [1.0, 0.25, 0.25, 0.25, np.nan, np.nan])
+        np.testing.assert_array_equal(state["n_obs"], presence.sum(axis=0))
+        np.testing.assert_array_equal(values, original)
+
     @staticmethod
     def _reference(y, x, c, weights, seed, draws, original_rows, total_samples):
         inverse = np.linalg.pinv(x)
@@ -964,18 +1055,16 @@ class TestConditionalRotation:
         values.setflags(write=False)
         weights = np.arange(bins, dtype=float)
         weights /= weights.sum()
-        result = compare_glm_masked(
+        result = l2._run_l2_conditional(
             values,
             x,
             c,
             presence,
             freq_weights=weights,
             normalize_shape=shape_only,
-            null="rotation",
             n_rotations=499,
             random_state=35,
         )
-        result = result.set_index("Feature").sort_index()
         expected = []
         for gene in range(3):
             rows = np.flatnonzero(presence[:, gene])
@@ -984,8 +1073,10 @@ class TestConditionalRotation:
                 power = normalize_shape(power)
             y = np.log(np.maximum(power, 1e-12))
             expected.append(self._reference(y, x[rows], c, weights, 35, 499, rows, n))
-        np.testing.assert_allclose(result.iloc[:3][["Statistic", "P_value"]], expected, atol=1e-12)
-        assert np.isnan(result.loc["3", "P_value"])
+        np.testing.assert_allclose(
+            np.column_stack([result["observed"][:3], result["pvals"][:3]]), expected, atol=1e-12
+        )
+        assert np.isnan(result["pvals"][3])
         np.testing.assert_array_equal(values, original)
 
     @pytest.mark.parametrize("masked", [False, True])
@@ -1002,7 +1093,7 @@ class TestConditionalRotation:
         kwargs = {"freq_weights": np.arange(9), "normalize_shape": shape_only}
         binary = ms.compare_two_groups_masked if masked else ms.compare_two_groups
         args = [values, groups, presence] if masked else [values, groups]
-        result = binary(*args, null="rotation", n_rotations=199, random_state=4, **kwargs)
+        result = binary(*args, null="rotation", **kwargs)
         analytic = binary(*args, covariance="per_gene", **kwargs)
         pd.testing.assert_series_equal(
             result.set_index("Feature").Statistic.sort_index(),
@@ -1012,7 +1103,7 @@ class TestConditionalRotation:
         glm_args = [values, np.c_[np.ones(10), groups], np.array([0.0, 1.0])]
         if masked:
             glm_args.append(presence & (presence[:5].sum(0) >= 2))
-        reference = glm(*glm_args, null="rotation", n_rotations=199, random_state=4, **kwargs)
+        reference = glm(*glm_args, null="rotation", **kwargs)
         np.testing.assert_allclose(
             result[["Statistic", "P_value", "P_adj"]],
             reference[["Statistic", "P_value", "P_adj"]],
@@ -1021,9 +1112,8 @@ class TestConditionalRotation:
         assert result.attrs == {
             "null": "rotation",
             "covariance": None,
-            "n_rotations": 199,
-            "random_state": 4,
-            "min_p_value": 0.005,
+            "method": "imhof",
+            "integration_tol": 1e-10,
         }
         if masked:
             assert result.set_index("Feature").loc["4", "n_obs_A"] == 1
@@ -1048,21 +1138,17 @@ class TestConditionalRotation:
             x,
             np.array([0.0, 1.0]),
             null="rotation",
-            n_rotations=49999,
-            random_state=77,
             gene_names=list(map(str, range(24))),
         )
         actual = result.set_index("Feature").loc[list(map(str, range(24))), "P_value"].to_numpy()
-        assert np.all(
-            np.abs(actual - exact) <= 6 * np.sqrt(exact * (1 - exact) / 50000) + 3 / 50000
-        )
+        np.testing.assert_allclose(actual, exact, rtol=0, atol=1e-10)
 
     def test_nuisance_units_and_contrast_scaling(self):
         rng = np.random.default_rng(28)
         x = np.c_[np.ones(14), np.linspace(-1, 1, 14), rng.normal(size=14)]
         c = np.array([0.0, 1.0, 0.0])
         y = rng.normal(size=(14, 6, 9))
-        kwargs = {"null": "rotation", "n_rotations": 999, "random_state": 11}
+        kwargs = {"null": "rotation"}
         reference = compare_glm(np.exp(y), x, c, **kwargs).set_index("Feature").sort_index()
         nuisance = rng.normal(size=(3, 54))
         nuisance[1] = 0
@@ -1080,7 +1166,7 @@ class TestConditionalRotation:
             np.testing.assert_allclose(
                 actual.Statistic, reference.Statistic * abs(scale), rtol=1e-10
             )
-            np.testing.assert_array_equal(actual.P_value, reference.P_value)
+            np.testing.assert_allclose(actual.P_value, reference.P_value, rtol=0, atol=1e-10)
 
     @pytest.mark.parametrize("masked", [False, True])
     @pytest.mark.parametrize("contrast_scale", [1.0, 1e-12])
@@ -1100,21 +1186,16 @@ class TestConditionalRotation:
             y[~presence] = np.nan
         values = np.exp(y)
         kwargs = {
-            "null": "rotation",
             "n_rotations": 999,
             "random_state": 20,
             "freq_weights": np.array([0.8, 0.2, 0.0]),
         }
-        if masked:
-            result = compare_glm_masked(values, x, c, presence, **kwargs)
-        else:
-            result = compare_glm(values, x, c, **kwargs)
-        result = result.set_index("Feature")
-        assert result.loc["0", "P_value"] == 1.0
-        assert result.loc["1", "P_value"] == 0.001
-        assert result.loc["1", "Statistic"] > 0
-        reference = compare_glm(values[:, 2:3], x, c, **kwargs)
-        assert result.loc["2", "P_value"] == reference.P_value.iloc[0]
+        result = l2._run_l2_conditional(values, x, c, presence if masked else None, **kwargs)
+        assert result["pvals"][0] == 1.0
+        assert result["pvals"][1] == 0.001
+        assert result["observed"][1] > 0
+        reference = l2._run_l2_conditional(values[:, 2:3], x, c, **kwargs)
+        assert result["pvals"][2] == reference["pvals"][0]
 
     def test_roundoff_guard_preserves_tiny_and_large_profile_scales(self):
 
@@ -1124,7 +1205,7 @@ class TestConditionalRotation:
         scales = np.array([1e-100, 1.0, 1e100])
         profiles = y * scales[None, :, None]
         profiles[:, :, -1] = 1e100 * x[:, 1, None]
-        result = l2._run_l2_rotations(
+        result = l2._run_l2_conditional(
             profiles,
             x,
             np.array([0.0, 1.0, 0.0]),
@@ -1138,7 +1219,7 @@ class TestConditionalRotation:
         np.testing.assert_allclose(result["observed"] / scales, result["observed"][1])
         assert np.isfinite(result["effective_rank"]).all()
 
-    def test_chunking_feature_order_and_shared_draws(self, monkeypatch):
+    def test_chunking_and_feature_order(self, monkeypatch):
 
         rng = np.random.default_rng(51)
         x = np.c_[np.ones(10), np.linspace(-1, 1, 10)]
@@ -1148,8 +1229,6 @@ class TestConditionalRotation:
         presence[0, 3:7] = False
         kwargs = {
             "null": "rotation",
-            "n_rotations": 499,
-            "random_state": 5,
             "gene_names": list(map(str, range(9))),
         }
 
@@ -1166,7 +1245,7 @@ class TestConditionalRotation:
         monkeypatch.setattr(l2, "_COMPARISON_WORKSPACE_BYTES", 4096)
         actual = run(values, presence, kwargs["gene_names"])
         np.testing.assert_allclose(actual, expected, atol=1e-12)
-        np.testing.assert_array_equal(actual.P_value, expected.P_value)
+        np.testing.assert_allclose(actual.P_value, expected.P_value, rtol=0, atol=1e-10)
         assert actual.loc["0", "P_value"] == actual.loc["1", "P_value"]
         order = rng.permutation(9)
         reordered = run(values[:, order], presence[:, order], [str(i) for i in order])
@@ -1182,41 +1261,44 @@ class TestConditionalRotation:
         y[:, 1, :5] = groups[:, None]
         y[:, 2, :5] = np.sqrt(5) * basis
         y[:, 3, -1] = np.arange(6)
-        result = compare_two_groups(
+        result = l2._run_l2_conditional(
             np.exp(y),
-            groups,
-            null="rotation",
+            x,
+            np.array([0.0, 1.0]),
             n_rotations=199,
             random_state=17,
             freq_weights=np.r_[np.ones(5), 0],
-        ).set_index("Feature")
-        np.testing.assert_array_equal(
-            result.loc[["0", "1", "2", "3"], "P_value"], [1.0, 0.005, 1.0, 1.0]
         )
-        low_df = compare_two_groups(
-            np.exp(y[:3]), np.array([0, 1, 1]), null="rotation", n_rotations=19, random_state=1
+        np.testing.assert_array_equal(result["pvals"], [1.0, 0.005, 1.0, 1.0])
+        low_df = l2._run_l2_conditional(
+            np.exp(y[:3]),
+            np.c_[np.ones(3), [0, 1, 1]],
+            np.array([0.0, 1.0]),
+            n_rotations=19,
+            random_state=1,
         )
-        assert low_df.P_value.between(0.05, 1).all()
+        assert ((low_df["pvals"] >= 0.05) & (low_df["pvals"] <= 1)).all()
 
     def test_generated_seed_can_be_replayed(self):
         values = np.random.default_rng(14).lognormal(size=(8, 3, 5))
-        groups = np.repeat([0, 1], 4)
-        result = compare_two_groups(values, groups, null="rotation", n_rotations=99)
-        replay = compare_two_groups(
-            values,
-            groups,
-            null="rotation",
-            n_rotations=99,
-            random_state=result.attrs["random_state"],
+        x = np.c_[np.ones(8), np.repeat([0, 1], 4)]
+        c = np.array([0.0, 1.0])
+        result = l2._run_l2_conditional(values, x, c, n_rotations=99)
+        replay = l2._run_l2_conditional(
+            values, x, c, n_rotations=99, random_state=result["metadata"]["random_state"]
         )
-        pd.testing.assert_frame_equal(result, replay)
-        assert result.attrs == replay.attrs
+        for key in result.keys() - {"metadata"}:
+            np.testing.assert_array_equal(result[key], replay[key])
+        assert result["metadata"] == replay["metadata"]
 
     @pytest.mark.parametrize("draws", [0, -1, 2.5, True])
     def test_invalid_draw_count(self, draws):
         with pytest.raises(ValueError, match="n_rotations must be a positive integer"):
-            compare_two_groups(
-                np.ones((6, 2, 3)), np.repeat([0, 1], 3), null="rotation", n_rotations=draws
+            l2._run_l2_conditional(
+                np.ones((6, 2, 3)),
+                np.c_[np.ones(6), np.repeat([0, 1], 3)],
+                np.array([0.0, 1.0]),
+                n_rotations=draws,
             )
 
     @pytest.mark.parametrize("covariance", ["pooled", "per_gene"])
@@ -1248,11 +1330,414 @@ class TestConditionalRotation:
                 values, np.c_[np.ones(6), np.ones(6)], np.array([1.0, 0.0]), null="rotation"
             )
         with pytest.raises(ValueError, match="finite profiles"):
-            compare_two_groups(np.full_like(values, np.nan), groups, null="rotation", n_rotations=9)
+            compare_two_groups(np.full_like(values, np.nan), groups, null="rotation")
         with pytest.raises(ValueError, match="no features"):
-            compare_two_groups_masked(
-                values, groups, np.zeros((6, 2), bool), null="rotation", n_rotations=9
+            compare_two_groups_masked(values, groups, np.zeros((6, 2), bool), null="rotation")
+
+
+class TestConditionalIntegration:
+    """Synthetic accuracy gates for the private deterministic rotation evaluator."""
+
+    @pytest.mark.parametrize(
+        "dimension,rank,q",
+        [(2, 1, 0.2), (7, 3, 0.5), (7, 6, 0.9), (3, 1, 1 - 1e-8)],
+    )
+    def test_two_level_spectra_match_exact_beta(self, dimension, rank, q):
+        from scipy.stats import beta
+
+        eigenvalues = np.r_[np.ones(rank), np.zeros(dimension - rank)]
+        expected = beta.sf(q, rank / 2, (dimension - rank) / 2)
+        actual, error = l2._imhof_tail(eigenvalues - q)
+        assert abs(actual - expected) <= error
+        assert error <= min(1e-10, 0.001 * actual)
+
+    def test_zero_shifted_coefficients_cancel_from_the_sign(self):
+        actual, error = l2._imhof_tail([2.0, 2.0, -3.0, -3.0, 0.0, 0.0])
+        assert abs(actual - 0.4) <= error
+
+    @pytest.mark.parametrize("df,score", [(1, 3.0), (10, 1.0), (30, 1e4)])
+    def test_rank_one_matches_student_t_including_extreme_tails(self, df, score):
+        from scipy.stats import t
+
+        actual, error = l2._imhof_tail(np.r_[df, np.full(df, -(score**2))])
+        expected = 2 * t.sf(score, df)
+        assert abs(actual - expected) <= error
+        assert error <= min(1e-10, 0.001 * actual)
+
+    @staticmethod
+    def _three_level_reference(levels, counts, q):
+        """Positive beta-conditioning integral, independent of Imhof inversion."""
+        from scipy.integrate import quad
+        from scipy.special import beta, betainc
+
+        lo, middle, hi = levels
+        k0, k1, k2 = counts
+        fraction = (middle - lo) / (hi - lo)
+        gap = (hi - q) / (hi - lo)
+
+        def integrand(v):
+            return betainc((k0 + k1) / 2, k2 / 2, gap / (1 - fraction * v))
+
+        value, error = quad(
+            integrand,
+            0,
+            1,
+            weight="alg",
+            wvar=(k1 / 2 - 1, k0 / 2 - 1),
+            epsabs=1e-300,
+            epsrel=2e-12,
+            limit=1000,
+        )
+        return value / beta(k1 / 2, k0 / 2), error / beta(k1 / 2, k0 / 2)
+
+    @pytest.mark.parametrize(
+        "counts,levels,fraction",
+        [
+            pytest.param((1, 1, 1), (0.0, 0.2, 1.0), 0.25, id="low-df"),
+            pytest.param((5, 7, 5), (0.0, 0.2, 1.0), 0.9, id="repeated-levels"),
+            pytest.param((1, 1, 1), (0.0, 1e-10, 1.0), 1 - 1e-8, id="small-tail"),
+            pytest.param((2, 2, 3), (1.0, 1 + 2e-10, 1 + 1e-9), 0.25, id="nearly-constant"),
+            pytest.param((2, 2, 3), (0.0, 0.2, 1.0), 1 - 1e-8, id="unresolved-tail"),
+        ],
+    )
+    def test_three_levels_match_independent_integral(self, counts, levels, fraction):
+        q = levels[1] + fraction * (levels[2] - levels[1])
+        expected, reference_error = self._three_level_reference(levels, counts, q)
+        coefficients = np.repeat(levels, counts) - q
+        if expected < 1e-12:
+            with pytest.raises(RuntimeError, match="relative error"):
+                l2._imhof_tail(coefficients)
+        else:
+            actual, error = l2._imhof_tail(coefficients)
+            assert abs(actual - expected) <= error + reference_error
+            assert abs(actual - expected) < 1e-10
+            assert error <= 0.001 * actual
+
+    @pytest.mark.parametrize(
+        "coefficients,reference,integral_error",
+        [
+            ([-0.7, -0.5, 0.3], 0.184938448031828, 5.46229728115577e-14),
+            ([-3, -1, 0.2, 0.8, 2], 0.449828725949695, 2.42861286636753e-14),
+            ([-5, -2, -0.7, 0.1, 1, 4, 8], 0.646938782053403, 2.78495619566519e-14),
+        ],
+    )
+    def test_matches_compquadform_reference(self, coefficients, reference, integral_error):
+        # CompQuadForm 1.4.4: imhof(0, lambda=a/max(abs(a)), epsabs=1e-13,
+        # epsrel=0, limit=10000); its reported abserr is on the integral scale.
+        # https://github.com/cran/CompQuadForm/blob/master/src/imhof.cpp
+        actual, error = l2._imhof_tail(coefficients)
+        assert abs(actual - reference) <= error + integral_error / np.pi
+        assert abs(actual - reference) < 1e-10
+
+    def test_beta_complement_avoids_rounding_argument_to_one(self):
+        expected = 1 - 2 * np.arctan(1e-10) / np.pi
+        actual, error = l2._imhof_tail([1.0, -1e-20])
+        assert abs(actual - expected) <= error
+        assert actual < 1
+
+    @pytest.mark.parametrize(
+        "coefficients,expected",
+        [
+            ([0.0], 1.0),
+            ([0.0, 0.0], 1.0),
+            ([0.0, 2.0], 1.0),
+            ([-2.0, 0.0], 0.0),
+            ([-2.0, -1.0], 0.0),
+        ],
+    )
+    def test_exact_sign_boundaries(self, coefficients, expected):
+        assert l2._imhof_tail(coefficients) == (expected, 0.0)
+
+    def test_constant_and_nearly_constant_scatter(self):
+        matrices = np.array([np.zeros((3, 3)), np.eye(3), np.diag([1 + 1e-14, 1, 1])])
+        pvalues, errors = l2._conditional_tails(matrices)
+        np.testing.assert_array_equal(pvalues, [1.0, 1.0, 0.0])
+        np.testing.assert_array_equal(errors, 0.0)
+        # The exact upper endpoint differs from the legacy Monte Carlo tie tolerance.
+        mc = l2._rotation_tails(matrices[-1:], np.eye(3), 199, np.random.SeedSequence(5))
+        assert mc[0] == 1.0
+
+    def test_scale_shift_and_eigenvalue_order_invariance(self):
+        rng = np.random.default_rng(721)
+        eigenvalues = rng.lognormal(size=7)
+        q = eigenvalues.mean()
+        expected, _ = l2._imhof_tail(eigenvalues - q)
+        for scale, shift in ((1e-200, 0), (1e200, 0), (3.0, 7.0)):
+            actual, _ = l2._imhof_tail(scale * eigenvalues + shift - (scale * q + shift))
+            assert abs(actual - expected) < 1e-10
+        actual, _ = l2._imhof_tail(rng.permutation(eigenvalues) - q)
+        assert abs(actual - expected) < 1e-12
+
+    @pytest.mark.parametrize(
+        "failure",
+        ["warning", "message", "value", "error", "negative_error", "large_error", "range", "zero"],
+    )
+    def test_integration_failures_retry_then_raise(self, failure, monkeypatch):
+        from scipy.integrate import IntegrationWarning
+
+        tolerances = []
+
+        def fail(*args, **kwargs):
+            tolerances.append(kwargs["epsabs"])
+            if failure == "warning":
+                warnings.warn("deliberate quadrature warning", IntegrationWarning, stacklevel=2)
+            if failure == "message":
+                return 0.0, 0.0, {}, "deliberate convergence failure"
+            value = {"value": np.nan, "range": 1e6, "zero": -np.pi / 2}.get(failure, 0.0)
+            error = {"error": np.nan, "negative_error": -1.0, "large_error": 1.0}.get(failure, 0.0)
+            return value, error, {}
+
+        monkeypatch.setattr(l2, "quad", fail)
+        with pytest.raises(RuntimeError, match="after three attempts"):
+            l2._imhof_tail([-0.7, -0.5, 0.3])
+        assert len(set(tolerances)) == 3
+        assert tolerances[-1] < tolerances[0]
+
+    def test_warning_can_be_resolved_by_tighter_retry(self, monkeypatch):
+        original = l2.quad
+        calls = []
+
+        def first_failure(*args, **kwargs):
+            calls.append(kwargs["epsabs"])
+            result = original(*args, **kwargs)
+            return (*result, "deliberate first-attempt failure") if len(calls) == 1 else result
+
+        expected, _ = l2._imhof_tail([-0.7, -0.5, 0.3])
+        monkeypatch.setattr(l2, "quad", first_failure)
+        actual, error = l2._imhof_tail([-0.7, -0.5, 0.3])
+        assert abs(actual - expected) < 1e-10
+        assert error < 1e-10
+        assert len(set(calls)) == 2
+
+    @pytest.mark.parametrize("tolerance", [True, 0, -1, 1, np.inf, np.nan, "small"])
+    def test_invalid_tolerance(self, tolerance):
+        with pytest.raises(ValueError, match="integration_tol"):
+            l2._imhof_tail([-1.0, 2.0], integration_tol=tolerance)
+        with pytest.raises(ValueError, match="integration_tol"):
+            compare_two_groups(
+                np.ones((6, 2, 3)),
+                np.repeat([0, 1], 3),
+                null="rotation",
+                integration_tol=tolerance,
             )
+
+    @pytest.mark.parametrize("coefficients", [[], [[1.0]], [np.nan], [np.inf]])
+    def test_invalid_coefficients(self, coefficients):
+        with pytest.raises(ValueError, match="coefficients"):
+            l2._imhof_tail(coefficients)
+
+    @pytest.mark.parametrize(
+        "coefficients", [[1e-200, -1, -1, -1, -1], [1e-160, -1, -1, -1, -1], [1e-300, -1e300]]
+    )
+    def test_unresolved_beta_or_dynamic_range_raises(self, coefficients):
+        with pytest.raises(RuntimeError, match="resolution|dynamic range"):
+            l2._imhof_tail(coefficients)
+
+    def test_too_tight_tolerance_and_unresolved_matrix_boundary(self, monkeypatch):
+        with pytest.raises(RuntimeError, match="floating-point resolution"):
+            l2._imhof_tail([-0.7, -0.5, 0.3], integration_tol=1e-20)
+        monkeypatch.setattr(np.linalg, "eigvalsh", lambda _: np.array([-1.0, 0.0]))
+        with pytest.raises(RuntimeError, match="block feature 0.*boundary"):
+            l2._conditional_tails(np.array([[[1.0, 0.1], [0.1, 0.5]]]))
+
+    @pytest.mark.parametrize(
+        "n,glm,masked,shape_only",
+        [
+            pytest.param(4, True, False, False, id="glm-low-df"),
+            pytest.param(12, False, False, True, id="binary-DF-norm"),
+            pytest.param(12, False, True, False, id="binary-masked"),
+            pytest.param(18, True, True, True, id="glm-masked-DF-norm"),
+        ],
+    )
+    def test_shared_profiles_agree_with_rotation(self, n, glm, masked, shape_only):
+        rng = np.random.default_rng(723)
+        genes, bins = 4, 9
+        groups = np.repeat([0, 1], n // 2)
+        x = (
+            np.c_[np.ones(n), np.linspace(-1, 1, n), rng.normal(size=n)]
+            if glm
+            else np.c_[np.ones(n), groups]
+        )
+        c = np.eye(x.shape[1])[1]
+        y = rng.normal(size=(n, genes, bins)) + rng.normal(size=(n, genes, 1))
+        if glm:
+            y += x[:, 2, None, None] * rng.normal(size=(genes, bins))
+        values = np.exp(y)
+        presence = np.ones((n, genes), bool)
+        if masked:
+            presence[0, ::3] = False
+            presence[-1, 1::3] = False
+            presence[:, -1] = False
+            values[~presence] = np.nan
+            if not glm:
+                presence &= (
+                    (presence[groups == 0].sum(0) >= 2) & (presence[groups == 1].sum(0) >= 2)
+                )[None, :]
+        mask = presence if masked else None
+        weights = np.arange(bins, dtype=float)
+        weights[::3] = 0
+        options = {"freq_weights": weights, "normalize_shape": shape_only}
+        result = l2._run_l2_conditional(values, x, c, mask, **options)
+        draws = 4999
+        reference = l2._run_l2_conditional(
+            values, x, c, mask, n_rotations=draws, random_state=724, **options
+        )
+        for key in ("observed", "eligible", "df_resid", "n_obs", "effective_rank"):
+            np.testing.assert_array_equal(result[key], reference[key])
+        eligible = result["eligible"]
+        tails = result["pvals"][eligible]
+        errors = result["pvalue_error"][eligible]
+        bound = 6 * np.sqrt(tails * (1 - tails) / draws) + 3 / draws
+        assert np.all(np.abs(tails - reference["pvals"][eligible]) <= bound)
+        assert np.all(errors <= np.minimum(1e-10, 0.001 * tails))
+        assert np.isnan(reference["pvalue_error"]).all()
+        if masked:
+            assert np.isnan(result["pvals"][-1])
+            assert np.isnan(result["pvalue_error"][-1])
+
+    @pytest.mark.parametrize(
+        "glm,masked", [(False, False), (True, False), (False, True), (True, True)]
+    )
+    def test_public_rank_one_extreme_tails(self, glm, masked):
+        from scipy.stats import t
+
+        groups = np.repeat([0, 1], 9)
+        x = np.c_[np.ones(18), groups]
+        if glm:
+            x = np.c_[x, np.linspace(-1, 1, 18)]
+        c = np.eye(x.shape[1])[1]
+        presence = np.ones((18, 3), bool)
+        if masked:
+            presence[0, 1] = False
+        y = np.zeros((18, 3))
+        expected = np.ones(3)
+        for gene, score in enumerate((20.0, 100.0)):
+            rows = presence[:, gene]
+            design = x[rows]
+            df = rows.sum() - x.shape[1]
+            residual = np.linalg.svd(design, full_matrices=True)[0][:, x.shape[1]]
+            se_factor = np.linalg.norm(c @ np.linalg.pinv(design)) / np.sqrt(df)
+            y[rows, gene] = design[:, 1] + residual / (score * se_factor)
+            expected[gene] = 2 * t.sf(score, df)
+        # Masked cases also exercise DF-norm with one positive-weight bin.
+        active = np.exp(y - y.max(axis=0) - 1)
+        values = np.stack([active, 1 - active], axis=-1) if masked else active[..., None]
+        values[~presence] = np.nan
+        options = {"null": "rotation", "normalize_shape": masked}
+        if masked:
+            options["freq_weights"] = np.array([2.0, 0.0])
+
+        if glm:
+            method = compare_glm_masked if masked else compare_glm
+            args = [values, x, c]
+        else:
+            method = compare_two_groups_masked if masked else compare_two_groups
+            args = [values, groups]
+        if masked:
+            args.append(presence)
+        result = method(*args, **options).set_index("Feature").sort_index()
+        np.testing.assert_allclose(result.P_value, expected, rtol=2e-11, atol=0)
+        assert np.all(result.P_value_error <= np.minimum(1e-10, 0.001 * result.P_value))
+
+    @pytest.mark.parametrize("n", [4, 18])
+    def test_one_bin_profiles_match_student_t(self, n):
+        from scipy.stats import t
+
+        rng = np.random.default_rng(725)
+        x = np.c_[np.ones(n), np.linspace(-1, 1, n)]
+        y = rng.normal(size=(n, 6))
+        inverse = np.linalg.pinv(x)
+        residuals = y - x @ inverse @ y
+        score = (inverse[1] @ y) / np.sqrt(
+            np.sum(inverse[1] ** 2) * np.sum(residuals**2, axis=0) / (n - 2)
+        )
+        exact = 2 * t.sf(abs(score), n - 2)
+        result = l2._run_l2_conditional(
+            np.exp(y[..., None]),
+            x,
+            np.array([0.0, 1.0]),
+        )
+        np.testing.assert_allclose(result["pvals"], exact, rtol=0, atol=1e-10)
+
+    @pytest.mark.parametrize("shape_only", [False, True])
+    def test_masked_binary_glm_feature_order_shift_and_chunk_invariance(
+        self, shape_only, monkeypatch
+    ):
+        rng = np.random.default_rng(726)
+        groups = np.repeat([0, 1], 6)
+        values = rng.lognormal(size=(12, 4, 9))
+        presence = np.ones((12, 4), bool)
+        presence[0, ::2] = False
+        values[~presence] = np.nan
+        options = {
+            "normalize_shape": shape_only,
+            "freq_weights": np.arange(9),
+            "null": "rotation",
+        }
+        expected = (
+            compare_two_groups_masked(values, groups, presence, **options)
+            .set_index("Feature")
+            .sort_index()
+        )
+        glm = (
+            compare_glm_masked(
+                values, np.c_[np.ones(12), groups], np.array([0.0, 1.0]), presence, **options
+            )
+            .set_index("Feature")
+            .sort_index()
+        )
+        pd.testing.assert_frame_equal(
+            expected,
+            glm.drop(columns=["n_obs", "df_resid"]).assign(
+                n_obs_A=expected.n_obs_A, n_obs_B=expected.n_obs_B
+            )[expected.columns],
+        )
+        monkeypatch.setattr(l2, "_COMPARISON_WORKSPACE_BYTES", 512)
+        order = rng.permutation(4)
+        actual = (
+            compare_two_groups_masked(
+                7 * values[:, order],
+                groups,
+                presence[:, order],
+                gene_names=[str(i) for i in order],
+                **options,
+            )
+            .set_index("Feature")
+            .sort_index()
+        )
+        np.testing.assert_allclose(actual, expected, rtol=0, atol=1e-10)
+
+    def test_public_rotation_controls_and_failure_propagation(self, monkeypatch):
+        import inspect
+
+        from sonic.comparators import multisample as ms
+
+        for method in (
+            ms.compare_two_groups,
+            ms.compare_two_groups_masked,
+            ms.compare_glm,
+            ms.compare_glm_masked,
+        ):
+            parameters = inspect.signature(method).parameters
+            assert "n_rotations" not in parameters
+            assert parameters["integration_tol"].kind == inspect.Parameter.KEYWORD_ONLY
+        values = np.random.default_rng(17).lognormal(size=(8, 3, 5))
+        groups = np.repeat([0, 1], 4)
+        result = compare_two_groups(values, groups, null="rotation", random_state=1)
+        replay = compare_two_groups(values, groups, null="rotation", random_state=2)
+        pd.testing.assert_frame_equal(result, replay)
+        assert result.attrs == replay.attrs
+        assert (result.P_value_error <= 1e-10).all()
+        np.testing.assert_allclose(result.P_adj, apply_bh_correction(result.P_value))
+        with pytest.raises(TypeError, match="n_rotations"):
+            compare_two_groups(values, groups, null="rotation", n_rotations=99)
+
+        def fail(*args, **kwargs):
+            raise RuntimeError("unresolved integration")
+
+        monkeypatch.setattr(l2, "_conditional_tails", fail)
+        with pytest.raises(RuntimeError, match="unresolved integration"):
+            compare_two_groups(values, groups, null="rotation")
 
 
 class TestTCauchyCalibration:

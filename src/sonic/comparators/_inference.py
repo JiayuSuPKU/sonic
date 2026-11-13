@@ -10,6 +10,8 @@ from typing import Literal, TypedDict
 
 import numpy as np
 import pandas as pd
+from scipy.integrate import IntegrationWarning, quad
+from scipy.special import betainc
 
 from sonic.comparators import _regression as _lm
 from sonic.comparators.normalization import _normalize_shape_apply
@@ -960,16 +962,260 @@ def _rotation_metadata(n_rotations, random_state):
     }
 
 
-def _rotation_tails(coordinates, basis, n_rotations, seed):
-    """Stream sphere draws for weighted conditional coordinates.
+def _conditional_scatter(coordinates):
+    """Form the small sample-space scatter without dropping null directions.
 
     Parameters
     ----------
     coordinates : np.ndarray
-        Shape ``(residual_df + 1, n_features, n_bins)``. The first row is
-        the standardized contrast; the remaining rows are residual coordinates.
+        Weighted coordinates, shape ``(residual_df + 1, n_features, n_bins)``.
+        The first row is the contrast divided by its sample-weight norm;
+        the remaining rows lie in the full-model residual basis.
+
+    Returns
+    -------
+    scatter : np.ndarray
+        Shape ``(n_features, residual_df + 1, residual_df + 1)``. Each feature
+        is rescaled before squaring; its observed quadratic form is
+        ``scatter[:, 0, 0]`` on the same scale. Zero eigenvalue directions
+        remain part of the conditional sphere, even when there are fewer bins.
+    effective_rank : np.ndarray
+        Squared trace divided by squared Frobenius norm; NaN for zero scatter.
+    """
+    # Per-feature rescaling leaves the tail unchanged and avoids squaring tiny values.
+    scale = np.max(np.abs(coordinates), axis=(0, 2))
+    coordinates = coordinates / np.where(scale > 0, scale, 1)[None, :, None]
+    rows = coordinates.transpose(1, 0, 2)
+    gram = rows @ rows.swapaxes(1, 2)
+    trace = np.trace(gram, axis1=1, axis2=2)
+    squared = np.sum(gram**2, axis=(1, 2))
+    effective_rank = np.divide(
+        trace**2, squared, out=np.full(len(trace), np.nan), where=squared > 0
+    )
+    return gram, effective_rank
+
+
+def _validate_integration_tol(integration_tol):
+    """Validate the absolute error target for conditional integration."""
+    if (
+        isinstance(integration_tol, (bool, np.bool_))
+        or not isinstance(integration_tol, (int, float, np.integer, np.floating))
+        or not np.isfinite(integration_tol)
+        or not 0 < integration_tol < 1
+    ):
+        raise ValueError("integration_tol must be a finite number strictly between 0 and 1.")
+
+
+def _imhof_tail(coefficients, *, integration_tol=1e-10):  # noqa: C901 — exact cases and quadrature acceptance
+    """Integrate ``P(sum(coefficients * Z**2) >= 0)`` for independent normal Z.
+
+    Parameters
+    ----------
+    coefficients : np.ndarray
+        Finite nonempty vector. For the conditional sphere tail these are
+        ``eigenvalues(A) - observed``. Include every sample-space direction:
+        a zero eigenvalue of A contributes ``-observed``, not zero.
+    integration_tol : float
+        Target absolute p-value error, strictly between zero and one.
+        A returned interior tail must also have estimated relative error
+        at most 0.001. Unresolved tails raise RuntimeError after three attempts.
+
+    Returns
+    -------
+    pvalue, error : tuple of float
+        Upper tail and numerical absolute error estimate. The estimate includes
+        quadrature, truncation and floating-point error, not statistical
+        uncertainty; it is not a rigorous bound on all floating-point operations.
+
+    Notes
+    -----
+    Imhof inversion (1961, doi:10.1093/biomet/48.3-4.419) is integrated in
+    log(t), with partitions at coefficient scales and explicit bounds on both
+    omitted tails. Exact sign boundaries and two-level beta laws bypass
+    quadrature. Distinct coefficient levels are never merged. No approximation
+    or Monte Carlo fallback is used when integration cannot resolve the tail.
+    """
+    _validate_integration_tol(integration_tol)
+    coefficients = np.asarray(coefficients, dtype=float)
+    if coefficients.ndim != 1 or not coefficients.size or not np.isfinite(coefficients).all():
+        raise ValueError("Imhof coefficients must be a finite nonempty vector.")
+    if np.all(coefficients >= 0):
+        return 1.0, 0.0
+    if np.all(coefficients <= 0):
+        return 0.0, 0.0
+
+    positive = coefficients[coefficients > 0]
+    negative = -coefficients[coefficients < 0]
+    two_levels = np.all(positive == positive[0]) and np.all(negative == negative[0])
+    nonzero = coefficients[coefficients != 0]
+    scaled = nonzero / np.max(np.abs(nonzero))
+    if np.any(scaled == 0):
+        raise RuntimeError("Conditional tail cannot resolve the coefficient dynamic range.")
+    eps = np.finfo(float).eps
+    if two_levels:
+        positive_scale = np.max(scaled)
+        negative_scale = -np.min(scaled)
+        pvalue = float(
+            betainc(
+                len(negative) / 2,
+                len(positive) / 2,
+                positive_scale / (positive_scale + negative_scale),
+            )
+        )
+        if pvalue > 0.5:
+            # A ratio near one may round to one; its small complement remains resolved.
+            pvalue = float(
+                1
+                - betainc(
+                    len(positive) / 2,
+                    len(negative) / 2,
+                    negative_scale / (positive_scale + negative_scale),
+                )
+            )
+        error = max(32 * eps * len(nonzero) * pvalue, np.nextafter(0.0, 1.0))
+        if (
+            np.isfinite(pvalue)
+            and 0 < pvalue <= 1
+            and error <= integration_tol
+            and error <= 0.001 * pvalue
+        ):
+            return pvalue, error
+        raise RuntimeError(
+            "Conditional beta tail underflowed or fails absolute/relative resolution."
+        )
+
+    # The cancellation in 1/2 + integral/pi imposes an absolute roundoff floor.
+    roundoff = 8 * eps
+    if integration_tol < roundoff:
+        raise RuntimeError("Imhof integration_tol is below floating-point resolution.")
+    logs = np.log(2 * np.abs(scaled))
+    signs = np.sign(scaled)
+    dimension = len(scaled)
+    mass = np.sum(np.abs(scaled))
+
+    def integrand(log_t):
+        log_z = logs + log_t
+        phase = 0.5 * np.sum(signs * np.arctan(np.exp(np.clip(log_z, -745, 709))))
+        amplitude = np.exp(-0.25 * np.logaddexp(0, 2 * log_z).sum())
+        return float(np.sin(phase) * amplitude)
+
+    for factor in (1.0, 0.01, 0.0001):
+        budget = integration_tol * factor / 4
+        lower = np.log(np.pi * budget / (4 * mass))
+        upper = (
+            2 / dimension * (np.log(2 / dimension) - 0.5 * logs.sum() - np.log(np.pi * budget / 4))
+        )
+        transitions = np.sort(-logs[(-logs > lower) & (-logs < upper)])
+        # Merge nearby quadrature knots, not coefficients, to avoid vanishing intervals.
+        points = [lower]
+        for point in transitions:
+            if point - points[-1] > 0.25 and upper - point > 0.25:
+                points.append(point)
+        points.append(upper)
+        values, errors = [], []
+        failed = False
+        for left, right in zip(points[:-1], points[1:], strict=True):
+            with warnings.catch_warnings(record=True) as caught:
+                warnings.simplefilter("always", IntegrationWarning)
+                result = quad(
+                    integrand,
+                    left,
+                    right,
+                    epsabs=np.pi * budget / (4 * (len(points) - 1)),
+                    epsrel=0,
+                    limit=1000,
+                    full_output=1,
+                )
+            value, error = result[:2]
+            # With full_output, QUADPACK reports convergence failures in an extra item.
+            failed |= bool(caught) or len(result) > 3
+            if not np.isfinite(value) or not np.isfinite(error) or error < 0:
+                failed = True
+                break
+            values.append(value)
+            errors.append(error)
+        pvalue = 0.5 + math.fsum(values) / np.pi
+        # |integrand| <= t*sum|a| near zero; <= product(2t|a|)^(-1/2) at infinity.
+        truncation = np.exp(lower) * mass + np.exp(
+            np.log(2 / dimension) - 0.5 * logs.sum() - dimension * upper / 2
+        )
+        error = (math.fsum(errors) + truncation) / np.pi + roundoff
+        if not failed and 0 < pvalue <= 1 and error <= integration_tol and error <= 0.001 * pvalue:
+            return float(pvalue), float(error)
+    raise RuntimeError(
+        "Imhof tail unresolved after three attempts: "
+        f"p={pvalue:.6g}, estimated_error={error:.3g}, integration_tol={integration_tol:g}, "
+        f"integration_failure={failed}; require relative error <= 0.001."
+    )
+
+
+def _conditional_tails(scatter, *, integration_tol=1e-10, rank_one=False):
+    """Evaluate prepared sphere tails by deterministic Imhof/beta integration.
+
+    Parameters
+    ----------
+    scatter : np.ndarray
+        Symmetric matrices from :func:`_conditional_scatter`, shape
+        ``(n_features, residual_df + 1, residual_df + 1)``. Each observed
+        quadratic form is the first diagonal entry.
+    integration_tol : float
+        Absolute p-value error target; see :func:`_imhof_tail` for acceptance
+        checks and explicit resolution failures.
+    rank_one : bool
+        True when a single active bin guarantees rank at most one. Use exact
+        beta coefficients from diagonal energies, without eigendecomposition.
+
+    Returns
+    -------
+    pvalues, errors : tuple of np.ndarray
+        One tail and numerical error estimate per feature. Zero eigenvalue
+        directions are retained; no covariance moments or sphere draws are used.
+    """
+    scatter = np.asarray(scatter, dtype=float)
+    if (
+        scatter.ndim != 3
+        or scatter.shape[1] == 0
+        or scatter.shape[1] != scatter.shape[2]
+        or not np.isfinite(scatter).all()
+    ):
+        raise ValueError("Conditional scatter must contain finite square matrices.")
+    pvalues, errors = np.empty(len(scatter)), np.empty(len(scatter))
+    for feature, matrix in enumerate(scatter):
+        try:
+            if rank_one:
+                coefficients = np.full(len(matrix), -matrix[0, 0])
+                # lambda - q is residual energy; avoid subtracting nearly equal totals.
+                coefficients[0] = np.diag(matrix)[1:].sum()
+            else:
+                # Shift before diagonalization to preserve nearly constant spectral differences.
+                shifted = matrix.copy()
+                shifted.flat[:: len(matrix) + 1] -= matrix[0, 0]
+                scale = np.max(np.abs(shifted))
+                if scale > 0:
+                    shifted /= scale
+                coefficients = np.linalg.eigvalsh(shifted)
+                if coefficients.max() <= 0 and np.any(shifted[0, 1:] != 0):
+                    raise RuntimeError("The upper spectral boundary is numerically unresolved.")
+            pvalues[feature], errors[feature] = _imhof_tail(
+                coefficients, integration_tol=integration_tol
+            )
+        except (RuntimeError, np.linalg.LinAlgError) as exc:
+            raise RuntimeError(
+                f"Conditional integration failed for block feature {feature}: {exc}"
+            ) from exc
+    return pvalues, errors
+
+
+def _rotation_tails(scatter, basis, n_rotations, seed):
+    """Stream Monte Carlo tails for a prepared conditional scatter.
+
+    Parameters
+    ----------
+    scatter : np.ndarray
+        Shape ``(n_features, residual_df + 1, residual_df + 1)`` from
+        :func:`_conditional_scatter`; the observed value is ``scatter[:, 0, 0]``.
     basis : np.ndarray
-        Orthonormal sample-space basis aligned with the coordinate rows.
+        Orthonormal sample-space basis aligned with the scatter axes.
     n_rotations : int
         Number of Monte Carlo draws.
     seed : np.random.SeedSequence
@@ -977,22 +1223,14 @@ def _rotation_tails(coordinates, basis, n_rotations, seed):
 
     Returns
     -------
-    pvalues, effective_rank : tuple of np.ndarray
-        Plus-one upper tails and ranks of the conditioned scatter matrices.
+    np.ndarray
+        Plus-one upper-tail p-values, one per feature.
     """
-    # Per-feature rescaling leaves the tail unchanged and avoids squaring tiny values.
-    scale = np.max(np.abs(coordinates), axis=(0, 2))
-    coordinates = coordinates / np.where(scale > 0, scale, 1)[None, :, None]
-    rows = coordinates.transpose(1, 0, 2)
-    gram = rows @ rows.swapaxes(1, 2)
+    gram = scatter
     observed = gram[:, 0, 0]
     trace = np.trace(gram, axis1=1, axis2=2)
-    squared = np.sum(gram**2, axis=(1, 2))
-    effective_rank = np.divide(
-        trace**2, squared, out=np.full(len(trace), np.nan), where=squared > 0
-    )
     if not trace.any():
-        return np.ones(len(trace)), effective_rank
+        return np.ones(len(trace))
     tolerance = 64 * np.finfo(float).eps * trace
     counts = np.zeros(len(trace), dtype=np.int64)
     n_samples, dimension = basis.shape
@@ -1008,10 +1246,10 @@ def _rotation_tails(coordinates, basis, n_rotations, seed):
         products = (directions[:, :, None] * directions[:, None, :]).reshape(size, -1)
         null = products @ gram.reshape(len(trace), -1).T
         counts += np.count_nonzero(null >= observed - tolerance, axis=0)
-    return (counts + 1) / (n_rotations + 1), effective_rank
+    return (counts + 1) / (n_rotations + 1)
 
 
-def _run_l2_rotations(  # noqa: C901
+def _run_l2_conditional(  # noqa: C901
     profiles,
     design,
     contrast,
@@ -1022,10 +1260,11 @@ def _run_l2_rotations(  # noqa: C901
     log_transform=True,
     min_resid_df=1,
     allow_empty=False,
-    n_rotations=19999,
+    integration_tol=1e-10,
+    n_rotations=None,
     random_state=None,
 ):
-    """Calibrate L2 by rotating each feature's nuisance-adjusted sample scatter.
+    """Prepare and evaluate each feature's conditional L2 null in bounded blocks.
 
     Parameters
     ----------
@@ -1041,16 +1280,23 @@ def _run_l2_rotations(  # noqa: C901
         Minimum residual degrees of freedom per observed design.
     allow_empty : bool
         Return skipped rows when no features qualify, for cross-spectrum callers.
-    n_rotations : int
-        Number of common sphere draws within each observation mask.
+    integration_tol : float
+        Absolute p-value error target for deterministic integration, the default.
+        See :func:`_imhof_tail` for numerical acceptance checks.
+    n_rotations : int or None
+        If supplied, use this many Monte Carlo draws instead of integration.
+        Retained for cross-spectrum tests and numerical reference checks.
     random_state : int or None
-        Seed. An automatically generated seed is retained in the metadata.
+        Monte Carlo seed; ignored by integration. The effective seed is saved
+        in metadata for replay.
 
     Returns
     -------
     dict
-        Statistics, Monte Carlo p-values, eligibility, counts, residual df,
-        conditional effective ranks, and rotation metadata.
+        Statistics, p-values, numerical errors, eligibility, counts, residual df
+        and conditional effective ranks in original feature order. Ineligible
+        tails remain NaN. Metadata records the integration method/tolerance or
+        Monte Carlo seed/draw count/floor; Monte Carlo numerical errors are NaN.
 
     Notes
     -----
@@ -1058,9 +1304,20 @@ def _run_l2_rotations(  # noqa: C901
     full-model residual basis. For transformed profiles Y and diagonal weights W,
     form ``A = B.T @ Y @ W @ Y.T @ B``. Compare ``L2**2 / (a @ a)`` with
     ``u.T @ A @ u`` for uniform sphere directions u; this preserves the
-    nuisance-adjusted cross-bin scatter ``Y.T @ B @ B.T @ Y``.
+    nuisance-adjusted cross-bin scatter ``Y.T @ B @ B.T @ Y`` without forming
+    that bin-by-bin matrix. The evaluator receives a rescaled A with all
+    ``residual_df + 1`` axes retained, including zero eigenvalue directions.
     """
-    metadata = _rotation_metadata(n_rotations, random_state)
+    if n_rotations is None:
+        _validate_integration_tol(integration_tol)
+        metadata = {
+            "null": "rotation",
+            "covariance": None,
+            "method": "imhof",
+            "integration_tol": float(integration_tol),
+        }
+    else:
+        metadata = _rotation_metadata(n_rotations, random_state)
     if int(min_resid_df) < 1:
         raise ValueError(f"min_resid_df must be >= 1, got {min_resid_df}.")
     profiles = np.asarray(profiles)
@@ -1087,11 +1344,12 @@ def _run_l2_rotations(  # noqa: C901
     sqrt_weights = np.sqrt(weights)
     observed = np.full(n_features, np.nan)
     pvals = np.full(n_features, np.nan)
+    pvalue_error = np.full(n_features, np.nan)
     effective_rank = np.full(n_features, np.nan)
     eligible = np.zeros(n_features, bool)
     df_resid = np.zeros(n_features, int)
     n_obs = presence.sum(axis=0)
-    # Matching observation masks share a design fit and the same rotation draws.
+    # Matching observation masks share the fitted design and conditional basis.
     for sample_mask, genes in _iter_mask_groups(presence):
         rows = np.flatnonzero(sample_mask)
         count = len(rows)
@@ -1111,10 +1369,11 @@ def _run_l2_rotations(  # noqa: C901
         # Unit contrast + residual axes span the sample space after nuisance removal.
         residual_basis = np.linalg.svd(x, full_matrices=True)[0][:, rank:]
         basis = np.column_stack([a / contrast_norm, residual_basis])
-        # Key draws by observed samples so feature blocking does not change p-values.
-        seed = np.random.SeedSequence(
-            metadata["random_state"], spawn_key=(n_samples, *map(int, rows))
-        )
+        if n_rotations is not None:
+            # Reuse this mask's seed across feature blocks to preserve seeded results.
+            seed = np.random.SeedSequence(
+                metadata["random_state"], spawn_key=(n_samples, *map(int, rows))
+            )
         # Bound workspace for both profile arrays and the (df + 1)-dimensional scatter.
         for block in _iter_feature_blocks(count, len(genes), max(n_bins, df + 1), matrix.shape[1]):
             cols = genes[block]
@@ -1140,23 +1399,29 @@ def _run_l2_rotations(  # noqa: C901
             # Remove numerical-zero scatter before rescaling can amplify fit roundoff.
             zero_scatter = np.max(np.abs(coordinates), axis=(0, 2)) <= roundoff
             coordinates[:, zero_scatter] = 0.0
-            # Compare first-row energy with random directions, holding cross-bin scatter fixed.
-            pvals[cols], effective_rank[cols] = _rotation_tails(
-                coordinates, basis, metadata["n_rotations"], seed
-            )
+            scatter, effective_rank[cols] = _conditional_scatter(coordinates)
+            if n_rotations is None:
+                pvals[cols], pvalue_error[cols] = _conditional_tails(
+                    scatter,
+                    integration_tol=integration_tol,
+                    rank_one=np.count_nonzero(weights) == 1,
+                )
+            else:
+                pvals[cols] = _rotation_tails(scatter, basis, metadata["n_rotations"], seed)
         eligible[genes] = True
     if not eligible.any() and not allow_empty:
         raise ValueError(
             "Rotation tests: no features have enough observed samples and an estimable contrast."
         )
     return {
+        "metadata": metadata,
         "observed": observed,
         "pvals": pvals,
+        "pvalue_error": pvalue_error,
         "effective_rank": effective_rank,
         "eligible": eligible,
         "n_obs": n_obs,
         "df_resid": df_resid,
-        "metadata": metadata,
     }
 
 
@@ -1178,7 +1443,7 @@ def _run_l2_test(  # noqa: C901 — binary/GLM and masked/unmasked null dispatch
     min_resid_df=1,
     n_perm=1000,
     max_exact_permutations=10000,
-    n_rotations=19999,
+    integration_tol=1e-10,
     random_state=None,
 ):
     """Select one L2 null for binary groups or a scalar GLM contrast.
@@ -1197,8 +1462,10 @@ def _run_l2_test(  # noqa: C901 — binary/GLM and masked/unmasked null dispatch
         Null calibration and profile options from the public comparison.
     min_samples_per_group, min_resid_df
         Binary and GLM eligibility thresholds, respectively, for masked fits.
-    n_perm, max_exact_permutations, n_rotations, random_state
-        Controls for the selected resampling method.
+    n_perm, max_exact_permutations, random_state
+        Controls for binary label permutations.
+    integration_tol
+        Absolute p-value error target for deterministic conditional integration.
 
     Returns
     -------
@@ -1264,7 +1531,7 @@ def _run_l2_test(  # noqa: C901 — binary/GLM and masked/unmasked null dispatch
                     extra["n_obs_B"] >= min_samples_per_group
                 )
                 presence = presence & eligible[None, :]
-        state = _run_l2_rotations(
+        state = _run_l2_conditional(
             profiles,
             design,
             contrast,
@@ -1272,10 +1539,10 @@ def _run_l2_test(  # noqa: C901 — binary/GLM and masked/unmasked null dispatch
             freq_weights=freq_weights,
             normalize_shape=normalize_shape,
             min_resid_df=min_resid_df if not binary and presence is not None else 1,
-            n_rotations=n_rotations,
-            random_state=random_state,
+            integration_tol=integration_tol,
         )
         observed, pvals, metadata = state["observed"], state["pvals"], state["metadata"]
+        extra["P_value_error"] = state["pvalue_error"]
 
     else:  # Binary label permutations; GLM permutations are not implemented.
         observed, pvals = _run_two_group_permutations(
@@ -1292,5 +1559,5 @@ def _run_l2_test(  # noqa: C901 — binary/GLM and masked/unmasked null dispatch
         metadata = {}
 
     if not binary and presence is not None:
-        extra = {"n_obs": state["n_obs"], "df_resid": state["df_resid"]}
+        extra.update(n_obs=state["n_obs"], df_resid=state["df_resid"])
     return observed, pvals, extra, metadata

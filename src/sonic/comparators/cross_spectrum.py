@@ -22,8 +22,8 @@ from sonic.comparators._inference import (
     _profile_roundoff,
     _resolve_freq_weights,
     _rotation_metadata,
+    _run_l2_conditional,
     _run_l2_permutations,
-    _run_l2_rotations,
     _weighted_covariance_eigensystem,
 )
 from sonic.comparators._regression import (
@@ -898,7 +898,7 @@ def _run_cross_rotations(
     Notes
     -----
     Each bin-support group delegates to
-    :func:`~sonic.comparators._inference._run_l2_rotations`, conditioning on
+    :func:`~sonic.comparators._inference._run_l2_conditional`, conditioning on
     each pair's nuisance-adjusted scatter without pooling across pairs.
     The caller assigns final statuses for self-pairs and entirely absent pairs.
     """
@@ -929,7 +929,7 @@ def _run_cross_rotations(
                     group_presence[group_b].sum(axis=0) >= min_samples_per_group
                 )
                 group_presence = group_presence & eligible[None, :]
-            rotation = _run_l2_rotations(
+            rotation = _run_l2_conditional(
                 profiles,
                 matrix,
                 vector,

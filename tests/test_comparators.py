@@ -1782,8 +1782,7 @@ class TestComparatorRotation:
         x = pd.DataFrame({"age": np.arange(10.0)}) if glm else groups
         kwargs = {
             "null": "rotation",
-            "n_rotations": 199,
-            "random_state": 15,
+            "integration_tol": 5e-11,
             "normalize_shape": shape_only,
             "freq_weights": np.arange(5),
         }
@@ -1795,6 +1794,10 @@ class TestComparatorRotation:
         expected = getattr(ms, method)(*args, gene_names=comparator.gene_names, **kwargs)
         pd.testing.assert_frame_equal(actual, expected)
         assert actual.attrs == expected.attrs
+        assert actual.attrs["method"] == "imhof"
+        assert actual.attrs["integration_tol"] == 5e-11
+        assert (actual.P_value_error <= 5e-11).all()
+        assert "n_rotations" not in actual.attrs
 
 
 class TestComparatorLogTCauchy:

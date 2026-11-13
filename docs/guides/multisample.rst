@@ -364,40 +364,55 @@ Cross-spectrum tests use ``covariance="per_pair"`` for separate pair estimates.
 Conditional rotation tests
 --------------------------
 
-``null="rotation"`` calibrates the same weighted L2 statistic by rotating
-profiles in the sample space after removing nuisance directions. This preserves
-each feature's cross-bin scatter and accounts for uncertainty without a
-plug-in covariance estimate.
-Use it for binary groups or an estimable scalar GLM contrast, including
-continuous predictors and missing samples:
+For DF and DF-norm, ``null="rotation"`` evaluates the conditional rotation
+null by deterministic integration. It tests the same weighted L2 statistic,
+conditioning on each feature's nuisance-adjusted scatter. The default
+``null="analytic"`` instead uses a pooled or per-gene covariance estimate
+and a Liu moment approximation.
 
 .. code-block:: python
 
    pattern_results = comparison.test_diff_freq(
        design, contrast="condition", normalize_shape=True,
-       null="rotation", n_rotations=19999, random_state=0,
+       null="rotation", integration_tol=1e-10,
    )
 
-Leave ``covariance=None`` for rotation. The same controls work with
-``test_cross_diff_freq`` and the standalone comparison functions. Samples
-should be independent biological units. The conditional null assumes Gaussian
-errors on the tested profile scale with common covariance across samples within
-each feature; covariance may differ between features. DF-norm's nonlinear
-normalization does not generally preserve Gaussian errors.
+Use ``statistic="log_l2"`` and leave ``covariance=None``. The four standalone
+binary/GLM comparison functions accept the same option, including masked data.
+Samples should be independent biological units. The conditional null assumes
+Gaussian errors on the tested profile scale with common covariance across
+samples within each feature; covariance may differ between features.
+DF-norm's nonlinear normalization does not generally preserve Gaussian errors.
+Deterministic evaluation retains these statistical assumptions.
 
-``n_rotations`` sets the draw count and ``random_state`` makes draws reproducible.
-The p-value is ``(1 + exceedances) / (n_rotations + 1)``, counting ties
-conservatively. With 19999 draws the minimum is 0.00005, which can limit BH
-resolution. Result ``attrs`` records ``n_rotations``, the effective
-``random_state``, and ``min_p_value``. Few residual degrees of freedom can limit
-power. Zero-information profiles receive p=1; nonzero perfect fits can reach
-the Monte Carlo floor.
+``integration_tol`` sets the target absolute p-value error. Imhof inversion,
+with exact beta special cases, removes Monte Carlo variability and the sampling
+p-value floor. Small tails must also have estimated relative error <= 0.001.
+Unresolved tails raise ``RuntimeError`` after numerical refinement; no
+approximation or sampling fallback is used. ``P_value_error`` reports the
+numerical absolute error estimate, not statistical uncertainty or a rigorous
+floating-point bound. Skipped features retain NaN results. Zero scatter and
+constant quadratic forms give p=1; a nonconstant form at its exact upper
+spectral boundary gives p=0.
+
+Result ``attrs`` records ``null="rotation"``, ``covariance=None``,
+``method="imhof"`` and ``integration_tol``. BH adjustment is unchanged, but
+calls may differ from earlier Monte Carlo results. DF functions no longer
+accept ``n_rotations``. ``random_state`` remains a binary-permutation control
+and is removed from the standalone GLM functions.
 
 For contrast weights ``a = c @ pinv(X)``, let B contain the unit contrast
 axis and an orthonormal full-model residual basis. With transformed profiles Y
-and diagonal bin weights W, rotation compares ``L2**2 / (a @ a)`` with
-``u.T @ (B.T @ Y @ W @ Y.T @ B) @ u`` for uniform sphere directions u.
-The nuisance-adjusted cross-bin scatter stays fixed.
+and diagonal bin weights W, set ``A = B.T @ Y @ W @ Y.T @ B`` and
+``q = L2**2 / (a @ a)``. The conditional tail is
+``P(u.T @ A @ u >= q) = P(sum((eigenvalues(A) - q) * Z**2) >= 0)``,
+where u is uniform on the sphere and Z has independent standard normal entries.
+All ``df_resid + 1`` directions remain, including zero eigenvalues of A.
+
+Cross-spectrum ``test_cross_diff_freq(null="rotation")`` continues to use
+Monte Carlo, controlled by ``n_rotations`` and ``random_state``. Its p-value
+remains ``(1 + exceedances) / (n_rotations + 1)``, with ties counted
+conservatively; its metadata retains the draw count, effective seed and floor.
 
 
 Permutation tests

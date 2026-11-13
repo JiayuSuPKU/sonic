@@ -1167,7 +1167,7 @@ class _ComparatorBase:
         min_samples_per_group: int = 2,
         min_resid_df: int = 1,
         covariance: str | None = None,
-        n_rotations: int = 19999,
+        integration_tol: float = 1e-10,
     ) -> Any:
         """Test differential frequency (DF) on the fitted gene spectra.
 
@@ -1191,7 +1191,7 @@ class _ComparatorBase:
             Null calibration (default ``'analytic'``), selected by ``statistic``:
 
             - ``'log_l2'``: ``'analytic'`` (selected covariance and Liu tail),
-              ``'rotation'`` (conditional on nuisance-adjusted scatter), or
+              ``'rotation'`` (deterministic conditional integration), or
               ``'permutation'`` (binary labels only, without ``contrast``).
             - ``'log_t_cauchy'``: ``'analytic'`` only (per-bin t tails and
               Cauchy combination).
@@ -1199,7 +1199,7 @@ class _ComparatorBase:
             Number of sampled label permutations; default 1000. Ignored when
             all assignments are enumerated or another null is selected.
         random_state : int, optional
-            Seed for resampling. Ignored by analytic tests.
+            Seed for binary label permutations; ignored by other nulls.
         freq_weights : np.ndarray, optional
             Nonnegative weights in the fitted frequency-bin order, normalized
             to sum to one. None gives uniform weights. Log t-Cauchy renormalizes
@@ -1222,9 +1222,11 @@ class _ComparatorBase:
             ``None`` (default) or ``'pooled'`` shares residual covariance across
             eligible genes. ``'per_gene'`` estimates it separately for each gene.
             An explicit choice requires an analytic L2 test.
-        n_rotations : int
-            Number of rotation draws; default 19999. Used only with
-            ``null='rotation'``, which requires ``covariance=None``.
+        integration_tol : float
+            Target absolute p-value error for ``null='rotation'``; default 1e-10.
+            Requires ``statistic='log_l2'`` and ``covariance=None``. Small tails
+            also require estimated relative error <= 0.001; unresolved tails raise
+            RuntimeError. Ignored by other nulls.
 
         Returns
         -------
@@ -1242,13 +1244,16 @@ class _ComparatorBase:
             significance does not establish the selected bin's significance.
             BH uses finite feature p-values.
             Analytic L2 results record ``null`` and ``covariance`` in ``attrs``.
-            Rotation also records ``n_rotations``, the effective ``random_state``,
-            and ``min_p_value``.
+            Rotation adds ``P_value_error``, a numerical absolute error estimate
+            (not statistical uncertainty), NaN for skipped features. Its ``attrs``
+            records ``null``, ``covariance=None``, ``method="imhof"`` (with exact
+            beta special cases), and ``integration_tol``.
 
         Raises
         ------
         RuntimeError
-            If the required spectra have not been computed.
+            If spectra have not been computed or conditional integration cannot
+            resolve a tail to the requested accuracy.
         ValueError
             If shapes, options, or the contrast are invalid.
         NotImplementedError
@@ -1277,9 +1282,8 @@ class _ComparatorBase:
             "freq_weights": freq_weights,
             "normalize_shape": normalize_shape,
             "null": null,
-            "random_state": random_state,
             "covariance": covariance,
-            "n_rotations": n_rotations,
+            "integration_tol": integration_tol,
         }
 
         use_glm = (contrast is not None) or (groups is None)
@@ -1319,6 +1323,7 @@ class _ComparatorBase:
             )
 
         # Binary path (1-D design, contrast is None).
+        options["random_state"] = random_state
         if use_masked:
             return compare_two_groups_masked(
                 self.spectra_,

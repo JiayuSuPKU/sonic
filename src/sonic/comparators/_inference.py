@@ -10,9 +10,11 @@ from typing import Literal, TypedDict
 
 import numpy as np
 import pandas as pd
-from scipy.integrate import IntegrationWarning, quad
+from scipy.optimize import brentq
 from scipy.special import betainc
+from scipy.stats import norm
 
+import sonic._davies as _davies
 from sonic.comparators import _regression as _lm
 from sonic.comparators.normalization import _normalize_shape_apply
 from sonic.statistics import liu_sf
@@ -1006,43 +1008,85 @@ def _validate_integration_tol(integration_tol):
         raise ValueError("integration_tol must be a finite number strictly between 0 and 1.")
 
 
-def _imhof_tail(coefficients, *, integration_tol=1e-10):  # noqa: C901 — exact cases and quadrature acceptance
-    """Integrate ``P(sum(coefficients * Z**2) >= 0)`` for independent normal Z.
+def _saddlepoint_tail(coefficients):
+    """Approximate a signed quadratic-form tail with Kuonen's modified normal law.
+
+    Solve ``K'(t)=0`` for ``K(t)=-sum(log(1-2*t*a))/2`` and evaluate the
+    modified signed root. Near the mean use its continuous limit. This is an
+    approximation, with no numerical bound on its distributional error.
+    """
+    a = np.asarray(coefficients, dtype=float)
+    variance = 2 * np.sum(a * a)
+    mean = a.sum()
+    if abs(mean) <= 1e-6 * np.sqrt(variance):
+        z = -mean / np.sqrt(variance) + 8 * np.sum(a**3) / (6 * variance**1.5)
+    else:
+        left = np.nextafter(0.5 / a.min(), 0.0)
+        right = np.nextafter(0.5 / a.max(), 0.0)
+        with np.errstate(divide="ignore", invalid="raise", over="raise"):
+            t = brentq(
+                lambda t: np.sum(a / (1 - 2 * t * a)),
+                left,
+                right,
+                xtol=np.nextafter(0.0, 1.0),
+                rtol=1e-14,
+                maxiter=200,
+            )
+            x = 2 * t * a
+            # Avoid cancellation of linear terms near the mean.
+            k = (
+                t * mean + 0.5 * sum(np.sum(x**order) / order for order in range(2, 9))
+                if np.max(np.abs(x)) < 0.01
+                else -0.5 * np.log1p(-x).sum()
+            )
+            w = np.sign(t) * np.sqrt(-2 * k)
+            # Form t*sqrt(K''(t)) without squaring tiny terms before multiplying by t.
+            v = np.sign(t) * np.sqrt(0.5 * np.sum((x / (1 - x)) ** 2))
+            z = w + np.log(v / w) / w
+    pvalue = float(norm.sf(z))
+    if not np.isfinite(pvalue) or not 0 < pvalue <= 1:
+        raise RuntimeError("Saddlepoint tail is nonfinite or below floating-point resolution.")
+    return pvalue
+
+
+def _conditional_tail(coefficients, *, integration_tol=1e-6):  # noqa: C901 — exact cases, one retry and marked fallback
+    """Evaluate ``P(sum(coefficients * Z**2) >= 0)`` for independent normal Z.
 
     Parameters
     ----------
     coefficients : np.ndarray
-        Finite nonempty vector. For the conditional sphere tail these are
-        ``eigenvalues(A) - observed``. Include every sample-space direction:
-        a zero eigenvalue of A contributes ``-observed``, not zero.
+        Finite nonempty vector ``eigenvalues(A) - observed``. Include every
+        sample-space direction: a zero eigenvalue of A contributes ``-observed``.
     integration_tol : float
-        Target absolute p-value error, strictly between zero and one.
-        A returned interior tail must also have estimated relative error
-        at most 0.001. Unresolved tails raise RuntimeError after three attempts.
+        Initial Davies absolute error target, default 1e-6. Accept an interior
+        tail only with ``ifault=0`` and error budget at most ``0.001*p``.
+        A valid but insufficiently resolved tail gets one retry at
+        ``min(integration_tol, 1e-4*p)``, with 10,000 terms per attempt.
 
     Returns
     -------
-    pvalue, error : tuple of float
-        Upper tail and numerical absolute error estimate. The estimate includes
-        quadrature, truncation and floating-point error, not statistical
-        uncertainty; it is not a rigorous bound on all floating-point operations.
+    pvalue, error, method : tuple
+        Tail, numerical error budget/estimate, and ``'davies'``, ``'saddlepoint'``,
+        ``'beta'`` or ``'exact'``. Davies reports its accepted requested accuracy;
+        beta reports a roundoff estimate, and exact boundaries report zero.
+        Unresolved Davies calls use marked saddlepoint with NaN error: the
+        integration target does not bound approximation error. If this also
+        fails, raise RuntimeError instead of returning a numerical zero.
 
     Notes
     -----
-    Imhof inversion (1961, doi:10.1093/biomet/48.3-4.419) is integrated in
-    log(t), with partitions at coefficient scales and explicit bounds on both
-    omitted tails. Exact sign boundaries and two-level beta laws bypass
-    quadrature. Distinct coefficient levels are never merged. No approximation
-    or Monte Carlo fallback is used when integration cannot resolve the tail.
+    Davies' AS 155 uses signed coefficients. Scale them before integration;
+    never merge distinct levels or discard zero eigenvalue directions of A.
+    Exact sign boundaries and two-level beta laws bypass both evaluators.
     """
     _validate_integration_tol(integration_tol)
     coefficients = np.asarray(coefficients, dtype=float)
     if coefficients.ndim != 1 or not coefficients.size or not np.isfinite(coefficients).all():
-        raise ValueError("Imhof coefficients must be a finite nonempty vector.")
+        raise ValueError("Conditional coefficients must be a finite nonempty vector.")
     if np.all(coefficients >= 0):
-        return 1.0, 0.0
+        return 1.0, 0.0, "exact"
     if np.all(coefficients <= 0):
-        return 0.0, 0.0
+        return 0.0, 0.0, "exact"
 
     positive = coefficients[coefficients > 0]
     negative = -coefficients[coefficients < 0]
@@ -1079,78 +1123,44 @@ def _imhof_tail(coefficients, *, integration_tol=1e-10):  # noqa: C901 — exact
             and error <= integration_tol
             and error <= 0.001 * pvalue
         ):
-            return pvalue, error
+            return pvalue, error, "beta"
         raise RuntimeError(
             "Conditional beta tail underflowed or fails absolute/relative resolution."
         )
 
-    # The cancellation in 1/2 + integral/pi imposes an absolute roundoff floor.
-    roundoff = 8 * eps
-    if integration_tol < roundoff:
-        raise RuntimeError("Imhof integration_tol is below floating-point resolution.")
-    logs = np.log(2 * np.abs(scaled))
-    signs = np.sign(scaled)
-    dimension = len(scaled)
-    mass = np.sum(np.abs(scaled))
-
-    def integrand(log_t):
-        log_z = logs + log_t
-        phase = 0.5 * np.sum(signs * np.arctan(np.exp(np.clip(log_z, -745, 709))))
-        amplitude = np.exp(-0.25 * np.logaddexp(0, 2 * log_z).sum())
-        return float(np.sin(phase) * amplitude)
-
-    for factor in (1.0, 0.01, 0.0001):
-        budget = integration_tol * factor / 4
-        lower = np.log(np.pi * budget / (4 * mass))
-        upper = (
-            2 / dimension * (np.log(2 / dimension) - 0.5 * logs.sum() - np.log(np.pi * budget / 4))
-        )
-        transitions = np.sort(-logs[(-logs > lower) & (-logs < upper)])
-        # Merge nearby quadrature knots, not coefficients, to avoid vanishing intervals.
-        points = [lower]
-        for point in transitions:
-            if point - points[-1] > 0.25 and upper - point > 0.25:
-                points.append(point)
-        points.append(upper)
-        values, errors = [], []
-        failed = False
-        for left, right in zip(points[:-1], points[1:], strict=True):
-            with warnings.catch_warnings(record=True) as caught:
-                warnings.simplefilter("always", IntegrationWarning)
-                result = quad(
-                    integrand,
-                    left,
-                    right,
-                    epsabs=np.pi * budget / (4 * (len(points) - 1)),
-                    epsrel=0,
-                    limit=1000,
-                    full_output=1,
-                )
-            value, error = result[:2]
-            # With full_output, QUADPACK reports convergence failures in an extra item.
-            failed |= bool(caught) or len(result) > 3
-            if not np.isfinite(value) or not np.isfinite(error) or error < 0:
-                failed = True
-                break
-            values.append(value)
-            errors.append(error)
-        pvalue = 0.5 + math.fsum(values) / np.pi
-        # |integrand| <= t*sum|a| near zero; <= product(2t|a|)^(-1/2) at infinity.
-        truncation = np.exp(lower) * mass + np.exp(
-            np.log(2 / dimension) - 0.5 * logs.sum() - dimension * upper / 2
-        )
-        error = (math.fsum(errors) + truncation) / np.pi + roundoff
-        if not failed and 0 < pvalue <= 1 and error <= integration_tol and error <= 0.001 * pvalue:
-            return float(pvalue), float(error)
-    raise RuntimeError(
-        "Imhof tail unresolved after three attempts: "
-        f"p={pvalue:.6g}, estimated_error={error:.3g}, integration_tol={integration_tol:g}, "
-        f"integration_failure={failed}; require relative error <= 0.001."
-    )
+    accuracy = float(integration_tol)
+    for attempt in range(2):
+        pvalue, fault = _davies.sf(scaled, accuracy, 10000)
+        valid = fault == 0 and np.isfinite(pvalue) and 0 < pvalue <= 1
+        error = max(accuracy, 8 * eps)
+        if valid and error <= integration_tol and error <= 0.001 * pvalue:
+            return pvalue, error, "davies"
+        if attempt or not valid or accuracy <= 0.001 * pvalue:
+            break
+        accuracy = min(accuracy, 1e-4 * pvalue)
+    try:
+        return _saddlepoint_tail(scaled), np.nan, "saddlepoint"
+    except (RuntimeError, ValueError, FloatingPointError, OverflowError) as exc:
+        raise RuntimeError(
+            f"Conditional tail unresolved by Davies (ifault={fault}) and saddlepoint: {exc}"
+        ) from exc
 
 
-def _conditional_tails(scatter, *, integration_tol=1e-10, rank_one=False):
-    """Evaluate prepared sphere tails by deterministic Imhof/beta integration.
+def _integration_metadata(integration_tol):
+    """Describe the shared deterministic tail policy, including empty comparisons."""
+    _validate_integration_tol(integration_tol)
+    return {
+        "null": "rotation",
+        "covariance": None,
+        "method": "davies",
+        "integration_tol": float(integration_tol),
+        "integration_limit": 10000,
+        "n_saddlepoint": 0,
+    }
+
+
+def _conditional_tails(scatter, *, integration_tol=1e-6, rank_one=False):
+    """Evaluate prepared sphere tails by Davies integration with marked saddlepoint fallback.
 
     Parameters
     ----------
@@ -1159,7 +1169,7 @@ def _conditional_tails(scatter, *, integration_tol=1e-10, rank_one=False):
         ``(n_features, residual_df + 1, residual_df + 1)``. Each observed
         quadratic form is the first diagonal entry.
     integration_tol : float
-        Absolute p-value error target; see :func:`_imhof_tail` for acceptance
+        Absolute p-value error target; see :func:`_conditional_tail` for acceptance
         checks and explicit resolution failures.
     rank_one : bool
         True when a single active bin guarantees rank at most one. Use exact
@@ -1167,8 +1177,8 @@ def _conditional_tails(scatter, *, integration_tol=1e-10, rank_one=False):
 
     Returns
     -------
-    pvalues, errors : tuple of np.ndarray
-        One tail and numerical error estimate per feature. Zero eigenvalue
+    pvalues, errors, methods : tuple of np.ndarray
+        One tail, numerical error budget/estimate and method per feature. Zero eigenvalue
         directions are retained; no covariance moments or sphere draws are used.
     """
     scatter = np.asarray(scatter, dtype=float)
@@ -1180,6 +1190,7 @@ def _conditional_tails(scatter, *, integration_tol=1e-10, rank_one=False):
     ):
         raise ValueError("Conditional scatter must contain finite square matrices.")
     pvalues, errors = np.empty(len(scatter)), np.empty(len(scatter))
+    methods = np.empty(len(scatter), dtype=object)
     for feature, matrix in enumerate(scatter):
         try:
             if rank_one:
@@ -1196,14 +1207,14 @@ def _conditional_tails(scatter, *, integration_tol=1e-10, rank_one=False):
                 coefficients = np.linalg.eigvalsh(shifted)
                 if coefficients.max() <= 0 and np.any(shifted[0, 1:] != 0):
                     raise RuntimeError("The upper spectral boundary is numerically unresolved.")
-            pvalues[feature], errors[feature] = _imhof_tail(
+            pvalues[feature], errors[feature], methods[feature] = _conditional_tail(
                 coefficients, integration_tol=integration_tol
             )
         except (RuntimeError, np.linalg.LinAlgError) as exc:
             raise RuntimeError(
                 f"Conditional integration failed for block feature {feature}: {exc}"
             ) from exc
-    return pvalues, errors
+    return pvalues, errors, methods
 
 
 def _rotation_tails(scatter, basis, n_rotations, seed):
@@ -1260,7 +1271,7 @@ def _run_l2_conditional(  # noqa: C901
     log_transform=True,
     min_resid_df=1,
     allow_empty=False,
-    integration_tol=1e-10,
+    integration_tol=1e-6,
     n_rotations=None,
     random_state=None,
 ):
@@ -1282,10 +1293,10 @@ def _run_l2_conditional(  # noqa: C901
         Return skipped rows when no features qualify, for cross-spectrum callers.
     integration_tol : float
         Absolute p-value error target for deterministic integration, the default.
-        See :func:`_imhof_tail` for numerical acceptance checks.
+        See :func:`_conditional_tail` for numerical acceptance checks.
     n_rotations : int or None
         If supplied, use this many Monte Carlo draws instead of integration.
-        Retained for cross-spectrum tests and numerical reference checks.
+        Retained for internal numerical reference checks.
     random_state : int or None
         Monte Carlo seed; ignored by integration. The effective seed is saved
         in metadata for replay.
@@ -1309,13 +1320,7 @@ def _run_l2_conditional(  # noqa: C901
     ``residual_df + 1`` axes retained, including zero eigenvalue directions.
     """
     if n_rotations is None:
-        _validate_integration_tol(integration_tol)
-        metadata = {
-            "null": "rotation",
-            "covariance": None,
-            "method": "imhof",
-            "integration_tol": float(integration_tol),
-        }
+        metadata = _integration_metadata(integration_tol)
     else:
         metadata = _rotation_metadata(n_rotations, random_state)
     if int(min_resid_df) < 1:
@@ -1345,6 +1350,7 @@ def _run_l2_conditional(  # noqa: C901
     observed = np.full(n_features, np.nan)
     pvals = np.full(n_features, np.nan)
     pvalue_error = np.full(n_features, np.nan)
+    pvalue_method = np.full(n_features, None, dtype=object)
     effective_rank = np.full(n_features, np.nan)
     eligible = np.zeros(n_features, bool)
     df_resid = np.zeros(n_features, int)
@@ -1401,7 +1407,7 @@ def _run_l2_conditional(  # noqa: C901
             coordinates[:, zero_scatter] = 0.0
             scatter, effective_rank[cols] = _conditional_scatter(coordinates)
             if n_rotations is None:
-                pvals[cols], pvalue_error[cols] = _conditional_tails(
+                pvals[cols], pvalue_error[cols], pvalue_method[cols] = _conditional_tails(
                     scatter,
                     integration_tol=integration_tol,
                     rank_one=np.count_nonzero(weights) == 1,
@@ -1413,11 +1419,14 @@ def _run_l2_conditional(  # noqa: C901
         raise ValueError(
             "Rotation tests: no features have enough observed samples and an estimable contrast."
         )
+    if n_rotations is None:
+        metadata["n_saddlepoint"] = int(np.count_nonzero(pvalue_method == "saddlepoint"))
     return {
         "metadata": metadata,
         "observed": observed,
         "pvals": pvals,
         "pvalue_error": pvalue_error,
+        "pvalue_method": pvalue_method,
         "effective_rank": effective_rank,
         "eligible": eligible,
         "n_obs": n_obs,
@@ -1443,7 +1452,7 @@ def _run_l2_test(  # noqa: C901 — binary/GLM and masked/unmasked null dispatch
     min_resid_df=1,
     n_perm=1000,
     max_exact_permutations=10000,
-    integration_tol=1e-10,
+    integration_tol=1e-6,
     random_state=None,
 ):
     """Select one L2 null for binary groups or a scalar GLM contrast.
@@ -1543,6 +1552,7 @@ def _run_l2_test(  # noqa: C901 — binary/GLM and masked/unmasked null dispatch
         )
         observed, pvals, metadata = state["observed"], state["pvals"], state["metadata"]
         extra["P_value_error"] = state["pvalue_error"]
+        extra["P_value_method"] = state["pvalue_method"]
 
     else:  # Binary label permutations; GLM permutations are not implemented.
         observed, pvals = _run_two_group_permutations(

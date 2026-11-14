@@ -1213,7 +1213,7 @@ class TestCrossRotation:
         np.testing.assert_allclose(result.P_adj, apply_bh_correction(expected), rtol=2e-11, atol=0)
 
     @pytest.mark.parametrize("representation", ["coherence", "coherency"])
-    def test_multibin_low_df_matches_beta(self, representation):
+    def test_multibin_low_df_reports_accuracy_against_beta(self, representation):
         groups = np.array([0, 0, 0, 1, 1])
         x = np.c_[np.ones(5), groups]
         y = np.zeros((5, 2, 3))
@@ -1245,11 +1245,17 @@ class TestCrossRotation:
                 freq_weights=np.array([1.0, 0.0, 3.0]),
             )
         )
-        np.testing.assert_allclose(result.P_value, expected, rtol=0, atol=1e-10)
+        for row, reference in zip(result.itertuples(), expected, strict=True):
+            if row.P_value_method == "saddlepoint":
+                # Roundoff separates repeated levels; low df can exhaust Davies' budget.
+                assert np.isnan(row.P_value_error)
+                assert abs(row.P_value / reference - 1) < 0.03
+            else:
+                assert abs(row.P_value - reference) <= row.P_value_error + 1e-12
         np.testing.assert_allclose(result.Statistic, statistics, atol=1e-14)
         np.testing.assert_array_equal(result.DF_resid, [3, 2])
         assert (result.N_bins == 2).all()
-        assert (result.P_value_error <= 1e-10).all()
+        assert (result.P_value_error.dropna() <= 1e-6).all()
 
     @pytest.mark.parametrize("representation", ["coherence", "coherency"])
     @pytest.mark.parametrize("glm", [False, True])
@@ -1305,7 +1311,10 @@ class TestCrossRotation:
                 [reference["observed"][0], reference["pvals"][0]],
                 atol=1e-12,
             )
-            assert result.loc[pair, "P_value_error"] <= 1e-10
+            assert (
+                result.loc[pair, "P_value_error"] <= 1e-6
+                or result.loc[pair, "P_value_method"] == "saddlepoint"
+            )
             # Integration must agree with independent draws within sampling uncertainty.
             y = transformed[rows, i][:, bins]
             inverse = np.linalg.pinv(x[rows])
@@ -1325,8 +1334,8 @@ class TestCrossRotation:
             assert abs(pvalue - (count + 1) / 500) <= bound
         assert result.attrs["null"] == "rotation"
         assert result.attrs["covariance"] is None
-        assert result.attrs["method"] == "imhof"
-        assert result.attrs["integration_tol"] == 1e-10
+        assert result.attrs["method"] == "davies"
+        assert result.attrs["integration_tol"] == 1e-6
         assert not {"n_rotations", "random_state", "min_p_value"} & result.attrs.keys()
         np.testing.assert_array_equal(result.attrs["freq_weights"], weights / weights.sum())
         assert (result.N_pairs_pooled == 0).all()
@@ -1356,7 +1365,7 @@ class TestCrossRotation:
             )
         )
         np.testing.assert_allclose(result.P_value, [1.0, 0.0], atol=1e-10)
-        assert (result.P_value_error <= 1e-10).all()
+        assert (result.P_value_error.dropna() <= 1e-6).all()
         assert np.isnan(result.Effective_rank.iloc[0])
         assert result.Effective_rank.iloc[1] == pytest.approx(1.0)
         assert (result.Status == "ok").all()
@@ -1388,7 +1397,7 @@ class TestCrossRotation:
         )
         assert empty.P_value.isna().all()
         assert empty.P_value_error.isna().all()
-        assert empty.attrs["method"] == "imhof"
+        assert empty.attrs["method"] == "davies"
         assert empty.attrs["integration_tol"] == 5e-11
 
     @pytest.mark.parametrize("covariance", ["pooled", "per_pair"])
@@ -1414,7 +1423,7 @@ class TestCrossRotation:
         assert result.attrs == replay.attrs
         self_pair = result[result.Status == "self_pair"].iloc[0]
         assert np.isnan(self_pair.P_value) and np.isnan(self_pair.P_value_error)
-        assert result.loc[result.Status == "ok", "P_value_error"].le(5e-11).all()
+        assert result.loc[result.Status == "ok", "P_value_error"].dropna().le(5e-11).all()
         with pytest.raises(TypeError, match="n_rotations"):
             comparator.test_cross_diff_freq(groups, null="rotation", n_rotations=99)
 
@@ -1428,6 +1437,42 @@ class TestCrossRotation:
         for tolerance in (0, True, np.nan):
             with pytest.raises(ValueError, match="integration_tol"):
                 comparator.test_cross_diff_freq(groups, null="rotation", integration_tol=tolerance)
+
+    @pytest.mark.parametrize("representation", ["coherence", "coherency"])
+    @pytest.mark.parametrize("glm", [False, True])
+    def test_marked_fallback_with_masks_bins_and_self_pairs(self, representation, glm, monkeypatch):
+        values = np.random.default_rng(811).uniform(0.1, 0.8, (10, 4, 5))
+        values[:, 3] = 0.3
+        comparator = _comparison(values)
+        cross = comparator.cross_spectra_
+        cross.presence[0, 0] = False
+        _mask_missing_pairs(cross)
+        cross.coherency_valid[:, 1] = False
+        cross.coherency_valid[2, 0, 2] = False
+        cross.pairs = (*cross.pairs[:2], ("g4", "g4"), cross.pairs[3])
+        cross.pair_indices[2, 1] = 4
+        groups = np.repeat([0, 1], 5)
+        x = np.c_[np.ones(10), groups, np.linspace(-1, 1, 10)]
+        monkeypatch.setattr(l2._davies, "sf", lambda *args: (0.0, 1))
+        result = _ordered(
+            comparator.test_cross_diff_freq(
+                x if glm else groups,
+                **({"contrast": np.array([0, 1, 0])} if glm else {}),
+                representation=representation,
+                null="rotation",
+                freq_weights=np.array([1, 0, 2, 3, 4]),
+            )
+        )
+        assert result.P_value_method.iloc[[0, 3]].tolist() == ["saddlepoint", "exact"]
+        assert result.P_value_method.iloc[1:3].isna().all()
+        assert result.P_value_error.iloc[:3].isna().all()
+        assert result.P_value_error.iloc[3] == 0
+        assert result.Status.tolist() == ["ok", "no_common_bins", "self_pair", "ok"]
+        assert result.attrs["n_saddlepoint"] == 1
+        assert result.attrs["integration_limit"] == 10000
+        np.testing.assert_allclose(
+            result.P_adj, apply_bh_correction(result.P_value), equal_nan=True
+        )
 
 
 class TestCrossTCauchy:

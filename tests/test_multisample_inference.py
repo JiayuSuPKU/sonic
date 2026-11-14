@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import itertools
-import warnings
 from unittest.mock import patch
 
 import numpy as np
@@ -1112,8 +1111,10 @@ class TestConditionalRotation:
         assert result.attrs == {
             "null": "rotation",
             "covariance": None,
-            "method": "imhof",
-            "integration_tol": 1e-10,
+            "method": "davies",
+            "integration_tol": 1e-6,
+            "integration_limit": 10000,
+            "n_saddlepoint": 0,
         }
         if masked:
             assert result.set_index("Feature").loc["4", "n_obs_A"] == 1
@@ -1158,7 +1159,7 @@ class TestConditionalRotation:
         actual = (
             compare_glm(np.exp(shifted_y), shifted_x, c, **kwargs).set_index("Feature").sort_index()
         )
-        np.testing.assert_allclose(actual, reference, atol=1e-10)
+        pd.testing.assert_frame_equal(actual, reference, check_exact=False, atol=1e-10)
         for scale in (-3.0, 1e-12, 1e12):
             actual = (
                 compare_glm(np.exp(y), x, c * scale, **kwargs).set_index("Feature").sort_index()
@@ -1244,12 +1245,12 @@ class TestConditionalRotation:
         expected = run(values, presence, kwargs["gene_names"])
         monkeypatch.setattr(l2, "_COMPARISON_WORKSPACE_BYTES", 4096)
         actual = run(values, presence, kwargs["gene_names"])
-        np.testing.assert_allclose(actual, expected, atol=1e-12)
+        pd.testing.assert_frame_equal(actual, expected, check_exact=False, atol=1e-12)
         np.testing.assert_allclose(actual.P_value, expected.P_value, rtol=0, atol=1e-10)
         assert actual.loc["0", "P_value"] == actual.loc["1", "P_value"]
         order = rng.permutation(9)
         reordered = run(values[:, order], presence[:, order], [str(i) for i in order])
-        np.testing.assert_allclose(reordered, expected, atol=1e-12)
+        pd.testing.assert_frame_equal(reordered, expected, check_exact=False, atol=1e-12)
 
     def test_constant_ties_perfect_fit_and_zero_weight_bins(self):
         groups = np.repeat([0, 1], 3)
@@ -1347,19 +1348,19 @@ class TestConditionalIntegration:
 
         eigenvalues = np.r_[np.ones(rank), np.zeros(dimension - rank)]
         expected = beta.sf(q, rank / 2, (dimension - rank) / 2)
-        actual, error = l2._imhof_tail(eigenvalues - q)
+        actual, error, method = l2._conditional_tail(eigenvalues - q)
         assert abs(actual - expected) <= error
         assert error <= min(1e-10, 0.001 * actual)
 
     def test_zero_shifted_coefficients_cancel_from_the_sign(self):
-        actual, error = l2._imhof_tail([2.0, 2.0, -3.0, -3.0, 0.0, 0.0])
+        actual, error, method = l2._conditional_tail([2.0, 2.0, -3.0, -3.0, 0.0, 0.0])
         assert abs(actual - 0.4) <= error
 
     @pytest.mark.parametrize("df,score", [(1, 3.0), (10, 1.0), (30, 1e4)])
     def test_rank_one_matches_student_t_including_extreme_tails(self, df, score):
         from scipy.stats import t
 
-        actual, error = l2._imhof_tail(np.r_[df, np.full(df, -(score**2))])
+        actual, error, method = l2._conditional_tail(np.r_[df, np.full(df, -(score**2))])
         expected = 2 * t.sf(score, df)
         assert abs(actual - expected) <= error
         assert error <= min(1e-10, 0.001 * actual)
@@ -1404,14 +1405,14 @@ class TestConditionalIntegration:
         q = levels[1] + fraction * (levels[2] - levels[1])
         expected, reference_error = self._three_level_reference(levels, counts, q)
         coefficients = np.repeat(levels, counts) - q
-        if expected < 1e-12:
-            with pytest.raises(RuntimeError, match="relative error"):
-                l2._imhof_tail(coefficients)
+        actual, error, method = l2._conditional_tail(coefficients)
+        if counts == (1, 1, 1) or expected < 1e-12:
+            assert method == "saddlepoint" and np.isnan(error)
+            assert actual > 0 and abs(actual / expected - 1) < 0.2
         else:
-            actual, error = l2._imhof_tail(coefficients)
+            assert method == "davies"
             assert abs(actual - expected) <= error + reference_error
-            assert abs(actual - expected) < 1e-10
-            assert error <= 0.001 * actual
+            assert error <= min(1e-6, 0.001 * actual)
 
     @pytest.mark.parametrize(
         "coefficients,reference,integral_error",
@@ -1425,13 +1426,17 @@ class TestConditionalIntegration:
         # CompQuadForm 1.4.4: imhof(0, lambda=a/max(abs(a)), epsabs=1e-13,
         # epsrel=0, limit=10000); its reported abserr is on the integral scale.
         # https://github.com/cran/CompQuadForm/blob/master/src/imhof.cpp
-        actual, error = l2._imhof_tail(coefficients)
-        assert abs(actual - reference) <= error + integral_error / np.pi
-        assert abs(actual - reference) < 1e-10
+        actual, error, method = l2._conditional_tail(coefficients)
+        if len(coefficients) == 3:
+            assert method == "saddlepoint" and np.isnan(error)
+            assert abs(actual / reference - 1) < 0.04
+        else:
+            assert method == "davies"
+            assert abs(actual - reference) <= error + integral_error / np.pi
 
     def test_beta_complement_avoids_rounding_argument_to_one(self):
         expected = 1 - 2 * np.arctan(1e-10) / np.pi
-        actual, error = l2._imhof_tail([1.0, -1e-20])
+        actual, error, method = l2._conditional_tail([1.0, -1e-20])
         assert abs(actual - expected) <= error
         assert actual < 1
 
@@ -1446,11 +1451,11 @@ class TestConditionalIntegration:
         ],
     )
     def test_exact_sign_boundaries(self, coefficients, expected):
-        assert l2._imhof_tail(coefficients) == (expected, 0.0)
+        assert l2._conditional_tail(coefficients) == (expected, 0.0, "exact")
 
     def test_constant_and_nearly_constant_scatter(self):
         matrices = np.array([np.zeros((3, 3)), np.eye(3), np.diag([1 + 1e-14, 1, 1])])
-        pvalues, errors = l2._conditional_tails(matrices)
+        pvalues, errors, methods = l2._conditional_tails(matrices)
         np.testing.assert_array_equal(pvalues, [1.0, 1.0, 0.0])
         np.testing.assert_array_equal(errors, 0.0)
         # The exact upper endpoint differs from the legacy Monte Carlo tie tolerance.
@@ -1461,58 +1466,132 @@ class TestConditionalIntegration:
         rng = np.random.default_rng(721)
         eigenvalues = rng.lognormal(size=7)
         q = eigenvalues.mean()
-        expected, _ = l2._imhof_tail(eigenvalues - q)
+        expected, _, _ = l2._conditional_tail(eigenvalues - q)
         for scale, shift in ((1e-200, 0), (1e200, 0), (3.0, 7.0)):
-            actual, _ = l2._imhof_tail(scale * eigenvalues + shift - (scale * q + shift))
+            actual, _, _ = l2._conditional_tail(scale * eigenvalues + shift - (scale * q + shift))
             assert abs(actual - expected) < 1e-10
-        actual, _ = l2._imhof_tail(rng.permutation(eigenvalues) - q)
+        actual, _, _ = l2._conditional_tail(rng.permutation(eigenvalues) - q)
         assert abs(actual - expected) < 1e-12
 
     @pytest.mark.parametrize(
-        "failure",
-        ["warning", "message", "value", "error", "negative_error", "large_error", "range", "zero"],
+        "p,fault", [(0.2, 1), (0.2, 2), (np.nan, 0), (0.0, 0), (-0.1, 0), (1.1, 0)]
     )
-    def test_integration_failures_retry_then_raise(self, failure, monkeypatch):
-        from scipy.integrate import IntegrationWarning
-
-        tolerances = []
-
-        def fail(*args, **kwargs):
-            tolerances.append(kwargs["epsabs"])
-            if failure == "warning":
-                warnings.warn("deliberate quadrature warning", IntegrationWarning, stacklevel=2)
-            if failure == "message":
-                return 0.0, 0.0, {}, "deliberate convergence failure"
-            value = {"value": np.nan, "range": 1e6, "zero": -np.pi / 2}.get(failure, 0.0)
-            error = {"error": np.nan, "negative_error": -1.0, "large_error": 1.0}.get(failure, 0.0)
-            return value, error, {}
-
-        monkeypatch.setattr(l2, "quad", fail)
-        with pytest.raises(RuntimeError, match="after three attempts"):
-            l2._imhof_tail([-0.7, -0.5, 0.3])
-        assert len(set(tolerances)) == 3
-        assert tolerances[-1] < tolerances[0]
-
-    def test_warning_can_be_resolved_by_tighter_retry(self, monkeypatch):
-        original = l2.quad
+    def test_failed_davies_is_marked_without_an_accuracy_retry(self, p, fault, monkeypatch):
         calls = []
 
-        def first_failure(*args, **kwargs):
-            calls.append(kwargs["epsabs"])
-            result = original(*args, **kwargs)
-            return (*result, "deliberate first-attempt failure") if len(calls) == 1 else result
+        def fail(a, accuracy, limit):
+            calls.append((accuracy, limit))
+            return p, fault
 
-        expected, _ = l2._imhof_tail([-0.7, -0.5, 0.3])
-        monkeypatch.setattr(l2, "quad", first_failure)
-        actual, error = l2._imhof_tail([-0.7, -0.5, 0.3])
-        assert abs(actual - expected) < 1e-10
-        assert error < 1e-10
-        assert len(set(calls)) == 2
+        monkeypatch.setattr(l2._davies, "sf", fail)
+        actual, error, method = l2._conditional_tail([-3, -1, 0.2, 0.8, 2])
+        assert 0 < actual < 1
+        assert np.isnan(error) and method == "saddlepoint"
+        assert calls == [(1e-6, 10000)]
+
+    @pytest.mark.parametrize("second", [(1e-5, 0), (1e-20, 0), (0.2, 1)])
+    def test_one_accuracy_retry_is_bounded_and_marked(self, second, monkeypatch):
+        calls = []
+
+        def integrate(a, accuracy, limit):
+            calls.append((accuracy, limit))
+            return (1e-5, 0) if len(calls) == 1 else second
+
+        monkeypatch.setattr(l2._davies, "sf", integrate)
+        actual, error, method = l2._conditional_tail([-3, -1, 0.2, 0.8, 2])
+        assert len(calls) == 2
+        np.testing.assert_allclose(calls, [(1e-6, 10000), (1e-9, 10000)])
+        if second == (1e-5, 0):
+            assert actual == 1e-5 and error == pytest.approx(1e-9) and method == "davies"
+        else:
+            assert 0 < actual < 1 and np.isnan(error) and method == "saddlepoint"
+
+    def test_exact_cases_bypass_native_and_saddlepoint(self, monkeypatch):
+        def fail(*args):
+            raise AssertionError("Exact laws must bypass numerical evaluators")
+
+        monkeypatch.setattr(l2._davies, "sf", fail)
+        monkeypatch.setattr(l2, "_saddlepoint_tail", fail)
+        assert l2._conditional_tail([0.0, 0.0]) == (1.0, 0.0, "exact")
+        p, _, method = l2._conditional_tail([2.0, 2.0, -3.0, -3.0])
+        assert p == pytest.approx(0.4) and method == "beta"
+
+    def test_saddlepoint_limit_and_unresolved_approximation(self, monkeypatch):
+        # Symmetry gives an independent check at the mean, where the formula is singular.
+        assert l2._saddlepoint_tail(np.array([-2, -1, 1, 2]) / 2) == 0.5
+        a = np.array([-0.7, -0.5, 1.2])
+        assert abs(l2._saddlepoint_tail(a + 1e-8) - l2._saddlepoint_tail(a - 1e-8)) < 1e-6
+        monkeypatch.setattr(l2._davies, "sf", lambda *args: (0.0, 0))
+        monkeypatch.setattr(l2.norm, "sf", lambda _: 0.0)
+        with pytest.raises(RuntimeError, match="Davies.*saddlepoint.*resolution"):
+            l2._conditional_tail([-3, -1, 0.2, 0.8, 2])
+
+    def test_native_repeated_and_concurrent_calls(self):
+        from concurrent.futures import ThreadPoolExecutor
+
+        from sonic._davies import sf
+
+        vectors = [[-3, -1, 0.2, 0.8, 2], [-5, -2, -0.7, 0.1, 1, 4, 8]]
+        references = [0.449828725949695, 0.646938782053403]
+        expected = [sf(a, 1e-6, 10000) for a in vectors]
+        for (p, fault), reference in zip(expected, references, strict=True):
+            assert fault == 0 and abs(p - reference) <= 1e-6
+        with ThreadPoolExecutor(max_workers=4) as pool:
+            actual = list(pool.map(lambda i: sf(vectors[i % 2], 1e-6, 10000), range(24)))
+        assert actual == expected * 12
+
+    def test_saddlepoint_extreme_scale_does_not_underflow_curvature(self):
+        # For two negative directions the small-positive limit is a/(2*sqrt(b1*b2)).
+        a = 1e-250
+        reference = a / (2 * np.sqrt(0.5))
+        p, error, method = l2._conditional_tail([a, -1.0, -0.5])
+        assert method == "saddlepoint" and np.isnan(error)
+        assert p > 0 and abs(p / reference - 1) < 0.3
+
+    @pytest.mark.parametrize(
+        "a,accuracy,limit",
+        [([], 1e-6, 10000), ([np.nan], 1e-6, 10000), ([1.0], 0.0, 10000), ([1.0], 1e-6, 0)],
+    )
+    def test_native_input_validation(self, a, accuracy, limit):
+        from sonic._davies import sf
+
+        with pytest.raises(ValueError):
+            sf(a, accuracy, limit)
+
+    @pytest.mark.parametrize("shape_only", [False, True])
+    def test_public_fallback_marks_eligible_rows_and_preserves_bh(self, shape_only, monkeypatch):
+        values = np.random.default_rng(792).lognormal(size=(10, 4, 5))
+        values[:, 2] = 1  # Exact zero scatter remains exact even with failed Davies.
+        presence = np.ones((10, 4), bool)
+        presence[:4, 3] = False
+        values[~presence] = np.nan
+        monkeypatch.setattr(l2._davies, "sf", lambda *args: (0.0, 1))
+        result = (
+            compare_two_groups_masked(
+                values,
+                np.repeat([0, 1], 5),
+                presence,
+                null="rotation",
+                normalize_shape=shape_only,
+                freq_weights=np.array([1, 2, 0, 3, 4]),
+            )
+            .set_index("Feature")
+            .sort_index()
+        )
+        assert result.P_value_method.iloc[:3].tolist() == ["saddlepoint", "saddlepoint", "exact"]
+        assert pd.isna(result.P_value_method.iloc[3])
+        assert result.P_value_error.iloc[:2].isna().all()
+        assert result.P_value_error.iloc[2] == 0
+        assert np.isnan(result.P_value.iloc[3]) and np.isnan(result.P_value_error.iloc[3])
+        assert result.attrs["n_saddlepoint"] == 2
+        np.testing.assert_allclose(
+            result.P_adj, apply_bh_correction(result.P_value), equal_nan=True
+        )
 
     @pytest.mark.parametrize("tolerance", [True, 0, -1, 1, np.inf, np.nan, "small"])
     def test_invalid_tolerance(self, tolerance):
         with pytest.raises(ValueError, match="integration_tol"):
-            l2._imhof_tail([-1.0, 2.0], integration_tol=tolerance)
+            l2._conditional_tail([-1.0, 2.0], integration_tol=tolerance)
         with pytest.raises(ValueError, match="integration_tol"):
             compare_two_groups(
                 np.ones((6, 2, 3)),
@@ -1524,18 +1603,18 @@ class TestConditionalIntegration:
     @pytest.mark.parametrize("coefficients", [[], [[1.0]], [np.nan], [np.inf]])
     def test_invalid_coefficients(self, coefficients):
         with pytest.raises(ValueError, match="coefficients"):
-            l2._imhof_tail(coefficients)
+            l2._conditional_tail(coefficients)
 
     @pytest.mark.parametrize(
         "coefficients", [[1e-200, -1, -1, -1, -1], [1e-160, -1, -1, -1, -1], [1e-300, -1e300]]
     )
     def test_unresolved_beta_or_dynamic_range_raises(self, coefficients):
         with pytest.raises(RuntimeError, match="resolution|dynamic range"):
-            l2._imhof_tail(coefficients)
+            l2._conditional_tail(coefficients)
 
     def test_too_tight_tolerance_and_unresolved_matrix_boundary(self, monkeypatch):
-        with pytest.raises(RuntimeError, match="floating-point resolution"):
-            l2._imhof_tail([-0.7, -0.5, 0.3], integration_tol=1e-20)
+        p, error, method = l2._conditional_tail([-0.7, -0.5, 0.3], integration_tol=1e-20)
+        assert p > 0 and np.isnan(error) and method == "saddlepoint"
         monkeypatch.setattr(np.linalg, "eigvalsh", lambda _: np.array([-1.0, 0.0]))
         with pytest.raises(RuntimeError, match="block feature 0.*boundary"):
             l2._conditional_tails(np.array([[[1.0, 0.1], [0.1, 0.5]]]))
@@ -1589,7 +1668,7 @@ class TestConditionalIntegration:
         errors = result["pvalue_error"][eligible]
         bound = 6 * np.sqrt(tails * (1 - tails) / draws) + 3 / draws
         assert np.all(np.abs(tails - reference["pvals"][eligible]) <= bound)
-        assert np.all(errors <= np.minimum(1e-10, 0.001 * tails))
+        assert np.all(np.isnan(errors) | (errors <= np.minimum(1e-6, 0.001 * tails)))
         assert np.isnan(reference["pvalue_error"]).all()
         if masked:
             assert np.isnan(result["pvals"][-1])
@@ -1705,7 +1784,13 @@ class TestConditionalIntegration:
             .set_index("Feature")
             .sort_index()
         )
-        np.testing.assert_allclose(actual, expected, rtol=0, atol=1e-10)
+        pd.testing.assert_series_equal(actual.P_value_method, expected.P_value_method)
+        np.testing.assert_allclose(
+            actual.drop(columns="P_value_method"),
+            expected.drop(columns="P_value_method"),
+            rtol=0,
+            atol=1e-10,
+        )
 
     def test_public_rotation_controls_and_failure_propagation(self, monkeypatch):
         import inspect
@@ -1727,7 +1812,7 @@ class TestConditionalIntegration:
         replay = compare_two_groups(values, groups, null="rotation", random_state=2)
         pd.testing.assert_frame_equal(result, replay)
         assert result.attrs == replay.attrs
-        assert (result.P_value_error <= 1e-10).all()
+        assert (result.P_value_error.dropna() <= 1e-6).all()
         np.testing.assert_allclose(result.P_adj, apply_bh_correction(result.P_value))
         with pytest.raises(TypeError, match="n_rotations"):
             compare_two_groups(values, groups, null="rotation", n_rotations=99)

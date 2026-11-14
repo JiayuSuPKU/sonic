@@ -14,6 +14,7 @@ from sonic.comparators._inference import (
     _estimate_two_group_masked_null_covariance,
     _estimate_two_group_null_covariance,
     _fit_glm_profiles,
+    _integration_metadata,
     _iter_feature_blocks,
     _iter_mask_groups,
     _l2_pvalues_from_state,
@@ -23,7 +24,6 @@ from sonic.comparators._inference import (
     _resolve_freq_weights,
     _run_l2_conditional,
     _run_l2_permutations,
-    _validate_integration_tol,
     _weighted_covariance_eigensystem,
 )
 from sonic.comparators._regression import (
@@ -876,8 +876,10 @@ def _run_cross_rotations(
     Parameters
     ----------
     integration_tol : float
-        Target absolute p-value error for deterministic conditional integration;
-        the shared DF evaluator also checks relative resolution of small tails.
+        Initial Davies absolute p-value error target for rotation; default 1e-6.
+        Use at most 10,000 terms per call and one accuracy retry. Accepted
+        integration also requires relative error budget <= 0.001. Unresolved
+        tails use marked saddlepoint approximation. Ignored by other nulls.
 
     Returns
     -------
@@ -888,8 +890,9 @@ def _run_cross_rotations(
         ``effective_rank`` describes each pair's nuisance-adjusted scatter.
         ``pooled_pairs`` and ``permutation_counts`` are zero;
         ``exact_permutations`` is False. Skipped pairs retain NaN statistics
-        and p-values. ``extra["P_value_error"]`` contains numerical absolute
-        error estimates, NaN for skipped pairs. ``metadata`` records the
+        and p-values. ``extra["P_value_method"]`` identifies each evaluator;
+        ``extra["P_value_error"]`` contains numerical error budgets/estimates,
+        NaN for saddlepoint or skipped pairs. ``metadata`` records the
         integration method/tolerance and null/covariance labels.
 
     Notes
@@ -900,13 +903,7 @@ def _run_cross_rotations(
     The caller assigns final statuses for self-pairs and entirely absent pairs.
     """
     n_samples, n_pairs = pair_presence.shape
-    _validate_integration_tol(integration_tol)
-    metadata = {
-        "null": "rotation",
-        "covariance": None,
-        "method": "imhof",
-        "integration_tol": float(integration_tol),
-    }
+    metadata = _integration_metadata(integration_tol)
     use_glm = prepared_design is not None
     if use_glm:
         matrix, _, vector, _, _ = prepared_design
@@ -917,6 +914,7 @@ def _run_cross_rotations(
     observed = np.full(n_pairs, np.nan)
     pvals = np.full(n_pairs, np.nan)
     pvalue_error = np.full(n_pairs, np.nan)
+    pvalue_method = np.full(n_pairs, None, dtype=object)
     effective_rank = np.full(n_pairs, np.nan)
     df_resid = np.zeros(n_pairs, int)
     status = np.full(n_pairs, "no_common_bins", dtype=object)
@@ -947,6 +945,7 @@ def _run_cross_rotations(
             observed[pairs] = rotation["observed"]
             pvals[pairs] = rotation["pvals"]
             pvalue_error[pairs] = rotation["pvalue_error"]
+            pvalue_method[pairs] = rotation["pvalue_method"]
             effective_rank[pairs] = rotation["effective_rank"]
             df_resid[pairs] = (
                 rotation["df_resid"]
@@ -955,6 +954,7 @@ def _run_cross_rotations(
             )
             status[pairs] = "ineligible_design" if use_glm else "insufficient_samples"
             status[pairs[rotation["eligible"]]] = "ok"
+    metadata["n_saddlepoint"] = int(np.count_nonzero(pvalue_method == "saddlepoint"))
     return {
         "observed": observed,
         "pvals": pvals,
@@ -965,7 +965,7 @@ def _run_cross_rotations(
         "permutation_counts": np.zeros(n_pairs, int),
         "exact_permutations": np.zeros(n_pairs, bool),
         "metadata": metadata,
-        "extra": {"P_value_error": pvalue_error},
+        "extra": {"P_value_error": pvalue_error, "P_value_method": pvalue_method},
     }
 
 
@@ -1180,7 +1180,7 @@ def _compare_cross_spectra(  # noqa: C901 — validation and dispatch over binar
     min_samples_per_group=2,
     min_resid_df=1,
     covariance=None,
-    integration_tol=1e-10,
+    integration_tol=1e-6,
 ):
     """Compare pairwise coupling profiles with the shared DF inference helpers.
 
@@ -1227,10 +1227,10 @@ def _compare_cross_spectra(  # noqa: C901 — validation and dispatch over binar
     random_state : int, optional
         Seed for binary label permutations; ignored by other nulls.
     integration_tol : float
-        Target absolute p-value error for ``null='rotation'``; default 1e-10.
-        Requires ``statistic='l2'`` and ``covariance=None``. Small tails also
-        require estimated relative error <= 0.001; unresolved tails raise
-        RuntimeError. Ignored by other nulls.
+        Initial Davies absolute p-value error target for rotation; default 1e-6.
+        Use at most 10,000 terms per call and one accuracy retry. Accepted
+        integration also requires relative error budget <= 0.001. Unresolved
+        tails use marked saddlepoint approximation. Ignored by other nulls.
     freq_weights : ndarray, optional
         Finite nonnegative weights for the original ``n_bins`` bins, with a
         positive sum. None means uniform weights. Zero-weight bins are
@@ -1239,7 +1239,7 @@ def _compare_cross_spectra(  # noqa: C901 — validation and dispatch over binar
         t-Cauchy). Choose weights independently of the observed signal.
     max_exact_permutations : int, default 10000
         Enumerate all binary label assignments if their number is at most
-        this threshold. Zero forces sampling. Ignored on the analytic path.
+        this threshold. Zero forces sampling. Used only for permutation tests.
     min_samples_per_group : int, default 2
         Minimum observed samples per arm on the masked binary path, as in DF.
     min_resid_df : int, default 1
@@ -1264,10 +1264,13 @@ def _compare_cross_spectra(  # noqa: C901 — validation and dispatch over binar
         ``n_obs_A`` and ``n_obs_B``. ``attrs`` records original sample/bin
         indices, weights, representation, null and design metadata. Permutation
         counts/exactness are per-pair dictionaries when presence is masked;
-        otherwise they are shared scalars. Rotation adds ``P_value_error``, a
-        numerical absolute error estimate (not statistical uncertainty), NaN
-        for skipped pairs. Its metadata records ``method="imhof"`` (with exact
-        beta special cases), ``integration_tol`` and ``covariance=None``.
+        otherwise they are shared scalars. Rotation adds ``P_value_method`` (``davies``, ``saddlepoint``, ``beta``
+        or ``exact``; missing for skipped rows) and ``P_value_error``. The latter
+        is the accepted Davies absolute error budget, a roundoff estimate for
+        beta, or zero at exact boundaries; it is NaN for saddlepoint/skipped
+        rows and does not measure statistical uncertainty. ``attrs`` records
+        ``method="davies"``, ``integration_tol``, ``integration_limit=10000``,
+        ``n_saddlepoint`` and ``covariance=None``.
 
     Notes
     -----

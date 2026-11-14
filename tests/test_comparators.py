@@ -1794,9 +1794,10 @@ class TestComparatorRotation:
         expected = getattr(ms, method)(*args, gene_names=comparator.gene_names, **kwargs)
         pd.testing.assert_frame_equal(actual, expected)
         assert actual.attrs == expected.attrs
-        assert actual.attrs["method"] == "imhof"
+        assert actual.attrs["method"] == "davies"
         assert actual.attrs["integration_tol"] == 5e-11
-        assert (actual.P_value_error <= 5e-11).all()
+        assert (actual.P_value_error.dropna() <= 5e-11).all()
+        assert actual.P_value_error.isna().equals(actual.P_value_method.eq("saddlepoint"))
         assert "n_rotations" not in actual.attrs
 
 

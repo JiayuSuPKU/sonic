@@ -29,6 +29,10 @@ Development install
 The ``dev`` and ``docs`` extras include the test and documentation toolchains,
 respectively.
 
+Source and editable installs require a C compiler to build the bundled Davies
+integrator. Binary wheels include it. After changing the C sources, rerun the
+editable install to rebuild the extension. No R installation is needed.
+
 
 Legacy ``quadsv`` compatibility
 -------------------------------

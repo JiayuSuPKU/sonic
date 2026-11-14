@@ -141,7 +141,7 @@ def _compare_two_group_profiles(  # noqa: C901 — input validation and statisti
     min_samples_per_group=2,
     n_perm=1000,
     max_exact_permutations=10000,
-    integration_tol=1e-10,
+    integration_tol=1e-6,
     random_state=None,
 ):
     """Validate binary inputs, select the statistic, and build one result table."""
@@ -398,7 +398,7 @@ def compare_two_groups(
     normalize_shape: bool = False,
     *,
     covariance: str | None = None,
-    integration_tol: float = 1e-10,
+    integration_tol: float = 1e-6,
 ) -> pd.DataFrame:
     """Test a spectral difference between two groups for each gene.
 
@@ -448,10 +448,10 @@ def compare_two_groups(
         eligible genes. ``'per_gene'`` estimates it separately for each gene.
         An explicit choice requires an analytic L2 test.
     integration_tol : float
-        Target absolute p-value error for ``null='rotation'``; default 1e-10.
-        Requires ``statistic='log_l2'`` and ``covariance=None``. Small tails
-        also require estimated relative error <= 0.001; unresolved tails raise
-        RuntimeError. Ignored by other nulls.
+        Initial Davies absolute p-value error target for rotation; default 1e-6.
+        Use at most 10,000 terms per call and one accuracy retry. Accepted
+        integration also requires relative error budget <= 0.001. Unresolved
+        tails use marked saddlepoint approximation. Ignored by other nulls.
 
     Returns
     -------
@@ -467,17 +467,20 @@ def compare_two_groups(
         Feature-level significance does not establish the selected bin's significance.
         Rows are sorted by descending statistic; BH uses finite p-values.
         Analytic L2 results record ``null`` and ``covariance`` in ``attrs``.
-        Rotation adds ``P_value_error``, a numerical absolute error estimate
-        (not statistical uncertainty), NaN for skipped features. Its ``attrs``
-        records ``null``, ``covariance=None``, ``method="imhof"`` (with exact
-        beta special cases), and ``integration_tol``.
+        Rotation adds ``P_value_method`` (``davies``, ``saddlepoint``, ``beta``
+        or ``exact``; missing for skipped rows) and ``P_value_error``. The latter
+        is the accepted Davies absolute error budget, a roundoff estimate for
+        beta, or zero at exact boundaries; it is NaN for saddlepoint/skipped
+        rows and does not measure statistical uncertainty. ``attrs`` records
+        ``method="davies"``, ``integration_tol``, ``integration_limit=10000``,
+        ``n_saddlepoint`` and ``covariance=None``.
 
     Raises
     ------
     ValueError
         If input shapes or options are invalid, or the test cannot be fitted.
     RuntimeError
-        If conditional integration cannot resolve a tail to the requested accuracy.
+        If conditional-tail evaluation fails, including the approximation fallback.
 
     Notes
     -----
@@ -516,7 +519,7 @@ def compare_two_groups_masked(
     normalize_shape: bool = False,
     *,
     covariance: str | None = None,
-    integration_tol: float = 1e-10,
+    integration_tol: float = 1e-6,
 ) -> pd.DataFrame:
     """Test a spectral difference between two groups using observed samples.
 
@@ -572,10 +575,10 @@ def compare_two_groups_masked(
         eligible genes. ``'per_gene'`` estimates it separately for each gene.
         An explicit choice requires an analytic L2 test.
     integration_tol : float
-        Target absolute p-value error for ``null='rotation'``; default 1e-10.
-        Requires ``statistic='log_l2'`` and ``covariance=None``. Small tails
-        also require estimated relative error <= 0.001; unresolved tails raise
-        RuntimeError. Ignored by other nulls.
+        Initial Davies absolute p-value error target for rotation; default 1e-6.
+        Use at most 10,000 terms per call and one accuracy retry. Accepted
+        integration also requires relative error budget <= 0.001. Unresolved
+        tails use marked saddlepoint approximation. Ignored by other nulls.
 
     Returns
     -------
@@ -592,17 +595,20 @@ def compare_two_groups_masked(
         Includes ``n_obs_A`` and ``n_obs_B``; skipped genes retain NaN results.
         Rows are sorted by descending statistic; BH uses finite p-values.
         Analytic L2 results record ``null`` and ``covariance`` in ``attrs``.
-        Rotation adds ``P_value_error``, a numerical absolute error estimate
-        (not statistical uncertainty), NaN for skipped features. Its ``attrs``
-        records ``null``, ``covariance=None``, ``method="imhof"`` (with exact
-        beta special cases), and ``integration_tol``.
+        Rotation adds ``P_value_method`` (``davies``, ``saddlepoint``, ``beta``
+        or ``exact``; missing for skipped rows) and ``P_value_error``. The latter
+        is the accepted Davies absolute error budget, a roundoff estimate for
+        beta, or zero at exact boundaries; it is NaN for saddlepoint/skipped
+        rows and does not measure statistical uncertainty. ``attrs`` records
+        ``method="davies"``, ``integration_tol``, ``integration_limit=10000``,
+        ``n_saddlepoint`` and ``covariance=None``.
 
     Raises
     ------
     ValueError
         If input shapes or options are invalid, or the test cannot be fitted.
     RuntimeError
-        If conditional integration cannot resolve a tail to the requested accuracy.
+        If conditional-tail evaluation fails, including the approximation fallback.
 
     Notes
     -----
@@ -638,7 +644,7 @@ def compare_glm(
     statistic: str = "log_l2",
     covariance: str | None = None,
     null: str = "analytic",
-    integration_tol: float = 1e-10,
+    integration_tol: float = 1e-6,
 ) -> pd.DataFrame:
     """Test one spectral linear-model contrast for each gene.
 
@@ -683,10 +689,10 @@ def compare_glm(
         - ``'log_t_cauchy'``: ``'analytic'`` only (per-bin t tails and
           Cauchy combination).
     integration_tol : float
-        Target absolute p-value error for ``null='rotation'``; default 1e-10.
-        Requires ``statistic='log_l2'`` and ``covariance=None``. Small tails
-        also require estimated relative error <= 0.001; unresolved tails raise
-        RuntimeError. Ignored by other nulls.
+        Initial Davies absolute p-value error target for rotation; default 1e-6.
+        Use at most 10,000 terms per call and one accuracy retry. Accepted
+        integration also requires relative error budget <= 0.001. Unresolved
+        tails use marked saddlepoint approximation. Ignored by other nulls.
 
     Returns
     -------
@@ -702,17 +708,20 @@ def compare_glm(
         Feature-level significance does not establish the selected bin's significance.
         Rows are sorted by descending statistic; BH uses finite p-values.
         Analytic L2 results record ``null`` and ``covariance`` in ``attrs``.
-        Rotation adds ``P_value_error``, a numerical absolute error estimate
-        (not statistical uncertainty), NaN for skipped features. Its ``attrs``
-        records ``null``, ``covariance=None``, ``method="imhof"`` (with exact
-        beta special cases), and ``integration_tol``.
+        Rotation adds ``P_value_method`` (``davies``, ``saddlepoint``, ``beta``
+        or ``exact``; missing for skipped rows) and ``P_value_error``. The latter
+        is the accepted Davies absolute error budget, a roundoff estimate for
+        beta, or zero at exact boundaries; it is NaN for saddlepoint/skipped
+        rows and does not measure statistical uncertainty. ``attrs`` records
+        ``method="davies"``, ``integration_tol``, ``integration_limit=10000``,
+        ``n_saddlepoint`` and ``covariance=None``.
 
     Raises
     ------
     ValueError
         If input shapes or options are invalid, or the test cannot be fitted.
     RuntimeError
-        If conditional integration cannot resolve a tail to the requested accuracy.
+        If conditional-tail evaluation fails, including the approximation fallback.
     TypeError
         If the design or contrast has an unsupported type.
 
@@ -762,7 +771,7 @@ def compare_glm_masked(
     statistic: str = "log_l2",
     covariance: str | None = None,
     null: str = "analytic",
-    integration_tol: float = 1e-10,
+    integration_tol: float = 1e-6,
 ) -> pd.DataFrame:
     """Test one spectral linear-model contrast using each gene's observed samples.
 
@@ -813,10 +822,10 @@ def compare_glm_masked(
         - ``'log_t_cauchy'``: ``'analytic'`` only (per-bin t tails and
           Cauchy combination).
     integration_tol : float
-        Target absolute p-value error for ``null='rotation'``; default 1e-10.
-        Requires ``statistic='log_l2'`` and ``covariance=None``. Small tails
-        also require estimated relative error <= 0.001; unresolved tails raise
-        RuntimeError. Ignored by other nulls.
+        Initial Davies absolute p-value error target for rotation; default 1e-6.
+        Use at most 10,000 terms per call and one accuracy retry. Accepted
+        integration also requires relative error budget <= 0.001. Unresolved
+        tails use marked saddlepoint approximation. Ignored by other nulls.
 
     Returns
     -------
@@ -833,17 +842,20 @@ def compare_glm_masked(
         Includes ``n_obs`` and ``df_resid``; skipped genes retain NaN results.
         Rows are sorted by descending statistic; BH uses finite p-values.
         Analytic L2 results record ``null`` and ``covariance`` in ``attrs``.
-        Rotation adds ``P_value_error``, a numerical absolute error estimate
-        (not statistical uncertainty), NaN for skipped features. Its ``attrs``
-        records ``null``, ``covariance=None``, ``method="imhof"`` (with exact
-        beta special cases), and ``integration_tol``.
+        Rotation adds ``P_value_method`` (``davies``, ``saddlepoint``, ``beta``
+        or ``exact``; missing for skipped rows) and ``P_value_error``. The latter
+        is the accepted Davies absolute error budget, a roundoff estimate for
+        beta, or zero at exact boundaries; it is NaN for saddlepoint/skipped
+        rows and does not measure statistical uncertainty. ``attrs`` records
+        ``method="davies"``, ``integration_tol``, ``integration_limit=10000``,
+        ``n_saddlepoint`` and ``covariance=None``.
 
     Raises
     ------
     ValueError
         If input shapes or options are invalid, or the test cannot be fitted.
     RuntimeError
-        If conditional integration cannot resolve a tail to the requested accuracy.
+        If conditional-tail evaluation fails, including the approximation fallback.
     TypeError
         If the design or contrast has an unsupported type.
 

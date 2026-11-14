@@ -367,7 +367,7 @@ Conditional rotation tests
 For DF and DF-norm, ``null="rotation"`` evaluates the conditional rotation
 null by deterministic integration. It tests the same weighted L2 statistic,
 conditioning on each feature's nuisance-adjusted scatter.
-Calibration is exact under independent Gaussian errors on the tested profile
+The conditional null is exact under independent Gaussian errors on the tested profile
 scale, with common covariance across samples within each feature or pair.
 Cross-bin correlations are unrestricted, and covariance may differ between
 features or pairs. Rotation can remain well calibrated under non-Gaussian
@@ -377,15 +377,29 @@ errors; robustness depends on the statistic, design and error distribution.
 
    pattern_results = comparison.test_diff_freq(
        design, contrast="condition", normalize_shape=True,
-       null="rotation", integration_tol=1e-10,
+       null="rotation", integration_tol=1e-6,
    )
 
 Use ``statistic="log_l2"`` and leave ``covariance=None``. The four standalone
 binary/GLM comparison functions accept the same option, including masked data.
-``integration_tol`` sets the target absolute p-value error used in Imhof inversion,
-and ``P_value_error`` reports the numerical absolute error estimate, not
-statistical uncertainty. Result ``attrs`` records ``null="rotation"``,
-``covariance=None``, ``method="imhof"`` and ``integration_tol``.
+``integration_tol`` is the initial Davies absolute p-value error target
+(default 1e-6). Each call uses at most 10,000 terms. Accepted integration also
+requires a relative error budget at most ``0.001*p``; a valid result failing
+this check gets one retry at ``min(integration_tol, 1e-4*p)``. Exact beta cases
+and spectral boundaries bypass integration.
+
+Unresolved tails use Kuonen's saddlepoint approximation.
+``P_value_method`` identifies ``davies``, ``saddlepoint``, ``beta`` or ``exact``
+(missing for skipped rows). ``P_value_error`` reports the accepted Davies accuracy
+budget, a roundoff estimate for beta, or zero at exact boundaries. It is NaN for
+saddlepoint and skipped rows. The integration tolerance does not bound
+saddlepoint approximation error; neither quantity is statistical uncertainty.
+A tail that cannot be evaluated by either route raises an error.
+
+Result ``attrs`` records ``method="davies"``, ``integration_tol``,
+``integration_limit=10000``, the number of approximate rows ``n_saddlepoint``,
+``null="rotation"`` and ``covariance=None``. BH correction includes all finite
+p-values, including the marked approximations.
 
 For contrast weights ``a = c @ pinv(X)``, let B contain the unit contrast
 axis and an orthonormal full-model residual basis. With transformed profiles Y
@@ -403,7 +417,7 @@ deterministic evaluator and ``integration_tol``, with ``statistic="l2"`` and
 
    coupling_results = comparison.test_cross_diff_freq(
        design, contrast="condition", representation="coherency",
-       null="rotation", integration_tol=1e-10,
+       null="rotation", integration_tol=1e-6,
    )
 
 

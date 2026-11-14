@@ -1167,7 +1167,7 @@ class _ComparatorBase:
         min_samples_per_group: int = 2,
         min_resid_df: int = 1,
         covariance: str | None = None,
-        integration_tol: float = 1e-10,
+        integration_tol: float = 1e-6,
     ) -> Any:
         """Test differential frequency (DF) on the fitted gene spectra.
 
@@ -1223,10 +1223,10 @@ class _ComparatorBase:
             eligible genes. ``'per_gene'`` estimates it separately for each gene.
             An explicit choice requires an analytic L2 test.
         integration_tol : float
-            Target absolute p-value error for ``null='rotation'``; default 1e-10.
-            Requires ``statistic='log_l2'`` and ``covariance=None``. Small tails
-            also require estimated relative error <= 0.001; unresolved tails raise
-            RuntimeError. Ignored by other nulls.
+            Initial Davies absolute p-value error target for rotation; default 1e-6.
+            Use at most 10,000 terms per call and one accuracy retry. Accepted
+            integration also requires relative error budget <= 0.001. Unresolved
+            tails use marked saddlepoint approximation. Ignored by other nulls.
 
         Returns
         -------
@@ -1244,16 +1244,18 @@ class _ComparatorBase:
             significance does not establish the selected bin's significance.
             BH uses finite feature p-values.
             Analytic L2 results record ``null`` and ``covariance`` in ``attrs``.
-            Rotation adds ``P_value_error``, a numerical absolute error estimate
-            (not statistical uncertainty), NaN for skipped features. Its ``attrs``
-            records ``null``, ``covariance=None``, ``method="imhof"`` (with exact
-            beta special cases), and ``integration_tol``.
+            Rotation adds ``P_value_method`` (``davies``, ``saddlepoint``, ``beta``
+            or ``exact``; missing for skipped rows) and ``P_value_error``. The latter
+            is the accepted Davies absolute error budget, a roundoff estimate for
+            beta, or zero at exact boundaries; it is NaN for saddlepoint/skipped
+            rows and does not measure statistical uncertainty. ``attrs`` records
+            ``method="davies"``, ``integration_tol``, ``integration_limit=10000``,
+            ``n_saddlepoint`` and ``covariance=None``.
 
         Raises
         ------
         RuntimeError
-            If spectra have not been computed or conditional integration cannot
-            resolve a tail to the requested accuracy.
+            If spectra have not been computed or conditional-tail evaluation fails.
         ValueError
             If shapes, options, or the contrast are invalid.
         NotImplementedError
@@ -1357,7 +1359,7 @@ class _ComparatorBase:
         min_samples_per_group: int = 2,
         min_resid_df: int = 1,
         covariance: str | None = None,
-        integration_tol: float = 1e-10,
+        integration_tol: float = 1e-6,
     ):
         """Test differential frequency in the coupling profiles of gene pairs.
 
@@ -1414,10 +1416,10 @@ class _ComparatorBase:
             estimates it separately on each pair's retained samples and bins.
             An explicit choice requires an analytic L2 test.
         integration_tol : float
-            Target absolute p-value error for ``null='rotation'``; default 1e-10.
-            Requires ``statistic='l2'`` and ``covariance=None``. Small tails
-            also require estimated relative error <= 0.001; unresolved tails raise
-            RuntimeError. Ignored by other nulls.
+            Initial Davies absolute p-value error target for rotation; default 1e-6.
+            Use at most 10,000 terms per call and one accuracy retry. Accepted
+            integration also requires relative error budget <= 0.001. Unresolved
+            tails use marked saddlepoint approximation. Ignored by other nulls.
 
         Returns
         -------
@@ -1446,17 +1448,19 @@ class _ComparatorBase:
             skipped, rotation, permutation and t-Cauchy pairs have zero. t-Cauchy has no
             covariance or effective rank and records ``per_bin_test`` as
             ``welch`` or ``ols``. Rotation effective ranks describe the
-            conditional scatter. Rotation adds ``P_value_error``, a numerical
-            absolute error estimate (not statistical uncertainty), NaN for
-            skipped/self-pairs. Its metadata records ``method="imhof"`` (with
-            exact beta special cases), ``integration_tol`` and ``covariance=None``.
+            conditional scatter. Rotation adds ``P_value_method`` (``davies``, ``saddlepoint``, ``beta``
+            or ``exact``; missing for skipped rows) and ``P_value_error``. The latter
+            is the accepted Davies absolute error budget, a roundoff estimate for
+            beta, or zero at exact boundaries; it is NaN for saddlepoint/skipped
+            rows and does not measure statistical uncertainty. ``attrs`` records
+            ``method="davies"``, ``integration_tol``, ``integration_limit=10000``,
+            ``n_saddlepoint`` and ``covariance=None``.
             Permutation counts/exactness are per-pair when masked, otherwise shared.
 
         Raises
         ------
         RuntimeError
-            If the required spectra have not been computed or conditional integration
-            cannot resolve a tail to the requested accuracy.
+            If the required spectra have not been computed or conditional-tail evaluation fails.
         ValueError
             If shapes, options, or the contrast are invalid.
         NotImplementedError

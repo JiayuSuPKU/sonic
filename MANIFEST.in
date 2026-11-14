@@ -2,7 +2,8 @@
 include README.md
 include LICENSE
 include pyproject.toml
-recursive-include src/sonic *.py
+recursive-include src/sonic *.py *.c *.h
+recursive-include licenses *.txt
 recursive-exclude tests *
 recursive-exclude data *
 recursive-exclude figures *

@@ -8,7 +8,7 @@ from unittest.mock import patch
 import numpy as np
 import pandas as pd
 import pytest
-from scipy.stats import kstest, t, ttest_ind
+from scipy.stats import beta, kstest, t, ttest_ind
 
 from sonic import ComparatorIrregular
 from sonic.comparators import _inference as l2
@@ -1128,7 +1128,8 @@ def test_per_pair_raw_results_do_not_borrow_from_other_pairs(representation, glm
 
 
 class TestCrossRotation:
-    def test_streaming_and_unmasked_df_controls(self, monkeypatch):
+    @pytest.mark.parametrize("representation", ["coherence", "coherency"])
+    def test_streaming_and_pair_order(self, monkeypatch, representation):
         import sonic.comparators.cross_spectrum as cs
 
         values = np.random.default_rng(18).uniform(-0.8, 0.8, (10, 8, 7))
@@ -1136,10 +1137,9 @@ class TestCrossRotation:
         design = np.c_[np.ones(10), np.linspace(-1, 1, 10)]
         kwargs = {
             "contrast": np.array([0.0, 1.0]),
-            "representation": "coherency",
+            "representation": representation,
             "null": "rotation",
-            "n_rotations": 499,
-            "random_state": 39,
+            "integration_tol": 5e-11,
         }
         expected = comparator.test_cross_diff_freq(design, **kwargs)
         prepared_sizes = []
@@ -1155,6 +1155,101 @@ class TestCrossRotation:
         pd.testing.assert_frame_equal(actual, expected)
         assert max(prepared_sizes) == 1
         assert actual.attrs == expected.attrs
+
+        cross = comparator.cross_spectra_
+        order = np.arange(len(cross.pairs))[::-1]
+        cross.cross_spectra = cross.cross_spectra[:, order]
+        cross.coherency_valid = cross.coherency_valid[:, order]
+        cross.pair_indices = cross.pair_indices[order]
+        cross.pairs = tuple(cross.pairs[i] for i in order)
+        reordered = comparator.test_cross_diff_freq(design, **kwargs)
+        pd.testing.assert_frame_equal(_ordered(reordered), _ordered(expected))
+        assert reordered.attrs == expected.attrs
+
+    @pytest.mark.parametrize("representation", ["coherence", "coherency"])
+    @pytest.mark.parametrize("glm", [False, True])
+    def test_single_retained_bin_matches_extreme_student_t(self, representation, glm):
+        groups = np.repeat([0, 1], 9)
+        x = np.c_[np.ones(18), groups]
+        if glm:
+            x = np.c_[x, np.linspace(-1, 1, 18)]
+        c = np.eye(x.shape[1])[1]
+        y = np.random.default_rng(29).uniform(-0.3, 0.3, (18, 2, 3))
+        expected, dfs = [], []
+        for pair, (bin_index, score) in enumerate(zip([0, 2], [20, 100], strict=True)):
+            rows = np.arange(pair, 18)
+            subx = x[rows]
+            df = len(rows) - x.shape[1]
+            residual = np.linalg.svd(subx, full_matrices=True)[0][:, x.shape[1]]
+            se = np.linalg.norm(c @ np.linalg.pinv(subx)) / np.sqrt(df)
+            # A unit residual direction gives an exact, prespecified t statistic.
+            y[rows, pair, bin_index] = 0.2 * (subx[:, 1] + residual / (score * se))
+            if glm:
+                y[rows, pair, bin_index] += 0.1 * subx[:, 2]
+            expected.append(2 * t.sf(score, df))
+            dfs.append(df)
+        values = np.exp((y - 2) / 2 + 0.4j) if representation == "coherence" else y + 0.2j
+        comparator = _comparison(values)
+        cross = comparator.cross_spectra_
+        cross.presence[0, 2] = False
+        _mask_missing_pairs(cross)
+        cross.coherency_valid[0, 0, 2] = False
+        cross.coherency_valid[1, 1, 0] = False
+        result = _ordered(
+            comparator.test_cross_diff_freq(
+                x if glm else groups,
+                **({"contrast": c} if glm else {}),
+                representation=representation,
+                null="rotation",
+                freq_weights=np.array([2.0, 0.0, 5.0]),
+            )
+        )
+        np.testing.assert_allclose(result.P_value, expected, rtol=2e-11, atol=0)
+        np.testing.assert_allclose(result.Statistic, 0.2, atol=1e-14)
+        np.testing.assert_array_equal(result.DF_resid, dfs)
+        assert (result.N_bins == 1).all()
+        assert list(result.attrs["bin_indices"].values()) == [(0,), (2,)]
+        assert (result.P_value_error <= np.minimum(1e-10, 0.001 * result.P_value)).all()
+        np.testing.assert_allclose(result.P_adj, apply_bh_correction(expected), rtol=2e-11, atol=0)
+
+    @pytest.mark.parametrize("representation", ["coherence", "coherency"])
+    def test_multibin_low_df_matches_beta(self, representation):
+        groups = np.array([0, 0, 0, 1, 1])
+        x = np.c_[np.ones(5), groups]
+        y = np.zeros((5, 2, 3))
+        y[:, :, 1] = np.linspace(-0.4, 0.4, 5)[:, None]
+        expected, statistics = [], []
+        for pair, q in enumerate([0.25, 0.9]):
+            rows = np.arange(pair, 5)
+            subx = x[rows]
+            a = np.array([0.0, 1.0]) @ np.linalg.pinv(subx)
+            residual = np.linalg.svd(subx, full_matrices=True)[0][:, 2:]
+            basis = np.column_stack([a / np.linalg.norm(a), residual])
+            coordinates = np.zeros((basis.shape[1], 2))
+            coordinates[0, 0], coordinates[-1, 0] = np.sqrt(q), np.sqrt(1 - q)
+            coordinates[1, 1] = 1
+            # Two equal eigenvalues: sphere projection energy has a beta law.
+            profiles = 0.2 * (basis @ coordinates) / np.sqrt([0.25, 0.75])
+            y[rows, pair, 0], y[rows, pair, 2] = profiles.T
+            expected.append(beta.sf(q, 1, (basis.shape[1] - 2) / 2))
+            statistics.append(0.2 * np.linalg.norm(a) * np.sqrt(q))
+        values = np.exp((y - 2) / 2 + 0.4j) if representation == "coherence" else y + 0.2j
+        comparator = _comparison(values)
+        comparator.cross_spectra_.presence[0, 2] = False
+        _mask_missing_pairs(comparator.cross_spectra_)
+        result = _ordered(
+            comparator.test_cross_diff_freq(
+                groups,
+                representation=representation,
+                null="rotation",
+                freq_weights=np.array([1.0, 0.0, 3.0]),
+            )
+        )
+        np.testing.assert_allclose(result.P_value, expected, rtol=0, atol=1e-10)
+        np.testing.assert_allclose(result.Statistic, statistics, atol=1e-14)
+        np.testing.assert_array_equal(result.DF_resid, [3, 2])
+        assert (result.N_bins == 2).all()
+        assert (result.P_value_error <= 1e-10).all()
 
     @pytest.mark.parametrize("representation", ["coherence", "coherency"])
     @pytest.mark.parametrize("glm", [False, True])
@@ -1180,17 +1275,22 @@ class TestCrossRotation:
                 x if glm else groups,
                 representation=representation,
                 null="rotation",
-                n_rotations=499,
-                random_state=39,
                 freq_weights=weights,
                 **kwargs,
             )
         )
         transformed = _profiles(values, representation)
         for i, pair in enumerate(cross.pairs):
+            rows = np.flatnonzero(presence[:, i])
             bins = np.array(result.attrs["bin_indices"][pair])
+            expected_bins = np.flatnonzero(
+                original.coherency_valid[rows, i].all(axis=0) & (weights > 0)
+            )
+            np.testing.assert_array_equal(bins, expected_bins)
+            np.testing.assert_array_equal(result.attrs["sample_indices"][pair], rows)
             if masked and i == 2:
                 assert np.isnan(result.loc[pair, "P_value"])
+                assert np.isnan(result.loc[pair, "P_value_error"])
                 continue
             reference = l2._run_l2_conditional(
                 transformed[:, i : i + 1, bins],
@@ -1199,16 +1299,14 @@ class TestCrossRotation:
                 presence[:, i : i + 1] if masked else None,
                 freq_weights=weights[bins],
                 log_transform=False,
-                n_rotations=499,
-                random_state=39,
             )
             np.testing.assert_allclose(
                 result.loc[pair, ["Statistic", "P_value"]].to_numpy(dtype=float),
                 [reference["observed"][0], reference["pvals"][0]],
                 atol=1e-12,
             )
-            # Independent sample-space draws guard the shared Monte Carlo route.
-            rows = np.flatnonzero(presence[:, i])
+            assert result.loc[pair, "P_value_error"] <= 1e-10
+            # Integration must agree with independent draws within sampling uncertainty.
             y = transformed[rows, i][:, bins]
             inverse = np.linalg.pinv(x[rows])
             a = c @ inverse
@@ -1222,11 +1320,15 @@ class TestCrossRotation:
             observed = np.sum(w * (a @ y) ** 2) / (a @ a)
             trace = np.sum(w * (y - nuisance @ y) ** 2)
             count = np.count_nonzero(null >= observed - 64 * np.finfo(float).eps * trace)
-            assert result.loc[pair, "P_value"] == (count + 1) / 500
+            pvalue = result.loc[pair, "P_value"]
+            bound = 6 * np.sqrt(pvalue * (1 - pvalue) / 499) + 3 / 499
+            assert abs(pvalue - (count + 1) / 500) <= bound
         assert result.attrs["null"] == "rotation"
         assert result.attrs["covariance"] is None
-        assert result.attrs["n_rotations"] == 499
-        assert result.attrs["min_p_value"] == 0.002
+        assert result.attrs["method"] == "imhof"
+        assert result.attrs["integration_tol"] == 1e-10
+        assert not {"n_rotations", "random_state", "min_p_value"} & result.attrs.keys()
+        np.testing.assert_array_equal(result.attrs["freq_weights"], weights / weights.sum())
         assert (result.N_pairs_pooled == 0).all()
         np.testing.assert_allclose(result.P_adj, apply_bh_correction(result.P_value))
         for name in ("cross_spectra", "auto_spectra", "presence", "coherency_valid"):
@@ -1250,11 +1352,11 @@ class TestCrossRotation:
                 contrast=np.array([0.0, 1.0, 0.0]),
                 representation=representation,
                 null="rotation",
-                n_rotations=999,
-                random_state=20,
+                freq_weights=np.array([1.0, 0.0, 0.0]),
             )
         )
-        np.testing.assert_array_equal(result.P_value, [1.0, 0.001])
+        np.testing.assert_allclose(result.P_value, [1.0, 0.0], atol=1e-10)
+        assert (result.P_value_error <= 1e-10).all()
         assert np.isnan(result.Effective_rank.iloc[0])
         assert result.Effective_rank.iloc[1] == pytest.approx(1.0)
         assert (result.Status == "ok").all()
@@ -1274,18 +1376,20 @@ class TestCrossRotation:
                 design,
                 representation="coherency",
                 null="rotation",
-                n_rotations=199,
-                random_state=21,
+                freq_weights=np.array([1.0, 0.0, 0.0, 0.0]),
                 **kwargs,
             )
         )
-        np.testing.assert_allclose(result.P_value, [1.0, 0.005, np.nan], equal_nan=True)
+        np.testing.assert_allclose(result.P_value, [1.0, 0.0, np.nan], atol=1e-10, equal_nan=True)
+        assert np.isnan(result.P_value_error.iloc[-1])
         comparator.cross_spectra_.coherency_valid[:] = False
         empty = comparator.test_cross_diff_freq(
-            design, null="rotation", n_rotations=199, random_state=21, **kwargs
+            design, null="rotation", integration_tol=5e-11, **kwargs
         )
         assert empty.P_value.isna().all()
-        assert empty.attrs["random_state"] == 21
+        assert empty.P_value_error.isna().all()
+        assert empty.attrs["method"] == "imhof"
+        assert empty.attrs["integration_tol"] == 5e-11
 
     @pytest.mark.parametrize("covariance", ["pooled", "per_pair"])
     def test_rejects_covariance_selection(self, covariance):
@@ -1294,6 +1398,36 @@ class TestCrossRotation:
             comparator.test_cross_diff_freq(
                 np.repeat([0, 1], 3), null="rotation", covariance=covariance
             )
+
+    def test_controls_self_pairs_and_integration_failure(self, monkeypatch):
+        import sonic.comparators.cross_spectrum as cs
+
+        comparator = _comparison(np.random.default_rng(195).uniform(-0.8, 0.8, (8, 2, 5)))
+        cross = comparator.cross_spectra_
+        cross.pairs = (("g0", "g0"), cross.pairs[1])
+        cross.pair_indices[0, 1] = 0
+        groups = np.repeat([0, 1], 4)
+        options = {"null": "rotation", "integration_tol": 5e-11}
+        result = comparator.test_cross_diff_freq(groups, random_state=1, **options)
+        replay = comparator.test_cross_diff_freq(groups, random_state=2, **options)
+        pd.testing.assert_frame_equal(result, replay)
+        assert result.attrs == replay.attrs
+        self_pair = result[result.Status == "self_pair"].iloc[0]
+        assert np.isnan(self_pair.P_value) and np.isnan(self_pair.P_value_error)
+        assert result.loc[result.Status == "ok", "P_value_error"].le(5e-11).all()
+        with pytest.raises(TypeError, match="n_rotations"):
+            comparator.test_cross_diff_freq(groups, null="rotation", n_rotations=99)
+
+        def fail(*args, **kwargs):
+            raise RuntimeError("unresolved integration")
+
+        monkeypatch.setattr(cs, "_run_l2_conditional", fail)
+        with pytest.raises(RuntimeError, match="unresolved integration"):
+            comparator.test_cross_diff_freq(groups, **options)
+        cross.coherency_valid[:] = False
+        for tolerance in (0, True, np.nan):
+            with pytest.raises(ValueError, match="integration_tol"):
+                comparator.test_cross_diff_freq(groups, null="rotation", integration_tol=tolerance)
 
 
 class TestCrossTCauchy:

@@ -21,9 +21,9 @@ from sonic.comparators._inference import (
     _prepare_profile_block,
     _profile_roundoff,
     _resolve_freq_weights,
-    _rotation_metadata,
     _run_l2_conditional,
     _run_l2_permutations,
+    _validate_integration_tol,
     _weighted_covariance_eigensystem,
 )
 from sonic.comparators._regression import (
@@ -864,8 +864,7 @@ def _run_cross_rotations(
     prepared_design,
     min_samples_per_group,
     min_resid_df,
-    n_rotations,
-    random_state,
+    integration_tol,
 ):
     """Calibrate weighted L2 contrasts with the conditional rotation null.
 
@@ -876,24 +875,22 @@ def _run_cross_rotations(
 
     Parameters
     ----------
-    n_rotations : int
-        Positive number of Monte Carlo sphere draws. Pairs with the same
-        retained samples share draws across bin groups and feature blocks.
-    random_state : int or None
-        Seed for the draws. An automatically generated seed is retained in
-        the returned metadata so the result can be reproduced.
+    integration_tol : float
+        Target absolute p-value error for deterministic conditional integration;
+        the shared DF evaluator also checks relative resolution of small tails.
 
     Returns
     -------
     dict
         Arrays of shape ``(n_pairs,)`` in original pair order, with the same
         keys as :func:`_run_cross_analytic`. ``observed`` is weighted L2 and
-        ``pvals`` contains Monte Carlo tails with a +1 correction.
+        ``pvals`` contains deterministic conditional tails.
         ``effective_rank`` describes each pair's nuisance-adjusted scatter.
         ``pooled_pairs`` and ``permutation_counts`` are zero;
         ``exact_permutations`` is False. Skipped pairs retain NaN statistics
-        and p-values. ``metadata`` contains the effective seed, draw count,
-        minimum p-value, and null/covariance labels.
+        and p-values. ``extra["P_value_error"]`` contains numerical absolute
+        error estimates, NaN for skipped pairs. ``metadata`` records the
+        integration method/tolerance and null/covariance labels.
 
     Notes
     -----
@@ -903,7 +900,13 @@ def _run_cross_rotations(
     The caller assigns final statuses for self-pairs and entirely absent pairs.
     """
     n_samples, n_pairs = pair_presence.shape
-    metadata = _rotation_metadata(n_rotations, random_state)
+    _validate_integration_tol(integration_tol)
+    metadata = {
+        "null": "rotation",
+        "covariance": None,
+        "method": "imhof",
+        "integration_tol": float(integration_tol),
+    }
     use_glm = prepared_design is not None
     if use_glm:
         matrix, _, vector, _, _ = prepared_design
@@ -913,6 +916,7 @@ def _run_cross_rotations(
         vector = np.array([0.0, 1.0])
     observed = np.full(n_pairs, np.nan)
     pvals = np.full(n_pairs, np.nan)
+    pvalue_error = np.full(n_pairs, np.nan)
     effective_rank = np.full(n_pairs, np.nan)
     df_resid = np.zeros(n_pairs, int)
     status = np.full(n_pairs, "no_common_bins", dtype=object)
@@ -938,11 +942,11 @@ def _run_cross_rotations(
                 log_transform=representation == "coherence",
                 min_resid_df=min_resid_df if use_glm and use_masked else 1,
                 allow_empty=True,
-                n_rotations=metadata["n_rotations"],
-                random_state=metadata["random_state"],
+                integration_tol=integration_tol,
             )
             observed[pairs] = rotation["observed"]
             pvals[pairs] = rotation["pvals"]
+            pvalue_error[pairs] = rotation["pvalue_error"]
             effective_rank[pairs] = rotation["effective_rank"]
             df_resid[pairs] = (
                 rotation["df_resid"]
@@ -961,6 +965,7 @@ def _run_cross_rotations(
         "permutation_counts": np.zeros(n_pairs, int),
         "exact_permutations": np.zeros(n_pairs, bool),
         "metadata": metadata,
+        "extra": {"P_value_error": pvalue_error},
     }
 
 
@@ -1175,7 +1180,7 @@ def _compare_cross_spectra(  # noqa: C901 — validation and dispatch over binar
     min_samples_per_group=2,
     min_resid_df=1,
     covariance=None,
-    n_rotations=19999,
+    integration_tol=1e-10,
 ):
     """Compare pairwise coupling profiles with the shared DF inference helpers.
 
@@ -1208,9 +1213,9 @@ def _compare_cross_spectra(  # noqa: C901 — validation and dispatch over binar
         ``null='analytic'`` and ``covariance=None``, and returns bin diagnostics
         as documented in ``test_cross_diff_freq``.
     null : str
-        For L2, ``'analytic'`` (default) uses Liu; ``'rotation'``
-        conditions on each pair's nuisance-adjusted scatter. Both support
-        GLM contrasts. ``'permutation'`` is available only for binary
+        For L2, ``'analytic'`` (default) uses Liu; ``'rotation'`` deterministically
+        integrates each pair's conditional null. Both support GLM contrasts.
+        ``'permutation'`` is available only for binary
         comparisons with group labels and no explicit contrast.
     covariance : {None, 'pooled', 'per_pair'}, optional
         ``None`` retains pooling across eligible pairs. ``'per_pair'`` uses
@@ -1220,10 +1225,12 @@ def _compare_cross_spectra(  # noqa: C901 — validation and dispatch over binar
         Number of sampled relabellings when exact enumeration is too large.
         Ignored for analytic tests and overridden by exact enumeration.
     random_state : int, optional
-        Seed for label permutations or rotation draws; ignored by analytic tests.
-    n_rotations : int
-        Number of Monte Carlo rotations; default 19999. Used only with
-        ``null='rotation'``, which requires ``covariance=None``.
+        Seed for binary label permutations; ignored by other nulls.
+    integration_tol : float
+        Target absolute p-value error for ``null='rotation'``; default 1e-10.
+        Requires ``statistic='l2'`` and ``covariance=None``. Small tails also
+        require estimated relative error <= 0.001; unresolved tails raise
+        RuntimeError. Ignored by other nulls.
     freq_weights : ndarray, optional
         Finite nonnegative weights for the original ``n_bins`` bins, with a
         positive sum. None means uniform weights. Zero-weight bins are
@@ -1257,8 +1264,10 @@ def _compare_cross_spectra(  # noqa: C901 — validation and dispatch over binar
         ``n_obs_A`` and ``n_obs_B``. ``attrs`` records original sample/bin
         indices, weights, representation, null and design metadata. Permutation
         counts/exactness are per-pair dictionaries when presence is masked;
-        otherwise they are shared scalars. Rotation metadata contains the
-        effective seed, draw count, and minimum p-value as in ``compare_glm``.
+        otherwise they are shared scalars. Rotation adds ``P_value_error``, a
+        numerical absolute error estimate (not statistical uncertainty), NaN
+        for skipped pairs. Its metadata records ``method="imhof"`` (with exact
+        beta special cases), ``integration_tol`` and ``covariance=None``.
 
     Notes
     -----
@@ -1422,8 +1431,7 @@ def _compare_cross_spectra(  # noqa: C901 — validation and dispatch over binar
             prepared_design=prepared_design,
             min_samples_per_group=min_samples_per_group,
             min_resid_df=min_resid_df,
-            n_rotations=n_rotations,
-            random_state=random_state,
+            integration_tol=integration_tol,
         )
     else:
         inference = _run_cross_analytic(

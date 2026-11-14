@@ -366,9 +366,12 @@ Conditional rotation tests
 
 For DF and DF-norm, ``null="rotation"`` evaluates the conditional rotation
 null by deterministic integration. It tests the same weighted L2 statistic,
-conditioning on each feature's nuisance-adjusted scatter. The default
-``null="analytic"`` instead uses a pooled or per-gene covariance estimate
-and a Liu moment approximation.
+conditioning on each feature's nuisance-adjusted scatter.
+Calibration is exact under independent Gaussian errors on the tested profile
+scale, with common covariance across samples within each feature or pair.
+Cross-bin correlations are unrestricted, and covariance may differ between
+features or pairs. Rotation can remain well calibrated under non-Gaussian
+errors; robustness depends on the statistic, design and error distribution.
 
 .. code-block:: python
 
@@ -379,27 +382,10 @@ and a Liu moment approximation.
 
 Use ``statistic="log_l2"`` and leave ``covariance=None``. The four standalone
 binary/GLM comparison functions accept the same option, including masked data.
-Samples should be independent biological units. The conditional null assumes
-Gaussian errors on the tested profile scale with common covariance across
-samples within each feature; covariance may differ between features.
-DF-norm's nonlinear normalization does not generally preserve Gaussian errors.
-Deterministic evaluation retains these statistical assumptions.
-
-``integration_tol`` sets the target absolute p-value error. Imhof inversion,
-with exact beta special cases, removes Monte Carlo variability and the sampling
-p-value floor. Small tails must also have estimated relative error <= 0.001.
-Unresolved tails raise ``RuntimeError`` after numerical refinement; no
-approximation or sampling fallback is used. ``P_value_error`` reports the
-numerical absolute error estimate, not statistical uncertainty or a rigorous
-floating-point bound. Skipped features retain NaN results. Zero scatter and
-constant quadratic forms give p=1; a nonconstant form at its exact upper
-spectral boundary gives p=0.
-
-Result ``attrs`` records ``null="rotation"``, ``covariance=None``,
-``method="imhof"`` and ``integration_tol``. BH adjustment is unchanged, but
-calls may differ from earlier Monte Carlo results. DF functions no longer
-accept ``n_rotations``. ``random_state`` remains a binary-permutation control
-and is removed from the standalone GLM functions.
+``integration_tol`` sets the target absolute p-value error used in Imhof inversion,
+and ``P_value_error`` reports the numerical absolute error estimate, not
+statistical uncertainty. Result ``attrs`` records ``null="rotation"``,
+``covariance=None``, ``method="imhof"`` and ``integration_tol``.
 
 For contrast weights ``a = c @ pinv(X)``, let B contain the unit contrast
 axis and an orthonormal full-model residual basis. With transformed profiles Y
@@ -409,10 +395,16 @@ and diagonal bin weights W, set ``A = B.T @ Y @ W @ Y.T @ B`` and
 where u is uniform on the sphere and Z has independent standard normal entries.
 All ``df_resid + 1`` directions remain, including zero eigenvalues of A.
 
-Cross-spectrum ``test_cross_diff_freq(null="rotation")`` continues to use
-Monte Carlo, controlled by ``n_rotations`` and ``random_state``. Its p-value
-remains ``(1 + exceedances) / (n_rotations + 1)``, with ties counted
-conservatively; its metadata retains the draw count, effective seed and floor.
+Cross-spectrum ``test_cross_diff_freq(null="rotation")`` uses the same
+deterministic evaluator and ``integration_tol``, with ``statistic="l2"`` and
+``covariance=None``.
+
+.. code-block:: python
+
+   coupling_results = comparison.test_cross_diff_freq(
+       design, contrast="condition", representation="coherency",
+       null="rotation", integration_tol=1e-10,
+   )
 
 
 Permutation tests

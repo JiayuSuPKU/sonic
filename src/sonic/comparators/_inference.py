@@ -102,6 +102,7 @@ class _AnalyticNullMetadata(TypedDict, total=False):
     contrast_vector: np.ndarray
     n_obs: int | np.ndarray
     zero_covariance: np.ndarray
+    estimate_per_bin: np.ndarray
 
 
 class _AnalyticNullState(_AnalyticNullMetadata):
@@ -487,7 +488,7 @@ def _fit_glm_profiles(
     Returns
     -------
     state : _AnalyticNullState
-        Per-feature weighted L2 distances, residual covariance diagnostics,
+        Weighted L2 distances, signed per-bin contrasts, residual covariance diagnostics,
         contrast-scaled eigenvalues for Liu calibration, and design metadata.
         Fitted ``beta`` coefficients have shape ``(n_terms, n_features, n_bins)``.
         P-values are computed separately from this state.
@@ -510,6 +511,7 @@ def _fit_glm_profiles(
         _init_per_gene_covariance(n_features, n_bins, store_covariance) if per_gene else {}
     )
     observed = np.empty(n_features)
+    estimates = np.empty((n_features, n_bins))
     beta = np.empty((n_terms, n_features, n_bins))
     residual_cov = None if per_gene else np.zeros((n_bins, n_bins))
     roundoff = 0.0
@@ -533,7 +535,9 @@ def _fit_glm_profiles(
             response, design_matrix, design_inverse, contrast_vector, rank
         )
         beta[:, block] = beta_block.reshape(n_terms, -1, n_bins)
-        observed[block] = np.sqrt(np.sum(weights * theta.reshape(-1, n_bins) ** 2, axis=-1))
+        effect = theta.reshape(-1, n_bins)
+        observed[block] = np.sqrt(np.sum(weights * effect**2, axis=-1))
+        estimates[block] = effect
         if per_gene:
             # Update per-gene covariance with the current block's residuals.
             _store_per_gene_covariance(
@@ -571,6 +575,7 @@ def _fit_glm_profiles(
         "mode": "glm",
         "masked": False,
         "observed": observed,
+        "estimate_per_bin": estimates,
         "covariance": covariance,
         "freq_weights": weights,
         **covariance_state,
@@ -640,6 +645,7 @@ def _estimate_glm_masked_null_covariance(  # noqa: C901
     n_obs = np.zeros(n_genes, dtype=int)
     df_resid = np.zeros(n_genes, dtype=int)
     observed = np.full(n_genes, np.nan, dtype=float)
+    estimates = np.full((n_genes, n_bins), np.nan)
     contrast_scale = np.full(n_genes, np.nan, dtype=float)
     beta = np.full((n_terms, n_genes, n_bins), np.nan, dtype=float)
     eligible = np.zeros(n_genes, dtype=bool)
@@ -681,7 +687,9 @@ def _estimate_glm_masked_null_covariance(  # noqa: C901
             gene_beta, residuals, theta = _lm._fit_glm_response(
                 response.reshape(count, -1), gene_design, design_inverse, contrast_vector, rank_gene
             )
-            observed[cols] = np.sqrt(np.sum(weights * theta.reshape(-1, n_bins) ** 2, axis=-1))
+            effect = theta.reshape(-1, n_bins)
+            observed[cols] = np.sqrt(np.sum(weights * effect**2, axis=-1))
+            estimates[cols] = effect
             beta[:, cols] = gene_beta.reshape(n_terms, -1, n_bins)
             if per_gene:
                 _store_per_gene_covariance(
@@ -730,6 +738,7 @@ def _estimate_glm_masked_null_covariance(  # noqa: C901
         "mode": "glm",
         "masked": True,
         "observed": observed,
+        "estimate_per_bin": estimates,
         "covariance": covariance,
         "freq_weights": weights,
         **covariance_state,
@@ -859,8 +868,8 @@ def _run_l2_permutations(
     freq_weights: np.ndarray | None = None,
     is_exact: bool = False,
     log_transform: bool = True,
-) -> tuple[np.ndarray, np.ndarray]:
-    """Compute L2 statistics and label-permutation tails on transformed profiles.
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Return L2 distances, label-permutation tails, and observed A-minus-B bin contrasts.
 
     ``perm_labels`` is a ``(n_perm_used, n_samples)`` matrix of group
     relabellings (as produced by :func:`_make_label_permutations`).
@@ -877,17 +886,17 @@ def _run_l2_permutations(
     response -= response[:1].copy()
     weights = _resolve_freq_weights(freq_weights, profiles.shape[-1])
 
-    def statistic(a: np.ndarray) -> np.ndarray:
-        diff = response[a].mean(axis=0) - response[~a].mean(axis=0)
-        return np.sqrt(np.sum(weights * diff**2, axis=-1))
+    def statistic(group_a):
+        effect = response[group_a].mean(axis=0) - response[~group_a].mean(axis=0)
+        return np.sqrt(np.sum(weights * effect**2, axis=-1)), effect
 
-    observed = statistic(group_codes == a_val)
+    observed, estimates = statistic(group_codes == a_val)
     exceedances = np.zeros(profiles.shape[1], dtype=np.int64)
     for labels in perm_labels:
-        exceedances += statistic(labels == a_val) >= observed
+        exceedances += statistic(labels == a_val)[0] >= observed
     correction = 0.0 if is_exact else 1.0
     pvals = (exceedances + correction) / (len(perm_labels) + correction)
-    return observed, pvals
+    return observed, pvals, estimates
 
 
 def _run_two_group_permutations(
@@ -919,11 +928,16 @@ def _run_two_group_permutations(
                 int((groups == 0).sum()),
             )
         return _run_l2_permutations(
-            profiles, groups, labels, freq_weights=freq_weights, is_exact=exact
+            profiles,
+            groups,
+            labels,
+            freq_weights=freq_weights,
+            is_exact=exact,
         )
 
     observed = np.full(profiles.shape[1], np.nan)
     pvals = np.full(profiles.shape[1], np.nan)
+    estimates = np.full(profiles.shape[1:], np.nan)
     for gene in range(profiles.shape[1]):
         mask = presence[:, gene]
         sub_groups = groups[mask]
@@ -932,15 +946,15 @@ def _run_two_group_permutations(
         labels, exact = _make_label_permutations(
             sub_groups, n_perm, rng, max_exact_permutations=max_exact_permutations
         )
-        statistic, tail = _run_l2_permutations(
+        statistic, tail, effect = _run_l2_permutations(
             profiles[mask, gene : gene + 1],
             sub_groups,
             labels,
             freq_weights=freq_weights,
             is_exact=exact,
         )
-        observed[gene], pvals[gene] = statistic[0], tail[0]
-    return observed, pvals
+        observed[gene], pvals[gene], estimates[gene] = statistic[0], tail[0], effect[0]
+    return observed, pvals, estimates
 
 
 # Conditional rotation
@@ -1304,7 +1318,8 @@ def _run_l2_conditional(  # noqa: C901
     Returns
     -------
     dict
-        Statistics, p-values, numerical errors, eligibility, counts, residual df
+        Statistics (weighted L2 distances), signed bin estimates, p-values,
+        numerical errors, eligibility, counts, residual df
         and conditional effective ranks in original feature order. Ineligible
         tails remain NaN. Metadata records the integration method/tolerance or
         Monte Carlo seed/draw count/floor; Monte Carlo numerical errors are NaN.
@@ -1348,6 +1363,7 @@ def _run_l2_conditional(  # noqa: C901
     weights = _resolve_freq_weights(freq_weights, n_bins)
     sqrt_weights = np.sqrt(weights)
     observed = np.full(n_features, np.nan)
+    estimates = np.full((n_features, n_bins), np.nan)
     pvals = np.full(n_features, np.nan)
     pvalue_error = np.full(n_features, np.nan)
     pvalue_method = np.full(n_features, None, dtype=object)
@@ -1391,7 +1407,9 @@ def _run_l2_conditional(  # noqa: C901
             ).reshape(count, -1)
             _, residuals, theta = _lm._fit_glm_response(response, x, inverse, vector, rank)
             # theta = c^T beta_hat; report its weighted L2 before geometric normalization.
-            observed[cols] = np.sqrt(np.sum(weights * theta.reshape(-1, n_bins) ** 2, axis=-1))
+            effect = theta.reshape(-1, n_bins)
+            observed[cols] = np.sqrt(np.sum(weights * effect**2, axis=-1))
+            estimates[cols] = effect
             # Dividing by ||a|| makes the contrast axis unit length; it is not an SE.
             coordinates = np.concatenate(
                 [theta[None, :] / contrast_norm, residual_basis.T @ residuals]
@@ -1424,6 +1442,7 @@ def _run_l2_conditional(  # noqa: C901
     return {
         "metadata": metadata,
         "observed": observed,
+        "estimate_per_bin": estimates,
         "pvals": pvals,
         "pvalue_error": pvalue_error,
         "pvalue_method": pvalue_method,
@@ -1479,7 +1498,8 @@ def _run_l2_test(  # noqa: C901 — binary/GLM and masked/unmasked null dispatch
     Returns
     -------
     observed, pvals, extra, metadata : tuple
-        Per-feature statistics and p-values, sample-count columns, and null metadata.
+        Per-feature statistics and p-values, bin estimates, sample counts, and null metadata.
+        Binary bin estimates use A minus B (the negative of the indicator slope).
     """
     binary = groups is not None
     if not binary and null not in ("analytic", "rotation"):
@@ -1487,6 +1507,9 @@ def _run_l2_test(  # noqa: C901 — binary/GLM and masked/unmasked null dispatch
     if null not in _NULL_OPTIONS:
         raise ValueError(f"Unknown null='{null}'. Options: {list(_NULL_OPTIONS)}.")
     _resolve_covariance(covariance, null=null)
+    profiles = np.asarray(profiles)
+    if profiles.ndim != 3:
+        raise ValueError(f"spectra must be 3D, got {profiles.shape}.")
     extra = {}
     if binary:
         groups = (groups == np.unique(groups)[1]).astype(int)
@@ -1526,6 +1549,7 @@ def _run_l2_test(  # noqa: C901 — binary/GLM and masked/unmasked null dispatch
                 **options,
             )
         observed = state["observed"]
+        estimates = state["estimate_per_bin"]
         pvals = _l2_pvalues_from_state(state)
         metadata = {"covariance": state["covariance"], "null": "analytic"}
 
@@ -1551,11 +1575,12 @@ def _run_l2_test(  # noqa: C901 — binary/GLM and masked/unmasked null dispatch
             integration_tol=integration_tol,
         )
         observed, pvals, metadata = state["observed"], state["pvals"], state["metadata"]
+        estimates = state["estimate_per_bin"]
         extra["P_value_error"] = state["pvalue_error"]
         extra["P_value_method"] = state["pvalue_method"]
 
     else:  # Binary label permutations; GLM permutations are not implemented.
-        observed, pvals = _run_two_group_permutations(
+        observed, pvals, estimates = _run_two_group_permutations(
             profiles,
             groups,
             presence,
@@ -1568,6 +1593,9 @@ def _run_l2_test(  # noqa: C901 — binary/GLM and masked/unmasked null dispatch
         )
         metadata = {}
 
+    if binary and null != "permutation":
+        estimates *= -1
+    extra["Estimate_per_bin"] = list(estimates)
     if not binary and presence is not None:
         extra.update(n_obs=state["n_obs"], df_resid=state["df_resid"])
     return observed, pvals, extra, metadata

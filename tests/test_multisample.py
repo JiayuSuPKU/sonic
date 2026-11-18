@@ -30,6 +30,67 @@ def _stub_spectra_groups(seed: int = 0, n_a: int = 4, n_b: int = 4, n_genes: int
 class TestComparisonOptions:
     """Public options, result schemas, and spectrum transformations."""
 
+    @pytest.mark.parametrize("masked", [False, True])
+    @pytest.mark.parametrize("shape_only", [False, True])
+    @pytest.mark.parametrize(
+        "glm,null,covariance",
+        [
+            (False, "analytic", None),
+            (False, "analytic", "per_gene"),
+            (False, "rotation", None),
+            (False, "permutation", None),
+            (True, "analytic", None),
+            (True, "analytic", "per_gene"),
+            (True, "rotation", None),
+        ],
+    )
+    def test_log_l2_reports_fitted_bin_contrasts(self, glm, null, covariance, masked, shape_only):
+        rng = np.random.default_rng(413)
+        spectra = rng.lognormal(size=(10, 3, 4))
+        spectra[2, 0, 1] = 0
+        groups = np.tile(["B", "A"], 5)
+        design = np.column_stack((np.ones(10), np.linspace(-1, 1, 10), rng.normal(size=10)))
+        contrast = np.array([0.0, -2.0, 0.5])
+        weights = np.array([2.0, 0.0, 1.0, 1.0])
+        presence = np.ones(spectra.shape[:2], dtype=bool)
+        if masked:
+            presence[1::3, 1] = False
+            presence[:, 2] = False
+            spectra[~presence] = np.nan
+
+        if glm:
+            compare = compare_glm_masked if masked else compare_glm
+            args = [spectra, design, contrast]
+        else:
+            compare = compare_two_groups_masked if masked else compare_two_groups
+            args = [spectra, groups]
+        if masked:
+            args.append(presence)
+        options = {"normalize_shape": shape_only, "freq_weights": weights}
+        result = compare(*args, null=null, covariance=covariance, **options).sort_values("Feature")
+        cauchy = compare(*args, statistic="log_t_cauchy", **options).sort_values("Feature")
+        estimates = np.stack(result.Estimate_per_bin)
+        np.testing.assert_allclose(estimates, np.stack(cauchy.Estimate_per_bin), atol=1e-12)
+        for gene, observed_samples in enumerate(presence.T):
+            if not observed_samples.any():
+                assert np.isnan(estimates[gene]).all()
+                continue
+            values = spectra[observed_samples, gene]
+            if shape_only:
+                values = values / values.sum(axis=1, keepdims=True)
+            response = np.log(np.maximum(values, 1e-12))
+            if glm:
+                expected = (
+                    contrast @ np.linalg.lstsq(design[observed_samples], response, rcond=None)[0]
+                )
+            else:
+                group_a = groups[observed_samples] == "A"
+                expected = response[group_a].mean(0) - response[~group_a].mean(0)
+            np.testing.assert_allclose(estimates[gene], expected, atol=1e-12)
+            assert result.Statistic.iloc[gene] == pytest.approx(
+                np.sqrt(np.average(expected**2, weights=weights))
+            )
+
     @pytest.mark.parametrize("stat", ["log_l2", "log_t_cauchy"])
     def test_each_statistic_runs(self, stat):
         rng = np.random.default_rng(0)
@@ -503,9 +564,9 @@ class TestGLMComparison:
                 )
             else:
                 frame = compare_glm(spectra, x, contrast, covariance=covariance_mode)
-            return frame.sort_values("Feature").drop(columns="Feature").to_numpy()
+            return frame.set_index("Feature").sort_index()
 
-        np.testing.assert_allclose(compare(shifted), compare(design), rtol=2e-6, atol=1e-10)
+        pd.testing.assert_frame_equal(compare(shifted), compare(design), rtol=2e-6, atol=1e-10)
         np.testing.assert_array_equal(design[:, 2], covariate)
 
     @pytest.mark.parametrize(

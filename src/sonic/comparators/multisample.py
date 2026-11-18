@@ -202,9 +202,9 @@ def _compare_two_group_profiles(  # noqa: C901 — input validation and statisti
     )
     if presence is not None and (statistic != "log_l2" or null == "permutation"):
         # Keep the historical masked permutation/Welch column order.
-        columns = ["Feature", "n_obs_A", "n_obs_B", "Statistic", "P_value"]
+        columns = ["Feature", "n_obs_A", "n_obs_B", "Statistic", "P_value", "Estimate_per_bin"]
         if statistic != "log_l2":
-            columns.extend([*_BINWISE_COLUMNS, "Best_bin"])
+            columns.extend(["T_per_bin", "P_value_per_bin", "Best_bin"])
         result = result[[*columns, "P_adj"]]
     return result
 
@@ -457,11 +457,12 @@ def compare_two_groups(
     -------
     pandas.DataFrame
         Columns ``Feature``, ``Statistic``, ``P_value`` and ``P_adj``.
-        L2 tests report the weighted distance on log spectra.
-        Log t-Cauchy reports the largest absolute t over positive-weight bins.
-        It adds ``Estimate_per_bin`` (mean A minus mean B on log profiles),
-        signed ``T_per_bin``, and unadjusted ``P_value_per_bin`` in original
-        bin order. ``Best_bin`` is the zero-based index with the smallest
+        ``Estimate_per_bin`` gives the mean A minus mean B on natural-log profiles
+        in original bin order, without frequency weights. For ``Statistic``, L2 reports the
+        weighted RMS of these unweighted estimates, similar to an aggregated effect
+        size. Log t-Cauchy reports the largest absolute t over positive-weight bins.
+        It also adds signed ``T_per_bin`` and unadjusted ``P_value_per_bin``.
+        ``Best_bin`` is the zero-based index with the smallest
         p-value among informative, positive-weight bins (first index on ties),
         or missing if none. Skipped features have NaN per-bin arrays.
         Feature-level significance does not establish the selected bin's significance.
@@ -584,11 +585,12 @@ def compare_two_groups_masked(
     -------
     pandas.DataFrame
         Columns ``Feature``, ``Statistic``, ``P_value`` and ``P_adj``.
-        L2 tests report the weighted distance on log spectra.
-        Log t-Cauchy reports the largest absolute t over positive-weight bins.
-        It adds ``Estimate_per_bin`` (mean A minus mean B on log profiles),
-        signed ``T_per_bin``, and unadjusted ``P_value_per_bin`` in original
-        bin order. ``Best_bin`` is the zero-based index with the smallest
+        ``Estimate_per_bin`` gives the mean A minus mean B on natural-log profiles
+        in original bin order, without frequency weights. For ``Statistic``, L2 reports the
+        weighted RMS of these unweighted estimates, similar to an aggregated effect
+        size. Log t-Cauchy reports the largest absolute t over positive-weight bins.
+        It also adds signed ``T_per_bin`` and unadjusted ``P_value_per_bin``.
+        ``Best_bin`` is the zero-based index with the smallest
         p-value among informative, positive-weight bins (first index on ties),
         or missing if none. Skipped features have NaN per-bin arrays.
         Feature-level significance does not establish the selected bin's significance.
@@ -698,10 +700,11 @@ def compare_glm(
     -------
     pandas.DataFrame
         Columns ``Feature``, ``Statistic``, ``P_value`` and ``P_adj``.
-        L2 tests report the weighted distance on log spectra.
-        Log t-Cauchy reports the largest absolute t over positive-weight bins.
-        It adds ``Estimate_per_bin`` (fitted contrast on log profiles), signed
-        ``T_per_bin``, and unadjusted ``P_value_per_bin`` in original bin order.
+        ``Estimate_per_bin`` gives the mean A minus mean B on natural-log profiles
+        in original bin order, without frequency weights. For ``Statistic``, L2 reports the
+        weighted RMS of these unweighted estimates, similar to an aggregated effect
+        size. Log t-Cauchy reports the largest absolute t over positive-weight bins.
+        It also adds signed ``T_per_bin`` and unadjusted ``P_value_per_bin``.
         ``Best_bin`` is the zero-based index with the smallest p-value among
         informative, positive-weight bins (first index on ties), or missing
         if none. Skipped features have NaN per-bin arrays.
@@ -831,10 +834,11 @@ def compare_glm_masked(
     -------
     pandas.DataFrame
         Columns ``Feature``, ``Statistic``, ``P_value`` and ``P_adj``.
-        L2 tests report the weighted distance on log spectra.
-        Log t-Cauchy reports the largest absolute t over positive-weight bins.
-        It adds ``Estimate_per_bin`` (fitted contrast on log profiles), signed
-        ``T_per_bin``, and unadjusted ``P_value_per_bin`` in original bin order.
+        ``Estimate_per_bin`` gives the mean A minus mean B on natural-log profiles
+        in original bin order, without frequency weights. For ``Statistic``, L2 reports the
+        weighted RMS of these unweighted estimates, similar to an aggregated effect
+        size. Log t-Cauchy reports the largest absolute t over positive-weight bins.
+        It also adds signed ``T_per_bin`` and unadjusted ``P_value_per_bin``.
         ``Best_bin`` is the zero-based index with the smallest p-value among
         informative, positive-weight bins (first index on ties), or missing
         if none. Skipped features have NaN per-bin arrays.

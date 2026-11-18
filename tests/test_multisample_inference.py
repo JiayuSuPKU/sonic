@@ -749,6 +749,7 @@ class TestCovarianceEstimation:
         self,
     ):
         assert _AnalyticNullState.__optional_keys__ == {
+            "estimate_per_bin",
             "n_obs_A",
             "n_obs_B",
             "design_columns",
@@ -907,7 +908,7 @@ class TestCovarianceEstimation:
             .set_index("Feature")
             .loc[result.index]
         )
-        np.testing.assert_allclose(whole, result, atol=1e-12, equal_nan=True)
+        pd.testing.assert_frame_equal(whole, result, rtol=1e-7, atol=1e-12)
 
 
 class TestConditionalRotation:
@@ -1760,7 +1761,7 @@ class TestConditionalIntegration:
         )
         glm = (
             compare_glm_masked(
-                values, np.c_[np.ones(12), groups], np.array([0.0, 1.0]), presence, **options
+                values, np.c_[np.ones(12), groups], np.array([0.0, -1.0]), presence, **options
             )
             .set_index("Feature")
             .sort_index()
@@ -1784,13 +1785,7 @@ class TestConditionalIntegration:
             .set_index("Feature")
             .sort_index()
         )
-        pd.testing.assert_series_equal(actual.P_value_method, expected.P_value_method)
-        np.testing.assert_allclose(
-            actual.drop(columns="P_value_method"),
-            expected.drop(columns="P_value_method"),
-            rtol=0,
-            atol=1e-10,
-        )
+        pd.testing.assert_frame_equal(actual, expected, rtol=0, atol=1e-10)
 
     def test_public_rotation_controls_and_failure_propagation(self, monkeypatch):
         import inspect

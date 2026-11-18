@@ -51,6 +51,12 @@ Both result tables contain ``Feature``, ``Statistic``, ``P_value``, and
 ``expression_results`` tests sample-level mean expression. Looking at both
 separates a rearranged pattern from a simple change in abundance.
 
+DF and DF-norm return signed ``Estimate_per_bin`` for every null: mean A minus
+mean B (sorted binary labels), or the specified GLM contrast. Estimates are
+in natural-log power units (log power share for DF-norm); divide by ``ln(2)``
+for log₂ units. ``log_l2`` reports their weighted RMS as ``Statistic``, which
+serves as an aggregated effect size metric. Skipped genes have NaN estimates.
+
 ``normalize_background()`` is optional and is not applied by the default
 workflow. It divides spectra by each sample's geometric-mean spectrum. Use it
 when sample-wide spectral differences are nuisance variation; it can also

@@ -950,6 +950,7 @@ class TestComparatorNullCovariance:
 
         assert diag["mode"] == "two_group"
         assert not diag["masked"]
+        assert "estimate_per_bin" not in diag
         assert diag["sigma_log"].shape == (5, 5)
         assert diag["df_resid"] == 4
         assert {"n_obs_A", "n_obs_B"} <= set(diag)

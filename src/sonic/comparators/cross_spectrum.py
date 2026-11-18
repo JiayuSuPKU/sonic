@@ -828,7 +828,7 @@ def _run_cross_permutations(
             profiles = _prepare_cross_profiles(
                 result, selected, bins, representation, pair_presence[:, selected]
             )
-            observed[selected], pvals[selected] = _run_l2_permutations(
+            observed[selected], pvals[selected], _ = _run_l2_permutations(
                 profiles[sample_mask],
                 group_codes[sample_mask],
                 perm_labels,

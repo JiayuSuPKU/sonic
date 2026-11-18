@@ -1234,10 +1234,12 @@ class _ComparatorBase:
             ``Feature``, ``Statistic``, ``P_value`` and ``P_adj``, sorted by
             descending statistic. Masked binary tests include ``n_obs_A`` and
             ``n_obs_B``; masked GLMs include ``n_obs`` and ``df_resid``.
-            Log t-Cauchy reports the largest absolute t over positive-weight
-            bins and adds ``Estimate_per_bin``, signed ``T_per_bin``, and raw
-            ``P_value_per_bin`` in original bin order. Estimates are mean A
-            minus mean B for binary labels, or the GLM contrast, on log profiles.
+            Both statistics return ``Estimate_per_bin``: mean A minus mean B
+            (sorted binary labels), or the specified GLM contrast, on natural-log
+            profiles in original bin order. For ``Statistic``, L2 reports the
+            weighted RMS of these unweighted estimates, similar to an aggregated effect
+            size. Log t-Cauchy reports the largest absolute t over positive-weight bins.
+            It also adds signed ``T_per_bin`` and raw ``P_value_per_bin``.
             ``Best_bin`` is the zero-based index with the smallest p-value among
             informative, positive-weight bins (first index on ties), or missing
             if none. Skipped genes have NaN per-bin arrays. Feature-level
@@ -1592,7 +1594,7 @@ class _ComparatorBase:
                     "`design` is a multi-column / continuous design."
                 )
             if use_masked:
-                return _estimate_glm_masked_null_covariance(
+                state = _estimate_glm_masked_null_covariance(
                     self.spectra_,
                     design_obj,
                     contrast,
@@ -1600,26 +1602,22 @@ class _ComparatorBase:
                     min_resid_df=int(min_resid_df),
                     **options,
                 )
-            return _estimate_glm_null_covariance(
-                self.spectra_,
-                design_obj,
-                contrast,
-                **options,
-            )
-
-        if use_masked:
-            return _estimate_two_group_masked_null_covariance(
+            else:
+                state = _estimate_glm_null_covariance(
+                    self.spectra_, design_obj, contrast, **options
+                )
+        elif use_masked:
+            state = _estimate_two_group_masked_null_covariance(
                 self.spectra_,
                 groups,
                 self.presence_,
                 min_samples_per_group=int(min_samples_per_group),
                 **options,
             )
-        return _estimate_two_group_null_covariance(
-            self.spectra_,
-            groups,
-            **options,
-        )
+        else:
+            state = _estimate_two_group_null_covariance(self.spectra_, groups, **options)
+        del state["estimate_per_bin"]
+        return state
 
     def test_diff_expr(
         self,

@@ -1434,10 +1434,11 @@ class _ComparatorBase:
             also return ``n_obs_A`` and ``n_obs_B``. Skipped and self-pair rows
             have NaN p-values; BH uses finite pair p-values.
 
-            t-Cauchy adds ``Estimate_per_bin``, signed ``T_per_bin``, and raw
-            ``P_value_per_bin`` in original bin order, with NaNs for unsupported
-            bins or skipped pairs. Estimates are mean A minus mean B for binary
-            labels, or the GLM contrast, on the selected representation's scale.
+            Both statistics return signed ``Estimate_per_bin``: mean A minus mean B
+            (sorted binary labels), or the specified GLM contrast, on natural-log
+            coherence or untransformed real coherency. Estimates include supported
+            zero-weight bins in original bin order; unsupported bins and skipped
+            pairs have NaNs. t-Cauchy adds signed ``T_per_bin`` and raw ``P_value_per_bin``.
             ``Best_bin`` is the zero-based index with the smallest p-value among
             informative, positive-weight bins (first index on ties), or missing
             if none. Pair-level significance does not establish the selected

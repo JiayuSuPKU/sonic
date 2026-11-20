@@ -140,6 +140,13 @@ sample/bin counts. ``Status`` identifies skipped pairs; ``N_pairs_pooled``
 reports the covariance pool size. Retained bins and samples are recorded in
 ``attrs["bin_indices"]`` and ``attrs["sample_indices"]``.
 
+Both statistics return ``Estimate_per_bin``: the mean for group A minus the mean
+for group B (sorted labels), or the specified GLM contrast. Coherence estimates
+use natural-log coherence; coherency estimates are differences on the signed real
+scale. L2 fits all supported bins together; only positive-weight bins contribute
+to the weighted RMS, pooled covariance, or null calibration. Unsupported bins
+and skipped pairs have NaN estimates.
+
 
 Explain selected frequency bins
 -------------------------------
@@ -450,7 +457,8 @@ For a binary comparison, permutation calibration relabels samples:
 
 ``n_perm`` sets the number of sampled relabelings, and ``random_state`` makes
 them reproducible. When the number of possible assignments is at most
-``max_exact_permutations``, SONIC enumerates them all.
+``max_exact_permutations``, SONIC enumerates them all. Sampled and exhaustive
+tests count distances tied with the observed L2 within floating-point roundoff.
 
 
 Keep physical units consistent

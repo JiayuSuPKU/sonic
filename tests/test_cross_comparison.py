@@ -144,6 +144,9 @@ class TestAnalyticNull:
         )
         actual = actual.set_index("Feature_1").loc[[f"g{i}" for i in range(0, 2 * p, 2)]]
         np.testing.assert_allclose(actual.Statistic, expected_stat, rtol=1e-12)
+        np.testing.assert_allclose(
+            np.stack(actual.Estimate_per_bin), effect if glm else -effect, atol=1e-12
+        )
         np.testing.assert_allclose(actual.P_value, expected_p, rtol=1e-11, atol=1e-13)
         assert (actual.N_pairs_pooled == p).all()
         assert (actual.N_bins == b).all()
@@ -273,6 +276,26 @@ class TestAnalyticNull:
 
 
 class TestCovariancePooling:
+    @pytest.mark.parametrize("masked", [False, True])
+    def test_pooled_eigensystem_only_uses_tested_bins(self, masked):
+        values = np.random.default_rng(42).uniform(0.1, 0.8, (10, 3, 64))
+        comp = _comparison(values)
+        if masked:
+            comp.cross_spectra_.presence[0, 0] = False
+            _mask_missing_pairs(comp.cross_spectra_)
+        groups = np.repeat([0, 1], 5)
+        weights = np.zeros(64)
+        weights[[4, 25, 53]] = [2, 1, 4]
+        with patch.object(np.linalg, "eigvalsh", wraps=np.linalg.eigvalsh) as eig:
+            result = _ordered(comp.test_cross_diff_freq(groups, freq_weights=weights))
+        assert [call.args[0].shape for call in eig.call_args_list] == [(3, 3)]
+        assert np.isfinite(np.stack(result.Estimate_per_bin)).all()
+        comp.cross_spectra_.coherency_valid[..., weights == 0] = False
+        compact = _ordered(comp.test_cross_diff_freq(groups, freq_weights=weights))
+        np.testing.assert_allclose(
+            result[["Statistic", "P_value"]], compact[["Statistic", "P_value"]]
+        )
+
     @pytest.mark.parametrize("representation", ["coherence", "coherency"])
     def test_bin_support_groups_share_covariance_without_dropping_samples(self, representation):
         rng = np.random.default_rng(43)
@@ -614,6 +637,33 @@ class TestSamplePresence:
 
 @pytest.mark.parametrize("representation", ["coherence", "coherency"])
 class TestPermutations:
+    def test_equal_maxima_count_across_support_groups(self, representation):
+        groups = np.repeat([0, 1], [1, 8])
+        values = np.random.default_rng(3).uniform(0.3, 0.4, (9, 2, 2))
+        values[[0, 5], 0, 0] = 0.9
+        # Both equal singleton contrasts count, even on a tiny signed profile.
+        if representation == "coherency":
+            values[:, 0, 0] *= 2.0**-40
+        options = {"null": "permutation", "representation": representation, "freq_weights": [1, 0]}
+        comp = _comparison(values)
+        for supported in (True, False):
+            comp.cross_spectra_.coherency_valid[:, 1, 1] = supported
+            result = _ordered(comp.test_cross_diff_freq(groups, **options))
+            assert result.P_value.iloc[0] == 2 / 9
+        # A resolvable difference at the same scale must count only once.
+        comp.cross_spectra_.cross_spectra[5, 0, 0] *= 1 - 1e-8
+        result = _ordered(comp.test_cross_diff_freq(groups, **options))
+        assert result.P_value.iloc[0] == 1 / 9
+
+    def test_zero_weight_bins_preserve_observed_label_tie(self, representation):
+        groups = np.repeat([0, 1], [1, 8])
+        values = np.random.default_rng(34).uniform(0.3, 0.4, (9, 1, 3))
+        values[0, 0, 0] = 0.9  # Only this singleton gives the largest tested contrast.
+        result = _comparison(values).test_cross_diff_freq(
+            groups, representation=representation, null="permutation", freq_weights=[1, 0, 0]
+        )
+        assert result.P_value.item() == 1 / 9
+
     @pytest.mark.parametrize("exact", [False, True])
     def test_permutations_match_exhaustive_or_sampled_label_reference(self, representation, exact):
         rng = np.random.default_rng(98)
@@ -1125,6 +1175,73 @@ def test_per_pair_raw_results_do_not_borrow_from_other_pairs(representation, glm
         comparator.test_cross_diff_freq(design, **(kwargs | {"covariance": "pooled"}))
     )
     np.testing.assert_allclose(alone[columns], pooled[columns], atol=1e-12)
+
+
+@pytest.mark.parametrize("representation", ["coherence", "coherency"])
+@pytest.mark.parametrize("masked", [False, True])
+@pytest.mark.parametrize(
+    "glm,null,covariance",
+    [
+        (False, "analytic", None),
+        (False, "analytic", "per_pair"),
+        (False, "rotation", None),
+        (False, "permutation", None),
+        (True, "analytic", None),
+        (True, "analytic", "per_pair"),
+        (True, "rotation", None),
+    ],
+)
+def test_l2_bin_estimates_match_t_cauchy(representation, masked, glm, null, covariance):
+    rng = np.random.default_rng(729)
+    values = rng.uniform(-0.7, 0.7, (10, 5, 6)) + 0.15j
+    values[1, 0, 0] = 0
+    comparator = _comparison(values)
+    cross = comparator.cross_spectra_
+    groups = np.tile(["B", "A"], 5)
+    weights = np.array([0, 1, 2, 0, 1, 0])
+    cross.coherency_valid[0, 0, [0, 2]] = False
+    cross.coherency_valid[:, 1, weights > 0] = False
+    cross.pairs = (*cross.pairs[:-1], ("g8", "g8"))
+    cross.pair_indices[-1] = [8, 8]
+    if masked:
+        cross.presence[0, 0] = False
+        cross.presence[1:, 6] = False
+        _mask_missing_pairs(cross)
+    design = np.c_[np.ones(10), np.arange(10), rng.normal(size=10)] if glm else groups
+    options = {"representation": representation, "freq_weights": weights}
+    if glm:
+        options["contrast"] = np.array([0, -2, 0.5])
+    l2_options = {"null": null, "covariance": covariance}
+    if null == "permutation":
+        l2_options.update(random_state=781, n_perm=99, max_exact_permutations=0)
+    actual = _ordered(comparator.test_cross_diff_freq(design, **l2_options, **options))
+    reference = _ordered(comparator.test_cross_diff_freq(design, statistic="t_cauchy", **options))
+    effects = np.stack(actual.Estimate_per_bin)
+    np.testing.assert_allclose(effects, np.stack(reference.Estimate_per_bin), atol=1e-12)
+    assert np.isnan(effects[[1, 4]]).all()
+    if masked:
+        assert np.isnan(effects[3]).all()
+    assert np.isfinite(effects[0, 3])
+    for effect, row in zip(effects, actual.itertuples(), strict=True):
+        tested = np.isfinite(effect) & (weights > 0)
+        if tested.any():
+            assert row.Statistic == pytest.approx(
+                np.sqrt(np.average(effect[tested] ** 2, weights=weights[tested]))
+            )
+            assert row.N_bins == tested.sum()
+
+    cross.coherency_valid[..., weights == 0] = False
+    tested_only = _ordered(comparator.test_cross_diff_freq(design, **l2_options, **options))
+    pd.testing.assert_frame_equal(
+        actual.drop(columns="Estimate_per_bin"),
+        tested_only.drop(columns="Estimate_per_bin"),
+        rtol=1e-10,
+        atol=1e-12,
+    )
+    assert actual.attrs == tested_only.attrs
+    np.testing.assert_allclose(
+        effects[:, weights > 0], np.stack(tested_only.Estimate_per_bin)[:, weights > 0], atol=1e-12
+    )
 
 
 class TestCrossRotation:

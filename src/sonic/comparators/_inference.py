@@ -193,9 +193,10 @@ class _AnalyticNullState(_AnalyticNullMetadata):
     sigma_log: np.ndarray | None
     roundoff: float | np.ndarray
     freq_weights: np.ndarray
+    # Intermediate cross-spectrum fits defer these fields until after pooling.
     weighted_cov: np.ndarray | None
-    eigenvalues: np.ndarray
-    effective_rank: float | np.ndarray
+    eigenvalues: np.ndarray | None
+    effective_rank: float | np.ndarray | None
     contrast_scale: float | np.ndarray
     df_resid: int | np.ndarray
     eligible: np.ndarray
@@ -243,6 +244,21 @@ def _weighted_covariance_eigensystem(covariance, weights):
     weighted_cov = sqrt_weights[:, None] * covariance * sqrt_weights[None, :]
     eigenvalues = np.maximum(np.linalg.eigvalsh(weighted_cov), 0.0)
     return weighted_cov, eigenvalues, _effective_rank_from_eigenvalues(eigenvalues)
+
+
+def _pooled_covariance_state(covariance, weights, contrast_scale, roundoff, for_pooling):
+    """Defer the eigensystem when this covariance contributes to a larger pool."""
+    weighted = eigenvalues = rank = None
+    if not for_pooling:
+        weighted, eigenvalues, rank = _weighted_covariance_eigensystem(covariance, weights)
+        eigenvalues = np.asarray(contrast_scale)[..., None] * eigenvalues
+    return {
+        "sigma_log": covariance,
+        "roundoff": roundoff,
+        "weighted_cov": weighted,
+        "eigenvalues": eigenvalues,
+        "effective_rank": rank,
+    }
 
 
 def _init_per_gene_covariance(n_features, n_bins, store_covariance):
@@ -295,6 +311,7 @@ def _estimate_two_group_null_covariance(
     log_transform: bool = True,
     covariance: str | None = None,
     store_covariance: bool = True,
+    for_pooling: bool = False,
 ) -> _AnalyticNullState:
     """Fit the unmasked binary null as an intercept-plus-indicator GLM.
 
@@ -329,6 +346,7 @@ def _estimate_two_group_null_covariance(
         log_transform=log_transform,
         covariance=covariance,
         store_covariance=store_covariance,
+        for_pooling=for_pooling,
     )
     for key in ("design_columns", "contrast_vector", "n_obs"):
         del state[key]
@@ -348,6 +366,7 @@ def _estimate_two_group_masked_null_covariance(
     min_samples_per_group: int = 2,
     covariance: str | None = None,
     store_covariance: bool = True,
+    for_pooling: bool = False,
 ) -> _AnalyticNullState:
     """Estimate a masked two-group null through the shared GLM estimator.
 
@@ -393,6 +412,7 @@ def _estimate_two_group_masked_null_covariance(
         allow_empty=True,
         covariance=covariance,
         store_covariance=store_covariance,
+        for_pooling=for_pooling,
     )
     if not state["eligible"].any() and not allow_empty:
         raise ValueError(
@@ -422,6 +442,7 @@ def _estimate_glm_null_covariance(
     log_transform: bool = True,
     covariance: str | None = None,
     store_covariance: bool = True,
+    for_pooling: bool = False,
 ) -> _AnalyticNullState:
     """Compute analytic null state for unmasked GLM ``log_l2`` tests.
 
@@ -447,6 +468,7 @@ def _estimate_glm_null_covariance(
         log_transform=log_transform,
         covariance=covariance,
         store_covariance=store_covariance,
+        for_pooling=for_pooling,
     )
 
 
@@ -459,6 +481,7 @@ def _fit_glm_profiles(
     log_transform=True,
     covariance: str | None = None,
     store_covariance: bool = True,
+    for_pooling: bool = False,
 ) -> _AnalyticNullState:
     """Build the unmasked L2 null state from 3D spectral profiles.
 
@@ -484,6 +507,9 @@ def _fit_glm_profiles(
     store_covariance : bool, default True
         Retain full covariance matrices in per-gene mode; otherwise their state
         entries are None. Pooled covariance is always retained.
+    for_pooling : bool, default False
+        Return pooled covariance on positive-weight bins for later combination
+        across support groups. Defer the eigensystem until that pool is complete.
 
     Returns
     -------
@@ -513,7 +539,8 @@ def _fit_glm_profiles(
     observed = np.empty(n_features)
     estimates = np.empty((n_features, n_bins))
     beta = np.empty((n_terms, n_features, n_bins))
-    residual_cov = None if per_gene else np.zeros((n_bins, n_bins))
+    cov_bins = weights > 0 if for_pooling and np.any(weights == 0) else slice(None)
+    residual_cov = None if per_gene else np.zeros((weights[cov_bins].size,) * 2)
     roundoff = 0.0
     for block in _iter_feature_blocks(n_samples, n_features, n_bins, n_terms):
         # Transform feature blocks and flatten their feature/bin columns for GLM fitting.
@@ -550,7 +577,7 @@ def _fit_glm_profiles(
                 tolerance,
             )
         else:
-            residuals = residuals.reshape(-1, n_bins)
+            residuals = residuals.reshape(-1, n_bins)[:, cov_bins]
             residual_cov += residuals.T @ residuals
     if not per_gene:
         residual_cov /= n_features * df_resid
@@ -559,17 +586,9 @@ def _fit_glm_profiles(
     # Calibrate the L2 statistic on the tested profile scale.
     contrast_scale = float(np.sum((contrast_vector @ design_inverse) ** 2))
     if not per_gene:
-        weighted_cov, weighted_cov_eigenvalues, effective_rank = _weighted_covariance_eigensystem(
-            residual_cov, weights
+        covariance_state = _pooled_covariance_state(
+            residual_cov, weights, contrast_scale, roundoff, for_pooling
         )
-        eigenvalues = weighted_cov_eigenvalues * contrast_scale
-        covariance_state = {
-            "sigma_log": residual_cov,
-            "roundoff": roundoff,
-            "weighted_cov": weighted_cov,
-            "eigenvalues": eigenvalues,
-            "effective_rank": effective_rank,
-        }
 
     return {
         "mode": "glm",
@@ -602,6 +621,7 @@ def _estimate_glm_masked_null_covariance(  # noqa: C901
     min_resid_df: int = 1,
     covariance: str | None = None,
     store_covariance: bool = True,
+    for_pooling: bool = False,
 ) -> _AnalyticNullState:
     """Compute analytic null state for masked GLM ``log_l2`` tests.
 
@@ -614,6 +634,8 @@ def _estimate_glm_masked_null_covariance(  # noqa: C901
     ``log_transform=False`` fits signed profiles without the log floor.
     ``allow_empty=True`` returns an ineligible state for an empty covariance
     pool, allowing cross-spectrum callers to report other support groups.
+    With ``for_pooling=True``, return covariance only on tested bins and defer
+    its eigensystem as in ``_fit_glm_profiles``.
     """
     covariance = _resolve_covariance(covariance)
     if int(min_resid_df) < 1:
@@ -649,7 +671,8 @@ def _estimate_glm_masked_null_covariance(  # noqa: C901
     contrast_scale = np.full(n_genes, np.nan, dtype=float)
     beta = np.full((n_terms, n_genes, n_bins), np.nan, dtype=float)
     eligible = np.zeros(n_genes, dtype=bool)
-    sigma_acc = None if per_gene else np.zeros((n_bins, n_bins), dtype=float)
+    cov_bins = weights > 0 if for_pooling and np.any(weights == 0) else slice(None)
+    sigma_acc = None if per_gene else np.zeros((weights[cov_bins].size,) * 2)
     pooled_df = 0
     roundoff = 0.0
 
@@ -702,7 +725,7 @@ def _estimate_glm_masked_null_covariance(  # noqa: C901
                     tolerance,
                 )
             else:
-                residuals = residuals.reshape(-1, n_bins)
+                residuals = residuals.reshape(-1, n_bins)[:, cov_bins]
                 sigma_acc += residuals.T @ residuals
         pooled_df += df_gene * len(genes)
         contrast_scale[genes] = scale
@@ -721,18 +744,9 @@ def _estimate_glm_masked_null_covariance(  # noqa: C901
         )
     if not per_gene:
         residual_cov = sigma_acc / max(pooled_df, 1)
-        weighted_cov, weighted_cov_eigenvalues, effective_rank = _weighted_covariance_eigensystem(
-            residual_cov, weights
+        covariance_state = _pooled_covariance_state(
+            residual_cov, weights, contrast_scale, roundoff, for_pooling
         )
-        eigenvalues = np.full((n_genes, n_bins), np.nan, dtype=float)
-        eigenvalues[eligible] = contrast_scale[eligible, None] * weighted_cov_eigenvalues[None, :]
-        covariance_state = {
-            "sigma_log": residual_cov,
-            "roundoff": roundoff,
-            "weighted_cov": weighted_cov,
-            "eigenvalues": eigenvalues,
-            "effective_rank": effective_rank,
-        }
 
     return {
         "mode": "glm",
@@ -886,14 +900,29 @@ def _run_l2_permutations(
     response -= response[:1].copy()
     weights = _resolve_freq_weights(freq_weights, profiles.shape[-1])
 
-    def statistic(group_a):
-        effect = response[group_a].mean(axis=0) - response[~group_a].mean(axis=0)
-        return np.sqrt(np.sum(weights * effect**2, axis=-1)), effect
+    def difference(values, group_a):
+        return values[group_a].mean(axis=0) - values[~group_a].mean(axis=0)
 
-    observed, estimates = statistic(group_codes == a_val)
+    group_a = group_codes == a_val
+    estimates = difference(response, group_a)
+    active = weights > 0
+    effect = estimates
+    if not active.all():
+        response = np.ascontiguousarray(response[..., active])
+        weights = weights[active]
+        # Use the same reduction as the permutations so the observed labeling ties itself.
+        effect = difference(response, group_a)
+        estimates[:, active] = effect
+    observed = np.sqrt(np.sum(weights * effect**2, axis=-1))
+    # Comparing two L2 values rounds four group means and two weighted sums over bins.
+    bin_scale = np.max(np.abs(response), axis=0)
+    scale = np.sqrt(np.sum(weights * bin_scale**2, axis=-1))
+    tie_tol = (4 * len(response) + 2 * len(weights)) * np.finfo(float).eps * scale
+    threshold = observed - tie_tol
     exceedances = np.zeros(profiles.shape[1], dtype=np.int64)
     for labels in perm_labels:
-        exceedances += statistic(labels == a_val)[0] >= observed
+        effect = difference(response, labels == a_val)
+        exceedances += np.sqrt(np.sum(weights * effect**2, axis=-1)) >= threshold
     correction = 0.0 if is_exact else 1.0
     pvals = (exceedances + correction) / (len(perm_labels) + correction)
     return observed, pvals, estimates

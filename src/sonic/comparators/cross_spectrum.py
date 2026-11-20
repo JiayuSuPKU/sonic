@@ -19,8 +19,6 @@ from sonic.comparators._inference import (
     _iter_mask_groups,
     _l2_pvalues_from_state,
     _make_label_permutations,
-    _prepare_profile_block,
-    _profile_roundoff,
     _resolve_freq_weights,
     _run_l2_conditional,
     _run_l2_permutations,
@@ -537,7 +535,7 @@ def _cross_pvalues_from_covariance(observed, scales, covariance, weights, roundo
 def _run_cross_analytic(  # noqa: C901 — shared fits across covariance modes and design paths
     result,
     pair_presence,
-    common,
+    support,
     candidates,
     weights,
     *,
@@ -559,15 +557,11 @@ def _run_cross_analytic(  # noqa: C901 — shared fits across covariance modes a
     pair_presence : ndarray of bool, shape (n_samples, n_pairs)
         Sample inclusion mask: ``pair_presence[s, p]`` is True when both
         genes in pair p pass the expression-presence threshold in sample s.
-    common : ndarray of bool, shape (n_pairs, n_bins)
-        Retained-bin mask on the original flattened frequency axis.
-        ``common[p, b]`` is True when bin b has valid coherency in every
-        sample retained for pair p and its frequency weight is positive.
-        A pair with no retained samples has an all-False row. Polar bins
-        retain the original radius-then-angle order.
+    support : ndarray of bool, shape (n_pairs, n_bins)
+        Bins valid in every retained sample, including zero-weight bins.
+        Polar bins retain the original radius-then-angle order.
     candidates : ndarray of int, shape (n_candidates,)
-        Indices of requested non-self pairs on the original pair axis of
-        ``result``, ``pair_presence``, and ``common``.
+        Non-self pairs with at least one supported, positive-weight bin.
     weights : ndarray, shape (n_bins,)
         Validated nonnegative frequency weights on the original bin axis.
         The DF helpers renormalize these weights over each retained bin set.
@@ -605,6 +599,8 @@ def _run_cross_analytic(  # noqa: C901 — shared fits across covariance modes a
         ``pooled_pairs`` counts all eligible contributors to the shared matrix;
         the contributors to each individual entry depend on bin overlap.
         Per-pair fits count one contributor for each eligible pair, zero otherwise.
+        ``estimate_per_bin`` contains signed contrasts on the original
+        bin axis, including valid zero-weight bins.
 
     Notes
     -----
@@ -618,6 +614,7 @@ def _run_cross_analytic(  # noqa: C901 — shared fits across covariance modes a
     The existing DF fitting helpers retain their small-residual-df warnings.
     """
     per_pair = covariance_mode == "per_pair"
+    estimates = np.full(support.shape, np.nan)
     n_samples, n_pairs, _ = result.cross_spectra.shape
     n_observed = pair_presence.sum(axis=0)
     use_glm = prepared_design is not None
@@ -636,16 +633,14 @@ def _run_cross_analytic(  # noqa: C901 — shared fits across covariance modes a
     if not per_pair:
         contrast_scale = np.full(n_pairs, np.nan)
         roundoff = np.zeros(n_pairs)
-        pooled_bins = np.flatnonzero(common[candidates].any(axis=0))
+        tested = support & (weights > 0)
+        pooled_bins = np.flatnonzero(tested[candidates].any(axis=0))
         covariance = np.zeros((len(pooled_bins), len(pooled_bins)))
         covariance_df = np.zeros_like(covariance)
-        n_covariance_groups = 0
     # Batch fits by bin support; pooled mode combines shared covariance entries afterward.
-    for keep, indices in _iter_mask_groups(common[candidates].T):
+    for keep, indices in _iter_mask_groups(support[candidates].T):
         pairs = candidates[indices]
         bins = np.flatnonzero(keep)
-        if not bins.size:
-            continue
         group_presence = pair_presence[:, pairs]
         profiles = _prepare_cross_profiles(result, pairs, bins, representation, group_presence)
         group_weights = weights[bins]
@@ -653,6 +648,8 @@ def _run_cross_analytic(  # noqa: C901 — shared fits across covariance modes a
         kwargs = {"freq_weights": group_weights, "log_transform": log_transform}
         if per_pair:
             kwargs.update(covariance="per_gene", store_covariance=False)
+        else:
+            kwargs["for_pooling"] = True
         if use_masked:
             if use_glm:
                 state = _estimate_glm_masked_null_covariance(
@@ -682,6 +679,8 @@ def _run_cross_analytic(  # noqa: C901 — shared fits across covariance modes a
         eligible = state["eligible"]
         selected = pairs[eligible]
         observed[pairs] = state["observed"]
+        effect = state["estimate_per_bin"]
+        estimates[np.ix_(pairs, bins)] = effect if use_glm else -effect
         df_resid[pairs] = state["df_resid"]
         status[pairs] = "ineligible_design" if use_glm else "insufficient_samples"
         if not eligible.any():
@@ -693,33 +692,24 @@ def _run_cross_analytic(  # noqa: C901 — shared fits across covariance modes a
             status[selected] = np.where(np.isnan(pvals[selected]), "degenerate_null", "ok")
             continue
         contrast_scale[selected] = np.broadcast_to(state["contrast_scale"], (len(pairs),))[eligible]
-        positions = np.searchsorted(pooled_bins, bins)
+        active = np.flatnonzero(group_weights > 0)
+        positions = np.searchsorted(pooled_bins, bins[active])
         block = np.ix_(positions, positions)
         group_df = df_resid[selected].sum()
         covariance[block] += state["sigma_log"] * group_df
         covariance_df[block] += group_df
-        n_covariance_groups += 1
+        roundoff[selected] = state["roundoff"]
         status[selected] = "ok"
-        # Ignore excluded samples/pairs when scaling the existing roundoff guard.
-        retained = (group_presence & eligible[None, :])[..., None]
-        extremes = np.array(
-            [
-                np.min(profiles, where=retained, initial=np.inf),
-                np.max(profiles, where=retained, initial=-np.inf),
-            ]
-        )
-        roundoff[selected] = _profile_roundoff(
-            _prepare_profile_block(extremes, False, log_transform=log_transform)
-        )
 
     if not per_pair:
         np.divide(covariance, covariance_df, out=covariance, where=covariance_df > 0)
-        if n_covariance_groups > 1:
-            covariance = _stabilize_cross_covariance(covariance)
         eligible_pairs = np.flatnonzero(status == "ok")
         pooled_pairs[eligible_pairs] = len(eligible_pairs)
         # Subset only after PSD correction, so every test uses the same covariance.
-        for keep, indices in _iter_mask_groups(common[eligible_pairs].T):
+        tested_groups = list(_iter_mask_groups(tested[eligible_pairs].T))
+        if len(tested_groups) > 1:
+            covariance = _stabilize_cross_covariance(covariance)
+        for keep, indices in tested_groups:
             pairs = eligible_pairs[indices]
             bins = np.flatnonzero(keep)
             positions = np.searchsorted(pooled_bins, bins)
@@ -731,13 +721,14 @@ def _run_cross_analytic(  # noqa: C901 — shared fits across covariance modes a
                 contrast_scale[pairs],
                 pair_covariance,
                 group_weights,
-                roundoff[pairs[0]],
+                roundoff[pairs].max(),
                 n_observed[pairs],
             )
     return {
         "observed": observed,
         "pvals": pvals,
         "pooled_pairs": pooled_pairs,
+        "estimate_per_bin": estimates,
         "effective_rank": effective_rank,
         "df_resid": df_resid,
         "status": status,
@@ -749,7 +740,7 @@ def _run_cross_analytic(  # noqa: C901 — shared fits across covariance modes a
 def _run_cross_permutations(
     result,
     pair_presence,
-    common,
+    support,
     candidates,
     weights,
     group_codes,
@@ -797,6 +788,7 @@ def _run_cross_permutations(
         for self-pairs and entirely absent pairs.
     """
     n_pairs = result.cross_spectra.shape[1]
+    estimates = np.full(support.shape, np.nan)
     n_a = pair_presence[group_codes == 0].sum(axis=0)
     n_b = pair_presence[group_codes == 1].sum(axis=0)
     observed = np.full(n_pairs, np.nan)
@@ -807,7 +799,7 @@ def _run_cross_permutations(
     # Match DF: masked features draw in original order; unmasked features share labels.
     batches = (np.array([pair]) for pair in candidates) if use_masked else (candidates,)
     for pairs in batches:
-        if not pairs.size or not common[pairs].any():
+        if not pairs.size:
             continue
         sample_mask = pair_presence[:, pairs[0]]
         minimum = int(min_samples_per_group) if use_masked else 1
@@ -820,15 +812,13 @@ def _run_cross_permutations(
             rng,
             max_exact_permutations=max_exact_permutations,
         )
-        for keep, local in _iter_mask_groups(common[pairs].T):
+        for keep, local in _iter_mask_groups(support[pairs].T):
             selected = pairs[local]
             bins = np.flatnonzero(keep)
-            if not bins.size:
-                continue
             profiles = _prepare_cross_profiles(
                 result, selected, bins, representation, pair_presence[:, selected]
             )
-            observed[selected], pvals[selected], _ = _run_l2_permutations(
+            observed[selected], pvals[selected], effect = _run_l2_permutations(
                 profiles[sample_mask],
                 group_codes[sample_mask],
                 perm_labels,
@@ -837,6 +827,7 @@ def _run_cross_permutations(
                 log_transform=representation == "coherence",
             )
             permutation_counts[selected] = len(perm_labels)
+            estimates[np.ix_(selected, bins)] = effect
             exact_permutations[selected] = is_exact
             status[selected] = "ok"
     return {
@@ -847,6 +838,7 @@ def _run_cross_permutations(
         "df_resid": np.maximum(pair_presence.sum(axis=0) - 2, 0),
         "status": status,
         "permutation_counts": permutation_counts,
+        "estimate_per_bin": estimates,
         "exact_permutations": exact_permutations,
     }
 
@@ -854,7 +846,7 @@ def _run_cross_permutations(
 def _run_cross_rotations(
     result,
     pair_presence,
-    common,
+    support,
     candidates,
     weights,
     *,
@@ -904,6 +896,7 @@ def _run_cross_rotations(
     """
     n_samples, n_pairs = pair_presence.shape
     metadata = _integration_metadata(integration_tol)
+    estimates = np.full(support.shape, np.nan)
     use_glm = prepared_design is not None
     if use_glm:
         matrix, _, vector, _, _ = prepared_design
@@ -918,10 +911,8 @@ def _run_cross_rotations(
     effective_rank = np.full(n_pairs, np.nan)
     df_resid = np.zeros(n_pairs, int)
     status = np.full(n_pairs, "no_common_bins", dtype=object)
-    for keep, indices in _iter_mask_groups(common[candidates].T):
+    for keep, indices in _iter_mask_groups(support[candidates].T):
         bins = np.flatnonzero(keep)
-        if not bins.size:
-            continue
         for block in _iter_feature_blocks(n_samples, len(indices), len(bins)):
             pairs = candidates[indices[block]]
             group_presence = pair_presence[:, pairs]
@@ -943,6 +934,8 @@ def _run_cross_rotations(
                 integration_tol=integration_tol,
             )
             observed[pairs] = rotation["observed"]
+            effect = rotation["estimate_per_bin"]
+            estimates[np.ix_(pairs, bins)] = effect if use_glm else -effect
             pvals[pairs] = rotation["pvals"]
             pvalue_error[pairs] = rotation["pvalue_error"]
             pvalue_method[pairs] = rotation["pvalue_method"]
@@ -965,6 +958,7 @@ def _run_cross_rotations(
         "permutation_counts": np.zeros(n_pairs, int),
         "exact_permutations": np.zeros(n_pairs, bool),
         "metadata": metadata,
+        "estimate_per_bin": estimates,
         "extra": {"P_value_error": pvalue_error, "P_value_method": pvalue_method},
     }
 
@@ -994,8 +988,6 @@ def _run_cross_t_cauchy(
     ----------
     support : ndarray of bool, shape (n_pairs, n_bins)
         Bins valid in every retained sample, in original flattened bin order.
-        Unlike ``common`` in :func:`_run_cross_analytic`, this mask includes
-        valid zero-weight bins so their per-bin diagnostics remain available.
         Pairs with no positive-weight supported bins are skipped.
     weights : ndarray, shape (n_bins,)
         Validated nonnegative weights on the original bin axis. Cauchy
@@ -1251,7 +1243,8 @@ def _compare_cross_spectra(  # noqa: C901 — validation and dispatch over binar
         One row per requested pair, sorted by descending ``Statistic``.
         ``Feature_1`` and ``Feature_2`` identify the pair; ``Statistic`` is
         the weighted L2 contrast or maximum absolute t, with ``P_value`` and
-        BH-adjusted ``P_adj``. t-Cauchy adds per-bin estimates, signed t
+        BH-adjusted ``P_adj``. Both statistics return unweighted, signed
+        ``Estimate_per_bin`` on the tested scale. t-Cauchy adds signed t
         statistics, p-values, and the original ``Best_bin`` index.
         ``N_samples`` and ``N_bins`` record the support. ``DF_resid``,
         ``N_pairs_pooled`` and ``Effective_rank`` describe the analytic fit;
@@ -1391,7 +1384,7 @@ def _compare_cross_spectra(  # noqa: C901 — validation and dispatch over binar
     support &= pair_presence.any(axis=0)[:, None]
     common = support & (weights > 0)
     self_pairs = np.array([a == b for a, b in result.pairs], dtype=bool)
-    candidates = np.flatnonzero(~self_pairs)
+    candidates = np.flatnonzero(~self_pairs & common.any(axis=1))
     if statistic == "t_cauchy":
         inference = _run_cross_t_cauchy(
             result,
@@ -1410,7 +1403,7 @@ def _compare_cross_spectra(  # noqa: C901 — validation and dispatch over binar
         inference = _run_cross_permutations(
             result,
             pair_presence,
-            common,
+            support,
             candidates,
             weights,
             group_codes,
@@ -1425,7 +1418,7 @@ def _compare_cross_spectra(  # noqa: C901 — validation and dispatch over binar
         inference = _run_cross_rotations(
             result,
             pair_presence,
-            common,
+            support,
             candidates,
             weights,
             representation=representation,
@@ -1440,7 +1433,7 @@ def _compare_cross_spectra(  # noqa: C901 — validation and dispatch over binar
         inference = _run_cross_analytic(
             result,
             pair_presence,
-            common,
+            support,
             candidates,
             weights,
             representation=representation,
@@ -1455,6 +1448,8 @@ def _compare_cross_spectra(  # noqa: C901 — validation and dispatch over binar
         "ineligible_design" if use_glm else "insufficient_samples"
     )
     inference["status"][self_pairs] = "self_pair"
+    if statistic == "l2":
+        inference.setdefault("extra", {})["Estimate_per_bin"] = list(inference["estimate_per_bin"])
     return _cross_comparison_frame(
         result,
         inference,

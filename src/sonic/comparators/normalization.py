@@ -323,6 +323,8 @@ def normalize_shape(
     spectra = np.asarray(spectra, dtype=np.float64)
     if not np.isfinite(spectra).all():
         raise ValueError("Shape normalization requires finite profiles for observed samples.")
+    if np.any(spectra < 0):
+        raise ValueError("Observed spectral powers must be nonnegative.")
     peak = spectra.max(axis=axis, keepdims=True, initial=0.0)
     exponent = np.frexp(peak)[1]
     scaled = np.ldexp(spectra, 1 - exponent, out=np.zeros_like(spectra), where=peak > 0)

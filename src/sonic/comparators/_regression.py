@@ -298,10 +298,10 @@ def _test_glm_response(response, design, inverse, contrast, rank, *, unit_fits=N
     roundoff = _glm_fit_roundoff(design, inverse, scale)
     suspect = (scale > 0) & (np.max(np.abs(residuals), axis=0) <= roundoff)
     has_variation = np.any(response != response[:1], axis=0)
+    constants = (scale > 0) & ~has_variation
     if rank == design.shape[1] and np.any(np.all(design == design[:1], axis=0) & (design[0] != 0)):
         # _fit_glm_response already fits constant columns exactly with an explicit intercept.
-        suspect &= has_variation
-    constants = suspect & ~has_variation
+        constants[:] = False
     refit = np.flatnonzero(suspect & has_variation)
     unit_fit = unit_fits.get(mask_key) if unit_fits is not None else None
     need_unit_fit = constants.any() and unit_fit is None

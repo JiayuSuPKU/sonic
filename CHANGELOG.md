@@ -12,10 +12,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   rotation. P-values and BH calls can change. For Gaussian plug-in calibration,
   replace `null="analytic"` with `null="plugin"` in L2 calls. Covariance defaults
   to per gene for DF and DF-norm and per pair for cross-spectrum tests. Use
-  `covariance="pooled"` with the same saved spectra to reproduce the previous
-  pooled p-values. Recomputing `feature_mode="2d"` spectra can change those
-  p-values because each polar bin now uses its area-weighted sector mean in
-  place of the value at its center.
+  `null="plugin", covariance="pooled"` for the previous pooled calibration method.
+  A nonzero DF contrast with numerically zero covariance now returns a NaN p-value.
+  Recomputing `feature_mode="2d"` spectra can also change results because each
+  polar bin now uses its area-weighted sector mean in place of the value at its center.
   Binwise t-Cauchy tests continue to use `null="analytic"`.
 - L2 and t-Cauchy comparisons require finite, strictly positive frequency weights.
   Binary L2 requires at least `min_samples_per_group` observations per group
@@ -26,7 +26,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Rerun the analysis when migrating because bin estimates and p-values can change.
 
 ### Fixed
-- DF and DF-norm reject nonfinite observed spectra before logging or shape normalization. Samples
+- DF and DF-norm reject negative or nonfinite observed powers before logging or shape normalization. Samples
   marked absent for a feature are excluded from its comparison.
 
 ## [1.0.0rc2] - 2026-10-07

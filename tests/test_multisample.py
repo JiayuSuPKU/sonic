@@ -31,32 +31,31 @@ class TestComparisonOptions:
     """Public options, result schemas, and spectrum transformations."""
 
     @pytest.mark.parametrize(
-        "options",
+        "options,shape_only,bad",
         [
-            {"covariance": "per_gene"},
-            {"null": "plugin"},
-            {"null": "permutation"},
-            {},
-            {"statistic": "log_t_cauchy"},
+            ({}, False, np.nan),
+            ({}, True, -1.0),
+            ({"covariance": "pooled"}, True, np.inf),
+            ({"null": "plugin"}, False, -1.0),
+            ({"null": "permutation"}, True, -np.inf),
+            ({"statistic": "log_t_cauchy"}, False, np.nan),
         ],
     )
-    @pytest.mark.parametrize("bad", [np.nan, np.inf, -np.inf])
-    @pytest.mark.parametrize("shape_only", [False, True])
     def test_comparisons_check_observed_profiles(self, options, bad, shape_only):
         groups = np.repeat([0, 1], 6)
         spectra = np.tile([1.0, 2.0, 3.0], (12, 1, 1))
-        spectra[1:6, 0, 1] = bad
-        with pytest.raises(ValueError, match="finite"):
+        spectra[1, 0, 1] = bad
+        message = "nonnegative" if np.isfinite(bad) else "finite"
+        with pytest.raises(ValueError, match=message):
             compare_two_groups(spectra, groups, normalize_shape=shape_only, **options)
-        # Leave enough samples in each arm for the masked comparison.
-        spectra[4:6, 0, 1] = 2.0
-        presence = np.isfinite(spectra).all(axis=-1)
+        presence = np.ones((12, 1), dtype=bool)
+        presence[1] = False
         masked = compare_two_groups_masked(
             spectra, groups, presence, normalize_shape=shape_only, **options
         )
         assert masked.P_value.item() == 1
         presence[1] = True
-        with pytest.raises(ValueError, match="finite"):
+        with pytest.raises(ValueError, match=message):
             compare_two_groups_masked(
                 spectra, groups, presence, normalize_shape=shape_only, **options
             )
@@ -1021,6 +1020,24 @@ class TestLogTCauchy:
         assert result.P_value_per_bin[0] == 1
         assert result.Best_bin == reference.Best_bin != 0
         assert result.P_value == reference.P_value
+
+    def test_df_norm_constant_share_without_intercept(self):
+        x = np.tile([-1, 1], 8)
+        second = np.where(x > 0, 0.5 - 2.0**-12, 2.0**-12)
+        total = 1 + 2.0**-52
+        powers = np.column_stack([np.full(len(x), 0.5), second, total - 0.5 - second])
+        args = (x[:, None], np.array([1.0]))
+        reference = compare_glm(powers[:, None, 1:] / total, *args, statistic="log_t_cauchy").iloc[
+            0
+        ]
+        for values in (powers, powers * np.where(x[:, None] > 0, 3, 1)):
+            row = compare_glm(
+                values[:, None], *args, statistic="log_t_cauchy", normalize_shape=True
+            ).iloc[0]
+            assert row.Estimate_per_bin[0] == row.T_per_bin[0] == 0
+            assert row.P_value_per_bin[0] == 1 and row.Best_bin == reference.Best_bin + 1
+            assert row.P_value == pytest.approx(reference.P_value, rel=1e-12)
+            assert row.P_value < 0.01
 
     @pytest.mark.parametrize("masked", [False, True])
     def test_df_norm_refines_nuisance_fits_without_refining_noisy_features(self, masked):

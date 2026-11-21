@@ -50,10 +50,15 @@ def _exact_shape_shares(profiles):
     )
 
 
+def _exact_shape_response(profiles, log_transform):
+    shares = _exact_shape_shares(profiles)
+    return np.log(np.maximum(shares, 1e-12)) if log_transform else shares
+
+
 def _prepare_profile_block(
     profiles, normalize_shape, *, log_transform=True, design_fit=None, permutation_group_size=None
 ):
-    """Prepare float64 responses, rechecking shares only for roundoff-sized fits."""
+    """Prepare float64 responses and verify shares for nearly constant or exactly fitted bins."""
     if normalize_shape:
         block = _normalize_shape_apply(profiles)
         # Shares well below the log floor give the same response after exact division.
@@ -62,6 +67,8 @@ def _prepare_profile_block(
         block = np.array(profiles, dtype=np.float64, copy=True)
         if not np.isfinite(block).all():
             raise ValueError("Tests require finite profiles for observed samples.")
+        if log_transform and np.any(block < 0):
+            raise ValueError("Observed spectral powers must be nonnegative.")
     if log_transform:
         np.maximum(block, 1e-12, out=block)
         np.log(block, out=block)
@@ -71,6 +78,8 @@ def _prepare_profile_block(
         if permutation_group_size is None:
             design, inverse = design_fit
             residual = np.max(np.abs(response - design @ (inverse @ response)), axis=0)
+            # A constant share can have a large residual in a model without an intercept.
+            residual = np.minimum(residual, np.ptp(response, axis=0))
             tol = _lm._glm_fit_roundoff(design, inverse, scale)
         else:
             # A two-group fit can be exact only if the sorted values form two tight groups.
@@ -86,8 +95,7 @@ def _prepare_profile_block(
         flagged = active & (residual <= tol).reshape(active.shape)
         for gene in np.flatnonzero(flagged.any(axis=1)):
             # One denominator for all bins preserves ties in their joint L2 statistic.
-            shares = _exact_shape_shares(profiles[:, gene])
-            block[:, gene] = np.log(np.maximum(shares, 1e-12)) if log_transform else shares
+            block[:, gene] = _exact_shape_response(profiles[:, gene], log_transform)
     return block
 
 
@@ -1430,9 +1438,9 @@ def _conditional_tails(scatter, *, integration_tol=1e-6, rank_one=False, refine=
 
     Returns
     -------
-    pvalues, errors, methods : tuple of np.ndarray
-        One tail, numerical error budget/estimate and method per feature. Zero eigenvalue
-        directions are retained; no covariance moments or sphere draws are used.
+    pvalues, errors, methods, saddlepoint_ties : tuple of np.ndarray
+        Tail, numerical error estimate, method and a flag for saddlepoint tails with a
+        shifted eigenvalue within roundoff of zero on the scatter matrix's scale.
     """
     scatter = np.asarray(scatter, dtype=float)
     if (
@@ -1444,6 +1452,8 @@ def _conditional_tails(scatter, *, integration_tol=1e-6, rank_one=False, refine=
         raise ValueError("Conditional scatter must contain finite square matrices.")
     pvalues, errors = np.empty(len(scatter)), np.empty(len(scatter))
     methods = np.empty(len(scatter), dtype=object)
+    saddlepoint_ties = np.zeros(len(scatter), dtype=bool)
+    tie_rtol = 32 * np.finfo(float).eps * scatter.shape[1]
     rank_one = np.broadcast_to(rank_one, (len(scatter),))
     for feature, matrix in enumerate(scatter):
         try:
@@ -1458,7 +1468,8 @@ def _conditional_tails(scatter, *, integration_tol=1e-6, rank_one=False, refine=
                 scale = np.max(np.abs(shifted))
                 if scale > 0:
                     shifted /= scale
-                coefficients = np.linalg.eigvalsh(shifted)
+                scatter_shifts = np.linalg.eigvalsh(shifted)
+                coefficients = scatter_shifts
                 verified = None
                 if refine is not None and matrix.any():
                     verified = refine(feature, np.min(np.abs(coefficients)) * scale)
@@ -1469,11 +1480,17 @@ def _conditional_tails(scatter, *, integration_tol=1e-6, rank_one=False, refine=
             pvalues[feature], errors[feature], methods[feature] = _conditional_tail(
                 coefficients, integration_tol=integration_tol
             )
+            if not rank_one[feature] and methods[feature] == "saddlepoint":
+                # Refinement can rescale every gap. Restore the nearest gap to scatter units.
+                gaps = np.abs(coefficients)
+                largest_shift = np.max(np.abs(scatter_shifts)) * scale
+                nearest_gap = (gaps.min() / gaps.max()) * largest_shift
+                saddlepoint_ties[feature] = nearest_gap <= tie_rtol * matrix.trace()
         except (RuntimeError, np.linalg.LinAlgError) as exc:
             raise RuntimeError(
                 f"Conditional integration failed for block feature {feature}: {exc}"
             ) from exc
-    return pvalues, errors, methods
+    return pvalues, errors, methods, saddlepoint_ties
 
 
 def _rotation_tails(scatter, basis, n_rotations, seed):
@@ -1721,12 +1738,24 @@ def _run_l2_conditional(  # noqa: C901
                     near_rank_one=np.sqrt(np.maximum(0, effective_rank[cols] - 1)) <= tolerance,
                     shift_tolerance=tolerance * trace,
                 )
-                pvals[cols], pvalue_error[cols], pvalue_method[cols] = _conditional_tails(
-                    scatter,
-                    integration_tol=integration_tol,
-                    rank_one=rank_one,
-                    refine=refine,
+                pvals[cols], pvalue_error[cols], pvalue_method[cols], saddlepoint_ties = (
+                    _conditional_tails(
+                        scatter,
+                        integration_tol=integration_tol,
+                        rank_one=rank_one,
+                        refine=refine,
+                    )
                 )
+                if normalize_shape:
+                    # Equal eigenvalues give maximal effective rank and a constant rotation statistic.
+                    near_constant = effective_rank[cols] >= (df + 1) * (1 - 32 * eps * (df + 1))
+                    for j in np.flatnonzero(near_constant | saddlepoint_ties):
+                        checked = _exact_shape_response(values[:, j], log_transform)
+                        if not np.array_equal(checked, profiles_block[:, j]):
+                            raise RuntimeError(
+                                f"DF-norm rotation tie is sensitive to normalization roundoff "
+                                f"for input feature {cols[j]}."
+                            )
             else:
                 pvals[cols] = _rotation_tails(scatter, basis, metadata["n_rotations"], seed)
         eligible[genes] = True

@@ -72,12 +72,11 @@ runs before testing.
 
 ``normalize_shape=True`` compares the distribution of power across spatial
 scales after removing total spectrum amplitude. Leave it off when amplitude is
-part of the pattern you want to compare. Observed spectra must be finite.
+part of the pattern you want to compare. Observed powers must be finite and nonnegative.
 Samples marked absent are excluded for that feature. Every nonzero spectrum is normalized
 to unit total, including very small powers; all-zero spectra remain zero.
-DF-norm computes shares in float64. If a bin fits the design to within
-roundoff, SONIC recomputes that feature’s shares using exact spectrum totals.
-All its bins then use the same denominator, preserving ties in the L2 statistic.
+DF-norm computes shares in float64. If a bin is constant or fits the design
+to within roundoff, SONIC recomputes the feature’s shares using exact spectrum totals.
 
 For 2D NUFFT features and rotation landmarks, SONIC evaluates an extra border
 of Fourier modes for interpolation at the sampling Nyquist boundary. The
@@ -426,6 +425,9 @@ When a fitted residual is comparable to rounding error, SONIC recomputes the
 contrast and residuals on the retained design using the transformed profile values.
 An exact fit gives p=1 for a zero contrast and p=0 for a nonzero contrast.
 If every rotation gives the same L2 statistic, the inclusive upper tail is p=1.
+DF-norm rechecks the shares when the rotation statistic is nearly constant or when
+a saddlepoint tail falls at a spectral tie. If exact spectrum totals change the
+transformed profile, SONIC raises an error giving the feature's input index.
 SONIC checks ambiguous spectral endpoints using the supplied bin-weight ratios.
 A verified rank-one scatter uses the beta tail even when several bins carry the same signal.
 

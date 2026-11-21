@@ -1,8 +1,4 @@
-"""Public spectral and scalar comparison functions for comparator outputs.
-
-Spectral L2 inference lives in ``_inference``; shared OLS fits live in
-``_regression``. These functions validate user options and assemble results.
-"""
+"""Compare gene spectra or mean expression across biological samples."""
 
 from __future__ import annotations
 
@@ -425,92 +421,81 @@ def compare_two_groups(
     covariance: str | None = None,
     integration_tol: float = 1e-6,
 ) -> pd.DataFrame:
-    """Test a spectral difference between two groups for each gene.
+    """Compare each gene's power spectrum between two groups.
 
     Parameters
     ----------
     spectra : np.ndarray
-        Raw spectral powers of shape ``(n_samples, n_genes, n_bins)``;
-        not logged. Inputs are not modified.
-    groups : np.ndarray
-        Labels of shape ``(n_samples,)`` with exactly two distinct values.
-        Groups A and B follow the sorted label order.
+        Spectral power with shape ``(n_samples, n_genes, n_bins)``. Supply
+        finite, nonnegative power for observed samples.
+    groups : array-like
+        Two distinct group labels, one per sample. Group A has the first
+        label in sorted order. Group B has the second.
     gene_names : sequence of str, optional
-        Feature names. Defaults to stringified zero-based indices.
-    statistic : str
-        ``'log_l2'`` (default) is the weighted L2 contrast of log spectra.
-        ``'log_t_cauchy'`` combines per-bin Welch p-values on log profiles
-        and also supports localizing the best bin by its smallest p-value
-        among informative bins.
-        It requires two observations per arm and excludes constant bins.
+        Names in input gene order. The default labels are zero-based indices
+        written as strings.
+    statistic : {'log_l2', 'log_t_cauchy'}, default 'log_l2'
+        L2 measures the size of the contrast across bins. ``'log_t_cauchy'``
+        combines bin p-values and identifies the bin with the smallest
+        p-value among those used in the combination.
     null : str, optional
-        Null calibration depends on the statistic:
-
-        - ``'log_l2'``: ``'rotation'`` (default, deterministic conditional integration),
-          ``'plugin'`` (Gaussian plug-in calibration using the estimated covariance), or
-          ``'permutation'`` (shuffled binary labels).
-        - ``'log_t_cauchy'``: ``'analytic'`` only (per-bin t tails and
-          Cauchy combination).
-    n_perm : int
-        Number of sampled label permutations; default 1000. Ignored when
-        all assignments are enumerated or another null is selected.
-    max_exact_permutations : int
-        Enumerate all binary label assignments when their number is at
-        most this threshold; default 10000. Zero forces sampling.
+        For L2, use ``'rotation'`` (default) or ``'plugin'`` for Gaussian
+        plug-in calibration. Use ``'permutation'`` for two exchangeable groups.
+        For ``'log_t_cauchy'``, the only calibration is ``'analytic'`` (default).
+    n_perm : int, default 1000
+        Number of random group assignments for a sampled permutation test.
+    max_exact_permutations : int, default 10000
+        Enumerate all group assignments when their number is at most this
+        limit. Set it to zero to sample assignments.
     random_state : int, optional
-        Seed for binary label permutations; ignored by other nulls.
+        Random seed for sampled permutations.
     freq_weights : np.ndarray, optional
-        Finite, strictly positive bin weights. None gives uniform weights.
-        Log t-Cauchy renormalizes weights over informative bins.
-    normalize_shape : bool
-        If True, divide each sample/feature spectrum by its total power
-        before logging to test spectral shape (DF-norm). Default False.
-    min_samples_per_group : int
-        Minimum observations per group for L2 (default 2).
-    covariance : str or None
-        For plug-in L2 calibration, ``None`` or ``'per_gene'`` estimates residual covariance
-        separately for each gene. ``'pooled'`` shares it across eligible genes.
-        Specifying a covariance selects plug-in calibration when ``null`` is omitted.
-    integration_tol : float
-        Initial Davies absolute p-value error target for rotation; default 1e-6.
-        Use at most 10,000 terms per call and one accuracy retry. Accepted
-        integration also requires relative error budget <= 0.001. Unresolved
-        tails use marked saddlepoint approximation. Ignored by other nulls.
+        Positive, finite weights in fitted bin order.
+        The default gives each bin equal weight. Choose weights before testing.
+    normalize_shape : bool, default False
+        Divide each gene's power in each bin by its total power in that
+        sample before taking the logarithm (DF-norm).
+    min_samples_per_group : int, default 2
+        Minimum number of samples in each group for L2. Welch's t test
+        requires two samples in each group.
+    covariance : str, optional
+        With plug-in calibration, ``None`` or ``'per_gene'`` estimates residual
+        covariance across bins for each gene. ``'pooled'`` shares this estimate
+        across eligible genes. Setting a covariance selects plug-in calibration
+        if you omit ``null``. For other calibrations, leave this as ``None``.
+    integration_tol : float, default 1e-6
+        Target absolute error for numerical integration of rotation p-values.
 
     Returns
     -------
     pandas.DataFrame
-        Columns ``Feature``, ``Statistic``, ``P_value`` and ``P_adj``.
-        ``Estimate_per_bin`` gives the mean A minus mean B on natural-log profiles
-        in original bin order, without frequency weights. For ``Statistic``, L2 reports the
-        weighted RMS of these unweighted estimates, similar to an aggregated effect
-        size. Log t-Cauchy reports the largest absolute t across bins.
-        It also adds signed ``T_per_bin`` and unadjusted ``P_value_per_bin``.
-        ``Best_bin`` is the zero-based index with the smallest
-        p-value among informative bins (first index on ties),
-        or missing if none. Skipped features have NaN per-bin arrays.
-        Feature-level significance does not establish the selected bin's significance.
-        Rows are sorted by descending statistic; BH uses finite p-values.
-        Plug-in L2 results record ``null="plugin"`` and ``covariance`` in ``attrs``.
-        Rotation adds ``P_value_method`` (``davies``, ``saddlepoint``, ``beta``
-        or ``exact``; missing for skipped rows) and ``P_value_error``. The latter
-        is the Davies accuracy budget, the beta interval half-width plus estimated
-        roundoff, or zero at exact boundaries; it is NaN for saddlepoint/skipped
-        rows and does not measure statistical uncertainty. ``attrs`` records
-        ``method="davies"``, ``integration_tol``, ``integration_limit=10000``,
-        ``n_saddlepoint`` and ``covariance=None``.
+        One row per gene, sorted by decreasing ``Statistic``. ``Feature`` identifies
+        the gene. ``P_value`` tests its contrast. ``P_adj`` gives the
+        Benjamini–Hochberg adjustment across tested genes.
+
+        ``Estimate_per_bin`` gives the mean in group A minus the mean in group B.
+        Estimates use natural-log power or natural-log power share in fitted bin order.
+        L2 reports the weighted root mean square of these estimates.
+
+        For t-Cauchy, ``Statistic`` is the largest absolute t statistic.
+        ``T_per_bin`` and ``P_value_per_bin`` give signed t statistics and
+        unadjusted two-sided p-values. ``Best_bin`` is the zero-based index
+        of the smallest p-value among bins used in the combination.
+
+        For rotation, ``P_value_method`` identifies the calculation.
+        ``P_value_error`` gives its numerical error estimate or budget, when available.
 
     Raises
     ------
     ValueError
-        If input shapes or options are invalid, or the test cannot be fitted.
+        If the input or test options are invalid.
     RuntimeError
-        If conditional-tail evaluation fails, including the approximation fallback.
+        If the rotation p-value cannot be evaluated.
 
     Notes
     -----
-    For calibration assumptions and zero-variance behavior, see
-    :doc:`/guides/multisample`.
+    The binwise test uses Welch's t test. See :doc:`/guides/multisample` for calibration
+    assumptions and interpretation.
     """
     return _compare_two_group_profiles(
         spectra,
@@ -547,100 +532,85 @@ def compare_two_groups_masked(
     covariance: str | None = None,
     integration_tol: float = 1e-6,
 ) -> pd.DataFrame:
-    """Test a spectral difference between two groups using observed samples.
+    """Compare each gene's power spectrum between groups using its observed samples.
 
     Parameters
     ----------
     spectra : np.ndarray
-        Raw spectral powers of shape ``(n_samples, n_genes, n_bins)``;
-        not logged. Inputs are not modified.
-    groups : np.ndarray
-        Labels of shape ``(n_samples,)`` with exactly two distinct values.
-        Groups A and B follow the sorted label order.
+        Spectral power with shape ``(n_samples, n_genes, n_bins)``. Supply
+        finite, nonnegative power for observed samples.
+    groups : array-like
+        Two distinct group labels, one per sample. Group A has the first
+        label in sorted order. Group B has the second.
     presence : np.ndarray
-        Boolean observation mask of shape ``(n_samples, n_genes)``.
-        False entries exclude that sample from the feature's test.
+        Boolean array with shape ``(n_samples, n_genes)``. True means the
+        gene is present in that sample.
     gene_names : sequence of str, optional
-        Feature names. Defaults to stringified zero-based indices.
-    statistic : str
-        ``'log_l2'`` (default) is the weighted L2 contrast of log spectra.
-        ``'log_t_cauchy'`` combines per-bin Welch p-values on log profiles
-        and also supports localizing the best bin by its smallest p-value
-        among informative bins.
-        It requires two observations per arm and excludes constant bins.
+        Names in input gene order. The default labels are zero-based indices
+        written as strings.
+    statistic : {'log_l2', 'log_t_cauchy'}, default 'log_l2'
+        L2 measures the size of the contrast across bins. ``'log_t_cauchy'``
+        combines bin p-values and identifies the bin with the smallest
+        p-value among those used in the combination.
     null : str, optional
-        Null calibration depends on the statistic:
-
-        - ``'log_l2'``: ``'rotation'`` (default, deterministic conditional integration),
-          ``'plugin'`` (Gaussian plug-in calibration using the estimated covariance), or
-          ``'permutation'`` (shuffled binary labels).
-        - ``'log_t_cauchy'``: ``'analytic'`` only (per-bin t tails and
-          Cauchy combination).
-    n_perm : int
-        Number of sampled label permutations; default 1000. Ignored when
-        all assignments are enumerated or another null is selected.
-    max_exact_permutations : int
-        Enumerate all binary label assignments when their number is at
-        most this threshold; default 10000. Zero forces sampling.
+        For L2, use ``'rotation'`` (default) or ``'plugin'`` for Gaussian
+        plug-in calibration. Use ``'permutation'`` for two exchangeable groups.
+        For ``'log_t_cauchy'``, the only calibration is ``'analytic'`` (default).
+    n_perm : int, default 1000
+        Number of random group assignments for a sampled permutation test.
+    max_exact_permutations : int, default 10000
+        Enumerate all group assignments when their number is at most this
+        limit. Set it to zero to sample assignments.
     random_state : int, optional
-        Seed for binary label permutations; ignored by other nulls.
-    min_samples_per_group : int
-        Minimum observed samples per group for each feature (default 2).
-        L2 raises ValueError if either group has fewer labeled samples than
-        this minimum before masking. After masking, features below the minimum
-        in either group receive NaN results. Rotation and plug-in calibration
-        raise ValueError if no feature qualifies.
+        Random seed for sampled permutations.
+    min_samples_per_group : int, default 2
+        Minimum observed samples in each group for each gene. For L2,
+        each group must also meet this minimum before masking.
     freq_weights : np.ndarray, optional
-        Finite, strictly positive bin weights. None gives uniform weights.
-        Log t-Cauchy renormalizes weights over informative bins.
-    normalize_shape : bool
-        If True, divide each sample/feature spectrum by its total power
-        before logging to test spectral shape (DF-norm). Default False.
-    covariance : str or None
-        For plug-in L2 calibration, ``None`` or ``'per_gene'`` estimates residual covariance
-        separately for each gene. ``'pooled'`` shares it across eligible genes.
-        Specifying a covariance selects plug-in calibration when ``null`` is omitted.
-    integration_tol : float
-        Initial Davies absolute p-value error target for rotation; default 1e-6.
-        Use at most 10,000 terms per call and one accuracy retry. Accepted
-        integration also requires relative error budget <= 0.001. Unresolved
-        tails use marked saddlepoint approximation. Ignored by other nulls.
+        Positive, finite weights in fitted bin order.
+        The default gives each bin equal weight. Choose weights before testing.
+    normalize_shape : bool, default False
+        Divide each gene's power in each bin by its total power in that
+        sample before taking the logarithm (DF-norm).
+    covariance : str, optional
+        With plug-in calibration, ``None`` or ``'per_gene'`` estimates residual
+        covariance across bins for each gene. ``'pooled'`` shares this estimate
+        across eligible genes. Setting a covariance selects plug-in calibration
+        if you omit ``null``. For other calibrations, leave this as ``None``.
+    integration_tol : float, default 1e-6
+        Target absolute error for numerical integration of rotation p-values.
 
     Returns
     -------
     pandas.DataFrame
-        Columns ``Feature``, ``Statistic``, ``P_value`` and ``P_adj``.
-        ``Estimate_per_bin`` gives the mean A minus mean B on natural-log profiles
-        in original bin order, without frequency weights. For ``Statistic``, L2 reports the
-        weighted RMS of these unweighted estimates, similar to an aggregated effect
-        size. Log t-Cauchy reports the largest absolute t across bins.
-        It also adds signed ``T_per_bin`` and unadjusted ``P_value_per_bin``.
-        ``Best_bin`` is the zero-based index with the smallest
-        p-value among informative bins (first index on ties),
-        or missing if none. Skipped features have NaN per-bin arrays.
-        Feature-level significance does not establish the selected bin's significance.
-        Includes ``n_obs_A`` and ``n_obs_B``; skipped genes retain NaN results.
-        Rows are sorted by descending statistic; BH uses finite p-values.
-        Plug-in L2 results record ``null="plugin"`` and ``covariance`` in ``attrs``.
-        Rotation adds ``P_value_method`` (``davies``, ``saddlepoint``, ``beta``
-        or ``exact``; missing for skipped rows) and ``P_value_error``. The latter
-        is the Davies accuracy budget, the beta interval half-width plus estimated
-        roundoff, or zero at exact boundaries; it is NaN for saddlepoint/skipped
-        rows and does not measure statistical uncertainty. ``attrs`` records
-        ``method="davies"``, ``integration_tol``, ``integration_limit=10000``,
-        ``n_saddlepoint`` and ``covariance=None``.
+        One row per gene, sorted by decreasing ``Statistic``. ``Feature`` identifies
+        the gene. ``P_value`` tests its contrast. ``P_adj`` gives the
+        Benjamini–Hochberg adjustment across tested genes.
+
+        ``Estimate_per_bin`` gives the mean in group A minus the mean in group B.
+        Estimates use natural-log power or natural-log power share in fitted bin order.
+        L2 reports the weighted root mean square of these estimates.
+
+        For t-Cauchy, ``Statistic`` is the largest absolute t statistic.
+        ``T_per_bin`` and ``P_value_per_bin`` give signed t statistics and
+        unadjusted two-sided p-values. ``Best_bin`` is the zero-based index
+        of the smallest p-value among bins used in the combination.
+
+        For rotation, ``P_value_method`` identifies the calculation.
+        ``P_value_error`` gives its numerical error estimate or budget, when available.
+        ``n_obs_A`` and ``n_obs_B`` give the sample count in each group.
 
     Raises
     ------
     ValueError
-        If input shapes or options are invalid, or the test cannot be fitted.
+        If the input or test options are invalid.
     RuntimeError
-        If conditional-tail evaluation fails, including the approximation fallback.
+        If the rotation p-value cannot be evaluated.
 
     Notes
     -----
-    For calibration assumptions and zero-variance behavior, see
-    :doc:`/guides/multisample`.
+    The binwise test uses Welch's t test. See :doc:`/guides/multisample` for calibration
+    assumptions and interpretation.
     """
     return _compare_two_group_profiles(
         spectra,
@@ -673,89 +643,77 @@ def compare_glm(
     null: str | None = None,
     integration_tol: float = 1e-6,
 ) -> pd.DataFrame:
-    """Test one spectral linear-model contrast for each gene.
+    """Test a linear contrast in each gene's power spectrum.
 
     Parameters
     ----------
     spectra : np.ndarray
-        Raw spectral powers of shape ``(n_samples, n_genes, n_bins)``;
-        not logged. Inputs are not modified.
-    design : pandas.DataFrame or np.ndarray
-        Sample-level design. A DataFrame adds an intercept and encodes
-        categorical columns; column names must remain unique after encoding.
-        A numeric array is used as supplied, including any intercept.
+        Spectral power with shape ``(n_samples, n_genes, n_bins)``. Supply
+        finite, nonnegative power for observed samples.
+    design : pandas.DataFrame or 2-D np.ndarray
+        One row per sample. SONIC adds an intercept to a data frame and encodes
+        categorical predictors. Include any intercept in a numeric matrix yourself.
     contrast : str, dict, or np.ndarray
-        One finite, nonzero, estimable linear contrast. A string names
-        an encoded effect; a dictionary maps column names to coefficients;
-        an array supplies one coefficient per design column.
+        Name one coefficient, map coefficient names to weights, or supply a
+        vector in encoded design-matrix column order. The contrast must be
+        estimable from the design.
     gene_names : sequence of str, optional
-        Feature names. Defaults to stringified zero-based indices.
+        Names in input gene order. The default labels are zero-based indices
+        written as strings.
     freq_weights : np.ndarray, optional
-        Finite, strictly positive bin weights. None gives uniform weights.
-        Log t-Cauchy renormalizes weights over informative bins.
-    normalize_shape : bool
-        If True, divide each sample/feature spectrum by its total power
-        before logging to test spectral shape (DF-norm). Default False.
-    statistic : str
-        ``'log_l2'`` (default) tests the weighted L2 contrast of log spectra.
-        ``'log_t_cauchy'`` combines per-bin OLS contrast t-test p-values
-        and also supports localizing the best bin by its smallest p-value
-        among informative bins.
-    covariance : str or None
-        For plug-in L2 calibration, ``None`` or ``'per_gene'`` estimates residual covariance
-        separately for each gene. ``'pooled'`` shares it across eligible genes.
-        Specifying a covariance selects plug-in calibration when ``null`` is omitted.
+        Positive, finite weights in fitted bin order.
+        The default gives each bin equal weight. Choose weights before testing.
+    normalize_shape : bool, default False
+        Divide each gene's power in each bin by its total power in that
+        sample before taking the logarithm (DF-norm).
+    statistic : {'log_l2', 'log_t_cauchy'}, default 'log_l2'
+        L2 measures the size of the contrast across bins. ``'log_t_cauchy'``
+        combines bin p-values and identifies the bin with the smallest
+        p-value among those used in the combination.
+    covariance : str, optional
+        With plug-in calibration, ``None`` or ``'per_gene'`` estimates residual
+        covariance across bins for each gene. ``'pooled'`` shares this estimate
+        across eligible genes. Setting a covariance selects plug-in calibration
+        if you omit ``null``. For other calibrations, leave this as ``None``.
     null : str, optional
-        Null calibration depends on the statistic:
-
-        - ``'log_l2'``: ``'rotation'`` (default, deterministic conditional integration),
-          ``'plugin'`` (Gaussian plug-in calibration using the estimated covariance).
-        - ``'log_t_cauchy'``: ``'analytic'`` only (per-bin t tails and
-          Cauchy combination).
-    integration_tol : float
-        Initial Davies absolute p-value error target for rotation; default 1e-6.
-        Use at most 10,000 terms per call and one accuracy retry. Accepted
-        integration also requires relative error budget <= 0.001. Unresolved
-        tails use marked saddlepoint approximation. Ignored by other nulls.
+        For L2, use ``'rotation'`` (default) or ``'plugin'`` for Gaussian
+        plug-in calibration.
+        For ``'log_t_cauchy'``, the only calibration is ``'analytic'`` (default).
+    integration_tol : float, default 1e-6
+        Target absolute error for numerical integration of rotation p-values.
 
     Returns
     -------
     pandas.DataFrame
-        Columns ``Feature``, ``Statistic``, ``P_value`` and ``P_adj``.
-        ``Estimate_per_bin`` gives the fitted contrast on the natural-log profile
-        scale for each bin, in original order and without frequency weights.
-        A unit contrast on a 0/1 predictor gives the fitted difference from 0 to 1.
-        On a continuous predictor it gives the slope per unit increase.
-        For ``Statistic``, L2 reports the weighted RMS of the per-bin estimates.
-        Log t-Cauchy reports the largest absolute t across bins.
-        It also adds signed ``T_per_bin`` and unadjusted ``P_value_per_bin``.
-        ``Best_bin`` is the zero-based index with the smallest p-value among
-        informative bins (first index on ties), or missing
-        if none. Skipped features have NaN per-bin arrays.
-        Feature-level significance does not establish the selected bin's significance.
-        Rows are sorted by descending statistic; BH uses finite p-values.
-        Plug-in L2 results record ``null="plugin"`` and ``covariance`` in ``attrs``.
-        Rotation adds ``P_value_method`` (``davies``, ``saddlepoint``, ``beta``
-        or ``exact``; missing for skipped rows) and ``P_value_error``. The latter
-        is the Davies accuracy budget, the beta interval half-width plus estimated
-        roundoff, or zero at exact boundaries; it is NaN for saddlepoint/skipped
-        rows and does not measure statistical uncertainty. ``attrs`` records
-        ``method="davies"``, ``integration_tol``, ``integration_limit=10000``,
-        ``n_saddlepoint`` and ``covariance=None``.
+        One row per gene, sorted by decreasing ``Statistic``. ``Feature`` identifies
+        the gene. ``P_value`` tests its contrast. ``P_adj`` gives the
+        Benjamini–Hochberg adjustment across tested genes.
+
+        ``Estimate_per_bin`` gives the specified signed contrast in each bin.
+        Estimates use natural-log power or natural-log power share in fitted bin order.
+        L2 reports the weighted root mean square of these estimates.
+
+        For t-Cauchy, ``Statistic`` is the largest absolute t statistic.
+        ``T_per_bin`` and ``P_value_per_bin`` give signed t statistics and
+        unadjusted two-sided p-values. ``Best_bin`` is the zero-based index
+        of the smallest p-value among bins used in the combination.
+
+        For rotation, ``P_value_method`` identifies the calculation.
+        ``P_value_error`` gives its numerical error estimate or budget, when available.
 
     Raises
     ------
     ValueError
-        If input shapes or options are invalid, or the test cannot be fitted.
+        If the input or test options are invalid.
     RuntimeError
-        If conditional-tail evaluation fails, including the approximation fallback.
+        If the rotation p-value cannot be evaluated.
     TypeError
         If the design or contrast has an unsupported type.
 
     Notes
     -----
-    For calibration assumptions and zero-variance behavior, see
-    :doc:`/guides/multisample`.
+    The binwise test uses ordinary least squares. See :doc:`/guides/multisample` for calibration
+    assumptions and interpretation.
     """
     null = _resolve_profile_null(null, statistic, covariance)
     if statistic == "log_t_cauchy":
@@ -801,96 +759,84 @@ def compare_glm_masked(
     null: str | None = None,
     integration_tol: float = 1e-6,
 ) -> pd.DataFrame:
-    """Test one spectral linear-model contrast using each gene's observed samples.
+    """Test a linear contrast in each gene's power spectrum using its observed samples.
 
     Parameters
     ----------
     spectra : np.ndarray
-        Raw spectral powers of shape ``(n_samples, n_genes, n_bins)``;
-        not logged. Inputs are not modified.
-    design : pandas.DataFrame or np.ndarray
-        Sample-level design. A DataFrame adds an intercept and encodes
-        categorical columns; column names must remain unique after encoding.
-        A numeric array is used as supplied, including any intercept.
+        Spectral power with shape ``(n_samples, n_genes, n_bins)``. Supply
+        finite, nonnegative power for observed samples.
+    design : pandas.DataFrame or 2-D np.ndarray
+        One row per sample. SONIC adds an intercept to a data frame and encodes
+        categorical predictors. Include any intercept in a numeric matrix yourself.
     contrast : str, dict, or np.ndarray
-        One finite, nonzero, estimable linear contrast. A string names
-        an encoded effect; a dictionary maps column names to coefficients;
-        an array supplies one coefficient per design column.
+        Name one coefficient, map coefficient names to weights, or supply a
+        vector in encoded design-matrix column order. The contrast must be
+        estimable from the design.
     presence : np.ndarray
-        Boolean observation mask of shape ``(n_samples, n_genes)``.
-        False entries exclude that sample from the feature's test.
+        Boolean array with shape ``(n_samples, n_genes)``. True means the
+        gene is present in that sample.
     gene_names : sequence of str, optional
-        Feature names. Defaults to stringified zero-based indices.
+        Names in input gene order. The default labels are zero-based indices
+        written as strings.
     freq_weights : np.ndarray, optional
-        Finite, strictly positive bin weights. None gives uniform weights.
-        Log t-Cauchy renormalizes weights over informative bins.
-    normalize_shape : bool
-        If True, divide each sample/feature spectrum by its total power
-        before logging to test spectral shape (DF-norm). Default False.
-    min_resid_df : int
-        Minimum residual degrees of freedom for a masked GLM test;
-        default 1. Ineligible or unestimable features receive NaN results.
-    statistic : str
-        ``'log_l2'`` (default) tests the weighted L2 contrast of log spectra.
-        ``'log_t_cauchy'`` combines per-bin OLS contrast t-test p-values
-        and also supports localizing the best bin by its smallest p-value
-        among informative bins.
-    covariance : str or None
-        For plug-in L2 calibration, ``None`` or ``'per_gene'`` estimates residual covariance
-        separately for each gene. ``'pooled'`` shares it across eligible genes.
-        Specifying a covariance selects plug-in calibration when ``null`` is omitted.
+        Positive, finite weights in fitted bin order.
+        The default gives each bin equal weight. Choose weights before testing.
+    normalize_shape : bool, default False
+        Divide each gene's power in each bin by its total power in that
+        sample before taking the logarithm (DF-norm).
+    min_resid_df : int, default 1
+        Minimum residual degrees of freedom for each gene's linear model.
+    statistic : {'log_l2', 'log_t_cauchy'}, default 'log_l2'
+        L2 measures the size of the contrast across bins. ``'log_t_cauchy'``
+        combines bin p-values and identifies the bin with the smallest
+        p-value among those used in the combination.
+    covariance : str, optional
+        With plug-in calibration, ``None`` or ``'per_gene'`` estimates residual
+        covariance across bins for each gene. ``'pooled'`` shares this estimate
+        across eligible genes. Setting a covariance selects plug-in calibration
+        if you omit ``null``. For other calibrations, leave this as ``None``.
     null : str, optional
-        Null calibration depends on the statistic:
-
-        - ``'log_l2'``: ``'rotation'`` (default, deterministic conditional integration),
-          ``'plugin'`` (Gaussian plug-in calibration using the estimated covariance).
-        - ``'log_t_cauchy'``: ``'analytic'`` only (per-bin t tails and
-          Cauchy combination).
-    integration_tol : float
-        Initial Davies absolute p-value error target for rotation; default 1e-6.
-        Use at most 10,000 terms per call and one accuracy retry. Accepted
-        integration also requires relative error budget <= 0.001. Unresolved
-        tails use marked saddlepoint approximation. Ignored by other nulls.
+        For L2, use ``'rotation'`` (default) or ``'plugin'`` for Gaussian
+        plug-in calibration.
+        For ``'log_t_cauchy'``, the only calibration is ``'analytic'`` (default).
+    integration_tol : float, default 1e-6
+        Target absolute error for numerical integration of rotation p-values.
 
     Returns
     -------
     pandas.DataFrame
-        Columns ``Feature``, ``Statistic``, ``P_value`` and ``P_adj``.
-        ``Estimate_per_bin`` gives the fitted contrast on the natural-log profile
-        scale for each bin, in original order and without frequency weights.
-        A unit contrast on a 0/1 predictor gives the fitted difference from 0 to 1.
-        On a continuous predictor it gives the slope per unit increase.
-        For ``Statistic``, L2 reports the weighted RMS of the per-bin estimates.
-        Log t-Cauchy reports the largest absolute t across bins.
-        It also adds signed ``T_per_bin`` and unadjusted ``P_value_per_bin``.
-        ``Best_bin`` is the zero-based index with the smallest p-value among
-        informative bins (first index on ties), or missing
-        if none. Skipped features have NaN per-bin arrays.
-        Feature-level significance does not establish the selected bin's significance.
-        Includes ``n_obs`` and ``df_resid``; skipped genes retain NaN results.
-        Rows are sorted by descending statistic; BH uses finite p-values.
-        Plug-in L2 results record ``null="plugin"`` and ``covariance`` in ``attrs``.
-        Rotation adds ``P_value_method`` (``davies``, ``saddlepoint``, ``beta``
-        or ``exact``; missing for skipped rows) and ``P_value_error``. The latter
-        is the Davies accuracy budget, the beta interval half-width plus estimated
-        roundoff, or zero at exact boundaries; it is NaN for saddlepoint/skipped
-        rows and does not measure statistical uncertainty. ``attrs`` records
-        ``method="davies"``, ``integration_tol``, ``integration_limit=10000``,
-        ``n_saddlepoint`` and ``covariance=None``.
+        One row per gene, sorted by decreasing ``Statistic``. ``Feature`` identifies
+        the gene. ``P_value`` tests its contrast. ``P_adj`` gives the
+        Benjamini–Hochberg adjustment across tested genes.
+
+        ``Estimate_per_bin`` gives the specified signed contrast in each bin.
+        Estimates use natural-log power or natural-log power share in fitted bin order.
+        L2 reports the weighted root mean square of these estimates.
+
+        For t-Cauchy, ``Statistic`` is the largest absolute t statistic.
+        ``T_per_bin`` and ``P_value_per_bin`` give signed t statistics and
+        unadjusted two-sided p-values. ``Best_bin`` is the zero-based index
+        of the smallest p-value among bins used in the combination.
+
+        For rotation, ``P_value_method`` identifies the calculation.
+        ``P_value_error`` gives its numerical error estimate or budget, when available.
+        ``n_obs`` and ``df_resid`` give the sample count and residual degrees
+        of freedom.
 
     Raises
     ------
     ValueError
-        If input shapes or options are invalid, or the test cannot be fitted.
+        If the input or test options are invalid.
     RuntimeError
-        If conditional-tail evaluation fails, including the approximation fallback.
+        If the rotation p-value cannot be evaluated.
     TypeError
         If the design or contrast has an unsupported type.
 
     Notes
     -----
-    For calibration assumptions and zero-variance behavior, see
-    :doc:`/guides/multisample`.
+    The binwise test uses ordinary least squares. See :doc:`/guides/multisample` for calibration
+    assumptions and interpretation.
     """
     null = _resolve_profile_null(null, statistic, covariance)
     if statistic == "log_t_cauchy":
@@ -933,41 +879,42 @@ def compare_two_groups_scalar(
     log_expression: bool = False,
     eps: float = 1e-12,
 ) -> pd.DataFrame:
-    """Test a scalar mean difference between two groups with Welch's t test.
+    """Compare two groups for each gene with a two-sided Welch t test.
 
     Parameters
     ----------
     values : np.ndarray
-        Per-sample scalar responses of shape ``(n_samples, n_genes)``.
-        Inputs are not modified.
-    groups : np.ndarray
-        Labels of shape ``(n_samples,)`` with exactly two distinct values.
-        Groups A and B follow the sorted label order.
+        Sample-level responses with shape ``(n_samples, n_genes)``.
+    groups : array-like
+        Two distinct group labels, one per sample. Group A has the first
+        label in sorted order. Group B has the second.
     gene_names : sequence of str, optional
-        Feature names. Defaults to stringified zero-based indices.
-    log_expression : bool
-        If True, fit ``log(values + eps)`` instead of raw values.
-        Default False; the reported effect uses the fitted response scale.
-    eps : float
-        Positive additive offset used only with ``log_expression=True``;
-        default 1e-12.
+        Names in input gene order. The default labels are zero-based indices
+        written as strings.
+    log_expression : bool, default False
+        Test ``log(values + eps)`` using the natural logarithm. By default
+        the test uses the input values.
+    eps : float, default 1e-12
+        Positive offset for ``log_expression=True``.
 
     Returns
     -------
     pandas.DataFrame
-        Columns ``Feature``, ``Statistic`` (absolute Welch t), ``Mean_diff``
-        (group A minus B), ``P_value`` and ``P_adj``. P-values use the
-        two-sided Welch-Satterthwaite t tail.
-        Rows are sorted by descending statistic; BH uses finite p-values.
+        One row per gene, sorted by decreasing ``Statistic``. ``Feature`` identifies
+        the gene. ``P_value`` tests its contrast. ``P_adj`` gives the
+        Benjamini–Hochberg adjustment across tested genes.
+        ``Statistic`` is the absolute t statistic. ``Mean_diff`` gives the mean
+        in group A minus the mean in group B on the tested scale.
 
     Raises
     ------
     ValueError
-        If input shapes or options are invalid, or the test cannot be fitted.
+        If the input or test options are invalid.
 
     Notes
     -----
-    Both groups require two observations.
+    Each group needs at least two observations. Welch's test allows unequal
+    group variances.
     """
     values = np.asarray(values, dtype=float)
     if values.ndim != 2:
@@ -1007,49 +954,48 @@ def compare_glm_scalar(
     log_expression: bool = False,
     eps: float = 1e-12,
 ) -> pd.DataFrame:
-    """Test one scalar linear-model contrast with an OLS t test.
+    """Test a linear contrast for each gene with a two-sided ordinary least squares t test.
 
     Parameters
     ----------
     values : np.ndarray
-        Per-sample scalar responses of shape ``(n_samples, n_genes)``.
-        Inputs are not modified.
-    design : pandas.DataFrame or np.ndarray
-        Sample-level design. A DataFrame adds an intercept and encodes
-        categorical columns; column names must remain unique after encoding.
-        A numeric array is used as supplied, including any intercept.
+        Sample-level responses with shape ``(n_samples, n_genes)``.
+    design : pandas.DataFrame or 2-D np.ndarray
+        One row per sample. SONIC adds an intercept to a data frame and encodes
+        categorical predictors. Include any intercept in a numeric matrix yourself.
     contrast : str, dict, or np.ndarray
-        One finite, nonzero, estimable linear contrast. A string names
-        an encoded effect; a dictionary maps column names to coefficients;
-        an array supplies one coefficient per design column.
+        Name one coefficient, map coefficient names to weights, or supply a
+        vector in encoded design-matrix column order. The contrast must be
+        estimable from the design.
     gene_names : sequence of str, optional
-        Feature names. Defaults to stringified zero-based indices.
-    log_expression : bool
-        If True, fit ``log(values + eps)`` instead of raw values.
-        Default False; the reported effect uses the fitted response scale.
-    eps : float
-        Positive additive offset used only with ``log_expression=True``;
-        default 1e-12.
+        Names in input gene order. The default labels are zero-based indices
+        written as strings.
+    log_expression : bool, default False
+        Test ``log(values + eps)`` using the natural logarithm. By default
+        the test uses the input values.
+    eps : float, default 1e-12
+        Positive offset for ``log_expression=True``.
 
     Returns
     -------
     pandas.DataFrame
-        Columns ``Feature``, ``Statistic`` (absolute OLS t), ``Estimate``
-        (signed contrast), ``P_value`` and ``P_adj``. P-values use the
-        two-sided Student t tail with ``n_samples - rank(design)`` df.
-        Rows are sorted by descending statistic; BH uses finite p-values.
+        One row per gene, sorted by decreasing ``Statistic``. ``Feature`` identifies
+        the gene. ``P_value`` tests its contrast. ``P_adj`` gives the
+        Benjamini–Hochberg adjustment across tested genes.
+        ``Statistic`` is the absolute t statistic. ``Estimate`` gives the signed
+        contrast on the response scale used in the test.
 
     Raises
     ------
     ValueError
-        If input shapes or options are invalid, or the test cannot be fitted.
+        If the input or test options are invalid.
     TypeError
         If the design or contrast has an unsupported type.
 
     Notes
     -----
-    With zero residual variance, a zero contrast has p=1 and a nonzero
-    contrast has p=0.
+    The usual t reference assumes independent Gaussian errors with a common
+    variance across samples for each gene.
     """
     values = np.asarray(values, dtype=float)
     if values.ndim != 2:

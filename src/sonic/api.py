@@ -125,45 +125,34 @@ def Detector(data: Any, **kwargs: Any) -> Any:  # noqa: N802 - factory mimics cl
 def Comparator(  # noqa: N802 - factory mimics class names
     data_list: Sequence[Any], **kwargs: Any
 ) -> Any:
-    """Construct the right :class:`~sonic.Comparator` for ``data_list``.
-
-    Dispatches on the homogeneous element type:
-
-    - all :class:`anndata.AnnData` → :class:`~sonic.ComparatorIrregular`.
-    - all :class:`spatialdata.SpatialData` → :class:`~sonic.ComparatorGrid`.
-    - mixed types → :class:`TypeError`.
-
-    Unlike :func:`Detector`, the data list **is** forwarded as the
-    first positional arg to the chosen class (both comparator
-    constructors take ``samples`` as their first positional
-    parameter).
+    """Create a comparator for a set of biological samples.
 
     Parameters
     ----------
     data_list : sequence of anndata.AnnData or sequence of spatialdata.SpatialData
-        Per-sample inputs. Must all be of the same type.
+        One object per sample. Use the same input type for all samples.
     **kwargs
-        Forwarded to the chosen class's ``__init__`` verbatim
-        (e.g. ``gene_names=...``, ``feature_mode=...``, etc.). The
-        cross-sample contrast (``design``) is supplied later on
-        :meth:`test_diff_freq` / :meth:`test_diff_expr`, not here.
+        Options for :class:`~sonic.comparators.irregular.ComparatorIrregular`
+        (irregular coordinates) or :class:`~sonic.comparators.grid.ComparatorGrid`
+        (regular grids).
 
     Returns
     -------
     ComparatorIrregular or ComparatorGrid
-        Constructed comparator instance.
+        Use ``compute_spectra()`` before testing gene power or mean expression.
+        Use ``compute_cross_spectra(pairs)`` before testing gene pairs.
+        Supply the sample design when you call a test.
 
     Raises
     ------
     TypeError
-        If ``data_list`` is empty or its elements aren't all the
-        same supported type.
+        If the sequence is empty or contains mixed or unsupported types.
 
     Examples
     --------
     >>> from sonic import Comparator
-    >>> cmp = Comparator([a1, a2, a3]).compute_spectra()
-    >>> df = cmp.test_diff_freq(group_labels)
+    >>> comparison = Comparator([control1, control2, case1, case2]).compute_spectra()
+    >>> results = comparison.test_diff_freq([0, 0, 1, 1])
     """
     items = list(data_list)
     if len(items) == 0:

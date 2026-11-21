@@ -1,10 +1,5 @@
-"""Spectral feature construction, alignment and diagnostics for comparators.
-
-Shared radial/angular binning lives in :mod:`sonic.comparators.binning`.
-Comparator backends call the private helpers directly.
-Legacy binning imports remain available here for compatibility.
-Container handling and tests live in the comparator backends and multisample.
-"""
+"""Compute spatial power spectra, align directional spectra, and measure variation
+across gene profiles. See :mod:`sonic.comparators.binning` for frequency bins."""
 
 from __future__ import annotations
 
@@ -530,40 +525,25 @@ def gene_pattern_diversity(
     *,
     eps: float = 1e-12,
 ) -> float:
-    r"""Spatial-pattern diversity across genes within a single sample.
-
-    Quantifies how heterogeneous the per-gene spatial-frequency profiles
-    are within one sample. Computes the cross-gene covariance of the
-    log-spectra,
-
-    .. math::
-        \hat\Sigma_\mathrm{genes} \;=\; \frac{1}{G - 1}
-            \sum_g \big(\ell_g - \bar\ell\big)\big(\ell_g - \bar\ell\big)^\top
-
-    where :math:`\ell_g \in \mathbb{R}^K` is gene :math:`g`'s
-    radially-binned log-spectrum and :math:`\bar\ell` the mean across
-    genes, then returns ``effective_rank(Σ_genes, weights)``.
-
-    Interpretation:
-
-    - **Low diversity** (:math:`K_\mathrm{eff} \approx 1`): most genes
-      share the same spatial-frequency profile — the sample's spatial
-      patterns collapse onto a single dominant mode (e.g. all "smooth"
-      or all "punctate").
-    - **High diversity** (:math:`K_\mathrm{eff} \approx K`): genes vary
-      widely in their spatial structure — the sample carries a rich
-      mix of spatial scales.
+    """Measure how variation in log power across genes is distributed across bins.
 
     Parameters
     ----------
     spectra : np.ndarray
-        ``(n_genes, n_bins)`` raw spectrum matrix (typically a single sample's
-        radially-binned spectrum). Log is taken internally with an ``eps``
-        floor.
+        Power spectra for one sample with shape ``(n_genes, n_bins)``.
     weights : np.ndarray, optional
-        Per-bin weights, same semantics as :func:`effective_rank`.
+        Nonnegative weights for the frequency bins. The default gives each
+        bin equal weight.
     eps : float, default 1e-12
-        Floor for ``log(spectra)`` to handle exact-zero bins.
+        Lower bound on power before taking the natural logarithm.
+
+    Returns
+    -------
+    float
+        Effective rank of the covariance of log power across genes. A value
+        near one means that one linear combination of bins accounts for most
+        of the variance. Equal positive eigenvalues give a rank equal to
+        the number of bins.
     """
     if spectra.ndim != 2:
         raise ValueError(f"spectra must be (n_genes, n_bins), got shape {spectra.shape}.")

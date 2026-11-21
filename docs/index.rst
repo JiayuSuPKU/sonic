@@ -20,6 +20,7 @@ SONIC
    :hidden:
    :caption: API Reference
 
+   comparator_api
    autoapi/sonic/index
 
 .. toctree::
@@ -81,12 +82,10 @@ coordinate systems.
    pattern_results = comparison.test_diff_freq(groups, normalize_shape=True)
    expression_results = comparison.test_diff_expr(groups)
 
-The two result tables answer different questions. ``pattern_results`` tests
-whether spatial layout changes between groups; ``expression_results`` tests
-whether sample-level mean expression changes. See :doc:`guides/multisample`
-for covariates and multi-factor designs.
-Background normalization is optional and should be enabled only when
-sample-wide spectral differences are nuisance variation.
+With ``normalize_shape=True``, the pattern test compares each gene's share of
+power at each spatial scale. The expression test compares its mean expression
+between groups. See :doc:`guides/multisample` for test options, assumptions,
+and examples with sample-level covariates.
 
 
 Choose your input

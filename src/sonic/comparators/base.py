@@ -1,35 +1,7 @@
-"""
-Shared mixin and input-validation helpers for the comparator layer.
+"""Shared methods for the regular-grid and irregular-coordinate comparators.
 
-This module hosts the private :class:`_ComparatorBase` mixin that
-:class:`~sonic.ComparatorIrregular` and :class:`~sonic.ComparatorGrid`
-inherit from. The mixin owns:
-
-- the ``compute_spectra`` driver that turns per-sample 2-D images
-  into the ``(n_samples, n_genes, n_feature_bins)`` ``spectra_`` tensor;
-- the chainable preprocessing methods ``normalize_background()`` and
-  ``normalize_covariates(covariates)`` — thin wrappers around the
-  same-named standalone functions in
-  :mod:`sonic.comparators.normalization` that mutate ``spectra_`` in
-  place;
-- the test methods ``test_diff_freq(design, ...)`` and
-  ``test_diff_expr(design, ...)`` — design-at-call-time so a single
-  fitted comparator can serve any number of unrelated contrasts on
-  the same spectra;
-- the diagnostic ``effective_rank()``;
-
-- the ``compute_cross_spectra`` driver that computes pairwise cross-spectra
-  for given feature pairs and populates the ``cross_spectra_`` attribute.
-
-The shape-only / sum-1 feature representation is reached via the
-``normalize_shape: bool = False`` keyword on :meth:`test_diff_freq`
-(forwarded to its dispatch target), not via a chainable method — this
-keeps the per-test choice non-destructive.
-
-Concrete classes live in sibling modules:
-:mod:`sonic.comparators.irregular` and
-:mod:`sonic.comparators.grid`.
-"""
+Fit spectra once, then test the contrasts of interest. See
+:doc:`/guides/multisample` for examples and calibration assumptions."""
 
 from __future__ import annotations
 
@@ -148,80 +120,35 @@ def _unpack_sample_triples(
 
 
 class _ComparatorBase:
-    """Shared state + shared methods for NUFFT / FFT pattern comparators.
+    """Common interface for gene and gene-pair comparisons across samples.
 
-    Subclasses populate the small public surface and the underscored
-    internal state listed below in ``__init__``, then implement
-    :meth:`_sample_spectrum_chunker` to fill the post-``compute_spectra``
-    attributes. The comparator carries **no design / contrast state**:
-    cross-sample comparisons are specified per-call on
-    :meth:`test_diff_freq` and :meth:`test_diff_expr`, so a single
-    fitted comparator can serve any number of unrelated contrasts on
-    the same ``spectra_``.
-
-    Public attributes (user-facing, inspection-worthy)
-    --------------------------------------------------
+    Attributes
+    ----------
     samples : list
-        The exact ``samples`` sequence passed at construction (AnnData
-        list for the irregular path, SpatialData list for the grid
-        path). Reference-shared with the user's collection.
-    gene_names : list[str]
-        Per-gene labels (length ``n_genes``).
+        Input samples in design row order.
+    gene_names : list of str
+        Gene names in input column order.
     feature_mode : {'radial', '2d'}
-        Spectral feature representation chosen at construction.
-    freq_edges : np.ndarray | None
-        Shared radial-frequency bin edges used by both feature modes.
-        Auto-derived during :meth:`compute_spectra` if not supplied at
-        construction.
-
-    Public attributes set by :meth:`compute_spectra`
-    -------------------------------------------------
-    spectra_ : np.ndarray | None
-        Per-(sample, gene) spectral feature matrix, shape
-        ``(n_samples, n_genes, n_feature_bins)``. The trailing axis is
-        radial bins in ``feature_mode='radial'`` and flattened
-        ``radius × theta`` bins in ``feature_mode='2d'``. This is the
-        input to :meth:`test_diff_freq` and the in-place
-        :meth:`normalize_background` / :meth:`normalize_covariates`
-        preprocessing transforms.
-    dc_ : np.ndarray | None
-        DC component of the spectrum per (sample, gene), shape
-        ``(n_samples, n_genes)``. Equals the sample-grid mean of each
-        gene's uncentered expression. Input to :meth:`test_diff_expr`.
-    presence_ : np.ndarray | None
-        Boolean mask of shape ``(n_samples, n_genes)`` — ``True`` where
-        a gene's per-sample spot-presence fraction cleared
-        ``_presence_threshold``. Drives the masked variant of
-        :meth:`test_diff_freq` when any entry is ``False``.
-    rotation_angles_ : np.ndarray | None
-        Per-sample rotation angle (degrees) applied during
-        rotation-alignment. Populated only when ``feature_mode='2d'``.
-    freq_edges_requested_ : np.ndarray | None
-        The original auto-resolved or requested 1-D edge grid before adaptive
-        merging and support filtering. This is for reference purposes only.
-    frequency_bin_intervals_ : np.ndarray | None
-        The final radial frequency intervals of shape ``(n_retained_radius_bins, 2)``.
-        It is stored as intervals because after dropping empty bins the
-        edges may not be contiguous.
-    frequency_bin_counts_ : np.ndarray | None
-        Number of FFT-cell counts for each sample and originally requested radial
-        frequency bin, shape ``(n_samples, len(freq_edges_requested_) - 1)``.
-        These counts diagnose requested-bin support and distinguish empty
-        Fourier-grid intervals from true zero-power measurements in
-        :attr:`spectra_`.
-
-    cross_spectra_ : CrossSpectra | None
-        Pairwise result set by ``compute_cross_spectra``. Its ``cross_spectra``
-        and matched ``auto_spectra`` use the same retained radial intervals
-        as ``spectra_``.
-        Successful auto-spectrum recomputation clears this result. Failed
-        computations leave all previously fitted results intact.
-
-    Private state (set by subclasses; not part of the user API)
-    -----------------------------------------------------------
-    ``_n_radial_bins``, ``_n_theta_bins``, ``_fft_solver``, ``_workers``,
-    ``_presence_threshold``, ``_spacings``,
-    ``_spectrum_fft_solver``, ``_grid_shapes``.
+        Radial bins describe spatial scale. Directional bins also describe angle.
+    freq_edges : np.ndarray or None
+        Shared radial frequency edges in cycles per spatial unit.
+    spectra_ : np.ndarray or None
+        Power spectra with axes (sample, gene, bin). In directional mode, bin
+        indices run by radius and then by angle.
+    dc_ : np.ndarray or None
+        Mean expression for each sample and gene.
+    presence_ : np.ndarray or None
+        Boolean mask identifying genes that meet the sample's presence threshold.
+    rotation_angles_ : np.ndarray or None
+        Sample alignment angles in degrees for directional spectra.
+    freq_edges_requested_ : np.ndarray or None
+        Requested radial frequency edges before bin selection.
+    frequency_bin_intervals_ : np.ndarray or None
+        Lower and upper frequency bounds for each retained radial interval.
+    frequency_bin_counts_ : np.ndarray or None
+        Number of Fourier cells per sample and requested radial bin.
+    cross_spectra_ : CrossSpectra or None
+        Most recent result from ``compute_cross_spectra()``.
     """
 
     # --- public attribute stubs populated by subclass __init__ --------
@@ -656,54 +583,35 @@ class _ComparatorBase:
         memory_budget_bytes: int | str = _DEFAULT_CHUNK_BUDGET,
         chunk_size: int | str | None = None,
     ) -> _ComparatorBase:
-        """
-        Compute binned power spectra per feature per sample.
-
-        Frequency bins are either 1D radial (``feature_mode='radial'``) or
-        flattened 2D radial+angular (``feature_mode='2d'``).
-        In 2D mode, the per-sample spectra are optionally rotation-aligned using a
-        landmark gene set (default: a single geometric-mean landmark over all genes).
-        2D bins are interpolated after rotation to handle heterogeneous sample grids,
-        while empty 1D radial bins are adaptively merged to ensure every retained bin
-        has support in all samples.
+        """Compute a power spectrum for each gene in each sample.
 
         Parameters
         ----------
         n_jobs : int, default -1
-            Parallelism over samples for the per-sample spectrum pass. When
-            ``progress=True`` the outer loop is sequential (so the tqdm bar is
-            accurate). Transform threads use spare CPUs, capped at four by
-            default. With automatic chunks, negative job counts are also capped
-            by the workspace needed for one feature per concurrent sample.
+            Number of samples to process in parallel. Use ``-1`` for automatic
+            allocation. Set ``progress=False`` to enable parallel sample processing.
         landmark_genes : sequence of str, optional
-            Only used in ``feature_mode='2d'``. Names of genes (matched against
-            :attr:`gene_names`) whose spectra define the rotation-alignment
-            landmarks. Recovered rotations are still applied to every gene in
-            :attr:`gene_names`. If None (default), a single streamed geometric
-            mean over every configured gene is used on the first call, without
-            presence filtering. Later calls reuse existing alignment when None
-            is passed or the same explicit landmark panel is supplied. A changed
-            panel refits alignment. Successful recomputation clears cross_spectra_.
+            Genes that define sample alignment in directional mode. The default
+            reuses an existing alignment or estimates one from all genes.
         progress : bool, default True
-            Show tqdm progress bars over the three phases (spectrum compute,
-            optional rotation alignment, radial binning).
-        memory_budget_bytes : int or str, default 2147483648 (2 GiB)
-            Bytes or a size string, e.g. ``"512 MB"`` or ``"2 GiB"``. Units are
-            case-insensitive: GB uses powers of 1000, GiB powers of 1024.
-            Positive estimated transform-workspace budget shared across actual
-            sample jobs when ``fft_chunk_size`` / ``nufft_chunk_size`` is
-            ``'auto'``. More jobs divide this fixed budget; increase it explicitly
-            to allow larger batches. Setting explicit chunk sizes (``fft_chunk_size``
-            / ``nufft_chunk_size``) bypasses the budget limitation.
-
-        chunk_size : int, "auto" or None, default None
-            Genes per transform block. None uses the constructor setting;
-            explicit sizes override the budget for this call only.
+            Show a progress bar and process one sample at a time.
+        memory_budget_bytes : int or str, default '2 GiB'
+            Estimated memory available for automatic transform blocks across sample
+            jobs. Supply bytes or a size such as ``'512 MiB'``.
+        chunk_size : int, 'auto', or None, optional
+            Genes per transform block. By default, use the constructor setting.
+            An explicit size overrides the automatic memory budget.
 
         Returns
         -------
         self
-            Results replace the previous fit only after successful computation.
+            Stores binned powers in ``spectra_``, sample mean expression in ``dc_``,
+            and gene presence in ``presence_``. Radial bins describe spatial scale.
+            Directional bins also describe angle.
+
+        Notes
+        -----
+        Recomputing gene spectra clears any previously computed cross-spectra.
         """
         chunk_size = self._resolve_chunk_spec(chunk_size)
         # Fit on a shallow copy: old arrays are never mutated by extraction.
@@ -759,54 +667,40 @@ class _ComparatorBase:
         memory_budget_bytes: int | str = _DEFAULT_CHUNK_BUDGET,
         chunk_size: int | str | None = None,
     ) -> _ComparatorBase:
-        """Compute raw cross-spectra using the auto-spectrum grid and alignment.
+        """Compute cross-spectra for selected gene pairs on a common frequency grid.
 
         Parameters
         ----------
         pairs : sequence of (str, str)
-            Ordered feature pairs, using F_x * conj(F_y). Each requested name
-            must identify one feature in the source data. Self-pairs are
-            allowed; duplicate or reversed duplicate pairs are rejected.
+            Ordered gene pairs. Each name must identify one gene. Supply each
+            pair once, in one order. Self-pairs are available for description.
         n_jobs : int, default -1
-            Sample parallelism, as in compute_spectra. Progress reporting
-            processes samples serially; otherwise jobs share the memory budget.
+            Number of samples to process in parallel. Use ``-1`` for automatic
+            allocation. Set ``progress=False`` to enable parallel sample processing.
         landmark_genes : sequence of str, optional
-            Shared polar-alignment landmarks, as in compute_spectra. Cold calls
-            estimate alignment only but do not populate spectra_. None reuses
-            existing angles, or uses all configured genes on the first call.
-            If auto-spectra exist, change landmarks through compute_spectra first
-            to keep their frame consistent. Cross-spectra always use the same
-            alignment as the auto-spectra.
+            Genes that define sample alignment in directional mode. The default
+            reuses an existing alignment or estimates one from all genes.
         progress : bool, default True
-            Show progress during alignment and pair extraction.
-        memory_budget_bytes : int or str, default 2147483648 (2 GiB)
-            Estimated transform-workspace budget shared across sample jobs.
-        chunk_size : int, "auto" or None, default None
-            Features per transform block. None uses the constructor's
-            FFT/NUFFT chunk setting; explicit sizes override the budget.
+            Show a progress bar and process one sample at a time.
+        memory_budget_bytes : int or str, default '2 GiB'
+            Estimated memory available for automatic transform blocks across sample
+            jobs. Supply bytes or a size such as ``'512 MiB'``.
+        chunk_size : int, 'auto', or None, optional
+            Genes per transform block. By default, use the constructor setting.
+            An explicit size overrides the automatic memory budget.
 
         Returns
         -------
         self
-            Raw results are stored in cross_spectra_. Its cross_spectra and
-            coherency arrays have axes (sample, pair, bin); auto_spectra has
-            axes (sample, selected gene, bin). Radial intervals match
-            frequency_bin_intervals_; polar bins flatten radius then angle.
+            Stores the requested pairs in ``cross_spectra_``, replacing the previous
+            set. Cross-spectra have axes (sample, pair, bin). The matching power
+            spectra have axes (sample, gene, bin).
 
         Notes
         -----
-        Existing spectra_ and its normalization are preserved. A successful call
-        replaces cross_spectra_ with exactly the requested pairs; failures preserve
-        the previous result and alignment. Results are not implicitly accumulated.
-
-        Matching auto_spectra are recomputed from source values and agree
-        with the selected genes in unnormalized spectra_ within numerical
-        tolerance. They do not follow background or covariate normalization;
-        coherency always uses its matched raw cross- and auto-spectra.
-
-        Polar alignment uses one shared axial angle per sample, modulo
-        180 degrees. A half turn conjugates the cross-spectrum, leaving its
-        real part and coherence unchanged but reversing its imaginary part.
+        Pair spectra use the original expression values, even after single-gene
+        normalization. Both kinds of spectra use the same directional alignment.
+        To change landmarks after fitting gene spectra, call ``compute_spectra()`` first.
         """
         from sonic.comparators.cross_spectrum import _compute_cross_spectra
 
@@ -833,55 +727,37 @@ class _ComparatorBase:
         representation: str | None = None,
         memory_budget_bytes: int | str = _DEFAULT_CHUNK_BUDGET,
     ) -> SpatialExplanation:
-        """Explain selected raw spectrum bins in one sample's spatial coordinates.
-
-        This function allocates the observed feature value in each selected frequency bin
-        to the source coordinates. It is not a derivative or a local significance test.
+        """Map each location's contribution to selected frequency bins in one sample.
 
         Parameters
         ----------
-        features : str or sequence of one/two str
-            One feature for power, or an ordered pair for cross-spectrum maps.
+        features : str or sequence of str
+            One gene for a power map, or an ordered pair for a cross-spectrum map.
         sample_index : int, default 0
-            Sample in this comparator (or its subset).
+            Zero-based sample index in this comparator.
         bands : sequence of int
-            Distinct indices into the retained flattened spectrum, in output
-            order. Polar bins flatten radius then angle; these are not indices
-            into the original, potentially unsupported frequency intervals.
+            Distinct zero-based indices of retained bins, in the desired output
+            order. Directional bins use radius first, then angle.
         representation : str, optional
-            One feature: 'power' (default) or 'power_norm', which divides by
-            the sum of raw power across all retained bins. An all-zero power
-            profile remains zero. Pair: 'cross' (default, real co-spectrum),
-            'coherency' (real signed coherency), or 'coherence' (squared complex
-            magnitude). Invalid normalized pair bins raise ValueError.
+            For one gene, use ``'power'`` (default) or ``'power_norm'`` for its
+            share of total power. For a pair, use ``'cross'`` (default, real
+            cross-spectrum), ``'coherency'`` (signed real part), or ``'coherence'``
+            (squared magnitude).
         memory_budget_bytes : int or str, default '2 GiB'
-            Estimated memory for returned maps, reducers and transform scratch.
-            Checked before loading selected features.
+            Memory budget for reconstruction, including the returned maps.
 
         Returns
         -------
         sonic.explanation.SpatialExplanation
-            One map per requested bin band. Signed contributions sum to that bin's
-            **untransformed** feature (no log floor, test statistic or p-value is
-            attributed). When the selected representation requires scaling
-            (e.g., 'power_norm'), it is applied with observed normalization
-            factors held fixed, and no attribution from the denominator.
+            One map per selected bin. Local contributions sum to the bin value
+            on the selected representation's original scale. Individual
+            contributions can be negative, including for coherence.
 
         Notes
         -----
-        Requires compute_spectra() or compute_cross_spectra() first. Recomputes
-        only the selected source features using the fitted grid, bin reducers
-        and alignment, without refitting or changing caches. Maps always explain
-        raw-source spectra, including after normalize_background/covariates.
-
-        For complex polar cross-spectrum S, let a_i be its complex allocation.
-        Coherence allocates Re(conj(S) * a_i) / (P_x * P_y). Thus phase contributes
-        to coherence maps, and local contributions can be negative.
-
-        NUFFT maps retain source coordinates and row indices. FFT maps contain
-        occupied raster cells, indexed in C order, with local (y, x) coordinates
-        from spacing and origin zero, not SpatialData world coordinates. Only
-        frequency weights are aligned; spatial coordinates are never rotated.
+        Compute gene spectra or cross-spectra first. Maps use the source expression
+        values. Irregular samples retain their source coordinates. Grid maps use
+        local coordinates with origin zero and the specified grid spacing.
         """
         from sonic.comparators.explanation import _explain_spectrum
 
@@ -896,13 +772,18 @@ class _ComparatorBase:
 
     # ------------------------------------------------------------------
     def subset(self, indices: Sequence[int] | np.ndarray) -> _ComparatorBase:
-        """Return a lightweight comparator view over a subset of samples.
+        """Select samples from this comparator for another comparison.
 
-        The returned comparator is a shallow copy of ``self``: sample containers
-        and gene-level configuration are shared, while per-sample fitted arrays
-        and per-sample metadata are indexed to ``indices``. This is intended for
-        running multiple contrasts against one fitted comparator without
-        recomputing spectra.
+        Parameters
+        ----------
+        indices : sequence of int or np.ndarray
+            Sample indices in the desired order, or a Boolean mask in sample order.
+
+        Returns
+        -------
+        ComparatorIrregular or ComparatorGrid
+            A comparator with the selected samples and their available fitted
+            results. It shares the source sample objects with this comparator.
         """
         idx = np.asarray(indices)
         if idx.dtype == bool:
@@ -955,10 +836,13 @@ class _ComparatorBase:
     # Post-fit transforms
     # ------------------------------------------------------------------
     def normalize_background(self) -> _ComparatorBase:
-        """Normalize each sample using its observed genes' geometric mean.
+        """Adjust power in each frequency bin for the sample-wide background.
 
-        Genes excluded by ``presence_`` neither contribute to the background
-        nor get transformed. Samples with no observed genes are left unchanged.
+        Returns
+        -------
+        self
+            Updates ``spectra_`` using the geometric mean power of the observed
+            genes in each bin. Only observed genes enter the adjustment.
         """
         if self.spectra_ is None:
             raise RuntimeError("Call .compute_spectra() before .normalize_background().")
@@ -970,45 +854,22 @@ class _ComparatorBase:
         return self
 
     def normalize_covariates(self, covariates: Sequence[Any]) -> _ComparatorBase:  # noqa: C901
-        """Regress out per-sample covariate spectra from :attr:`spectra_`.
-
-        Two input modes, detected from the first element's type:
-
-        - **Sequence of str** — column-key list shared across samples.
-          Each string key is considered as one covariate applied to every
-          sample. Implementation depends on the subclass:
-
-            * :class:`~sonic.ComparatorIrregular` looks each key up in
-              ``adata.obs.columns`` first, then ``adata.var_names``
-              (preferring obs on collision); the resolved per-spot
-              vector is NUFFTed directly onto the sample's k-grid.
-            * :class:`~sonic.ComparatorGrid` rasterizes via
-              :func:`spatialdata.rasterize_bins` with the keys forwarded
-              as ``value_key`` (any combination of ``.obs`` columns and
-              ``var_names``).
-
-        - **Sequence of np.ndarray** — per-sample pre-rasterized images,
-          one ``(n_covariates, ny_i, nx_i)`` array per sample. Universal
-          path; works on either subclass. Use when you want full control
-          over rasterization, or when the covariates aren't already
-          attached to the sample containers. These rasters must have
-          frequency support compatible with the comparator's retained bins.
-
-        Both modes produce the same downstream behaviour: per-sample
-        covariate features are reduced to ``(n_covariates, n_feature_bins)``
-        (same trailing axis as :attr:`spectra_`) and passed through
-        :func:`~sonic.comparators.normalization.normalize_covariates` to
-        log-space-residualise each gene's spectrum against them.
+        """Adjust gene power for the spectra of known spatial covariates in each sample.
 
         Parameters
         ----------
         covariates : sequence of str or sequence of np.ndarray
-            See modes above. Strings are interpreted by the subclass;
-            ndarrays are used verbatim (one per sample).
+            Names of spatial covariates shared by the samples. On irregular
+            coordinates, SONIC checks ``obs`` first and then ``var_names``. On a
+            grid, use keys from the expression table. Alternatively, supply one
+            array of shape ``(n_covariates, ny, nx)`` per sample on a grid that
+            supports its frequency bins.
 
         Returns
         -------
-        self : _ComparatorBase
+        self
+            Replaces ``spectra_`` with the exponentiated residuals from regressing
+            each gene's log power on the log powers of the spatial covariates.
         """
         if self.spectra_ is None:
             raise RuntimeError("Call .compute_spectra() before .normalize_covariates().")
@@ -1172,105 +1033,90 @@ class _ComparatorBase:
         covariance: str | None = None,
         integration_tol: float = 1e-6,
     ) -> Any:
-        """Test differential frequency (DF) on the fitted gene spectra.
+        """Compare gene power across spatial frequencies in the fitted samples.
 
         Parameters
         ----------
-        design : 1-D array, pandas.DataFrame, or 2-D np.ndarray
-            Binary labels select the two-group path. A DataFrame or 2D array
-            selects a GLM; supplying ``contrast`` also selects a GLM.
-            Rows must match the fitted sample order. DataFrames add an intercept;
-            numeric matrices are used as supplied.
+        design : array-like, pandas.DataFrame, or 2-D np.ndarray
+            One row per sample, in fitted sample order. Use one-dimensional labels
+            for two groups. Use a design matrix and ``contrast`` for a linear model.
+            SONIC adds an intercept to a data frame. Include any intercept in a
+            numeric matrix yourself.
         contrast : str, dict, or np.ndarray, optional
-            One linear contrast, required on the GLM path. Names, coefficient
-            dictionaries, and arrays follow :func:`~sonic.comparators.multisample.compare_glm`.
-        statistic : str
-            ``'log_l2'`` (default) is the weighted L2 contrast of log spectra.
-            ``'log_t_cauchy'`` combines per-bin p-values on log profiles using
-            Welch for binary labels or OLS contrast t tests for a GLM. It also
-            supports localizing the best bin by its smallest per-bin p-value
-            among informative bins.
+            Required for a linear model. Name one coefficient, map coefficient names
+            to weights, or supply a vector in encoded design-matrix column order.
+            The contrast must be estimable from the design.
+        statistic : {'log_l2', 'log_t_cauchy'}, default 'log_l2'
+            L2 measures the size of the contrast across bins. ``'log_t_cauchy'``
+            combines bin p-values and identifies the bin with the smallest
+            p-value among those used in the combination.
         null : str, optional
-            Null calibration depends on the statistic:
-
-            - ``'log_l2'``: ``'rotation'`` (default, deterministic conditional integration),
-              ``'plugin'`` (Gaussian plug-in calibration using the estimated covariance), or
-              ``'permutation'`` (binary labels only, without ``contrast``).
-            - ``'log_t_cauchy'``: ``'analytic'`` only (per-bin t tails and
-              Cauchy combination).
-        n_perm : int
-            Number of sampled label permutations; default 1000. Ignored when
-            all assignments are enumerated or another null is selected.
+            For L2, use ``'rotation'`` (default) or ``'plugin'`` for Gaussian
+            plug-in calibration. Use ``'permutation'`` for two exchangeable groups
+            with one-dimensional labels and no ``contrast``.
+            For ``'log_t_cauchy'``, the only calibration is ``'analytic'`` (default).
+        n_perm : int, default 1000
+            Number of random group assignments for a sampled permutation test.
         random_state : int, optional
-            Seed for binary label permutations; ignored by other nulls.
+            Random seed for sampled permutations.
         freq_weights : np.ndarray, optional
-            Finite, strictly positive weights in fitted bin order. None gives uniform
-            weights. Log t-Cauchy renormalizes weights over informative bins.
-            Choose weights independently of the observed signal.
-        max_exact_permutations : int
-            Enumerate all binary label assignments when their number is at
-            most this threshold; default 10000. Zero forces sampling.
-        normalize_shape : bool
-            If True, divide each sample/feature spectrum by its total power
-            before logging to test spectral shape (DF-norm). Default False.
-        min_samples_per_group : int
-            Minimum observed samples per arm for binary L2 and masked binary t-Cauchy
-            tests. Defaults to 2.
-        min_resid_df : int
-            Minimum residual degrees of freedom in masked GLM tests; default 1.
-            Ignored for unmasked or binary comparisons.
-        covariance : str or None
-            For plug-in L2 calibration, ``None`` or ``'per_gene'`` estimates residual covariance
-            separately for each gene. ``'pooled'`` shares it across eligible genes.
-            Specifying a covariance selects plug-in calibration when ``null`` is omitted.
-        integration_tol : float
-            Initial Davies absolute p-value error target for rotation; default 1e-6.
-            Use at most 10,000 terms per call and one accuracy retry. Accepted
-            integration also requires relative error budget <= 0.001. Unresolved
-            tails use marked saddlepoint approximation. Ignored by other nulls.
+            Positive, finite weights in fitted bin order.
+            The default gives each bin equal weight. Choose weights before testing.
+        max_exact_permutations : int, default 10000
+            Enumerate all group assignments when their number is at most this
+            limit. Set it to zero to sample assignments.
+        normalize_shape : bool, default False
+            Divide each gene's power in each bin by its total power in that
+            sample before taking the logarithm (DF-norm).
+        min_samples_per_group : int, default 2
+            Minimum observed samples in each group for binary L2 tests and
+            masked binary t-Cauchy tests.
+        min_resid_df : int, default 1
+            Minimum residual degrees of freedom for a masked linear model.
+        covariance : str, optional
+            With plug-in calibration, ``None`` or ``'per_gene'`` estimates residual
+            covariance across bins for each gene. ``'pooled'`` shares this estimate
+            across eligible genes. Setting a covariance selects plug-in calibration
+            if you omit ``null``. For other calibrations, leave this as ``None``.
+        integration_tol : float, default 1e-6
+            Target absolute error for numerical integration of rotation p-values.
 
         Returns
         -------
         pandas.DataFrame
-            ``Feature``, ``Statistic``, ``P_value`` and ``P_adj``, sorted by
-            descending statistic. Masked binary tests include ``n_obs_A`` and
-            ``n_obs_B``; masked GLMs include ``n_obs`` and ``df_resid``.
-            Both statistics return ``Estimate_per_bin``: mean A minus mean B
-            (sorted binary labels), or the specified GLM contrast, on natural-log
-            profiles in original bin order. For ``Statistic``, L2 reports the
-            weighted RMS of these unweighted estimates, similar to an aggregated effect
-            size. Log t-Cauchy reports the largest absolute t across bins.
-            It also adds signed ``T_per_bin`` and raw ``P_value_per_bin``.
-            ``Best_bin`` is the zero-based index with the smallest p-value among
-            informative bins (first index on ties), or missing
-            if none. Skipped genes have NaN per-bin arrays. Feature-level
-            significance does not establish the selected bin's significance.
-            BH uses finite feature p-values.
-            Plug-in L2 results record ``null="plugin"`` and ``covariance`` in ``attrs``.
-            Rotation adds ``P_value_method`` (``davies``, ``saddlepoint``, ``beta``
-            or ``exact``; missing for skipped rows) and ``P_value_error``. The latter
-            is the Davies accuracy budget, the beta interval half-width plus estimated
-            roundoff, or zero at exact boundaries; it is NaN for saddlepoint/skipped
-            rows and does not measure statistical uncertainty. ``attrs`` records
-            ``method="davies"``, ``integration_tol``, ``integration_limit=10000``,
-            ``n_saddlepoint`` and ``covariance=None``.
+            One row per gene, sorted by decreasing ``Statistic``. ``Feature`` identifies
+            the gene. ``P_value`` tests its contrast. ``P_adj`` gives the
+            Benjamini-Hochberg adjustment across tested genes.
+
+            ``Estimate_per_bin`` gives the first sorted group's mean minus the second
+            group's mean, or the specified linear contrast.
+            Estimates use natural-log power or natural-log power share in fitted bin order.
+            L2 reports the weighted root mean square of these estimates.
+
+            For t-Cauchy, ``Statistic`` is the largest absolute t statistic.
+            ``T_per_bin`` and ``P_value_per_bin`` give signed t statistics and
+            unadjusted two-sided p-values. ``Best_bin`` is the zero-based index
+            of the smallest p-value among bins used in the combination.
+
+            For rotation, ``P_value_method`` identifies the calculation.
+            ``P_value_error`` gives its numerical error estimate or budget, when available.
+            Masked comparisons add ``n_obs_A`` and ``n_obs_B`` for binary groups,
+            or ``n_obs`` and ``df_resid`` for a linear model.
 
         Raises
         ------
         RuntimeError
-            If spectra have not been computed or conditional-tail evaluation fails.
+            If spectra are unavailable or the rotation p-value cannot be evaluated.
         ValueError
-            If shapes, options, or the contrast are invalid.
+            If the input or test options are invalid.
         NotImplementedError
-            If a GLM permutation null is requested.
+            If a linear model requests label permutation.
 
         Notes
         -----
-        Uses :func:`~sonic.comparators.multisample.compare_two_groups` or
-        :func:`~sonic.comparators.multisample.compare_glm` and their masked
-        variants. ``normalize_shape`` leaves the cached spectra unchanged.
-        For calibration assumptions and zero-variance behavior, see
-        :doc:`/guides/multisample`.
+        Binary labels select binwise Welch t tests. A linear model uses ordinary
+        least squares t tests. See :doc:`/guides/multisample` for calibration
+        assumptions and interpretation.
         """
         if self.spectra_ is None:
             raise RuntimeError("Call .compute_spectra() before .test_diff_freq().")
@@ -1365,118 +1211,98 @@ class _ComparatorBase:
         covariance: str | None = None,
         integration_tol: float = 1e-6,
     ):
-        """Test differential frequency in the coupling profiles of gene pairs.
+        """Compare the spatial coupling of each gene pair across samples.
 
         Parameters
         ----------
-        design : 1-D array, pandas.DataFrame, or 2-D np.ndarray
-            Binary labels select the two-group path. A DataFrame or 2D array
-            selects a GLM; supplying ``contrast`` also selects a GLM.
-            Rows must match the fitted sample order. DataFrames add an intercept;
-            numeric matrices are used as supplied.
+        design : array-like, pandas.DataFrame, or 2-D np.ndarray
+            One row per sample, in fitted sample order. Use one-dimensional labels
+            for two groups. Use a design matrix and ``contrast`` for a linear model.
+            SONIC adds an intercept to a data frame. Include any intercept in a
+            numeric matrix yourself.
         contrast : str, dict, or np.ndarray, optional
-            One linear contrast, required on the GLM path. Names, coefficient
-            dictionaries, and arrays follow :func:`~sonic.comparators.multisample.compare_glm`.
-        representation : str
-            ``'coherence'`` (default) tests log squared-magnitude coherency.
-            ``'coherency'`` tests its signed real part without logging.
-        statistic : str
-            ``'l2'`` (default) is the weighted L2 contrast on the selected scale.
-            ``'t_cauchy'`` combines per-bin p-values using Welch for binary
-            labels or OLS contrast t tests for a GLM. It also localizes the
-            best bin by its smallest p-value among informative bins.
+            Required for a linear model. Name one coefficient, map coefficient names
+            to weights, or supply a vector in encoded design-matrix column order.
+            The contrast must be estimable from the design.
+        representation : {'coherence', 'coherency'}, default 'coherence'
+            ``'coherence'`` tests the natural logarithm of squared-magnitude coherency.
+            ``'coherency'`` tests the signed real part of coherency.
+        statistic : {'l2', 't_cauchy'}, default 'l2'
+            L2 measures the size of the contrast across bins. ``'t_cauchy'``
+            combines bin p-values and identifies the bin with the smallest
+            p-value among those used in the combination.
         null : str, optional
-            Null calibration depends on the statistic:
-
-            - ``'l2'``: ``'rotation'`` (default, deterministic conditional integration),
-              ``'plugin'`` (Gaussian plug-in calibration using the estimated covariance), or
-              ``'permutation'`` (binary labels only, without ``contrast``).
-            - ``'t_cauchy'``: ``'analytic'`` only (per-bin t tails and
-              Cauchy combination).
-        n_perm : int
-            Number of sampled label permutations; default 1000. Ignored when
-            all assignments are enumerated or another null is selected.
+            For L2, use ``'rotation'`` (default) or ``'plugin'`` for Gaussian
+            plug-in calibration. Use ``'permutation'`` for two exchangeable groups
+            with one-dimensional labels and no ``contrast``.
+            For ``'t_cauchy'``, the only calibration is ``'analytic'`` (default).
+        n_perm : int, default 1000
+            Number of random group assignments for a sampled permutation test.
         random_state : int, optional
-            Seed for binary label permutations; ignored by other nulls.
+            Random seed for sampled permutations.
         freq_weights : np.ndarray, optional
-            Finite, strictly positive weights in original bin order (radius then angle
-            for polar features). None gives uniform weights. Weights are normalized
-            over supported bins for L2 and informative supported bins for t-Cauchy.
-            Choose weights independently of the observed signal.
-        max_exact_permutations : int
-            Enumerate all binary label assignments when their number is at
-            most this threshold; default 10000. Zero forces sampling.
-        min_samples_per_group : int
-            Minimum observed samples per arm for binary L2 and masked binary t-Cauchy
-            tests. Defaults to 2.
-        min_resid_df : int
-            Minimum residual degrees of freedom in masked GLM tests; default 1.
-            Ignored for unmasked or binary comparisons.
-        covariance : str or None
-            For plug-in L2 calibration, ``None`` or ``'per_pair'`` estimates residual covariance
-            on each pair's retained samples and bins. ``'pooled'`` shares it across
-            eligible pairs and PSD-corrects the pooled matrix. Specifying a
-            covariance selects plug-in calibration when ``null`` is omitted.
-        integration_tol : float
-            Initial Davies absolute p-value error target for rotation; default 1e-6.
-            Use at most 10,000 terms per call and one accuracy retry. Accepted
-            integration also requires relative error budget <= 0.001. Unresolved
-            tails use marked saddlepoint approximation. Ignored by other nulls.
+            Positive, finite weights in original bin order (radius, then angle).
+            The default gives each bin equal weight. Choose weights before testing.
+        max_exact_permutations : int, default 10000
+            Enumerate all group assignments when their number is at most this
+            limit. Set it to zero to sample assignments.
+        min_samples_per_group : int, default 2
+            Minimum observed samples in each group for binary L2 tests and
+            masked binary t-Cauchy tests.
+        min_resid_df : int, default 1
+            Minimum residual degrees of freedom for a masked linear model.
+        covariance : str, optional
+            With plug-in calibration, ``None`` or ``'per_pair'`` estimates residual
+            covariance across bins for each pair. ``'pooled'`` shares this estimate
+            across eligible pairs. Setting a covariance selects plug-in calibration
+            if you omit ``null``. For other calibrations, leave this as ``None``.
+        integration_tol : float, default 1e-6
+            Target absolute error for numerical integration of rotation p-values.
 
         Returns
         -------
         pandas.DataFrame
-            ``Feature_1``, ``Feature_2``, ``Statistic``, ``P_value`` and ``P_adj``,
-            sorted by descending statistic. L2 reports the weighted distance;
-            t-Cauchy reports the largest absolute t across bins.
-            Includes sample/bin counts, ``DF_resid`` (design residual df),
-            ``Effective_rank``, ``N_pairs_pooled`` and ``Status``. Binary tests
-            also return ``n_obs_A`` and ``n_obs_B``. Skipped and self-pair rows
-            have NaN p-values; BH uses finite pair p-values.
+            One row per pair, sorted by decreasing ``Statistic``. ``Feature_1`` and
+            ``Feature_2`` identify the pair. ``P_value`` tests its contrast. ``P_adj`` gives
+            the Benjamini-Hochberg adjustment across tested pairs.
 
-            Both statistics return signed ``Estimate_per_bin``: mean A minus mean B
-            (sorted binary labels), or the specified GLM contrast, on natural-log
-            coherence or untransformed real coherency. Estimates include supported
-            bins in original bin order; unsupported bins and skipped
-            pairs have NaNs. t-Cauchy adds signed ``T_per_bin`` and raw ``P_value_per_bin``.
-            ``Best_bin`` is the zero-based index with the smallest p-value among
-            informative bins (first index on ties), or missing
-            if none. Pair-level significance does not establish the selected
-            bin's significance. Welch degrees of freedom vary by bin;
-            ``DF_resid`` is not the df used for its tails.
+            ``Estimate_per_bin`` gives the first sorted group's mean minus the second
+            group's mean, or the specified linear contrast.
+            Estimates use natural-log coherence or real coherency in original bin order.
+            L2 reports the weighted root mean square of these estimates.
 
-            ``attrs`` records retained sample/bin indices, representation and design.
-            Pass ``attrs["original_freq_weights"]`` (a tuple or None) as ``freq_weights``
-            to replay the comparison. ``attrs["freq_weights"]`` holds normalized weights.
-            ``covariance`` is ``'pooled_across_valid_bins_psd'``,
-            ``'per_pair'``, or None. Per-pair fits have one pooled contributor;
-            skipped, rotation, permutation and t-Cauchy pairs have zero. t-Cauchy has no
-            covariance or effective rank and records ``per_bin_test`` as
-            ``welch`` or ``ols``. Rotation effective ranks describe the
-            conditional scatter. Rotation adds ``P_value_method`` (``davies``, ``saddlepoint``, ``beta``
-            or ``exact``; missing for skipped rows) and ``P_value_error``. The latter
-            is the Davies accuracy budget, the beta interval half-width plus estimated
-            roundoff, or zero at exact boundaries; it is NaN for saddlepoint/skipped
-            rows and does not measure statistical uncertainty. ``attrs`` records
-            ``method="davies"``, ``integration_tol``, ``integration_limit=10000``,
-            ``n_saddlepoint`` and ``covariance=None``.
-            Permutation counts/exactness are per-pair when masked, otherwise shared.
+            For t-Cauchy, ``Statistic`` is the largest absolute t statistic.
+            ``T_per_bin`` and ``P_value_per_bin`` give signed t statistics and
+            unadjusted two-sided p-values. ``Best_bin`` is the zero-based index
+            of the smallest p-value among bins used in the combination.
+
+            For rotation, ``P_value_method`` identifies the calculation.
+            ``P_value_error`` gives its numerical error estimate or budget, when available.
+            ``N_samples`` and ``N_bins`` give the retained counts. ``Status`` indicates
+            whether the pair was tested. ``DF_resid`` gives design residual degrees
+            of freedom. Binary comparisons also report ``n_obs_A`` and ``n_obs_B``.
+            ``N_pairs_pooled`` counts the pairs used to estimate covariance.
+            ``Effective_rank`` measures how many directions account for variation
+            in the plug-in covariance or conditional rotation distribution.
+            Use ``attrs["original_freq_weights"]`` to repeat the bin weighting.
 
         Raises
         ------
         RuntimeError
-            If the required spectra have not been computed or conditional-tail evaluation fails.
+            If cross-spectra are unavailable or the rotation p-value cannot be evaluated.
         ValueError
-            If shapes, options, or the contrast are invalid.
+            If the input or test options are invalid.
         NotImplementedError
-            If a GLM permutation null is requested.
+            If a linear model requests label permutation.
 
         Notes
         -----
-        Each pair retains samples where both genes are present, and bins
-        valid in every retained sample. Self-pairs are descriptive only.
-        For calibration assumptions and zero-variance behavior, see
-        :doc:`/guides/multisample`.
+        Each pair uses samples where both genes are present and bins with valid
+        coherency in all those samples. Self-pairs are descriptive only.
+
+        Binary labels select binwise Welch t tests. A linear model uses ordinary
+        least squares t tests. See :doc:`/guides/multisample` for calibration
+        assumptions and interpretation.
         """
         from sonic.comparators.cross_spectrum import _compare_cross_spectra
 
@@ -1512,68 +1338,58 @@ class _ComparatorBase:
         min_resid_df: int = 1,
         covariance: str | None = None,
     ) -> _PluginNullState:
-        """Estimate the covariance for Gaussian plug-in calibration of L2 and return fitted coefficients.
+        """Estimate residual covariance across bins for Gaussian plug-in calibration.
 
         Parameters
         ----------
-        design : 1-D array, pandas.DataFrame, or 2-D np.ndarray
-            Binary labels select the two-group path. A DataFrame or 2D array
-            selects a GLM; supplying ``contrast`` also selects a GLM.
-            Rows must match the fitted sample order. DataFrames add an intercept;
-            numeric matrices are used as supplied.
+        design : array-like, pandas.DataFrame, or 2-D np.ndarray
+            One row per sample, in fitted sample order. Use one-dimensional labels
+            for two groups. Use a design matrix and ``contrast`` for a linear model.
+            SONIC adds an intercept to a data frame. Include any intercept in a
+            numeric matrix yourself.
         contrast : str, dict, or np.ndarray, optional
-            One linear contrast, required on the GLM path. Names, coefficient
-            dictionaries, and arrays follow :func:`~sonic.comparators.multisample.compare_glm`.
+            Required for a linear model. Name one coefficient, map coefficient names
+            to weights, or supply a vector in encoded design-matrix column order.
+            The contrast must be estimable from the design.
         freq_weights : np.ndarray, optional
-            Finite, strictly positive bin weights, normalized to sum to one.
-            None gives uniform weights.
-        normalize_shape : bool
-            If True, divide each sample/feature spectrum by its total power
-            before logging to test spectral shape (DF-norm). Default False.
-        min_samples_per_group : int
-            Minimum observed samples per arm in binary comparisons. Defaults to 2.
-        min_resid_df : int
-            Minimum residual degrees of freedom in masked GLM tests; default 1.
-            Ignored for unmasked or binary comparisons.
-        covariance : str or None
-            ``None`` or ``'per_gene'`` estimates residual covariance separately for
-            each gene (default). ``'pooled'`` shares it across eligible genes.
+            Positive, finite weights in fitted bin order. The default gives each
+            bin equal weight.
+        normalize_shape : bool, default False
+            Divide each gene's power in each bin by its total power in that
+            sample before taking the logarithm (DF-norm).
+        min_samples_per_group : int, default 2
+            Minimum number of observed samples in each group for a binary fit.
+        min_resid_df : int, default 1
+            Minimum residual degrees of freedom for a masked linear model.
+        covariance : str, optional
+            Use ``'per_gene'`` (default) for separate gene covariance estimates.
+            Use ``'pooled'`` for a shared estimate across eligible genes.
 
         Returns
         -------
         dict
-            Plug-in null state with common keys ``mode``, ``masked``,
-            ``observed``, ``beta``, ``sigma_log``, ``freq_weights``, ``weighted_cov``,
-            ``eigenvalues``, ``effective_rank``, ``contrast_scale``,
-            ``df_resid``, ``eligible``, and the effective ``covariance`` choice.
-            With per-gene covariance, ``sigma_log`` and ``weighted_cov``
-            have shape ``(n_genes, n_bins, n_bins)``, ``eigenvalues`` has shape
-            ``(n_genes, n_bins)``, and ``effective_rank`` and ``roundoff`` are
-            per-gene vectors. Ineligible covariance/eigenvalue rows are NaN.
-            Full per-gene covariance storage is only allocated by this diagnostic
-            method; tests retain eigenvalues without storing all matrices.
+            ``sigma_log`` gives the covariance across bins. Its shape is
+            ``(n_genes, n_bins, n_bins)`` for separate estimates and
+            ``(n_bins, n_bins)`` for a pooled estimate. ``weighted_cov`` includes the bin
+            weights. ``effective_rank`` measures how many directions account for its
+            variance. ``eigenvalues`` also includes the contrast variance factor.
+            ``observed`` gives the L2 statistic and ``eligible`` identifies tested genes.
 
-            Fitted ``beta`` coefficients always have shape
-            ``(n_terms, n_genes, n_bins)`` on the tested profile scale. GLM
-            coefficients are returned in the original predictor units. For
-            aliased terms, the fit uses the minimum-norm solution in the
-            column-scaled design. Binary tests return two rows: the group-A
-            mean and B-minus-A difference, with groups ordered by ``np.unique``.
-            Skipped genes retain NaNs.
-            Two-group-only metadata: ``n_obs_A`` and ``n_obs_B``.
-            GLM-only metadata: ``design_columns``, ``contrast_vector``, and ``n_obs``.
+            ``beta`` contains fitted coefficients in the original predictor units,
+            with shape ``(n_terms, n_genes, n_bins)``. For binary labels the two rows
+            give the first sorted group's mean and the second mean minus the first.
+            For a linear model, ``design_columns`` identifies the coefficient rows.
 
         Raises
         ------
         RuntimeError
-            If the required spectra have not been computed.
+            Compute spectra before calling this method.
         ValueError
-            If shapes, options, or the contrast are invalid.
+            If the input or test options are invalid.
 
         Notes
         -----
-        This diagnostic stores full covariance matrices. Comparison tests
-        retain eigenvalues without storing all per-gene covariance matrices.
+        See :doc:`/guides/multisample` for the covariance options.
         """
         if self.spectra_ is None:
             raise RuntimeError("Call .compute_spectra() before .estimate_null_covariance().")
@@ -1633,45 +1449,46 @@ class _ComparatorBase:
         log_expression: bool = False,
         eps: float = 1e-12,
     ) -> Any:
-        """Test differential expression (DE) on the fitted sample-level DC means.
+        """Compare the sample mean expression of each gene.
 
         Parameters
         ----------
-        design : 1-D array, pandas.DataFrame, or 2-D np.ndarray
-            Binary labels select the two-group path. A DataFrame or 2D array
-            selects a GLM; supplying ``contrast`` also selects a GLM.
-            Rows must match the fitted sample order. DataFrames add an intercept;
-            numeric matrices are used as supplied.
+        design : array-like, pandas.DataFrame, or 2-D np.ndarray
+            One row per sample, in fitted sample order. Use one-dimensional labels
+            for two groups. Use a design matrix and ``contrast`` for a linear model.
+            SONIC adds an intercept to a data frame. Include any intercept in a
+            numeric matrix yourself.
         contrast : str, dict, or np.ndarray, optional
-            One linear contrast, required on the GLM path. Names, coefficient
-            dictionaries, and arrays follow :func:`~sonic.comparators.multisample.compare_glm`.
-        log_expression : bool
-            If True, fit ``log(dc + eps)`` instead of raw DC means.
-            Default False; reported effects use the fitted response scale.
-        eps : float
-            Positive additive offset used only with ``log_expression=True``;
-            default 1e-12.
+            Required for a linear model. Name one coefficient, map coefficient names
+            to weights, or supply a vector in encoded design-matrix column order.
+            The contrast must be estimable from the design.
+        log_expression : bool, default False
+            Take the natural logarithm of each sample's mean expression plus ``eps``.
+            By default, the test uses mean expression on the input scale.
+        eps : float, default 1e-12
+            Positive offset for ``log_expression=True``.
 
         Returns
         -------
         pandas.DataFrame
-            ``Feature``, ``Statistic`` (absolute t), ``P_value`` and ``P_adj``,
-            plus ``Mean_diff`` (group A minus B) for binary comparisons or
-            ``Estimate`` (signed contrast) for GLMs. Rows are sorted by
-            descending statistic; BH uses finite p-values.
+            One row per gene, sorted by decreasing ``Statistic``. ``Feature`` identifies
+            the gene. ``P_value`` tests its contrast. ``P_adj`` gives the
+            Benjamini-Hochberg adjustment across tested genes.
+            ``Statistic`` is the absolute t statistic. ``Mean_diff`` gives the first
+            sorted group's mean minus the second group's mean. A linear model
+            returns its signed contrast in ``Estimate``.
 
         Raises
         ------
         RuntimeError
-            If the required spectra have not been computed.
+            Compute spectra before calling this method.
         ValueError
-            If shapes, options, or the contrast are invalid.
+            If the input or test options are invalid.
 
         Notes
         -----
-        Binary comparisons use :func:`~sonic.comparators.multisample.compare_two_groups_scalar`
-        and Welch-Satterthwaite tails. GLMs use
-        :func:`~sonic.comparators.multisample.compare_glm_scalar` and Student t tails.
+        Binary labels select Welch's t test. A design matrix or an explicit
+        contrast selects an ordinary least squares t test.
         """
         if self.dc_ is None:
             raise RuntimeError("Call .compute_spectra() before .test_diff_expr().")
@@ -1700,24 +1517,26 @@ class _ComparatorBase:
         )
 
     def effective_rank(self, *, weights: np.ndarray | None = None) -> np.ndarray:
-        """Per-sample effective rank ``K_eff`` of the gene-spectrum covariance.
-
-        Quantifies how concentrated the spatial-frequency content is along
-        the eigen-directions of each sample's cross-gene-spectrum covariance matrix.
-        ``K_eff = (Σλ)² / Σλ²`` — bounded by 1 (rank-1, all power on a
-        single direction) and ``n_feature_bins`` (uniformly spread).
+        """Measure how the variance across genes is distributed across frequency bins.
 
         Parameters
         ----------
         weights : np.ndarray, optional
-            Per-bin weights (same semantics as ``freq_weights``). When
-            given, returns the effective rank of
-            ``W^{1/2} Σ W^{1/2}`` — useful for analysing how a
-            frequency-weighted L2 statistic redistributes its power.
+            Nonnegative weights in fitted bin order. By default, use the
+            unweighted covariance across bins.
 
         Returns
         -------
-        np.ndarray of shape ``(n_samples,)``.
+        np.ndarray
+            One effective rank per sample. For nonzero covariance, the rank is one
+            when a single direction accounts for all the variance. It equals the
+            number of bins when all covariance eigenvalues are equal.
+
+        Notes
+        -----
+        The covariance is calculated from log power across genes in this sample.
+        The effective rank is the squared sum of its eigenvalues divided by the
+        sum of their squares.
         """
         if self.spectra_ is None:
             raise RuntimeError("Call .compute_spectra() before .effective_rank().")

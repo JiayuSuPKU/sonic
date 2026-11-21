@@ -120,37 +120,32 @@ def cauchy_combine(
     where: np.ndarray | None = None,
     weights: np.ndarray | None = None,
 ) -> np.ndarray:
-    """
-    Weighted Cauchy combination test.
-
-    Forms :math:`T = \\sum_k w_k \\cot(\\pi p_k)` with nonnegative weights
-    normalized over selected tests, and returns
-    :math:`p = \\arctan2(1, T) / \\pi`. The Cauchy reference is exact for
-    independent uniform p-values; under dependence it is a tail approximation
-    with distributional assumptions. Weighting does not correct invalid
-    individual p-values.
+    """Combine p-values from several tests with the weighted Cauchy test.
 
     Parameters
     ----------
     pvals : np.ndarray
-        Input p-values in ``[0, 1]``. Values at the exact endpoints are
-        clipped away from them to keep :math:`\\tan` finite.
+        Input p-values between zero and one.
     axis : int, default -1
-        Axis along which to combine.
+        Axis containing the tests to combine.
     where : np.ndarray of bool, optional
-        Broadcastable mask selecting informative tests. Slices with no
-        selected tests return 1. Unselected tests receive no weight.
+        Boolean mask that can be broadcast to the input shape. True selects a test.
     weights : np.ndarray, optional
-        One-dimensional finite nonnegative weights along ``axis``, with a
-        positive finite sum. None gives equal weights. Weights are normalized
-        over selected tests; zero weights exclude tests. Slices with no positive
-        selected weight return 1. Choose weights independently of the observed
-        test statistics.
+        One finite, nonnegative weight per test along ``axis``, with a positive
+        sum. A zero weight excludes a test. Choose weights independently of the
+        observed test statistics. The default gives selected tests equal weight.
 
     Returns
     -------
     np.ndarray
-        Combined p-value(s); one less axis than ``pvals``.
+        One combined p-value per input slice, with the test axis removed.
+        A slice with no selected positive weight returns one.
+
+    Notes
+    -----
+    The reference distribution is exact for independent uniform null p-values
+    with fixed weights and selection. For dependent tests, the Cauchy tail
+    is an approximation.
     """
     pvals = np.asarray(pvals, dtype=float)
     clipped = np.clip(pvals, np.finfo(float).tiny, np.nextafter(1.0, 0.0))

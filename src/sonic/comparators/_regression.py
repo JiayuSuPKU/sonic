@@ -83,7 +83,7 @@ def _resolve_contrast(
       with >1 matching column this raises ``ValueError`` (multi-DOF
       contrasts are out of scope; pass an explicit dict or ndarray).
     - ``dict``: maps column-name → coefficient; missing columns get 0.
-    - ``ndarray`` of shape ``(p,)``: used as-is.
+    - ``ndarray`` of shape ``(p,)``: weights in encoded design-matrix column order.
     """
     n_terms = len(design_columns)
     if isinstance(contrast, np.ndarray):

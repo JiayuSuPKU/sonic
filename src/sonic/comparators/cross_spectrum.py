@@ -50,57 +50,46 @@ from sonic.utils import _parse_memory_budget, resolve_parallelism
 
 @dataclass
 class CrossSpectra:
-    """Raw binned cross-spectra and their matching auto-spectra.
+    """Binned cross-spectra and the corresponding power spectra of the genes.
 
     Attributes
     ----------
-    cross_spectra : ndarray, shape (n_samples, n_pairs, n_bins)
-        Ordered products F_x * conj(F_y) / n_observed**2 after mean centering.
-        Radial bins contain real co-spectra (stored with zero imaginary part);
-        polar bins retain complex phase. Finite raw values are preserved
-        even when coherency is masked.
-    auto_spectra : ndarray, shape (n_samples, n_genes, n_bins)
-        Matching raw powers for the selected genes, in gene_names order.
-        These agree with the corresponding unnormalized ``comparator.spectra_``
-        within numerical tolerance. They are recomputed from source values
-        and do not follow later background or covariate normalization.
+    cross_spectra : np.ndarray, shape (n_samples, n_pairs, n_bins)
+        Mean cross-products for the ordered pairs. The second gene supplies
+        the complex conjugate. Radial bins retain the real part. Directional
+        bins also retain phase information.
+    auto_spectra : np.ndarray, shape (n_samples, n_genes, n_bins)
+        Power spectra from the source expression values, in ``gene_names`` order.
     pairs : tuple of (str, str)
-        Requested ordered gene pairs.
+        Ordered gene pairs in the requested order.
     gene_names : tuple of str
-        Selected genes, retaining the comparator's gene order.
-    presence : ndarray of bool, shape (n_samples, n_genes)
-        Expression presence for selected genes, in gene_names order. Testing
-        uses a sample only when both genes in the pair are present.
-    pair_indices : ndarray, shape (n_pairs, 2)
-        Indices into gene_names for each ordered pair.
-    coherency_valid : ndarray of bool, shape (n_samples, n_pairs, n_bins)
-        Whether coherency can be computed. Requires finite cross-spectra,
-        at least two frequency groups, sufficient expression presence and
-        positive auto-power above 1e-12 of each gene's peak band power.
-    mode_pair_counts : ndarray, shape (n_samples, n_bins)
-        Contributing source-frequency groups up to conjugacy, excluding DC.
-        These are geometric support counts, not independent observations.
-    frequency_bin_intervals : ndarray, shape (n_radius, 2)
-        Retained radial intervals in cycles per spatial unit, matching the
-        comparator's ``frequency_bin_intervals_``. Polar arrays flatten radius
-        then angle, with angle varying fastest.
-    angle_centers_rad : ndarray, shape (n_theta,)
-        Polar sector centers in radians over [0, pi); empty for radial bins.
-    rotation_angles_deg : ndarray, shape (n_samples,)
-        A copy of the comparator's shared polar alignment angles in degrees;
-        zeros for radial bins. No separate pairwise alignment is estimated.
+        Genes in the selected pairs, in comparator order.
+    presence : np.ndarray of bool, shape (n_samples, n_genes)
+        True when the gene meets the sample's expression presence criterion.
+    pair_indices : np.ndarray, shape (n_pairs, 2)
+        Indices of each pair in ``gene_names``.
+    coherency_valid : np.ndarray of bool, shape (n_samples, n_pairs, n_bins)
+        True where the data support a coherency estimate for the pair.
+    mode_pair_counts : np.ndarray, shape (n_samples, n_bins)
+        Number of frequency groups in each bin. A Fourier mode and its
+        conjugate count as one group.
+    frequency_bin_intervals : np.ndarray, shape (n_radius, 2)
+        Retained radial intervals in cycles per spatial unit. Directional bins
+        are ordered by radius, then by angle.
+    angle_centers_rad : np.ndarray
+        Directional bin centers in radians over a half turn. Empty for radial bins.
+    rotation_angles_deg : np.ndarray, shape (n_samples,)
+        Sample alignment angles in degrees. Zero for radial bins.
     feature_mode : {'radial', '2d'}
-        Same feature mode as the comparator; '2d' denotes polar bins.
+        Frequency representation used for the spectra.
     chunk_schedules : list of dict
-        Per-sample chunk_size, estimated_workspace_bytes, n_locations and
-        n_freqs (number of source Fourier cells). No FFT cache is retained.
+        Per-sample processing sizes and estimated memory use.
 
     Notes
     -----
-    The same nonnegative bin weights reduce cross-products and both powers.
-    Polar alignment is axial, modulo 180 degrees. A half turn conjugates
-    the complex cross-spectrum, so the sign of its imaginary part has an
-    orientation ambiguity; the real part and coherence are unaffected.
+    Directional alignment determines an axis up to a half turn. A half turn
+    reverses the sign of the imaginary part of coherency. The real part and
+    squared magnitude are invariant to this choice.
     """
 
     cross_spectra: np.ndarray
@@ -119,7 +108,7 @@ class CrossSpectra:
 
     @property
     def coherency(self):
-        """Cross-spectrum / sqrt(matched auto powers); radial values are signed."""
+        """Cross-spectrum divided by the geometric mean of the two gene powers in each bin."""
         return self._coherency_block(slice(None))
 
     def _coherency_block(self, pairs):
@@ -137,7 +126,7 @@ class CrossSpectra:
 
     @property
     def coherence(self):
-        """Squared magnitude of coherency; invalid bins remain NaN."""
+        """Squared magnitude of coherency in each bin."""
         return np.abs(self.coherency) ** 2
 
 
@@ -1188,6 +1177,7 @@ def _compare_cross_spectra(  # noqa: C901 — validation and dispatch over binar
     contrast : str, dict or ndarray, optional
         One finite, nonzero, estimable GLM contrast. Required when ``groups``
         is None; supplying it selects the GLM path even with binary labels.
+        Contrast vectors follow the encoded design-matrix column order.
     representation : {'coherence', 'coherency'}, default 'coherence'
         Let ``k = S_xy / sqrt(S_xx * S_yy)`` using matching binned products.
         ``coherence`` tests ``Y = log(max(abs(k)**2, 1e-12))``;

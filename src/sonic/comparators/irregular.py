@@ -1,7 +1,4 @@
-"""
-:class:`ComparatorIrregular` — cross-sample pattern comparison on a
-list of :class:`anndata.AnnData` (irregular spots, NUFFT backend).
-"""
+"""Compare spectra from irregular locations stored in :class:`anndata.AnnData`."""
 
 from __future__ import annotations
 
@@ -35,102 +32,55 @@ logger = logging.getLogger(__name__)
 
 
 class ComparatorIrregular(_ComparatorBase):
-    """
-    Cross-sample pattern comparison on irregular spots via NUFFT.
+    """Compare spatial power spectra at irregular sample coordinates.
 
-    Accepts a list of :class:`anndata.AnnData` (one per sample). For each
-    sample, the per-sample ``obsm[obsm_key]`` supplies the irregular
-    ``(y, x)`` coordinates and ``.X`` (or ``.layers[layer]`` when set) is the
-    expression matrix. Spectra are evaluated with a batched type-1 NUFFT
-    (``finufft.nufft2d1``), densifying at most :attr:`nufft_chunk_size`
-    columns of ``.X`` at a time so the full slab is never materialized.
+    See :doc:`/comparator_api` for methods and return values.
 
     Parameters
     ----------
-    samples : sequence of :class:`anndata.AnnData`
+    samples : sequence of anndata.AnnData
+        One object per sample. Each expression matrix has locations in rows
+        and genes in columns.
     gene_names : sequence of str, optional
-        If None, inferred from the first sample; every other sample must share
-        the same ``var_names``.
+        Gene names in input column order. By default, use the first sample's
+        ``var_names``. All samples must have the same names in the same order.
     feature_mode : {'radial', '2d'}, default 'radial'
-        2D features are adaptive, area-weighted radial/angular band means.
+        Radial bins average power over directions at each spatial scale.
+        Use ``'2d'`` to retain direction after aligning the sample spectra.
     n_radial_bins : int, default 30
-        Number of radial frequency intervals used when ``freq_edges`` is not
-        supplied. Radial mode excludes only the DC cell from the first interval,
-        so the automatic radial feature count is ``n_radial_bins``.
+        Number of requested radial intervals when ``freq_edges`` is omitted.
     n_theta_bins : int, default 36
-        Number of angular bins on the half-plane ``[0, π)`` for
-        ``feature_mode='2d'``. Ignored by radial mode. The 2D feature
-        count is ``n_radius_bins * n_theta_bins``, where
-        ``n_radius_bins = len(freq_edges) - 1`` (or ``n_radial_bins`` when
-        edges are auto-generated).
-    obsm_key : str, default 'spatial'. Key for the spatial coordinates in ``obsm``.
+        Number of angular intervals over a half turn for ``feature_mode='2d'``.
+    obsm_key : str, default 'spatial'
+        Key in ``obsm`` for the two spatial coordinates per location.
     layer : str, optional
+        Expression layer in each sample. The default uses ``X``.
     unit_scales : sequence of float, optional
-        Per-sample multiplier applied to coords before NUFFT (e.g. pixels→μm).
-    grid_shape, spacing : optional
-        Internal NUFFT k-grid definition. Each argument may be a single pair
-        applied to every sample — ``grid_shape=(ny, nx)`` and
-        ``spacing=(dy, dx)`` — or a per-sample sequence of pairs of length
-        ``n_samples``. ``spacing`` is in the same physical units as
-        ``coords * unit_scale`` and sets the frequency unit used downstream
-        (for example cycles/μm when coordinates are scaled to μm).
-
-        Manual grid control is used only when **both** ``grid_shape`` and
-        ``spacing`` are supplied. If either is omitted, both values are
-        auto-inferred independently for each sample from its unit-scaled
-        coordinates with :func:`sonic.kernels.nufft._infer_grid_from_coords`.
-
-        These values define each sample's raw NUFFT lattice; they do not by
-        themselves choose the comparison bins. Unless ``freq_edges`` is given,
-        :meth:`compute_spectra` builds one shared physical-frequency bin grid
-        from all resolved spacings: edges span ``[0, min Nyquist]``, where each
-        sample's Nyquist is ``1 / (2 * max(dy, dx))``. Radial features bin each
-        sample's spectrum onto those shared edges; ``feature_mode='2d'`` uses
-        the same edges as the polar radius grid after rotation alignment.
-        The 2D path evaluates one extra Fourier mode on each side of both axes
-        for interpolation at the Nyquist boundary. This preserves the original
-        physical frequencies without periodically wrapping off-grid spectra.
+        One coordinate multiplier per sample to convert to common physical units.
+    grid_shape : pair of ints or sequence of pairs, optional
+        Grid height and width for the nonuniform Fourier transform (NUFFT).
+        Supply both ``grid_shape`` and ``spacing`` for a manual grid. Otherwise,
+        SONIC infers both from each sample's coordinates.
+    spacing : pair of floats or sequence of pairs, optional
+        Grid spacing in the scaled coordinate units, in ``(dy, dx)`` order.
+        For both grid options, supply one pair for all samples or one per sample.
     freq_edges : np.ndarray, optional
-        Explicit shared radial-frequency bin edges. When supplied, these edges
-        are used as-is for all samples and override the automatic
-        ``[0, min Nyquist]`` construction. Edges must be in the same units as
-        ``spacing``. With the default DC exclusion, only the zero-frequency cell
-        is removed before bin averaging, so radial output has
-        ``len(freq_edges) - 1`` columns; automatic edges produce
-        ``n_radial_bins`` radial columns. In ``feature_mode='2d'``, the number
-        of radius bins is ``len(freq_edges) - 1`` and the feature axis has
-        ``(len(freq_edges) - 1) * n_theta_bins`` columns.
+        Shared radial bin edges in cycles per spatial unit. The automatic edges
+        cover the frequency range common to all samples.
     adaptive_freq_edges : bool, default False
-        If True, collapse radial bins that are empty for any sample's Fourier
-        grid by merging each empty bin into its right neighbour. Otherwise,
-        empty bins will be dropped across all samples. Regardless of the setting,
-        the retained final bins will always have support in every sample.
-        The fitted comparator records per-sample bin occupancy for the original
-        requested grid in ``frequency_bin_counts_``,
-        the pre-adaptation edge grid in ``freq_edges_requested_``, and
-        feature-axis-aligned intervals in ``frequency_bin_intervals_``.
+        Merge adjacent radial intervals when a sample lacks frequency support.
+        By default, omit unsupported radial intervals. The retained intervals
+        are available in ``frequency_bin_intervals_``.
     eps : float, default 1e-6
-        NUFFT tolerance.
+        Requested NUFFT accuracy.
     presence_threshold : float, default 0.0
-        Minimum fraction of non-zero spots for a gene to count as "observed"
-        in a sample (feeds :attr:`presence_` and, transitively, the masked
-        pattern test).
+        Minimum fraction of spots with nonzero expression for a gene
+        to count as present in a sample.
     nufft_chunk_size : int or 'auto', default 'auto'
-        Number of genes per batched NUFFT call. Automatic batches are capped
-        at 32 features and share the estimated workspace across sample jobs.
-        ``'auto'`` sizes the chunk from the per-sample k-grid shapes via
-        :func:`sonic.utils.resolve_chunk_size` — the NUFFT cache
-        cap (32) is reduced further by the live-memory budget.
+        Genes per transform block. The automatic size uses the memory budget.
     workers : int, 'auto', or None, default 'auto'
-        FINUFFT threads per sample job. Automatic threads use spare CPUs,
-        capped at four; ``None`` selects one.
-
-    Notes
-    -----
-    The comparator carries no design / contrast state — supply the
-    cross-sample contrast directly to :meth:`test_diff_freq` /
-    :meth:`test_diff_expr`. A single fitted comparator can therefore
-    serve any number of unrelated comparisons on the same spectra.
+        Threads per sample for the NUFFT. Use ``None`` for one thread or
+        ``'auto'`` to share available CPUs with concurrent sample jobs.
     """
 
     # NUFFT cache sweet-spot cap for nufft_chunk_size='auto' (utils.auto_chunk_size).

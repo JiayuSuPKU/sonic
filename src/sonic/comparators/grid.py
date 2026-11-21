@@ -1,8 +1,4 @@
-"""
-:class:`ComparatorGrid` — cross-sample pattern comparison on a list of
-:class:`spatialdata.SpatialData` (regular rasterized bins, FFT
-backend).
-"""
+"""Compare spectra from regular grids stored in :class:`spatialdata.SpatialData`."""
 
 from __future__ import annotations
 
@@ -71,88 +67,54 @@ def _observed_nonzero_fraction(block: np.ndarray) -> np.ndarray:
 
 
 class ComparatorGrid(_ComparatorBase):
-    """
-    Cross-sample pattern comparison on regular bins via FFT + SpatialData.
+    """Compare spatial power spectra on regular rectangular grids.
 
-    Accepts a list of :class:`spatialdata.SpatialData` (one per sample). For
-    each sample, :func:`spatialdata.rasterize_bins` turns the designated bin
-    shape + table into a dense ``(n_genes, ny, nx)`` image, which is then fed
-    to the batched 2D FFT. All samples are expected to share the same
-    rasterization schema (``bins`` / ``table_name`` / ``col_key`` / ``row_key``
-    / ``value_key``) — this mirrors :class:`~sonic.DetectorGrid`.
+    See :doc:`/comparator_api` for methods and return values.
 
     Parameters
     ----------
-    samples : sequence of :class:`spatialdata.SpatialData`
+    samples : sequence of spatialdata.SpatialData
+        One object per sample. Use the same table and grid keys in each.
     bins : str
-        SpatialElement key for the bin shapes in each ``sdata``.
+        Key for the spatial bin shapes.
     table_name : str
-        Table key in each ``sdata.tables``.
-    col_key, row_key : str
-        Column / row-index columns in the table's ``.obs``.
+        Key for the expression table in each sample.
+    col_key : str
+        Column in the expression table's ``obs`` that gives the grid column index.
+    row_key : str
+        Column in the expression table's ``obs`` that gives the grid row index.
     value_key : str, optional
-        Expression column in ``.obs``; defaults to ``None`` (rasterizes counts
-        / presence directly off ``.X``).
+        Key for the values to rasterize. The default uses the expression matrix.
     gene_names : sequence of str, optional
-        If None, inferred from the first sample's table. All samples must
-        share ``var_names``.
+        Gene names in input column order. By default, use the first sample's
+        ``var_names``. All samples must have the same names in the same order.
     feature_mode : {'radial', '2d'}, default 'radial'
-        2D features are adaptive, area-weighted radial/angular band means.
+        Radial bins average power over directions at each spatial scale.
+        Use ``'2d'`` to retain direction after aligning the sample spectra.
     n_radial_bins : int, default 30
-        Number of radial frequency intervals used when ``freq_edges`` is not
-        supplied. Radial mode excludes only the DC cell from the first interval,
-        so the automatic radial feature count is ``n_radial_bins``.
+        Number of requested radial intervals when ``freq_edges`` is omitted.
     n_theta_bins : int, default 36
-        Number of angular bins on the half-plane ``[0, π)`` for
-        ``feature_mode='2d'``. Ignored by radial mode. The 2D feature
-        count is ``n_radius_bins * n_theta_bins``, where
-        ``n_radius_bins = len(freq_edges) - 1`` (or ``n_radial_bins`` when
-        edges are auto-generated).
-    fft_chunk_size : int or 'auto', default 'auto'
-        Genes per chunk. The rasterised image is always kept **lazy** (dask)
-        and materialised one ``chunk``-gene block at a time, FFT'd, and
-        immediately reduced (radial-binned in ``feature_mode='radial'``;
-        rotated + physical-frequency polar-resampled in ``feature_mode='2d'``).
-        Peak memory is ``O(chunk · ny · nx · 8 B)`` and the full ``(n_genes, ny,
-        nx)`` raster / 2D spectra are *never* held in either mode.
-        ``'auto'`` sizes the chunk from the (lazily-known) lattice shapes via
-        :func:`sonic.utils.resolve_chunk_size` — the FFT cache sweet-spot
-        cap (32) capped further by the live-memory budget.
-        In 2d mode the rotation is learned from a streamed cross-gene geometric-mean
-        landmark by default, or from an explicit ``landmark_genes`` set passed
-        to :meth:`compute_spectra`.
+        Number of angular intervals over a half turn for ``feature_mode='2d'``.
+    fft_solver : {'fft2', 'rfft2'}, default 'rfft2'
+        Fourier transform for the grid. The real-input transform uses less memory.
     workers : int, 'auto', or None, default 'auto'
-        FFT threads per sample job. Automatic threads use spare CPUs, capped
-        at four; ``None`` selects one. Balanced against ``compute_spectra`` jobs.
-    spacing : (dy, dx) or sequence of (dy, dx), optional
-        Physical pitch of one rasterised bin. ``rasterize_bins`` emits one
-        pixel per bin, so this maps the pixel lattice to physical frequency
-        units (for example cycles/μm when spacing is in μm).
-        Pass a single ``(dy, dx)`` to apply to all samples, or one ``(dy, dx)``
-        per sample (length ``n_samples``) so that sections with different bin pitches
-        still bin onto a common physical frequency grid.
-        Defaults to ``(1.0, 1.0)`` (cycles per raster bin).
+        Threads per sample for the FFT. Use ``None`` for one thread or
+        ``'auto'`` to share available CPUs with concurrent sample jobs.
+    spacing : pair of floats or sequence of pairs, optional
+        Physical height and width of a grid cell, in that order. Supply one
+        pair for all samples or one per sample. The default is ``(1, 1)``.
+    freq_edges : np.ndarray, optional
+        Shared radial bin edges in cycles per spatial unit. The automatic edges
+        cover the frequency range common to all samples.
     adaptive_freq_edges : bool, default False
-        If True, collapse radial bins that are empty for any sample's Fourier
-        grid by merging each empty bin into its right neighbour. Otherwise,
-        empty bins will be dropped across all samples. Regardless of the setting,
-        the retained final bins will always have support in every sample.
-        The fitted comparator records per-sample bin occupancy for the original
-        requested grid in ``frequency_bin_counts_``,
-        the pre-adaptation edge grid in ``freq_edges_requested_``, and
-        feature-axis-aligned intervals in ``frequency_bin_intervals_``.
-
-    Other Parameters
-    ----------------
-    fft_solver, workers, freq_edges, presence_threshold
-        See :class:`_ComparatorBase`.
-
-    Notes
-    -----
-    The comparator carries no design / contrast state — supply the
-    cross-sample contrast directly to :meth:`test_diff_freq` /
-    :meth:`test_diff_expr`. A single fitted comparator can therefore
-    serve any number of unrelated comparisons on the same spectra.
+        Merge adjacent radial intervals when a sample lacks frequency support.
+        By default, omit unsupported radial intervals. The retained intervals
+        are available in ``frequency_bin_intervals_``.
+    presence_threshold : float, default 0.0
+        Minimum fraction of observed grid cells with nonzero expression for a gene
+        to count as present in a sample.
+    fft_chunk_size : int or 'auto', default 'auto'
+        Genes per transform block. The automatic size uses the memory budget.
     """
 
     def __init__(

@@ -1,21 +1,59 @@
-Cross-sample Pattern Comparison
+Cross-sample pattern comparison
 ===============================
 
-SONIC compares the spatial pattern of each gene across samples. Samples may
-differ in their spots, coordinate systems, and orientations.
+SONIC measures spatial variation in frequency bins.
+Low frequencies describe variation over longer distances.
+High frequencies describe variation over shorter distances.
+Use the same physical coordinate units for all samples.
 
-The default radial representation records how much variation occurs at each
-spatial scale. This makes the comparison insensitive to translation and
-rotation. Use the directional representation only when orientation is part of
-the biological question.
+.. list-table::
+   :header-rows: 1
+   :widths: 18 42 40
 
+   * - Test
+     - Measurement in each bin
+     - Use it to compare
+   * - DF
+     - Natural logarithm of a gene's power
+     - The amount of spatial variation at each scale
+   * - DF-norm
+     - Natural logarithm of the bin's share of a gene's total power
+     - How a gene's spatial variation is distributed across scales
+   * - DF-coherence
+     - Natural logarithm of squared-magnitude coherency
+     - The strength of spatial coupling between two genes
+   * - DF-coherency
+     - Real part of coherency
+     - The signed, in-phase component of spatial coupling
 
-Compare two groups
-------------------
+Let :math:`x_g` be the mean-centered expression of gene :math:`g` across
+locations in one sample. Let :math:`K_b` be the real spatial kernel that
+averages Fourier power in frequency bin :math:`b`. The bin power has the
+quadratic form of the Q statistic. The real part of the cross-spectrum
+between genes :math:`g` and :math:`h` has the bilinear form of the R statistic.
 
-Start with a list of :class:`anndata.AnnData` samples. They must share
-``var_names`` and contain coordinates in ``obsm["spatial"]``. Pass ``layer=``
-to :func:`~sonic.Comparator` when the values are stored outside ``X``.
+.. math::
+
+   P_g(b) = x_g^\top K_b x_g, \qquad
+   \operatorname{Re} S_{gh}(b) = x_g^\top K_b x_h.
+
+The :doc:`single-sample Q and R tests <theory>` use standardized expression.
+The power profiles retain each gene's expression scale. Dividing
+:math:`S_{gh}(b)` by :math:`\sqrt{P_g(b) P_h(b)}` gives coherency.
+Its real part is positive for in-phase variation and negative for opposing
+variation. Its squared magnitude is coherence.
+
+Compare single genes with DF and DF-norm
+----------------------------------------
+
+DF compares mean log power in each bin. Doubling a gene's expression at every
+location quadruples its power in every bin, even when the spatial pattern
+stays the same. To test whether power shifts between spatial scales, use DF-norm,
+which divides each bin's power by the sum across bins for that gene and sample.
+
+Supply the same gene names in the same order for all samples. For
+:class:`anndata.AnnData`, the default coordinate key is ``obsm["spatial"]``.
+Use ``layer`` if expression is stored outside ``X``.
 
 .. code-block:: python
 
@@ -24,515 +62,243 @@ to :func:`~sonic.Comparator` when the values are stored outside ``X``.
    from sonic import Comparator
 
    paths = [
-       "control_1.h5ad",
-       "control_2.h5ad",
-       "control_3.h5ad",
-       "case_1.h5ad",
-       "case_2.h5ad",
-       "case_3.h5ad",
+       "control_1.h5ad", "control_2.h5ad", "control_3.h5ad",
+       "case_1.h5ad", "case_2.h5ad", "case_3.h5ad",
    ]
    samples = [ad.read_h5ad(path) for path in paths]
    groups = np.array([0, 0, 0, 1, 1, 1])
+   comparison = Comparator(samples).compute_spectra()
 
-   comparison = Comparator(samples).compute_spectra(n_jobs=4)
+   df = comparison.test_diff_freq(groups)
+   df_norm = comparison.test_diff_freq(groups, normalize_shape=True)
+   expression = comparison.test_diff_expr(groups)
 
-   # Optional: remove the sample-wide spectral background before testing.
-   # comparison.normalize_background()
+Compare gene pairs with DF-coherence and DF-coherency
+-----------------------------------------------------
 
-   pattern_results = comparison.test_diff_freq(
-       groups,
-       statistic="log_l2",
-       normalize_shape=True,
-   )
-   expression_results = comparison.test_diff_expr(groups)
+Gene-pair tests use the cross-spectrum to compare spatial coupling between
+groups. DF-coherence tests for changes in coupling strength. DF-coherency
+tests for changes in signed alignment. Within a frequency bin, positive real
+coherency means the two expression patterns tend to peak together. Negative
+values mean peaks of one pattern tend to align with troughs of the other.
 
-Both result tables contain ``Feature``, ``Statistic``, ``P_value``, and
-``P_adj``. ``pattern_results`` tests spatial layout;
-``expression_results`` tests sample-level mean expression. Looking at both
-separates a rearranged pattern from a simple change in abundance.
-
-By default, DF and DF-norm use deterministic rotation to calibrate log L2.
-Binary L2 requires at least ``min_samples_per_group`` observed samples per arm
-(default 2) for each feature or pair, including complete data. L2 and t-Cauchy tests
-require finite, strictly positive ``freq_weights``. The default weights are uniform.
-Pass ``covariance="pooled"`` to reproduce p-values from Gaussian plug-in calibration
-with a pooled residual covariance.
-
-DF and DF-norm return signed ``Estimate_per_bin`` for every null: mean A minus
-mean B (sorted binary labels), or the specified GLM contrast. Estimates are
-in natural-log power units (log power share for DF-norm); divide by ``ln(2)``
-for log₂ units. ``log_l2`` reports their weighted RMS as ``Statistic``, which
-serves as an aggregated effect size metric. Skipped genes have NaN estimates.
-
-``normalize_background()`` is optional and is not applied by the default
-workflow. It divides spectra by each sample's geometric-mean spectrum. Use it
-when sample-wide spectral differences are nuisance variation; it can also
-remove shared biological signal. To enable it, uncomment the call above so it
-runs before testing.
-
-``normalize_shape=True`` compares the distribution of power across spatial
-scales after removing total spectrum amplitude. Leave it off when amplitude is
-part of the pattern you want to compare. Observed powers must be finite and nonnegative.
-Samples marked absent are excluded for that feature. Every nonzero spectrum is normalized
-to unit total, including very small powers; all-zero spectra remain zero.
-DF-norm computes shares in float64. If a bin is constant or fits the design
-to within roundoff, SONIC recomputes the feature’s shares using exact spectrum totals.
-
-For 2D NUFFT features and rotation landmarks, SONIC evaluates an extra border
-of Fourier modes for interpolation at the sampling Nyquist boundary. The
-original frequency bins and physical units stay unchanged. FFT spectra use
-their periodic frequency boundary.
-
-With ``null="plugin"``, DF tests return NaN p-values for nonzero contrasts
-when the selected residual covariance is numerically zero; zero contrasts
-return p=1.
-Untestable features are excluded from BH correction.
-
-
-Compare coupling between genes
-------------------------------
-
-Cross-spectrum tests compare the spatial coupling of gene pairs across
-conditions. Compute the requested pairs once, then select a representation:
+Like single-gene DF tests, cross-spectral tests separate spatial variation
+into frequency bins. When interpreting a bin, do not confuse the wavelength of
+an expression pattern from the distance over which two genes may interact.
+For example, higher coherence in a bin with wavelengths near 100 µm indicates
+stronger coupling in expression patterns that repeat about every 100 µm.
+It does not mean that the two genes interact over a distance of 100 µm.
 
 .. code-block:: python
 
    comparison.compute_cross_spectra([("CD8", "FoxP3"), ("CD8", "CD20")])
+   strength = comparison.test_cross_diff_freq(groups)
+   signed = comparison.test_cross_diff_freq(groups, representation="coherency")
 
-   # DF-coherence: changes in coupling strength across frequency bins.
-   coupling = comparison.test_cross_diff_freq(groups)
+Each pair uses samples where both genes are present. The comparison uses
+frequency bins that support a coherency estimate in every retained sample.
+Pair tests use spectra from the source expression values, including when
+you have normalized the single-gene spectra.
 
-   # DF-coherency: changes in signed, in-phase coupling.
-   signed_coupling = comparison.test_cross_diff_freq(
-       groups, representation="coherency",
+Identify a frequency bin and map its spatial contributions
+----------------------------------------------------------
+
+Each DF test combines information across frequency bins into one p-value per
+gene or pair. In test results, each row reports the overall p-value (``P_value``)
+for one gene or pair. ``P_adj`` gives that p-value after Benjamini-Hochberg
+adjustment across the genes or pairs tested.
+
+We can also examine the per-bin results to see which spatial scale has the
+strongest evidence for a difference. ``Estimate_per_bin`` gives the signed
+effect on the tested scale in each bin.
+For two groups, this is the mean for the first sorted label minus the mean
+for the second. In the example above, a positive estimate means the bin mean is
+higher in controls (0) than in cases (1). With a design matrix, the sign
+follows the specified contrast. Divide a natural-log estimate by ``ln(2)`` to
+express it in log₂ units.
+
+A frequency bin describes variation across the whole sample. To see where
+that variation occurs, map each spot's contribution to the selected bin in
+one sample. The same idea applies to single-sample Q and R statistics.
+For gene power, the bin kernel applied to centered expression :math:`x`
+gives the filtered response :math:`K_b x`. Spot :math:`i` contributes
+:math:`x_i (K_b x)_i`. These contributions sum to the power in the bin.
+
+Identify the frequency bin with the strongest evidence
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+The t-Cauchy test combines the two-sided bin p-values into one p-value for
+the gene or pair. ``T_per_bin`` gives the signed t statistics and
+``P_value_per_bin`` gives the unadjusted bin p-values. ``Best_bin`` is the
+zero-based index of the bin with the smallest p-value in the combination.
+The multiple-testing adjustment applies to the gene or pair as a whole.
+
+.. code-block:: python
+
+   gene_bins = comparison.test_diff_freq(groups, statistic="log_t_cauchy")
+   pair_bins = comparison.test_cross_diff_freq(
+       groups, representation="coherency", statistic="t_cauchy",
    )
 
-- ``representation="coherence"`` (default) compares coupling strength using
-  log squared-magnitude coherence.
-- ``representation="coherency"`` compares the real part of normalized
-  cross-spectra, retaining the sign of in-phase coupling.
+Map a selected bin in one sample
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
-Both default to ``statistic="l2"`` with deterministic rotation. For Gaussian
-plug-in calibration (``null="plugin"``), choose how to estimate residual covariance:
-
-- ``None`` or ``"per_pair"`` (default) estimates covariance for each pair,
-  retaining pair-specific variance and cross-bin correlation.
-- ``"pooled"`` shares covariance across eligible pairs.
-
-Specifying a covariance selects ``null="plugin"`` when ``null`` is omitted.
+Pass the selected bin to ``explain_spectrum``. This example maps each spot's
+contribution to signed coherency in the CD8-FoxP3 pair's ``Best_bin``,
+using a sample where both genes are present.
 
 .. code-block:: python
 
-   coupling = comparison.test_cross_diff_freq(groups, covariance="per_pair")
-
-Design matrices and continuous ``contrast=`` terms work as in ``test_diff_freq``.
-L2 supports ``null="plugin"`` and ``null="rotation"`` for either design;
-``null="permutation"`` is available only for binary comparisons. To also
-localize the best bin, use ``statistic="t_cauchy"`` with ``null="analytic"``:
-
-.. code-block:: python
-
-   pair_bins = comparison.test_cross_diff_freq(groups, statistic="t_cauchy")
-   signed_pair_bins = comparison.test_cross_diff_freq(
-       design, contrast="condition", representation="coherency", statistic="t_cauchy",
+   pair = ("CD8", "FoxP3")
+   best_bin = pair_bins.set_index(["Feature_1", "Feature_2"]).at[pair, "Best_bin"]
+   pair_map = comparison.explain_spectrum(
+       pair, sample_index=0, bands=[best_bin], representation="coherency",
    )
+   regions = pair_map.select_regions(map_index=0, size=100.0, direction="absolute")
+   figure = pair_map.plot(map_index=0, regions=regions)
 
-This applies binwise Welch or OLS tests to log coherence or real coherency,
-respectively, and combines the p-values with Cauchy's rule as described below.
+The map describes the source expression in the selected sample. For one gene,
+use ``"power"`` for DF or ``"power_norm"`` for DF-norm. For a pair, choose
+``"coherence"``, ``"coherency"``, or ``"cross"`` (real cross-spectrum).
+See :doc:`quickstart` for plotting options and :doc:`/comparator_api` for the
+method reference.
 
-Each pair uses samples where both genes are present and bins valid in all those
-samples. ``freq_weights`` sets bin weights in the original flattened bin order
-(radius then angle for polar features). Weights are renormalized over the
-retained bins. For masked GLMs, ``min_resid_df`` sets the minimum residual
-degrees of freedom.
+Adjust for covariates or test a continuous predictor
+----------------------------------------------------
 
-Results include pair names, the statistic, raw and BH-adjusted p-values, and
-sample/bin counts. ``Status`` identifies skipped pairs; ``N_pairs_pooled``
-reports the covariance pool size. Retained bins and samples are recorded in
-``attrs["bin_indices"]`` and ``attrs["sample_indices"]``.
-To repeat a comparison with the same bin weights, pass
-``freq_weights=result.attrs["original_freq_weights"]``.
-
-Both statistics return ``Estimate_per_bin``: the mean for group A minus the mean
-for group B (sorted labels), or the specified GLM contrast. Coherence estimates
-use natural-log coherence; coherency estimates are differences on the signed real
-scale. L2 fits and tests all supported bins. Unsupported bins and skipped
-pairs have NaN estimates.
-
-
-Explain selected frequency bins
--------------------------------
-
-Use ``explain_spectrum`` to reconstruct selected frequency bins from an
-individual sample's source data:
-
-.. code-block:: python
-
-   single = comparison.explain_spectrum(
-       "CD8", sample_index=0, bands=[1, 2], representation="power_norm",
-   )
-   pair = comparison.explain_spectrum(
-       ["CD8", "FoxP3"], sample_index=0, bands=[1, 2],
-       representation="coherency", memory_budget_bytes="512 MiB",
-   )
-
-- ``sample_index`` selects the sample; ``bands`` selects retained spectrum bins.
-- For one gene, ``representation="power"`` shows raw power contributions;
-  ``"power_norm"`` scales them by total power across retained bins.
-- For a pair, ``"cross"`` shows the real co-spectrum, ``"coherency"`` shows
-  signed normalized coupling, and ``"coherence"`` shows squared-magnitude coupling.
-- ``memory_budget_bytes`` sets the reconstruction memory budget.
-
-The returned ``SpatialExplanation`` contains source ``values``, per-bin
-``filtered`` fields, and ``contributions`` whose sums reproduce the selected
-raw-source feature. Use its plotting and region-selection methods to inspect
-local patterns:
-
-.. code-block:: python
-
-   regions = pair.select_regions(map_index=0, size=100.0, direction="absolute")
-   figure = pair.plot(map_index=0, regions=regions)
-
-``map_index`` selects a returned band, ``size`` sets region width in source
-coordinate units, and ``direction="absolute"`` selects large contributions of
-either sign. Omit ``size`` for an automatic frequency-based width when the
-band's lower frequency is positive. See :doc:`quickstart` for plotting options.
-
-
-Regular grids
--------------
-
-Pass a list of :class:`spatialdata.SpatialData` objects when each sample can be
-rasterized onto a rectangular grid:
-
-.. code-block:: python
-
-   comparison = Comparator(
-       spatial_samples,
-       bins="square_008um",
-       table_name="square_008um",
-       col_key="array_col",
-       row_key="array_row",
-       spacing=(8.0, 8.0),
-   ).compute_spectra()
-
-   pattern_results = comparison.test_diff_freq(groups)
-
-``spacing`` is the physical height and width of a bin. FFT comparisons use
-periodic rectangular grids. For standard Visium hexagonal spots, keep the data
-as coordinates in ``AnnData`` and use the irregular workflow above.
-
-
-Account for known spatial covariates
-------------------------------------
-
-Use :meth:`~sonic.ComparatorIrregular.normalize_covariates` after computing
-spectra to remove variation associated with known spatial maps:
-
-.. code-block:: python
-
-   comparison.normalize_covariates(
-       ["celltype_astro", "celltype_neuron", "MALAT1"]
-   )
-
-For ``AnnData``, SONIC looks for each name in ``obs`` first and then in
-``var_names``. Values must be numeric. The same call works with
-``SpatialData`` table fields. You can also pass one pre-rasterized covariate
-array per sample; see the API reference for the expected shapes.
-
-The covariate design must leave at least one residual frequency dimension.
-
-
-Multi-factor and continuous designs
------------------------------------
-
-Use a pandas data frame for batch terms, paired designs, or continuous
-covariates. Name the effect to test with ``contrast``:
+Supply a design matrix to adjust for other predictors or to test a continuous
+predictor. Use one row per sample in the same order as ``samples``.
+A contrast specifies the coefficient or combination of coefficients to test.
 
 .. code-block:: python
 
    import pandas as pd
 
-   design = pd.DataFrame(
-       {
-           "condition": ["control", "control", "control", "case", "case", "case"],
-           "batch": ["A", "B", "C", "A", "B", "C"],
-       }
-   )
+   design = pd.DataFrame({"condition": groups, "batch": ["A", "B", "C"] * 2})
+   adjusted = comparison.test_diff_freq(design, contrast="condition")
+   adjusted_pairs = comparison.test_cross_diff_freq(design, contrast="condition")
 
-   pattern_results = comparison.test_diff_freq(
-       design,
-       contrast="condition",
-       normalize_shape=True,
-   )
-   expression_results = comparison.test_diff_expr(
-       design,
-       contrast="condition",
-   )
+Use ``contrast="condition"`` here to test condition 1 minus condition 0 after
+adjustment for batch. Naming the coefficient avoids having to know its position.
+For a data frame, SONIC adds an intercept and encodes categorical predictors.
+Contrast vectors follow the column order of that encoded design matrix.
+For a numeric matrix, use its column order and include any intercept yourself.
 
-SONIC adds an intercept and encodes categorical columns for a pandas design.
-For a NumPy design matrix, include any intercept yourself and pass a contrast
-vector.
+For a continuous predictor, its coefficient gives the change per unit increase
+with the other predictors held fixed. The design must contain enough independent
+information to estimate the requested contrast.
 
+Advanced options
+----------------
 
-Binwise t tests and Cauchy combination
---------------------------------------
+Choose a frequency grid and adjust the spectra
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
-Use ``statistic="log_t_cauchy"`` to test each frequency bin separately and
-combine its p-values into a feature-level result, while retaining per-bin
-p-values to localize the best bin:
+Set the spatial units and bin directions
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+Use ``unit_scales`` to convert irregular coordinates to common physical units.
+For regular rectangular grids, pass :class:`spatialdata.SpatialData` samples
+and specify the physical bin height and width with ``spacing``.
 
 .. code-block:: python
 
-   bin_results = comparison.test_diff_freq(groups, statistic="log_t_cauchy")
-   adjusted_bin_results = comparison.test_diff_freq(
-       design, contrast="condition", statistic="log_t_cauchy",
-       normalize_shape=True,
-   )
-
-``log_t_cauchy`` uses the same ``log(max(profile, 1e-12))`` transformation as
-``log_l2``. Binary labels select per-bin Welch tests; a design matrix or
-explicit contrast selects per-bin OLS t tests, including nuisance covariates.
-``normalize_shape=True`` divides each spectrum by its total before logging.
-
-Welch permits different variances between groups and requires two observations
-per arm. OLS uses each bin's residual variance and ``n_samples - rank(design)``
-degrees of freedom, assuming constant residual variance across samples. Thus
-an explicit binary GLM differs from the Welch path. Masked tests fit only
-observed samples and apply the same eligibility thresholds as the L2 tests.
-Log-scale effects concern mean log power, or mean log power share for DF-norm.
-
-Both DF ``log_t_cauchy`` and cross-spectrum ``t_cauchy`` require
-``null="analytic"`` and ``covariance=None``.
-``freq_weights`` controls the Cauchy combination. None gives equal weights.
-Supply finite, strictly positive weights to emphasize prespecified spatial scales.
-Weights are renormalized over informative bins. The per-bin p-values and
-``Best_bin`` are independent of the weights.
-
-The combined statistic is ``sum(w[k] * cot(pi * p[k]))``, with retained weights
-summing to one. Its p-value uses the standard Cauchy tail, without estimating
-a cross-bin covariance. The Cauchy
-reference is an approximation for dependent bin p-values; log transformation
-and shape normalization do not guarantee calibration at small sample sizes.
-Low residual degrees of freedom or unequal sample variances can inflate the
-combined rejection rate even when marginal bin tests look well calibrated.
-
-Both Cauchy tests return the usual feature or pair identifiers, ``Statistic``,
-``P_value`` and ``P_adj``, plus these binwise outputs:
-
-- ``Estimate_per_bin``: mean A minus mean B (sorted binary labels), or the fitted
-  GLM contrast, on the tested profile scale.
-- ``T_per_bin``: signed t statistics.
-- ``P_value_per_bin``: unadjusted two-sided bin p-values.
-- ``Best_bin``: nullable, zero-based index of the smallest p-value among
-  informative bins. Ties use the first original index;
-  no eligible bin gives a missing value.
-
-Arrays preserve the original bin order.
-Cross-spectrum arrays use the original flattened radius/angle order, with
-NaNs for unsupported bins. ``Statistic`` is the maximum absolute t over
-tested bins; ``P_value`` is the Cauchy-combined tail and ``P_adj`` is
-BH-adjusted across features or pairs. ``Best_bin`` is descriptive: feature-level
-significance does not establish significance of the selected bin.
-Cross-spectrum ``DF_resid`` reports design residual degrees of freedom, not
-the Welch degrees of freedom, which vary by bin.
-
-Constant bins with a zero contrast and GLM bins fully explained by nuisance
-covariates keep their per-bin p=1. Both are excluded from combination and
-``Best_bin``. A feature with no informative bins receives p=1 and a missing
-``Best_bin``. Exact zero standard error gives p=1
-for a zero effect and a limiting zero tail for a nonzero effect. Binary Welch
-tails are clipped to the smallest positive float. Skipped features keep NaN
-feature results, NaN per-bin arrays and missing ``Best_bin``. Cauchy result
-``attrs`` records ``statistic``, ``null`` and ``per_bin_test`` (``welch`` or ``ols``).
-
-The standalone ``compare_two_groups``, ``compare_glm``, and their masked
-variants accept ``statistic="log_t_cauchy"`` with the same binwise outputs.
-
-
-Gaussian plug-in calibration
-----------------------------
-
-For ``null="plugin"``, SONIC treats the estimated residual covariance as fixed.
-It uses the Liu approximation to evaluate the weighted chi-square tail of the
-squared L2 statistic under a Gaussian null.
-For DF and DF-norm, the covariance options are:
-
-- ``None`` or ``"per_gene"`` (default) estimates covariance for each gene, retaining
-  its variance and cross-bin correlation.
-- ``"pooled"`` shares covariance across eligible genes.
-
-Specifying a covariance selects ``null="plugin"`` when ``null`` is omitted.
-Both estimators support binary groups, continuous contrasts, and gene-specific missing samples.
-
-.. code-block:: python
-
-   pattern_results = comparison.test_diff_freq(
-       groups, covariance="per_gene", normalize_shape=True,
-   )
-   adjusted_results = comparison.test_diff_freq(
-       design, contrast="condition", covariance="per_gene", normalize_shape=True,
-   )
-
-Use ``estimate_null_covariance`` to inspect the covariance, eigenvalues, and
-fitted ``beta`` coefficients used by the test:
-
-.. code-block:: python
-
-   diagnostics = comparison.estimate_null_covariance(
-       groups, covariance="per_gene", normalize_shape=True,
-   )
-
-The standalone binary and GLM comparison functions accept the same option.
-Cross-spectrum tests use ``covariance="per_pair"`` for separate pair estimates.
-
-
-Conditional rotation tests
---------------------------
-
-DF, DF-norm, coherence, and coherency L2 tests default to ``null="rotation"``.
-Deterministic integration evaluates the weighted L2 statistic conditional on
-each feature's or pair's nuisance-adjusted scatter.
-The conditional null is exact under independent Gaussian errors on the tested profile
-scale, with common covariance across samples within each feature or pair.
-Cross-bin correlations are unrestricted, and covariance may differ between
-features or pairs. For example, one feature may have noisier low-frequency bins
-than another, but both groups must have the same residual bin variances and
-cross-bin covariances for that feature under this model. Rotation can remain
-well calibrated under non-Gaussian errors, depending on the statistic, design
-and error distribution.
-
-.. code-block:: python
-
-   pattern_results = comparison.test_diff_freq(
-       design, contrast="condition", normalize_shape=True,
-       null="rotation", integration_tol=1e-6,
-   )
-
-Use ``statistic="log_l2"`` for DF or ``"l2"`` for cross-spectrum tests, and leave
-``covariance=None``. The standalone DF functions support rotation for binary and
-GLM designs, including masked data.
-``integration_tol`` is the initial Davies absolute p-value error target
-(default 1e-6). Each call uses at most 10,000 terms. Accepted integration also
-requires a relative error budget at most ``0.001*p``; a valid result failing
-this check gets one retry at ``min(integration_tol, 1e-4*p)``. Exact beta cases
-and spectral boundaries bypass integration. For nearly equal coefficients of
-each sign, two beta tails bound the rotation p-value. SONIC reports their midpoint
-when its error meets both the absolute and relative targets. If the bounds agree
-to roundoff and the requested accuracy exceeds numerical precision, SONIC raises an error.
-
-When a fitted residual is comparable to rounding error, SONIC recomputes the
-contrast and residuals on the retained design using the transformed profile values.
-An exact fit gives p=1 for a zero contrast and p=0 for a nonzero contrast.
-If every rotation gives the same L2 statistic, the inclusive upper tail is p=1.
-DF-norm rechecks the shares when the rotation statistic is nearly constant or when
-a saddlepoint tail falls at a spectral tie. If exact spectrum totals change the
-transformed profile, SONIC raises an error giving the feature's input index.
-SONIC checks ambiguous spectral endpoints using the supplied bin-weight ratios.
-A verified rank-one scatter uses the beta tail even when several bins carry the same signal.
-
-Unresolved tails use Kuonen's saddlepoint approximation.
-``P_value_method`` identifies ``davies``, ``saddlepoint``, ``beta`` or ``exact``
-(missing for skipped rows). ``P_value_error`` reports the accepted Davies accuracy
-budget, the beta interval's half-width plus estimated roundoff, or zero at exact
-boundaries. It is NaN for saddlepoint and skipped rows. The integration tolerance
-does not bound saddlepoint approximation error; neither quantity is statistical uncertainty.
-A tail that cannot be evaluated by either route raises an error.
-
-Result ``attrs`` records ``method="davies"``, ``integration_tol``,
-``integration_limit=10000``, the number of approximate rows ``n_saddlepoint``,
-``null="rotation"`` and ``covariance=None``. BH correction includes all finite
-p-values, including the marked approximations.
-
-For contrast weights ``a = c @ pinv(X)``, let B contain the unit contrast
-axis and an orthonormal full-model residual basis. With transformed profiles Y
-and diagonal bin weights W, set ``A = B.T @ Y @ W @ Y.T @ B`` and
-``q = L2**2 / (a @ a)``. The conditional tail is
-``P(u.T @ A @ u >= q) = P(sum((eigenvalues(A) - q) * Z**2) >= 0)``,
-where u is uniform on the sphere and Z has independent standard normal entries.
-All ``df_resid + 1`` directions remain, including zero eigenvalues of A.
-
-Cross-spectrum ``test_cross_diff_freq(null="rotation")`` uses the same
-deterministic evaluator and ``integration_tol``, with ``statistic="l2"`` and
-``covariance=None``.
-
-.. code-block:: python
-
-   coupling_results = comparison.test_cross_diff_freq(
-       design, contrast="condition", representation="coherency",
-       null="rotation", integration_tol=1e-6,
-   )
-
-
-Permutation tests
------------------
-
-``null="permutation"`` is available only for binary comparisons in
-``test_diff_freq`` and ``test_cross_diff_freq``, including masked comparisons.
-Pass one-dimensional labels for two exchangeable groups and omit ``contrast``.
-GLM designs, including continuous predictors, nuisance covariates, or an explicit
-contrast, support both rotation and Gaussian plug-in calibration for L2.
-Log t-Cauchy supports its analytic calibration only.
-
-For a binary comparison, permutation calibration relabels samples:
-
-.. code-block:: python
-
-   pattern_results = comparison.test_diff_freq(
-       groups,
-       null="permutation",
-       n_perm=1000,
-       random_state=0,
-   )
-
-``n_perm`` sets the number of sampled relabelings, and ``random_state`` makes
-them reproducible. When the number of possible assignments is at most
-``max_exact_permutations``, SONIC enumerates them all. Sampled and exhaustive
-tests count distances tied with the observed L2 within floating-point roundoff.
-
-
-Keep physical units consistent
-------------------------------
-
-Spatial frequencies are comparable only when coordinates use the same unit.
-Use ``unit_scales`` to convert each sample before spectrum calculation:
-
-.. code-block:: python
-
-   comparison = Comparator(
-       samples,
-       unit_scales=[1.0, 1.0, 1.0, 0.5, 0.5, 0.5],
+   gridded = Comparator(
+       spatial_samples, bins="square_008um", table_name="table",
+       col_key="array_col", row_key="array_row", spacing=(8.0, 8.0),
    ).compute_spectra()
 
-For example, the last three samples above may use pixels that are half the size
-of those in the first three samples. You can also supply a common or per-sample
-``spacing`` together with ``grid_shape`` when you need to control the internal
-NUFFT grid. Automatic inference is sufficient for most datasets.
-
-
-Preserve direction when needed
-------------------------------
-
-The default ``feature_mode="radial"`` removes direction. To compare
-directional structure, use ``feature_mode="2d"``. SONIC estimates one rotation
-per sample before comparison:
+Use the default radial bins to compare spatial scales across orientations.
+Use ``feature_mode="2d"`` to also compare direction. SONIC aligns the
+directional spectra across samples. Supply genes with stable directional
+patterns in ``landmark_genes`` to define the alignment.
 
 .. code-block:: python
 
-   comparison = Comparator(
-       samples,
-       feature_mode="2d",
-   ).compute_spectra(
+   directional = Comparator(samples, feature_mode="2d").compute_spectra(
        landmark_genes=["EPCAM", "KRT8", "KRT18"],
    )
 
-Use landmark genes with a stable directional pattern across samples. By
-default, SONIC estimates alignment from the geometric-mean spectrum.
+Adjust gene spectra before testing
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
 
+- ``normalize_background()`` divides each sample's power by the geometric mean
+  across observed genes in each bin. Use it when sample-wide differences are
+  nuisance variation. It can also remove shared biological signal.
+- ``normalize_covariates(["celltype_astro", "MALAT1"])`` removes the part of
+  each gene's log spectrum explained by the spectra of known spatial maps.
+  Use the test's design matrix for covariates defined at the sample level.
 
-See also
---------
+Choose between L2 distance and t-Cauchy
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
-- :doc:`/guides/quickstart` for the two main workflows.
-- :doc:`/guides/scaling` for chunking and parallelism.
-- :doc:`/autoapi/sonic/comparators/index` for all comparator options.
+For L2, ``Statistic`` is the weighted root mean square of the signed bin
+estimates. Effects in opposite directions both contribute to this distance.
+The default is ``statistic="log_l2"`` for DF and DF-norm, and
+``statistic="l2"`` for gene pairs.
+
+For t-Cauchy, ``Statistic`` reports the largest absolute t statistic. The
+p-value combines the two-sided p-values from bins with a nonzero estimated
+effect or variation unexplained by the model. A single small bin p-value can
+contribute strongly to the result.
+
+For two independent groups, each bin uses Welch's t test. The groups can
+have different variances. With a design matrix, each bin uses an ordinary
+least squares t test. Its usual t reference assumes independent Gaussian
+errors with a common variance across samples in that bin. The Cauchy
+reference is approximate when bin p-values are dependent. Both t-Cauchy
+options use ``null="analytic"`` and require ``covariance=None``.
+
+Both L2 and t-Cauchy give equal weight to bins by default. Supply positive,
+finite ``freq_weights`` to emphasize spatial scales chosen before testing.
+For t-Cauchy, weights affect the combined p-value. The individual bin tests
+and the choice of ``Best_bin`` use the original bin p-values.
+
+Choose the null calibration for L2
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Conditional rotation (default)
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+``null="rotation"`` is the default for all four L2 tests. It compares the
+observed distance with the distances expected if the contrast direction were
+random, given the variation across bins after adjustment for nuisance predictors.
+The calculation is deterministic.
+
+The conditional null distribution is exact for independent Gaussian errors on
+the tested scale when samples share the same cross-bin covariance for that gene
+or pair. Bins can be correlated. Different genes or pairs can have different
+covariances. With non-Gaussian errors, calibration depends on the design and
+the error distribution.
+
+Gaussian plug-in calibration
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+``null="plugin"`` uses a Gaussian reference distribution with an estimated
+residual covariance. It treats that estimate as fixed. With few independent
+samples, uncertainty in the covariance estimate can affect the p-value.
+The model assumes a common residual covariance across samples for each gene
+or pair.
+
+By default, plug-in calibration estimates covariance across bins separately for
+each gene (``"per_gene"``) or pair (``"per_pair"``). Use ``covariance="pooled"``
+when a common covariance across genes or pairs is plausible. Pooling uses more
+observations to estimate the bin variances and correlations. Specifying a
+covariance selects plug-in calibration if you omit ``null``.
+
+.. code-block:: python
+
+   per_gene = comparison.test_diff_freq(groups, null="plugin")
+   pooled = comparison.test_cross_diff_freq(groups, covariance="pooled")
+
+Use ``estimate_null_covariance`` to inspect the gene covariance estimates and
+fitted coefficients.
+
+Permutation of binary group labels
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+``null="permutation"`` compares the observed L2 distance with distances from
+other assignments of samples to the two groups. Use it when the group labels
+are exchangeable under the null hypothesis. Pass one-dimensional binary labels
+and omit ``contrast``. For sampled permutations, ``n_perm`` sets the number of
+assignments and ``random_state`` sets the seed.

@@ -237,6 +237,7 @@ def _run_t_cauchy_test(  # noqa: C901 — binary/GLM eligibility and masked fits
     design=None,
     contrast=None,
     prepared_design=None,
+    unit_fits=None,
     presence=None,
     normalize_shape=False,
     log_transform=True,
@@ -257,6 +258,8 @@ def _run_t_cauchy_test(  # noqa: C901 — binary/GLM eligibility and masked fits
     prepared_design : tuple, optional
         Validated unmasked GLM design from ``_prepare_glm_design``. Avoids
         repeating its decomposition across cross-spectrum bin-support groups.
+    unit_fits : dict, optional
+        Reuse constant-response fits by sample mask across cross-spectrum blocks.
     presence : np.ndarray, optional
         Sample-by-feature observation mask. Missing entries are never fitted.
     normalize_shape : bool
@@ -298,6 +301,8 @@ def _run_t_cauchy_test(  # noqa: C901 — binary/GLM eligibility and masked fits
                 "n_obs_B": presence[groups == 1].sum(axis=0),
             }
     else:
+        if unit_fits is None:
+            unit_fits = {}
         if masked and int(min_resid_df) < 1:
             raise ValueError("min_resid_df must be >= 1.")
         if masked:
@@ -331,6 +336,9 @@ def _run_t_cauchy_test(  # noqa: C901 — binary/GLM eligibility and masked fits
             if masked and min(np.sum(codes == 0), np.sum(codes == 1)) < int(min_samples_per_group):
                 continue
             n_terms = 0
+            if normalize_shape:
+                x = np.column_stack([codes == 0, codes == 1])
+                inv = x.T / x.sum(axis=0)[:, None]  # Each fitted value is its group mean.
         else:
             x = matrix[sample_mask]
             inv, rank_gene, estimable = (
@@ -350,25 +358,35 @@ def _run_t_cauchy_test(  # noqa: C901 — binary/GLM eligibility and masked fits
             ):
                 continue
             n_terms = x.shape[1]
+            mask_key = sample_mask.tobytes()
 
         rows = np.flatnonzero(sample_mask)
         for block in _l2._iter_feature_blocks(count, len(genes), n_bins, n_terms):
             cols = genes[block]
             values = spectra[rows[:, None], cols]
             response = _l2._prepare_profile_block(
-                values, normalize_shape, log_transform=log_transform
+                values,
+                normalize_shape,
+                log_transform=log_transform,
+                design_fit=(x, inv) if normalize_shape else None,
             )
             if binary:
                 t_stat, bins, effect = _welch_test(response[codes == 0], response[codes == 1])
+                informative = np.any(response != response[:1], axis=0) | (effect != 0)
             else:
-                t_stat, bins, effect = _lm._test_glm_response(
-                    response.reshape(count, -1), x, inv, vector, rank_gene
+                t_stat, bins, effect, informative = _lm._test_glm_response(
+                    response.reshape(count, -1),
+                    x,
+                    inv,
+                    vector,
+                    rank_gene,
+                    unit_fits=unit_fits,
+                    mask_key=mask_key,
                 )
+                informative = informative.reshape(-1, n_bins)
             t_stat = t_stat.reshape(-1, n_bins)
             effect = effect.reshape(-1, n_bins)
             bins = bins.reshape(-1, n_bins)
-            # A constant response can still test a nonzero intercept contrast.
-            informative = np.any(response != response[:1], axis=0) | (effect != 0)
             tail = cauchy_combine(
                 bins,
                 axis=-1,
@@ -1048,7 +1066,7 @@ def compare_glm_scalar(
         raise ValueError("Scalar GLM responses must be finite.")
     prepared_design = _lm._prepare_glm_design(design, contrast, n_samples)
     design_matrix, _, contrast_vector, design_inverse, rank = prepared_design
-    t_stat, pvals, estimate = _lm._test_glm_response(
+    t_stat, pvals, estimate, _ = _lm._test_glm_response(
         values, design_matrix, design_inverse, contrast_vector, rank
     )
     observed = np.abs(t_stat)

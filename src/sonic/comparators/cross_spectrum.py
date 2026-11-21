@@ -1013,6 +1013,7 @@ def _run_cross_t_cauchy(
     status = np.full(n_pairs, "no_common_bins", dtype=object)
     binwise = {name: np.full((n_pairs, n_bins), np.nan) for name in _BINWISE_COLUMNS}
     best_bin = np.full(n_pairs, np.nan)
+    unit_fits = {}
     for keep, indices in _iter_mask_groups(support[candidates].T):
         bins = np.flatnonzero(keep)
         for block in _iter_feature_blocks(n_samples, len(indices), len(bins)):
@@ -1025,6 +1026,7 @@ def _run_cross_t_cauchy(
                 design=matrix if use_glm else None,
                 contrast=vector if use_glm else None,
                 prepared_design=prepared_design if not use_masked else None,
+                unit_fits=unit_fits,
                 presence=presence if use_masked else None,
                 log_transform=representation == "coherence",
                 freq_weights=weights[bins],

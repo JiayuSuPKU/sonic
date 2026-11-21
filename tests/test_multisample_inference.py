@@ -976,8 +976,8 @@ class TestConditionalRotation:
 
     @pytest.mark.parametrize(
         "shape_only,low,high",
-        [(False, 3.0, 7.0), (True, 3.0, 7.0), (True, 0.3, 0.7)],
-        ids=["DF", "DF-norm", "DF-norm-decimal"],
+        [(False, 3.0, 7.0), (True, 3.0, 7.0), (True, 0.3, 0.7), (True, 0.1, 0.3)],
+        ids=["DF", "DF-norm", "DF-norm-decimal", "DF-norm-rounded-total"],
     )
     def test_df_rotation_is_invariant_to_bin_order(self, shape_only, low, high):
         a = np.array([-1, -1, 1, 1])

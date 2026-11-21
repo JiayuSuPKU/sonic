@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import math
 from collections.abc import Sequence
+from fractions import Fraction
 
 import numpy as np
 import pandas as pd
@@ -166,6 +168,33 @@ def _prepare_glm_design(design, contrast, n_samples):
     return matrix, columns, vector, inverse, rank
 
 
+_as_fractions = np.frompyfunc(Fraction, 1, 1)
+
+
+def _orthogonalize_columns(columns, n_samples):
+    """Rational Gram-Schmidt in place, using the sample rows for inner products."""
+    samples = columns[:n_samples]
+    for j in range(columns.shape[1] - 1):
+        column = samples[:, j]
+        squared = column @ column
+        if squared:
+            slopes = (column @ samples[:, j + 1 :]) / squared
+            columns[:, j + 1 :] -= columns[:, j, None] * slopes
+
+
+def _exact_glm_design(design, contrast, retained=None):
+    """Return an exact orthogonal design, its inverse and the contrast's sample weights."""
+    augmented = _as_fractions(np.vstack([design, contrast]))
+    if retained is not None and len(retained) < design.shape[1]:
+        # Restrict coefficients to the same right-singular subspace as the OLS fit.
+        augmented = augmented @ _as_fractions(retained.T)
+    # Apply the design column operations to the contrast as well.
+    _orthogonalize_columns(augmented, len(design))
+    q = augmented[:-1]
+    inverse = q.T / np.sum(q * q, axis=0)[:, None]
+    return q, inverse, augmented[-1] @ inverse
+
+
 def _fit_glm_response(
     response: np.ndarray,
     design: np.ndarray,
@@ -230,7 +259,13 @@ def _fit_glm_response(
     return beta, residual, effect
 
 
-def _test_glm_response(response, design, inverse, contrast, rank):
+def _glm_fit_roundoff(design, inverse, scale):
+    """Bound cancellation in X @ (X⁺ @ y), including nearly collinear designs."""
+    amplification = np.max(np.abs(design) @ np.sum(np.abs(inverse), axis=1))
+    return np.finfo(float).eps * max(design.shape) * (1 + amplification) * scale
+
+
+def _test_glm_response(response, design, inverse, contrast, rank, *, unit_fits=None, mask_key=None):
     """Compute ordinary OLS contrast t tests for a transformed response block.
 
     Parameters
@@ -240,13 +275,17 @@ def _test_glm_response(response, design, inverse, contrast, rank):
     design, inverse, contrast, rank
         Validated design and estimable contrast, as in ``_fit_glm_response``.
         The design must have positive residual degrees of freedom.
+    unit_fits : dict, optional
+        Cache of constant-response fits shared within one comparison and contrast.
+    mask_key : bytes, optional
+        Observed-sample mask identifying this design in ``unit_fits``.
 
     Returns
     -------
-    t_stat, pvals, estimate : tuple of np.ndarray
-        Signed t statistics, two-sided t tails, and signed contrasts, each
-        of shape ``(n_responses,)``. Each response uses its own residual
-        variance and ``n_samples - rank`` degrees of freedom.
+    t_stat, pvals, estimate, informative : tuple of np.ndarray
+        Signed t statistics, two-sided t tails, signed contrasts and a mask
+        for bin selection, each of shape ``(n_responses,)``. A nonzero contrast
+        or a varying response with residual variation is informative.
     """
     _, residuals, estimate = _fit_glm_response(response, design, inverse, contrast, rank)
     df_resid = len(response) - rank
@@ -255,6 +294,41 @@ def _test_glm_response(response, design, inverse, contrast, rank):
     if not np.isfinite(contrast_var) or contrast_var <= 0:
         raise ValueError("contrast has zero or nonfinite variance under the supplied design.")
     se = np.sqrt(np.maximum(sigma2, 0.0) * contrast_var)
+    scale = np.max(np.abs(response), axis=0)
+    roundoff = _glm_fit_roundoff(design, inverse, scale)
+    suspect = (scale > 0) & (np.max(np.abs(residuals), axis=0) <= roundoff)
+    has_variation = np.any(response != response[:1], axis=0)
+    if rank == design.shape[1] and np.any(np.all(design == design[:1], axis=0) & (design[0] != 0)):
+        # _fit_glm_response already fits constant columns exactly with an explicit intercept.
+        suspect &= has_variation
+    constants = suspect & ~has_variation
+    refit = np.flatnonzero(suspect & has_variation)
+    unit_fit = unit_fits.get(mask_key) if unit_fits is not None else None
+    need_unit_fit = constants.any() and unit_fit is None
+    if refit.size or need_unit_fit:
+        # Verify the contrast and SE before their ratio can turn roundoff into a signal.
+        retained = None
+        if rank < design.shape[1]:
+            retained = np.linalg.svd(design, full_matrices=False)[2][:rank]
+        q, exact_inverse, weights = _exact_glm_design(design, contrast, retained)
+        se_factor = math.hypot(*weights) / math.sqrt(df_resid)
+        if need_unit_fit:
+            # Every constant column is a multiple of the all-ones response.
+            unit_residual = 1 - q @ exact_inverse.sum(axis=1)
+            unit_fit = float(weights.sum()), se_factor * math.hypot(*unit_residual)
+            if unit_fits is not None:
+                unit_fits[mask_key] = unit_fit
+        for j in refit:
+            y = _as_fractions(response[:, j])
+            estimate[j] = weights @ y
+            residual = y - q @ (exact_inverse @ y)
+            se[j] = se_factor * math.hypot(*residual)
+            # Nuisance covariates can explain all the variation in a nonconstant bin.
+            has_variation[j] = residual.any()
+    if constants.any():
+        levels = response[0, constants]
+        estimate[constants] = levels * unit_fit[0]
+        se[constants] = np.abs(levels) * unit_fit[1]
     with np.errstate(divide="ignore", invalid="ignore"):
         t_stat = estimate / se
     zero_se = se == 0.0
@@ -262,4 +336,4 @@ def _test_glm_response(response, design, inverse, contrast, rank):
     perfect_effect = zero_se & (estimate != 0.0)
     t_stat[perfect_effect] = np.sign(estimate[perfect_effect]) * np.inf
     pvals = 2.0 * _t_dist.sf(np.abs(t_stat), df_resid)
-    return t_stat, pvals, estimate
+    return t_stat, pvals, estimate, has_variation | (estimate != 0)

@@ -362,14 +362,35 @@ class TestComparisonOptions:
         np.testing.assert_array_equal(run(spectra), run(spectra.astype(np.float64)))
         np.testing.assert_array_equal(spectra, original)
 
-    def test_shape_only_comparison_ignores_low_power_amplitude_changes(
-        self,
-    ):
-        spectra = np.tile(np.array([1.0, 2.0, 4.0]) * 1e-16, (8, 1, 1))
-        spectra[4:] *= 10
-        result = compare_two_groups(spectra, np.repeat([0, 1], 4), normalize_shape=True)
+    @pytest.mark.parametrize(
+        "profile,factor",
+        [(np.array([1.0, 2.0, 4.0]) * 1e-16, 10), ([0.5, 0.5 + 2.0**-52], 3)],
+        ids=["low-power", "exact-threefold"],
+    )
+    @pytest.mark.parametrize("null", ["rotation", "plugin", "permutation"])
+    def test_shape_only_comparison_ignores_amplitude_changes(self, profile, factor, null):
+        spectra = np.tile(profile, (8, 1, 1))
+        spectra[4:] *= factor
+        result = compare_two_groups(spectra, np.repeat([0, 1], 4), normalize_shape=True, null=null)
+        np.testing.assert_array_equal(result.Estimate_per_bin.iloc[0], np.zeros(len(profile)))
         np.testing.assert_array_equal(result["Statistic"], 0.0)
         np.testing.assert_array_equal(result["P_value"], 1.0)
+
+    def test_shape_permutation_uses_same_shares_for_mixed_labels(self):
+        # Two distinct shapes can fit a 3:5 split even when the supplied labels mix them.
+        low = [0.5, 0.5 + 2.0**-52]
+        powers = np.array([low] * 3 + [[0.5 - 2.0**-20, 0.5 + 2.0**-20]] * 5)[:, None, :]
+        powers[1] *= 3
+        expected = powers.copy()
+        expected[:3, 0] = np.array(low) / sum(low)
+        labels = np.array([0, 1, 0, 1, 1, 0, 1, 1])
+        for groups in (labels, 1 - labels):
+            result = compare_two_groups(
+                powers, groups, null="permutation", normalize_shape=True
+            ).iloc[0]
+            reference = compare_two_groups(expected, groups, null="permutation").iloc[0]
+            np.testing.assert_array_equal(result.Estimate_per_bin, reference.Estimate_per_bin)
+            assert result.P_value == reference.P_value
 
     @pytest.mark.parametrize(
         "path",
@@ -986,6 +1007,126 @@ class TestScalarGLMComparison:
 
 class TestLogTCauchy:
     """Direct references for log-profile binwise inference and masked designs."""
+
+    @pytest.mark.parametrize("glm", [False, True], ids=["binary", "glm"])
+    def test_df_norm_fixed_share_is_excluded(self, glm):
+        powers = np.array([[6, 4, 6], [6, 6, 4]] * 3 + [[6, 5, 5]] * 6)[:, None, :]
+        groups = np.repeat([0, 1], 6)
+        compare = compare_glm if glm else compare_two_groups
+        args = (np.c_[np.ones(12), groups], np.array([0, 1])) if glm else (groups,)
+        # All totals are exactly 16, so division by 16 gives the reference shares.
+        reference = compare(powers / 16, *args, statistic="log_t_cauchy").iloc[0]
+        result = compare(powers, *args, statistic="log_t_cauchy", normalize_shape=True).iloc[0]
+        assert result.Estimate_per_bin[0] == result.T_per_bin[0] == 0
+        assert result.P_value_per_bin[0] == 1
+        assert result.Best_bin == reference.Best_bin != 0
+        assert result.P_value == reference.P_value
+
+    @pytest.mark.parametrize("masked", [False, True])
+    def test_df_norm_refines_nuisance_fits_without_refining_noisy_features(self, masked):
+        from unittest.mock import patch
+
+        from sonic.comparators import _inference as inference
+
+        group = np.tile([0, 1, 0, 1], 6)
+        nuisance = np.tile([0, 0, 1, 1], 6)
+        design = np.c_[np.ones(len(group)), nuisance, group]
+        shape = np.where(nuisance[:, None], [0.25, 0.75], [0.5, 0.5 + 2.0**-52])
+        power = shape * np.where(group[:, None], 3.0, 1.0)
+        noise = np.random.default_rng(71).uniform(1, 2, size=power.shape)
+        values = np.stack([power, noise], axis=1)
+        args = [values, design, np.array([0, 0, 1])]
+        compare = compare_glm
+        if masked:
+            values[0, 0] = np.nan
+            args.append(np.isfinite(values).all(axis=-1))
+            compare = compare_glm_masked
+        with patch.object(
+            inference, "_exact_shape_shares", wraps=inference._exact_shape_shares
+        ) as exact:
+            result = compare(*args, normalize_shape=True, statistic="log_t_cauchy").set_index(
+                "Feature"
+            )
+        exact.assert_called_once()
+        np.testing.assert_array_equal(exact.call_args.args[0], power[int(masked) :])
+        np.testing.assert_array_equal(result.loc["0", "P_value_per_bin"], 1.0)
+        assert result.loc["0", "P_value"] == 1 and pd.isna(result.loc["0", "Best_bin"])
+
+    @pytest.mark.parametrize("coding", ["original", "aliased", "nearly_collinear"])
+    def test_exact_nuisance_and_tested_effects(self, coding):
+        z = np.array([0, 0, 1, 1, 1, 1, 1, 1, 0, 1, 1, 1])
+        x = np.array([0, 0, 1, 0, 0, 1, 1, 1, 1, 0, 0, 1])
+        design = np.c_[np.ones(len(z)), z, x]
+        contrast = np.array([0, 0, 1])
+        expected_effect = np.log(2)
+        if coding == "aliased":
+            design = np.c_[design, z]
+            contrast = np.r_[contrast, 0]
+        elif coding == "nearly_collinear":
+            design[:, 2] = z + x * 2.0**-20
+            expected_effect *= 2**20
+        spectra = np.exp2(np.column_stack([z, x]))[:, :, None]
+        frame = compare_glm(spectra, design, contrast, statistic="log_t_cauchy").set_index(
+            "Feature"
+        )
+        null, effect = frame.loc["0"], frame.loc["1"]
+        assert null.Estimate_per_bin[0] == null.T_per_bin[0] == 0
+        assert null.P_value_per_bin[0] == 1
+        assert null.P_value == 1
+        assert pd.isna(null.Best_bin)
+        assert effect.Estimate_per_bin[0] == expected_effect
+        assert effect.T_per_bin[0] == np.inf
+        assert effect.P_value_per_bin[0] == 0
+        assert effect.Best_bin == 0
+
+    def test_nuisance_bin_preserves_signal_and_noisy_null(self):
+        x = np.repeat([0, 1], 4)
+        z = np.tile([0, 0, 1, 1], 2)
+        noise = np.tile([-1, 1], 4)
+        design = np.c_[np.ones(8), x, z]
+        # Each feature has a nuisance-only first bin. The second has real residual variance.
+        signal = np.column_stack([z, 4 * x + noise])
+        noisy_null = np.column_stack([z, noise])
+        spectra = np.exp2(np.stack([signal, noisy_null], axis=1))
+        frame = compare_glm(
+            spectra, design, np.array([0, 1, 0]), statistic="log_t_cauchy", freq_weights=[9, 1]
+        ).set_index("Feature")
+        for row in frame.itertuples():
+            assert row.P_value_per_bin[0] == 1
+            assert row.Best_bin == 1
+            assert row.P_value == pytest.approx(row.P_value_per_bin[1], rel=1e-12)
+        assert frame.loc["0", "P_value"] < 0.05
+        assert frame.loc["1", "P_value"] == pytest.approx(1)
+
+    @pytest.mark.parametrize("contrast", [np.array([-1, 1]), np.array([1, 0])])
+    def test_constant_fits_reused_by_observation_mask(self, contrast, monkeypatch):
+        from unittest.mock import patch
+
+        from sonic.comparators import _inference, _regression
+
+        groups = np.repeat([0, 1], 4)
+        design = np.c_[1 - groups, groups]
+        levels = np.array([0.25, 0.5, 1, 2, 4])
+        spectra = np.tile(levels, (8, 6, 1))
+        presence = np.ones((8, 6), dtype=bool)
+        presence[0, ::2] = presence[-1, 1::2] = False
+        spectra[~presence] = np.nan
+        monkeypatch.setattr(_inference, "_COMPARISON_WORKSPACE_BYTES", 1)
+        with patch.object(
+            _regression, "_exact_glm_design", wraps=_regression._exact_glm_design
+        ) as fit:
+            frame = compare_glm_masked(
+                spectra, design, contrast, presence, statistic="log_t_cauchy"
+            )
+        assert fit.call_count == 2  # One unit fit per mask, across all bins and feature blocks.
+        expected = np.log(levels) * contrast.sum()
+        for row in frame.itertuples():
+            np.testing.assert_array_equal(row.Estimate_per_bin, expected)
+            np.testing.assert_array_equal(row.P_value_per_bin, expected == 0)
+            if contrast.sum():
+                assert row.Best_bin == 0
+            else:
+                assert pd.isna(row.Best_bin)
 
     @pytest.mark.parametrize("glm", [False, True])
     @pytest.mark.parametrize("masked", [False, True])

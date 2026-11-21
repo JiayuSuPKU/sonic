@@ -75,6 +75,9 @@ scales after removing total spectrum amplitude. Leave it off when amplitude is
 part of the pattern you want to compare. Observed spectra must be finite.
 Samples marked absent are excluded for that feature. Every nonzero spectrum is normalized
 to unit total, including very small powers; all-zero spectra remain zero.
+DF-norm computes shares in float64. If a bin fits the design to within
+roundoff, SONIC recomputes that feature’s shares using exact spectrum totals.
+All its bins then use the same denominator, preserving ties in the L2 statistic.
 
 For 2D NUFFT features and rotation landmarks, SONIC evaluates an extra border
 of Fourier modes for interpolation at the sampling Nyquist boundary. The
@@ -335,8 +338,10 @@ significance does not establish significance of the selected bin.
 Cross-spectrum ``DF_resid`` reports design residual degrees of freedom, not
 the Welch degrees of freedom, which vary by bin.
 
-Constant bins with a zero contrast are excluded from combination; a feature
-with no informative bins receives p=1. Exact zero standard error gives p=1
+Constant bins with a zero contrast and GLM bins fully explained by nuisance
+covariates keep their per-bin p=1. Both are excluded from combination and
+``Best_bin``. A feature with no informative bins receives p=1 and a missing
+``Best_bin``. Exact zero standard error gives p=1
 for a zero effect and a limiting zero tail for a nonzero effect. Binary Welch
 tails are clipped to the smallest positive float. Skipped features keep NaN
 feature results, NaN per-bin arrays and missing ``Best_bin``. Cauchy result

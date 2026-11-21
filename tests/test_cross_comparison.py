@@ -1867,6 +1867,62 @@ class TestCrossRotation:
 class TestCrossTCauchy:
     """Weighted binwise inference on both cross-spectrum representations."""
 
+    def test_coherency_exact_fits_and_one_ulp_residual(self):
+        z = np.array([0, 0, 1, 1, 1, 1, 1, 1, 0, 1, 1, 1])
+        x = np.array([0, 0, 1, 0, 0, 1, 1, 1, 1, 0, 0, 1])
+        design = np.c_[np.ones(len(z)), z, x]
+        contrast = np.array([0, 0, 1])
+        step = np.spacing(0.5)
+        impulse = np.eye(len(z))[2]
+        profiles = np.column_stack([z / 2, z / 2 - step * x, z / 2 + step * impulse])
+        # Removing the exact nuisance and dividing by one ULP leaves the unit impulse.
+        inverse = np.linalg.pinv(design)
+        beta = inverse @ impulse
+        df = len(z) - 3
+        se = np.linalg.norm(inverse[2]) * np.linalg.norm(impulse - design @ beta) / np.sqrt(df)
+        for rows in (slice(None), slice(None, None, -1)):
+            frame = _ordered(
+                _comparison(profiles[rows, :, None]).test_cross_diff_freq(
+                    design[rows],
+                    contrast=contrast,
+                    representation="coherency",
+                    statistic="t_cauchy",
+                )
+            )
+            null, perfect, nearby = frame.itertuples()
+            assert null.T_per_bin[0] == null.Estimate_per_bin[0] == 0
+            assert null.P_value_per_bin[0] == 1
+            assert null.P_value == 1 and pd.isna(null.Best_bin)
+            assert perfect.Estimate_per_bin[0] == -step
+            assert perfect.T_per_bin[0] == -np.inf
+            assert perfect.P_value_per_bin[0] == 0
+            np.testing.assert_allclose(nearby.Estimate_per_bin, [step * beta[2]], atol=0)
+            np.testing.assert_allclose(nearby.T_per_bin, [beta[2] / se])
+            np.testing.assert_allclose(nearby.P_value, 2 * t.sf(abs(beta[2]) / se, df))
+
+    @pytest.mark.parametrize("representation", ["coherence", "coherency"])
+    def test_nuisance_bin_excluded_with_masked_samples_and_bin_support(self, representation):
+        x = np.repeat([0, 1], 6)
+        z = np.tile([0, 0, 0, 1, 1, 1], 2)
+        signal = 0.3 + 0.4 * x + np.tile([-0.05, 0, 0.05], 4)
+        values = np.column_stack([0.25 + z / 4, signal, signal])
+        comparator = _comparison(values[:, None, :])
+        cross = comparator.cross_spectra_
+        cross.presence[0, 0] = False
+        _mask_missing_pairs(cross)
+        cross.coherency_valid[1, 0, 1] = False
+        row = comparator.test_cross_diff_freq(
+            np.c_[np.ones(len(x)), x, z],
+            contrast=np.array([0, 1, 0]),
+            representation=representation,
+            statistic="t_cauchy",
+            freq_weights=[8, 4, 1],
+        ).iloc[0]
+        assert row.P_value_per_bin[0] == 1 and np.isnan(row.P_value_per_bin[1])
+        assert row.Best_bin == 2
+        assert row.P_value == pytest.approx(row.P_value_per_bin[2], rel=1e-12, abs=0)
+        assert 0 < row.P_value < 0.05
+
     @pytest.mark.parametrize("representation", ["coherence", "coherency"])
     @pytest.mark.parametrize("glm", [False, True])
     @pytest.mark.parametrize("masked", [False, True])

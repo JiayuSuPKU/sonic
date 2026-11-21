@@ -19,6 +19,7 @@ from scipy.stats import norm
 
 import sonic._davies as _davies
 from sonic.comparators import _regression as _lm
+from sonic.comparators._regression import _as_fractions, _orthogonalize_columns
 from sonic.comparators.normalization import _normalize_shape_apply
 from sonic.statistics import liu_sf
 
@@ -40,10 +41,23 @@ def _iter_feature_blocks(n_samples, n_features, n_bins, n_terms=0):
         yield slice(start, min(start + step, n_features))
 
 
-def _prepare_profile_block(profiles, normalize_shape, *, log_transform=True):
-    """Make an owned float64 profile block, logarithmic by default."""
+def _exact_shape_shares(profiles):
+    """Round each share once using the exact total of the original spectrum."""
+    powers = _as_fractions(np.asarray(profiles, dtype=np.float64))
+    totals = powers.sum(axis=1, keepdims=True)
+    return np.divide(
+        powers, totals, where=totals != 0, out=np.zeros(powers.shape), casting="unsafe"
+    )
+
+
+def _prepare_profile_block(
+    profiles, normalize_shape, *, log_transform=True, design_fit=None, permutation_group_size=None
+):
+    """Prepare float64 responses, rechecking shares only for roundoff-sized fits."""
     if normalize_shape:
         block = _normalize_shape_apply(profiles)
+        # Shares well below the log floor give the same response after exact division.
+        active = np.max(block, axis=0) > (0.5e-12 if log_transform else 0.0)
     else:
         block = np.array(profiles, dtype=np.float64, copy=True)
         if not np.isfinite(block).all():
@@ -51,6 +65,29 @@ def _prepare_profile_block(profiles, normalize_shape, *, log_transform=True):
     if log_transform:
         np.maximum(block, 1e-12, out=block)
         np.log(block, out=block)
+    if normalize_shape and block.shape[-1] > 1:
+        response = block.reshape(len(block), -1)
+        scale = np.maximum(1.0, np.max(np.abs(response), axis=0))
+        if permutation_group_size is None:
+            design, inverse = design_fit
+            residual = np.max(np.abs(response - design @ (inverse @ response)), axis=0)
+            tol = _lm._glm_fit_roundoff(design, inverse, scale)
+        else:
+            # A two-group fit can be exact only if the sorted values form two tight groups.
+            # Screen both group sizes so relabelling never changes the prepared profiles.
+            ordered = np.sort(response, axis=0)
+            residual = np.minimum.reduce(
+                [
+                    np.maximum(ordered[k - 1] - ordered[0], ordered[-1] - ordered[k])
+                    for k in {permutation_group_size, len(block) - permutation_group_size}
+                ]
+            )
+            tol = 4 * np.finfo(float).eps * len(block) * scale
+        flagged = active & (residual <= tol).reshape(active.shape)
+        for gene in np.flatnonzero(flagged.any(axis=1)):
+            # One denominator for all bins preserves ties in their joint L2 statistic.
+            shares = _exact_shape_shares(profiles[:, gene])
+            block[:, gene] = np.log(np.maximum(shares, 1e-12)) if log_transform else shares
     return block
 
 
@@ -544,7 +581,10 @@ def _fit_glm_profiles(
     for block in _iter_feature_blocks(n_samples, n_features, n_bins, n_terms):
         # Transform feature blocks and flatten their feature/bin columns for GLM fitting.
         response = _prepare_profile_block(
-            profiles[:, block], normalize_shape, log_transform=log_transform
+            profiles[:, block],
+            normalize_shape,
+            log_transform=log_transform,
+            design_fit=(design_matrix, design_inverse),
         ).reshape(n_samples, -1)
         # Compute global or per-feature numerical roundoff for numerically zero residual covariance.
         roundoff = max(roundoff, _profile_roundoff(response.reshape(n_samples, -1, n_bins)))
@@ -694,7 +734,10 @@ def _estimate_glm_masked_null_covariance(  # noqa: C901
         for block in _iter_feature_blocks(count, len(genes), n_bins, n_terms):
             cols = genes[block]
             response = _prepare_profile_block(
-                spectra[rows[:, None], cols], normalize_shape, log_transform=log_transform
+                spectra[rows[:, None], cols],
+                normalize_shape,
+                log_transform=log_transform,
+                design_fit=(gene_design, design_inverse),
             )
             roundoff = max(roundoff, _profile_roundoff(response))
             tolerance = _profile_roundoff(response, per_gene=True) if per_gene else None
@@ -884,14 +927,19 @@ def _run_l2_permutations(
     """
     uniq = np.unique(group_codes)
     a_val = uniq[0]
-    response = _prepare_profile_block(profiles, normalize_shape, log_transform=log_transform)
+    group_a = group_codes == a_val
+    response = _prepare_profile_block(
+        profiles,
+        normalize_shape,
+        log_transform=log_transform,
+        permutation_group_size=int(group_a.sum()),
+    )
     response -= response[:1].copy()
     weights = freq_weights
 
     def difference(values, group_a):
         return values[group_a].mean(axis=0) - values[~group_a].mean(axis=0)
 
-    group_a = group_codes == a_val
     estimates = difference(response, group_a)
     observed = np.sqrt(np.sum(weights * estimates**2, axis=-1))
     # Comparing two L2 values rounds four group means and two weighted sums over bins.
@@ -988,33 +1036,9 @@ def _rotation_metadata(n_rotations, random_state):
     }
 
 
-_as_fractions = np.frompyfunc(Fraction, 1, 1)
-
-
-def _orthogonalize_columns(columns, n_samples):
-    """Rational Gram-Schmidt in place, using the sample rows for inner products."""
-    samples = columns[:n_samples]
-    for j in range(columns.shape[1] - 1):
-        column = samples[:, j]
-        squared = column @ column
-        if squared:
-            slopes = (column @ samples[:, j + 1 :]) / squared
-            columns[:, j + 1 :] -= columns[:, j, None] * slopes
-
-
 def _exact_rotation_design(design, contrast, retained, residual_basis):
     """Orthogonalize the retained model exactly for refitting roundoff-sized residuals."""
-    augmented = _as_fractions(np.vstack([design, contrast]))
-    if len(retained) < design.shape[1]:
-        # Restrict coefficients to the same right-singular subspace as the OLS fit.
-        augmented = augmented @ _as_fractions(retained.T)
-
-    # Apply the design column operations to the contrast as well. Rational
-    # Gram-Schmidt needs no square roots or tolerance-based pivot decisions.
-    _orthogonalize_columns(augmented, len(design))
-    q = augmented[:-1]
-    inverse = q.T / np.sum(q * q, axis=0)[:, None]
-    sample_weights = augmented[-1] @ inverse
+    q, inverse, sample_weights = _lm._exact_glm_design(design, contrast, retained)
     norm = math.hypot(*np.asarray(sample_weights, dtype=float))
     # Complete the well-conditioned design basis along the original rotation axes.
     # The original SVD complement can lose residual energy for nearly collinear designs.
@@ -1645,7 +1669,7 @@ def _run_l2_conditional(  # noqa: C901
             cols = genes[block]
             values = profiles[rows[:, None], cols]
             response = _prepare_profile_block(
-                values, normalize_shape, log_transform=log_transform
+                values, normalize_shape, log_transform=log_transform, design_fit=(x, inverse)
             ).reshape(count, -1)
             beta, residuals, theta = _lm._fit_glm_response(response, x, inverse, vector, rank)
             effect = theta.reshape(-1, n_bins)

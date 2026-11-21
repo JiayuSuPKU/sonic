@@ -308,15 +308,14 @@ def _run_t_cauchy_test(  # noqa: C901 — binary/GLM eligibility and masked fits
         if masked:
             matrix, columns = _lm._build_design_matrix(design, n_samples)
             vector = _lm._resolve_contrast(contrast, columns)
-            inverse, rank, full_estimable = _lm._decompose_glm_design(matrix, vector)
+            full_fit = _lm._decompose_glm_design(matrix, vector)
             extra = {"n_obs": presence.sum(axis=0), "df_resid": np.zeros(n_genes, dtype=int)}
         else:
-            matrix, _, vector, inverse, rank = (
+            matrix, _, vector, full_fit = (
                 prepared_design
                 if prepared_design is not None
                 else _lm._prepare_glm_design(design, contrast, n_samples)
             )
-            full_estimable = True
 
     observed = np.full(n_genes, np.nan)
     pvals = np.full(n_genes, np.nan)
@@ -340,19 +339,19 @@ def _run_t_cauchy_test(  # noqa: C901 — binary/GLM eligibility and masked fits
                 x = np.column_stack([codes == 0, codes == 1])
                 inv = x.T / x.sum(axis=0)[:, None]  # Each fitted value is its group mean.
         else:
-            x = matrix[sample_mask]
-            inv, rank_gene, estimable = (
-                (inverse, rank, full_estimable)
+            fit = (
+                full_fit
                 if sample_mask.all()
-                else _lm._decompose_glm_design(x, vector)
+                else _lm._decompose_glm_design(matrix[sample_mask], vector)
             )
-            df_resid = count - rank_gene
+            x, inv = fit.matrix, fit.inverse
+            df_resid = count - fit.rank
             if masked:
                 extra["df_resid"][genes] = df_resid
-            scale = float(np.sum((vector @ inv) ** 2))
+            scale = float(np.sum(fit.sample_weights**2))
             if (
                 df_resid < int(min_resid_df)
-                or not estimable
+                or not fit.estimable
                 or not np.isfinite(scale)
                 or scale <= 0
             ):
@@ -376,10 +375,7 @@ def _run_t_cauchy_test(  # noqa: C901 — binary/GLM eligibility and masked fits
             else:
                 t_stat, bins, effect, informative = _lm._test_glm_response(
                     response.reshape(count, -1),
-                    x,
-                    inv,
-                    vector,
-                    rank_gene,
+                    fit,
                     unit_fits=unit_fits,
                     mask_key=mask_key,
                 )
@@ -1064,11 +1060,8 @@ def compare_glm_scalar(
 
     if not np.isfinite(values).all():
         raise ValueError("Scalar GLM responses must be finite.")
-    prepared_design = _lm._prepare_glm_design(design, contrast, n_samples)
-    design_matrix, _, contrast_vector, design_inverse, rank = prepared_design
-    t_stat, pvals, estimate, _ = _lm._test_glm_response(
-        values, design_matrix, design_inverse, contrast_vector, rank
-    )
+    _, _, _, fit = _lm._prepare_glm_design(design, contrast, n_samples)
+    t_stat, pvals, estimate, _ = _lm._test_glm_response(values, fit)
     observed = np.abs(t_stat)
 
     frame = _comparison_frame(

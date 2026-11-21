@@ -32,6 +32,35 @@ from sonic.statistics import apply_bh_correction, liu_sf
 class TestLiuCalibration:
     """Gaussian plug-in calibration of L2 tails, masking, and low-df behavior."""
 
+    @pytest.mark.parametrize("masked", [False, True])
+    def test_df_norm_plugin_is_invariant_to_duplicate_timestamp(self, masked):
+        group = np.tile([0, 0, 1, 1], 6)
+        time = (1_730_000_000 + 86_400 * (np.arange(24) - 11.5)) * 1e9
+        powers = np.random.default_rng(325).lognormal(size=(24, 4, 7))
+        powers[:, 0, 0] *= np.exp(2 * group)
+        design = pd.DataFrame({"group": group, "time": time})
+
+        def fit(design):
+            options = {"normalize_shape": True, "null": "plugin"}
+            if masked:
+                presence = np.ones(powers.shape[:2], dtype=bool)
+                presence[:3, 1] = False
+                result = compare_glm_masked(powers, design, "group", presence, **options)
+            else:
+                result = compare_glm(powers, design, "group", **options)
+            return result.set_index("Feature").sort_index()
+
+        reference = fit(design)
+        duplicate = fit(design.assign(time_copy=time))
+        np.testing.assert_allclose(
+            duplicate[["Statistic", "P_value", "P_adj"]],
+            reference[["Statistic", "P_value", "P_adj"]],
+            rtol=1e-9,
+        )
+        np.testing.assert_allclose(
+            np.stack(duplicate.Estimate_per_bin), np.stack(reference.Estimate_per_bin), atol=1e-11
+        )
+
     def test_saturated_design_rejects_plugin(self):
         spectra = np.ones((2, 1, 3))
         with pytest.raises(ValueError, match="no residual degrees of freedom"):
@@ -1023,6 +1052,34 @@ class TestConditionalRotation:
         assert result.Statistic == pytest.approx(reference.Statistic, rel=1e-12)
         assert result.P_value == pytest.approx(reference.P_value, rel=1e-12)
 
+    @pytest.mark.parametrize("masked", [False, True])
+    def test_df_norm_timestamp_units_preserve_the_intercept(self, masked):
+        powers = np.random.default_rng(325).lognormal(size=(24, 12, 17))
+        days = np.arange(24) - 11.5
+        ns_per_day = 86_400_000_000_000
+        unix_ns = 1_730_000_000_000_000_000 + (days * ns_per_day).astype(np.int64)
+        presence = np.ones(powers.shape[:2], dtype=bool)
+        presence[:3, 0] = False
+
+        def fit(time):
+            design = pd.DataFrame({"time": time})
+            if masked:
+                frame = compare_glm_masked(powers, design, "time", presence, normalize_shape=True)
+                np.testing.assert_array_equal(frame.df_resid, frame.n_obs - 2)
+            else:
+                frame = compare_glm(powers, design, "time", normalize_shape=True)
+            return frame.set_index("Feature").sort_index()
+
+        reference, actual = fit(days), fit(unix_ns)
+        np.testing.assert_allclose(actual.P_value, reference.P_value, rtol=1e-9)
+        np.testing.assert_allclose(actual.P_adj, reference.P_adj, rtol=1e-9)
+        np.testing.assert_allclose(
+            np.stack(actual.Estimate_per_bin) * ns_per_day,
+            np.stack(reference.Estimate_per_bin),
+            rtol=1e-9,
+            atol=1e-12,
+        )
+
     def test_conditional_scatter_retains_zero_directions_and_profile_scales(self):
         coordinates = np.random.default_rng(86).normal(size=(8, 1, 2))
         scales = np.array([1e-100, 1.0, 1e100, 0.0])
@@ -1483,9 +1540,9 @@ class TestConditionalIntegration:
 
         g = np.tile([-1, 1], 6)
         noise = np.tile([-1, -1, 1, 1], 3)
-        # The third column either duplicates the contrast or falls below the SVD cutoff.
-        x = np.c_[np.ones(12), g, 2 * g if aliased else noise * 2.0**-60]
-        c = np.array([0, 1, 2 if aliased else 0])
+        # The third column is either exactly or numerically collinear with the tested term.
+        x = np.c_[np.ones(12), g, 2 * g if aliased else g + noise * 2.0**-51]
+        c = np.array([0, 1, 2 if aliased else 1])
         y = 0.5 + np.spacing(0.5) * (3 * g + noise)
         result = l2._run_l2_conditional(y[:, None, None], x, c, log_transform=False)
         assert result["df_resid"][0] == 10

@@ -532,6 +532,76 @@ class TestGLMComparison:
         with pytest.raises(ValueError, match="not estimable"):
             compare_glm(spectra, X, contrast=np.array([0.0, 1.0, 0.0]))
 
+    @pytest.mark.parametrize("null", ["rotation", "plugin"])
+    @pytest.mark.parametrize("origin", [0, 1_730_000_000], ids=["centered", "unix"])
+    @pytest.mark.parametrize("delay", [1 / 8, 1 / 65_536])
+    def test_duration_confounded_group_is_not_estimable(self, null, origin, delay):
+        group = np.tile([0, 0, 1, 1], 6)
+        start = origin + 86_400 * (np.arange(24) - 11.5)
+        end = start + 0.5 + group * delay
+        np.testing.assert_array_equal((end - start - 0.5) / delay, group)
+        design = pd.DataFrame({"group": group, "start": start, "end": end})
+        powers = np.random.default_rng(325).lognormal(size=(24, 2, 7))
+        with pytest.raises(ValueError, match="contrast is not estimable"):
+            compare_glm(powers, design, "group", null=null, normalize_shape=True)
+
+    @pytest.mark.parametrize("null", ["rotation", "plugin"])
+    def test_indicator_contrast_confounded_by_duration(self, null):
+        group = np.tile([0, 0, 1, 1], 6)
+        start = 86_400 * (np.arange(24) - 11.5)
+        powers = np.random.default_rng(325).lognormal(size=(24, 1, 3))
+        for origin in (0, 1_730_000_000):
+            time = start + origin
+            design = np.column_stack((1 - group, group, time, time + 0.5 + group / 65_536))
+            with pytest.raises(ValueError, match="contrast is not estimable"):
+                compare_glm(
+                    powers, design, np.array([-1, 1, 0, 0]), null=null, normalize_shape=True
+                )
+
+    @pytest.mark.parametrize("null", ["rotation", "plugin"])
+    def test_timestamp_centering_changes_rank(self, null):
+        group = np.tile([0, 0, 1, 1], 6)
+        time = 86_400 * (np.arange(24) - 11.5)
+        duration = 2 * group + np.tile([0, 1, 0, 1], 6)
+        end = time + 0.5 + duration / 65_536
+        powers = np.random.default_rng(325).lognormal(size=(24, 1, 3))
+
+        def fit(start, stop):
+            design = pd.DataFrame({"group": group, "start": start, "end": stop})
+            return compare_glm(powers, design, "group", null=null, normalize_shape=True)
+
+        with pytest.raises(ValueError, match="rank.*center"):
+            fit(time + 1_730_000_000, end + 1_730_000_000)
+        np.testing.assert_allclose(fit(time, end).P_value, fit(time, duration).P_value, atol=1e-4)
+
+    @pytest.mark.parametrize("indicators", [False, True], ids=["explicit", "implicit"])
+    def test_estimable_prediction_with_shifted_duplicate_predictor(self, indicators):
+        time = np.arange(16.0, 28.0)
+        if indicators:
+            group = np.tile([0, 0, 1], 4)
+            design = np.column_stack((time, 1 - group, group))
+        else:
+            design = np.column_stack((time, np.full_like(time, 2.0)))
+        powers = np.random.default_rng(37).lognormal(size=(len(time), 1, 3))
+        duplicate = np.column_stack((design, time + 8))
+        # A fitted mean at an observed sample is estimable in either encoding.
+        reference = compare_glm(powers, design, design[4], null="plugin")
+        actual = compare_glm(powers, duplicate, duplicate[4], null="plugin")
+        np.testing.assert_allclose(actual.P_value, reference.P_value, rtol=1e-12)
+
+    def test_mixed_contrast_keeps_small_timestamp_terms(self):
+        group = np.tile([0, 1], 6)
+        time = (1_730_000_000 + 86_400 * np.arange(12)) * 10**9
+        design = pd.DataFrame({"group": group, "time": time})
+        duplicate = design.assign(time_copy=time)
+        powers = np.random.default_rng(37).lognormal(size=(12, 1, 3))
+        contrast = {"group": 1, "time": 1}
+        with pytest.raises(ValueError, match="contrast is not estimable"):
+            compare_glm(powers, duplicate, contrast, null="plugin")
+        expected = compare_glm(powers, design, contrast, null="plugin")
+        actual = compare_glm(powers, duplicate, {**contrast, "time_copy": 1}, null="plugin")
+        np.testing.assert_allclose(actual.P_value, expected.P_value, rtol=1e-9)
+
     def test_glm_statistic_stays_keyword_only(self):
         import inspect
 
@@ -705,10 +775,10 @@ class TestGLMComparison:
         result = compare_glm_scalar(values, groups[:, None], np.ones(1))
         np.testing.assert_allclose(result.Estimate.iloc[0], 1.0)
         assert result.P_value.iloc[0] < 0.05
-        # A constant column removed by the rank cutoff must not change that model.
-        truncated = np.column_stack([np.full(12, 1e-18), groups])
-        actual = compare_glm_scalar(values, truncated, np.array([0.0, 1.0]))
-        np.testing.assert_allclose(actual[["Estimate", "P_value"]], result[["Estimate", "P_value"]])
+        # Changing intercept units still controls for the constant response.
+        rescaled = np.column_stack([np.full(12, 1e-18), groups])
+        actual = compare_glm_scalar(values, rescaled, np.array([0.0, 1.0]))
+        assert actual.Estimate.item() == 0 and actual.P_value.item() == 1
         # A nearly constant covariate still does not span an exact intercept.
         near_constant = (1 + 1e-10 * groups)[:, None]
         actual = compare_glm_scalar(values, near_constant, np.ones(1))

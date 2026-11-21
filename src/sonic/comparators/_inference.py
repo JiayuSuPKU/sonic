@@ -536,8 +536,8 @@ def _fit_glm_profiles(
         Shape ``(n_samples, n_features, n_bins)``, with samples in the same order
         as the prepared design matrix.
     prepared_design : tuple
-        Validated output of ``_prepare_glm_design``: design matrix, column names,
-        contrast vector, design pseudoinverse, and rank.
+        Original matrix, column names, contrast vector and scaled fit from
+        ``_prepare_glm_design``.
     freq_weights : np.ndarray, optional
         Positive bin weights of shape ``(n_bins,)``, normalized to sum to one.
         Defaults to equal weights.
@@ -573,9 +573,10 @@ def _fit_glm_profiles(
     """
     covariance = _resolve_covariance(covariance)
     n_samples, n_features, n_bins = profiles.shape
-    design_matrix, design_columns, contrast_vector, design_inverse, rank = prepared_design
-    n_terms = design_matrix.shape[1]
-    df_resid = n_samples - rank
+    _, design_columns, contrast_vector, fit = prepared_design
+    n_terms = fit.matrix.shape[1]
+    df_resid = n_samples - fit.rank
+    contrast_scale = float(np.sum(fit.sample_weights**2))
     weights = _resolve_freq_weights(freq_weights, n_bins)
     per_gene = covariance == "per_gene"
     covariance_state = (
@@ -592,7 +593,7 @@ def _fit_glm_profiles(
             profiles[:, block],
             normalize_shape,
             log_transform=log_transform,
-            design_fit=(design_matrix, design_inverse),
+            design_fit=(fit.matrix, fit.inverse),
         ).reshape(n_samples, -1)
         # Compute global or per-feature numerical roundoff for numerically zero residual covariance.
         roundoff = max(roundoff, _profile_roundoff(response.reshape(n_samples, -1, n_bins)))
@@ -601,10 +602,8 @@ def _fit_glm_profiles(
             if per_gene
             else None
         )
-        beta_block, residuals, theta = _lm._fit_glm_response(
-            response, design_matrix, design_inverse, contrast_vector, rank
-        )
-        beta[:, block] = beta_block.reshape(n_terms, -1, n_bins)
+        beta_block, residuals, theta = _lm._fit_glm_response(response, fit)
+        beta[:, block] = (beta_block / fit.scales[:, None]).reshape(n_terms, -1, n_bins)
         effect = theta.reshape(-1, n_bins)
         observed[block] = np.sqrt(np.sum(weights * effect**2, axis=-1))
         estimates[block] = effect
@@ -616,7 +615,7 @@ def _fit_glm_profiles(
                 residuals.reshape(n_samples, -1, n_bins),
                 weights,
                 df_resid,
-                float(np.sum((contrast_vector @ design_inverse) ** 2)),
+                contrast_scale,
                 tolerance,
             )
         else:
@@ -627,7 +626,6 @@ def _fit_glm_profiles(
     _maybe_warn_small_df_plugin(df_resid, log_transform=log_transform)
 
     # Calibrate the L2 statistic on the tested profile scale.
-    contrast_scale = float(np.sum((contrast_vector @ design_inverse) ** 2))
     if not per_gene:
         covariance_state = _pooled_covariance_state(
             residual_cov, weights, contrast_scale, roundoff, for_pooling
@@ -723,18 +721,15 @@ def _estimate_glm_masked_null_covariance(  # noqa: C901
         if count == 0:
             continue
 
-        gene_design = design_matrix[sample_mask]
-        design_inverse, rank_gene, estimable = _lm._decompose_glm_design(
-            gene_design, contrast_vector
-        )
-        df_gene = count - rank_gene
+        fit = _lm._decompose_glm_design(design_matrix[sample_mask], contrast_vector)
+        df_gene = count - fit.rank
         df_resid[genes] = df_gene
         if df_gene < int(min_resid_df):
             continue
-        if not estimable:
+        if not fit.estimable:
             continue
 
-        scale = float(np.sum((contrast_vector @ design_inverse) ** 2))
+        scale = float(np.sum(fit.sample_weights**2))
         if not np.isfinite(scale) or scale <= 0.0:
             continue
 
@@ -745,17 +740,15 @@ def _estimate_glm_masked_null_covariance(  # noqa: C901
                 spectra[rows[:, None], cols],
                 normalize_shape,
                 log_transform=log_transform,
-                design_fit=(gene_design, design_inverse),
+                design_fit=(fit.matrix, fit.inverse),
             )
             roundoff = max(roundoff, _profile_roundoff(response))
             tolerance = _profile_roundoff(response, per_gene=True) if per_gene else None
-            gene_beta, residuals, theta = _lm._fit_glm_response(
-                response.reshape(count, -1), gene_design, design_inverse, contrast_vector, rank_gene
-            )
+            gene_beta, residuals, theta = _lm._fit_glm_response(response.reshape(count, -1), fit)
             effect = theta.reshape(-1, n_bins)
             observed[cols] = np.sqrt(np.sum(weights * effect**2, axis=-1))
             estimates[cols] = effect
-            beta[:, cols] = gene_beta.reshape(n_terms, -1, n_bins)
+            beta[:, cols] = (gene_beta / fit.scales[:, None]).reshape(n_terms, -1, n_bins)
             if per_gene:
                 _store_per_gene_covariance(
                     covariance_state,
@@ -1622,12 +1615,12 @@ def _run_l2_conditional(  # noqa: C901
         raise ValueError("presence must have shape (n_samples, n_features).")
     matrix, columns = _lm._build_design_matrix(design, n_samples)
     vector = _lm._resolve_contrast(contrast, columns)
-    inverse, rank, estimable = _lm._decompose_glm_design(matrix, vector)
+    full_fit = _lm._decompose_glm_design(matrix, vector)
     if not masked:
-        if n_samples - rank < int(min_resid_df):
+        if n_samples - full_fit.rank < int(min_resid_df):
             raise ValueError("Rotation tests require positive residual degrees of freedom.")
-        if not estimable:
-            raise ValueError("contrast is not estimable from the supplied design matrix.")
+        if full_fit.estimability_error:
+            raise ValueError(full_fit.estimability_error)
     weights = _resolve_freq_weights(freq_weights, n_bins)
     sqrt_weights = np.sqrt(weights)
     exact_sqrt_weights = _as_fractions(sqrt_weights)
@@ -1656,14 +1649,14 @@ def _run_l2_conditional(  # noqa: C901
         count = len(rows)
         if not count:
             continue
-        x = matrix[rows]
-        inverse, rank, estimable = _lm._decompose_glm_design(x, vector)
+        fit = full_fit if count == n_samples else _lm._decompose_glm_design(matrix[rows], vector)
+        x, rank = fit.matrix, fit.rank
         df = count - rank
         df_resid[genes] = df
-        if df < int(min_resid_df) or not estimable:
+        if df < int(min_resid_df) or not fit.estimable:
             continue
         # a = c^T X^+ gives sample weights for the fitted contrast: theta = a @ Y.
-        a = vector @ inverse
+        a = fit.sample_weights
         contrast_norm = np.linalg.norm(a)
         if not np.isfinite(contrast_norm) or contrast_norm <= 0:
             continue
@@ -1671,10 +1664,12 @@ def _run_l2_conditional(  # noqa: C901
         u, singular, vt = np.linalg.svd(x, full_matrices=True)
         residual_basis = u[:, rank:]
         basis = np.column_stack([a / contrast_norm, residual_basis])
-        exact_design = cache(partial(_exact_rotation_design, x, vector, vt[:rank], residual_basis))
+        exact_design = cache(
+            partial(_exact_rotation_design, x, fit.contrast, vt[:rank], residual_basis)
+        )
         column_scale = np.max(np.abs(x), axis=0)
         constant_nuisance = rank == x.shape[1] and np.any(
-            np.all(x == x[0], axis=0) & (x[0] != 0) & (vector == 0)
+            np.all(x == x[0], axis=0) & (x[0] != 0) & (fit.contrast == 0)
         )
         if n_rotations is not None:
             # Reuse this mask's seed across feature blocks to preserve seeded results.
@@ -1686,9 +1681,9 @@ def _run_l2_conditional(  # noqa: C901
             cols = genes[block]
             values = profiles[rows[:, None], cols]
             response = _prepare_profile_block(
-                values, normalize_shape, log_transform=log_transform, design_fit=(x, inverse)
+                values, normalize_shape, log_transform=log_transform, design_fit=(x, fit.inverse)
             ).reshape(count, -1)
-            beta, residuals, theta = _lm._fit_glm_response(response, x, inverse, vector, rank)
+            beta, residuals, theta = _lm._fit_glm_response(response, fit)
             effect = theta.reshape(-1, n_bins)
             # Dividing by ||a|| makes the contrast axis unit length; it is not an SE.
             coordinates = np.concatenate(

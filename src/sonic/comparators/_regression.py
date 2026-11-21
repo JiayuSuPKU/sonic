@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import math
 from collections.abc import Sequence
+from dataclasses import dataclass
 from fractions import Fraction
 
 import numpy as np
@@ -123,49 +124,136 @@ def _resolve_contrast(
     raise TypeError(f"Contrast must be a str, dict, or ndarray; got {type(contrast).__name__}.")
 
 
-def _decompose_glm_design(
-    design_matrix: np.ndarray, contrast_vector: np.ndarray
-) -> tuple[np.ndarray, int, bool]:
-    """Use one SVD for the OLS inverse, rank, and contrast estimability.
+@dataclass
+class _ScaledDesign:
+    """OLS design, contrast and pseudoinverse in the same scaled coordinates."""
 
-    Forming X'X squares the condition number. Check the contrast against
-    the orthonormal row basis directly, without multiplying X's inverse by X.
-    Normalize the contrast for this check so its units cannot change estimability.
+    matrix: np.ndarray
+    contrast: np.ndarray
+    inverse: np.ndarray
+    scales: np.ndarray
+    rank: int
+    estimability_error: str | None
+
+    @property
+    def estimable(self):
+        return self.estimability_error is None
+
+    @property
+    def sample_weights(self):
+        return self.contrast @ self.inverse
+
+
+def _column_scales(matrix):
+    # Powers of two preserve the represented values for exact-fit checks.
+    largest = np.max(np.abs(matrix), axis=0)
+    exponents = np.frexp(largest)[1]
+    return np.ldexp(1.0, np.where(largest == 0, 0, exponents - 1))
+
+
+def _rank_and_cutoff(matrix, singular):
+    cutoff = np.finfo(float).eps * max(matrix.shape) * singular[0]
+    return int(np.count_nonzero(singular > cutoff)), cutoff
+
+
+def _contrast_in_row_space(matrix, contrast, rank, largest_singular, cutoff):
+    """An estimable contrast adds no independent row at the design's rank tolerance."""
+    while True:
+        direction = contrast / np.max(np.abs(contrast))
+        row = direction * (largest_singular / np.linalg.norm(direction))
+        if np.linalg.matrix_rank(np.vstack((matrix, row)), tol=cutoff) != rank:
+            return False
+        # A large estimable term can hide a smaller aliased term below the cutoff.
+        # Check those nonzero terms separately at a scale the rank test can resolve.
+        small = (contrast != 0) & (np.abs(row) <= cutoff)
+        if not small.any():
+            return True
+        contrast = np.where(small, contrast, 0.0)
+
+
+def _centered_design_error(matrix, contrast, fitted_rank):
+    """Check rank and contrast after removing offsets represented by the intercept."""
+    low, high = matrix.min(axis=0), matrix.max(axis=0)
+    origin = np.clip(0.0, low, high)
+    origin[low == high] = 0.0
+    if not np.any(origin):
+        return None
+    intercepts = np.flatnonzero((low == high) & (low != 0))
+    if intercepts.size:
+        i = intercepts[0]
+        intercept_weight = contrast[i] / low[i]
+    else:
+        # Use unshifted columns so large timestamps cannot masquerade as an intercept.
+        anchors = matrix[:, origin == 0]
+        if not anchors.shape[1]:
+            return None
+        tolerance = np.finfo(float).eps * max(anchors.shape)
+        inverse = np.linalg.pinv(anchors, rcond=tolerance)
+        coefficients = inverse.sum(axis=1)
+        residual = 1 - anchors @ coefficients
+        if np.max(np.abs(residual)) > tolerance:
+            return None
+        # Refine before applying contrasts such as the difference of two group means.
+        coefficients += inverse @ residual
+        intercept_weight = contrast[origin == 0] @ coefficients
+    centered = matrix - origin
+    scales = _column_scales(centered)
+    centered /= scales
+    singular = np.linalg.svd(centered, compute_uv=False)
+    rank, cutoff = _rank_and_cutoff(centered, singular)
+    if rank != fitted_rank:
+        return (
+            f"GLM design rank changes from {fitted_rank} to {rank} after centering. "
+            "Center the predictors or supply elapsed times before fitting."
+        )
+    adjusted = (contrast - intercept_weight * origin) / scales
+    if rank < centered.shape[1] and not _contrast_in_row_space(
+        centered, adjusted, rank, singular[0], cutoff
+    ):
+        return "contrast is not estimable from the centered design matrix."
+    return None
+
+
+def _decompose_glm_design(design_matrix: np.ndarray, contrast_vector: np.ndarray) -> _ScaledDesign:
+    """Fit in comparable column units so timestamps cannot swamp the intercept.
+
+    Keep the design, pseudoinverse and contrast together through inference.
+    Only reported coefficients need converting back to the input units.
     """
     if not np.isfinite(design_matrix).all() or not np.isfinite(contrast_vector).all():
         raise ValueError("Design matrix and contrast must be finite.")
-    contrast_size = np.max(np.abs(contrast_vector), initial=0.0)
-    if contrast_size == 0:
+    if not np.any(contrast_vector):
         raise ValueError("contrast must be nonzero.")
-    u, singular, vt = np.linalg.svd(design_matrix, full_matrices=False)
-    cutoff = np.finfo(float).eps * max(design_matrix.shape) * singular[0]
-    rank = int(np.count_nonzero(singular > cutoff))
+    scales = _column_scales(design_matrix)
+    matrix = design_matrix / scales
+    contrast = contrast_vector / scales
+    u, singular, vt = np.linalg.svd(matrix, full_matrices=False)
+    rank, cutoff = _rank_and_cutoff(matrix, singular)
     rows = vt[:rank]
     inverse = (rows.T / singular[:rank]) @ u[:, :rank].T
-    unit_contrast = contrast_vector / contrast_size
-    estimable = np.allclose(rows.T @ (rows @ unit_contrast), unit_contrast, rtol=1e-7, atol=1e-10)
-    return inverse, rank, bool(estimable)
+    error = _centered_design_error(matrix, contrast, rank)
+    if error is None and rank < matrix.shape[1]:
+        if rank == 0 or not _contrast_in_row_space(matrix, contrast, rank, singular[0], cutoff):
+            error = "contrast is not estimable from the supplied design matrix."
+    return _ScaledDesign(matrix, contrast, inverse, scales, rank, error)
 
 
 def _prepare_glm_design(design, contrast, n_samples):
     """Resolve and validate one design for reuse across response blocks.
 
-    Returns the matrix, column names, contrast vector, OLS inverse and rank.
+    Returns the original matrix, column names and contrast, plus the scaled design.
     Masked tests still decompose each distinct observed-sample design separately.
     """
     matrix, columns = _build_design_matrix(design, n_samples)
     vector = _resolve_contrast(contrast, columns)
-    inverse, rank, estimable = _decompose_glm_design(matrix, vector)
-    if n_samples <= rank:
+    fit = _decompose_glm_design(matrix, vector)
+    if n_samples <= fit.rank:
         raise ValueError(
-            f"design has no residual degrees of freedom: n_samples={n_samples}, rank={rank}."
+            f"design has no residual degrees of freedom: n_samples={n_samples}, rank={fit.rank}."
         )
-    if not estimable:
-        raise ValueError(
-            "contrast is not estimable from the supplied design matrix "
-            f"(rank={rank}, n_terms={matrix.shape[1]})."
-        )
-    return matrix, columns, vector, inverse, rank
+    if fit.estimability_error:
+        raise ValueError(fit.estimability_error)
+    return matrix, columns, vector, fit
 
 
 _as_fractions = np.frompyfunc(Fraction, 1, 1)
@@ -197,10 +285,7 @@ def _exact_glm_design(design, contrast, retained=None):
 
 def _fit_glm_response(
     response: np.ndarray,
-    design: np.ndarray,
-    inverse: np.ndarray,
-    contrast: np.ndarray,
-    rank: int,
+    fit: _ScaledDesign,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """Solve OLS for an already-transformed 2D response block.
 
@@ -209,19 +294,13 @@ def _fit_glm_response(
     response : np.ndarray
         Shape ``(n_samples, n_responses)``. Columns are already-transformed
         responses, such as flattened feature/bin profiles or scalar outcomes.
-    design : np.ndarray
-        Design matrix of shape ``(n_samples, n_terms)``, aligned with response rows.
-    inverse : np.ndarray
-        Precomputed pseudoinverse of ``design``, shape ``(n_terms, n_samples)``.
-    contrast : np.ndarray
-        Linear contrast weights, shape ``(n_terms,)``.
-    rank : int
-        Design rank from the same decomposition used to compute ``inverse``.
+    fit : _ScaledDesign
+        Scaled design for the observed response rows and requested contrast.
 
     Returns
     -------
     beta : np.ndarray
-        OLS coefficients, shape ``(n_terms, n_responses)``.
+        OLS coefficients in scaled design coordinates, shape ``(n_terms, n_responses)``.
     residuals : np.ndarray
         ``response - design @ beta``, shape ``(n_samples, n_responses)``.
     effect : np.ndarray
@@ -233,9 +312,10 @@ def _fit_glm_response(
     and restore its contribution to the coefficients and contrast afterward.
     This reduces cancellation error in residuals and small effects.
     """
+    design, inverse, contrast = fit.matrix, fit.inverse, fit.contrast
     constant = np.flatnonzero(np.all(design == design[:1], axis=0) & (design[0] != 0))
     offset_beta = np.zeros(design.shape[1])
-    if constant.size and rank == design.shape[1]:
+    if constant.size and fit.rank == design.shape[1]:
         j = constant[0]
         offset_beta[j] = 1.0 / design[0, j]
         offset_effect = contrast[j] / design[0, j]
@@ -265,14 +345,14 @@ def _glm_fit_roundoff(design, inverse, scale):
     return np.finfo(float).eps * max(design.shape) * (1 + amplification) * scale
 
 
-def _test_glm_response(response, design, inverse, contrast, rank, *, unit_fits=None, mask_key=None):
+def _test_glm_response(response, fit, *, unit_fits=None, mask_key=None):
     """Compute ordinary OLS contrast t tests for a transformed response block.
 
     Parameters
     ----------
     response : np.ndarray
         Finite responses, shape ``(n_samples, n_responses)``.
-    design, inverse, contrast, rank
+    fit : _ScaledDesign
         Validated design and estimable contrast, as in ``_fit_glm_response``.
         The design must have positive residual degrees of freedom.
     unit_fits : dict, optional
@@ -287,15 +367,16 @@ def _test_glm_response(response, design, inverse, contrast, rank, *, unit_fits=N
         for bin selection, each of shape ``(n_responses,)``. A nonzero contrast
         or a varying response with residual variation is informative.
     """
-    _, residuals, estimate = _fit_glm_response(response, design, inverse, contrast, rank)
+    design, rank = fit.matrix, fit.rank
+    _, residuals, estimate = _fit_glm_response(response, fit)
     df_resid = len(response) - rank
     sigma2 = np.sum(residuals**2, axis=0) / df_resid
-    contrast_var = float(np.sum((contrast @ inverse) ** 2))
+    contrast_var = float(np.sum(fit.sample_weights**2))
     if not np.isfinite(contrast_var) or contrast_var <= 0:
         raise ValueError("contrast has zero or nonfinite variance under the supplied design.")
     se = np.sqrt(np.maximum(sigma2, 0.0) * contrast_var)
     scale = np.max(np.abs(response), axis=0)
-    roundoff = _glm_fit_roundoff(design, inverse, scale)
+    roundoff = _glm_fit_roundoff(design, fit.inverse, scale)
     suspect = (scale > 0) & (np.max(np.abs(residuals), axis=0) <= roundoff)
     has_variation = np.any(response != response[:1], axis=0)
     constants = (scale > 0) & ~has_variation
@@ -310,7 +391,7 @@ def _test_glm_response(response, design, inverse, contrast, rank, *, unit_fits=N
         retained = None
         if rank < design.shape[1]:
             retained = np.linalg.svd(design, full_matrices=False)[2][:rank]
-        q, exact_inverse, weights = _exact_glm_design(design, contrast, retained)
+        q, exact_inverse, weights = _exact_glm_design(design, fit.contrast, retained)
         se_factor = math.hypot(*weights) / math.sqrt(df_resid)
         if need_unit_fit:
             # Every constant column is a multiple of the all-ones response.

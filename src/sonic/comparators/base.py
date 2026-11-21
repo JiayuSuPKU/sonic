@@ -764,7 +764,8 @@ class _ComparatorBase:
         Parameters
         ----------
         pairs : sequence of (str, str)
-            Ordered feature pairs, using F_x * conj(F_y). Self-pairs are
+            Ordered feature pairs, using F_x * conj(F_y). Each requested name
+            must identify one feature in the source data. Self-pairs are
             allowed; duplicate or reversed duplicate pairs are rejected.
         n_jobs : int, default -1
             Sample parallelism, as in compute_spectra. Progress reporting
@@ -1553,9 +1554,12 @@ class _ComparatorBase:
             method; tests retain eigenvalues without storing all matrices.
 
             Fitted ``beta`` coefficients always have shape
-            ``(n_terms, n_genes, n_bins)`` on the tested profile scale. Binary
-            tests return two rows: the group-A mean and B-minus-A difference,
-            with groups ordered by ``np.unique``. Skipped genes retain NaNs.
+            ``(n_terms, n_genes, n_bins)`` on the tested profile scale. GLM
+            coefficients are returned in the original predictor units. For
+            aliased terms, the fit uses the minimum-norm solution in the
+            column-scaled design. Binary tests return two rows: the group-A
+            mean and B-minus-A difference, with groups ordered by ``np.unique``.
+            Skipped genes retain NaNs.
             Two-group-only metadata: ``n_obs_A`` and ``n_obs_B``.
             GLM-only metadata: ``design_columns``, ``contrast_vector``, and ``n_obs``.
 

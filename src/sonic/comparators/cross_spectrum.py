@@ -200,7 +200,7 @@ def _compute_cross_spectra(  # noqa: C901 — validation and two backend schedul
     chunk_size = comparator._resolve_chunk_spec(chunk_size)
 
     # Check the requested pairs and map them to the comparator's gene names.
-    all_genes = tuple(comparator.gene_names)
+    all_genes = pd.Index(comparator.gene_names)
     pairs = tuple(pairs)
     if not pairs or any(isinstance(p, str) or len(p) != 2 for p in pairs):
         raise ValueError("Provide at least one pair of feature names")
@@ -210,10 +210,15 @@ def _compute_cross_spectra(  # noqa: C901 — validation and two backend schedul
         raise ValueError("All pair features must exist in the comparator")
     if len({frozenset(p) for p in pairs}) != len(pairs):
         raise ValueError("Duplicate or reversed duplicate pairs are not allowed")
-    genes = tuple(g for g in all_genes if g in pair_genes)
-    gene_index = {g: i for i, g in enumerate(genes)}
-    pair_indices = np.array([[gene_index[a], gene_index[b]] for a, b in pairs])
-    gene_columns = np.array([all_genes.index(g) for g in genes])
+    gene_columns = np.flatnonzero(all_genes.isin(pair_genes))
+    selected = all_genes[gene_columns]
+    if not selected.is_unique:
+        ambiguous = selected[selected.duplicated()].unique().tolist()
+        raise ValueError(
+            f"Ambiguous pair feature names {ambiguous}. Use unique feature identifiers."
+        )
+    genes = tuple(selected)
+    pair_indices = selected.get_indexer(np.ravel(pairs)).reshape(-1, 2)
     n_samples = len(comparator.samples)
 
     # Prepare on the public caller's shallow copy, so failed fits leave its state intact.
@@ -585,7 +590,7 @@ def _run_cross_plugin(  # noqa: C901 — shared fits across covariance modes and
         Validated binary sample labels in the original sample order.
         Used when ``prepared_design`` is None; ignored for GLM contrasts.
     prepared_design : tuple or None
-        Resolved GLM ``(matrix, column_names, contrast, inverse, rank)``
+        Resolved GLM ``(matrix, column_names, contrast, scaled_fit)``
         for the full sample set, or None to select binary comparison.
         Unmasked fits reuse this inverse. Masked fits refit the matrix on
         each distinct retained-sample set and check contrast estimability.
@@ -626,9 +631,9 @@ def _run_cross_plugin(  # noqa: C901 — shared fits across covariance modes and
     n_observed = pair_presence.sum(axis=0)
     use_glm = prepared_design is not None
     if use_glm:
-        matrix, _, vector, _, rank = prepared_design
+        matrix, _, vector, fit = prepared_design
         df_resid = (
-            np.zeros(n_pairs, dtype=int) if use_masked else np.full(n_pairs, n_samples - rank)
+            np.zeros(n_pairs, dtype=int) if use_masked else np.full(n_pairs, n_samples - fit.rank)
         )
     else:
         df_resid = np.maximum(n_observed - 2, 0)
@@ -896,7 +901,7 @@ def _run_cross_rotations(
     estimates = np.full(support.shape, np.nan)
     use_glm = prepared_design is not None
     if use_glm:
-        matrix, _, vector, _, _ = prepared_design
+        matrix, _, vector, _ = prepared_design
     else:
         group_b = groups == np.unique(groups)[1]
         matrix = np.column_stack([np.ones(n_samples), group_b])
@@ -1004,7 +1009,7 @@ def _run_cross_t_cauchy(
     n_bins = support.shape[1]
     use_glm = prepared_design is not None
     if use_glm:
-        matrix, _, vector, _, rank = prepared_design
+        matrix, _, vector, fit = prepared_design
     else:
         codes = (groups == np.unique(groups)[1]).astype(int)
     observed = np.full(n_pairs, np.nan)
@@ -1034,7 +1039,7 @@ def _run_cross_t_cauchy(
                 min_resid_df=min_resid_df if use_masked else 1,
             )
             if use_glm:
-                df_resid[pairs] = extra["df_resid"] if use_masked else n_samples - rank
+                df_resid[pairs] = extra["df_resid"] if use_masked else n_samples - fit.rank
             else:
                 df_resid[pairs] = np.maximum(presence.sum(axis=0) - 2, 0)
             status[pairs] = np.where(
@@ -1343,8 +1348,7 @@ def _compare_cross_spectra(  # noqa: C901 — validation and dispatch over binar
         if use_masked:
             matrix, columns = _build_design_matrix(design, n_samples)
             vector = _resolve_contrast(contrast, columns)
-            inverse, rank, _ = _decompose_glm_design(matrix, vector)
-            prepared_design = matrix, columns, vector, inverse, rank
+            prepared_design = matrix, columns, vector, _decompose_glm_design(matrix, vector)
         else:
             prepared_design = _prepare_glm_design(design, contrast, n_samples)
             columns, vector = prepared_design[1:3]

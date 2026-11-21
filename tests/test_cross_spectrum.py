@@ -483,6 +483,18 @@ class TestInputs:
         with pytest.raises(ValueError, match="finite"):
             make_comparator(values, backend="nufft").compute_cross_spectra([("a", "b")])
 
+    def test_only_requested_pair_names_must_be_unique(self):
+        values = np.random.default_rng(37).normal(size=(4, 17, 19))
+        sample = _grid_sample_to_adata(values, ["a", "b", "a", "c"])
+        comp = ComparatorIrregular([sample], grid_shape=(17, 19), **_DEFAULT_OPTIONS)
+        comp.compute_cross_spectra([("c", "b")], progress=False)
+        previous = comp.cross_spectra_
+        assert previous.gene_names == ("b", "c")
+        np.testing.assert_array_equal(previous.pair_indices, [[1, 0]])
+        with pytest.raises(ValueError, match="Ambiguous.*'a'"):
+            comp.compute_cross_spectra([("b", "a")], progress=False)
+        assert comp.cross_spectra_ is previous
+
 
 class TestChunking:
     @pytest.mark.parametrize("mode", ["radial", "2d"])

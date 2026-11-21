@@ -1746,7 +1746,7 @@ def test_per_gene_covariance_public_dispatch_and_diagnostics(glm, masked, shape_
     design = pd.DataFrame({"time": np.linspace(0, 1, 8)}) if glm else np.repeat([0, 1], 4)
     kwargs = {
         "normalize_shape": shape_only,
-        "freq_weights": np.arange(11),
+        "freq_weights": np.arange(1, 12),
     }
     if glm:
         kwargs["contrast"] = "time"
@@ -1783,7 +1783,7 @@ class TestComparatorRotation:
         kwargs = {
             "integration_tol": 5e-11,
             "normalize_shape": shape_only,
-            "freq_weights": np.arange(5),
+            "freq_weights": np.arange(1, 6),
         }
         actual = comparator.test_diff_freq(x, **kwargs, **({"contrast": "age"} if glm else {}))
         method = "compare_" + ("glm" if glm else "two_groups") + ("_masked" if masked else "")
@@ -1822,7 +1822,7 @@ class TestComparatorLogTCauchy:
         options = {
             "statistic": "log_t_cauchy",
             "normalize_shape": shape_only,
-            "freq_weights": np.array([4.0, 2.0, 1.0, 0.0, 0.0]),
+            "freq_weights": np.array([4.0, 2.0, 1.0, 0.5, 0.25]),
         }
         actual = comparator.test_diff_freq(
             design, **options, **({"contrast": "age"} if glm else {})

@@ -13,10 +13,11 @@ from sonic.comparators.binning import (
     _polar_quadrature_counts,
     _radial_bin_reducer,
 )
+from sonic.comparators.features import _center_observations, _shared_observation_mask
 from sonic.explanation import _explanation_from_responses
 from sonic.kernels.fft import _fourier_coefficients_2d
 from sonic.kernels.nufft import _fourier_coefficients_2d_nufft
-from sonic.utils import _parse_memory_budget
+from sonic.utils import _parse_memory_budget, _take_feature_columns
 
 
 def _check_spectrum_budget(comparator, sample_index, n_features, n_maps, budget):
@@ -114,7 +115,7 @@ def _explain_spectrum(  # noqa: C901 — validation, backend adjoints and five r
     if irregular:
         sample = comparator.samples[sample_index]
         matrix = sample.X if comparator._layer is None else sample.layers[comparator._layer]
-        selected = matrix[:, columns]
+        selected = _take_feature_columns(matrix, columns)
         values = np.array(selected.toarray() if issparse(selected) else selected, dtype=float)
         coordinates = comparator._coords[sample_index]
         if not np.isfinite(values).all() or not np.isfinite(coordinates).all():
@@ -128,12 +129,7 @@ def _explain_spectrum(  # noqa: C901 — validation, backend adjoints and five r
         if tuple(raster.shape[-2:]) != tuple(shape):
             raise ValueError("Raster geometry changed; recompute spectra before explaining bins.")
         block = comparator._batch_raster(raster, names).reshape(len(names), -1).T
-        observed = np.isfinite(block)
-        if np.isinf(block).any() or not np.all(observed == observed[:, :1]):
-            raise ValueError(
-                "FFT features require identical finite support; only shared NaN holes are allowed."
-            )
-        mask = observed[:, 0]
+        mask = _shared_observation_mask(block)
         indices = np.flatnonzero(mask)
         values = block[mask].copy()
         coordinates = np.column_stack(np.unravel_index(indices, shape)) * np.asarray(spacing)
@@ -142,7 +138,8 @@ def _explain_spectrum(  # noqa: C901 — validation, backend adjoints and five r
     n = len(values)
     if n < 2:
         raise ValueError("Each sample must have at least two observed locations.")
-    prepared = values - values.mean(axis=0)
+    prepared = values.copy()
+    _center_observations(prepared)
     if irregular:
         coefficients = _fourier_coefficients_2d_nufft(
             coordinates,

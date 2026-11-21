@@ -294,8 +294,8 @@ def normalize_shape(
     """Normalize each nonzero spectrum to unit total power along ``axis``.
 
     Spectra differing only by a positive scalar have identical shapes, up to
-    floating-point rounding. All-zero spectra stay zero. Scaling by the largest
-    entry before summing avoids overflow and preserves very small powers.
+    floating-point rounding. All-zero spectra stay zero. Power-of-two scaling
+    before summing avoids overflow and preserves very small powers.
 
     Parameters
     ----------
@@ -323,9 +323,17 @@ def normalize_shape(
     spectra = np.asarray(spectra, dtype=np.float64)
     if not np.isfinite(spectra).all():
         raise ValueError("Shape normalization requires finite profiles for observed samples.")
-    scale = spectra.max(axis=axis, keepdims=True, initial=0.0)
-    scaled = np.divide(spectra, scale, out=np.zeros_like(spectra), where=scale > 0)
-    total = scaled.sum(axis=axis, keepdims=True)
+    peak = spectra.max(axis=axis, keepdims=True, initial=0.0)
+    exponent = np.frexp(peak)[1]
+    scaled = np.ldexp(spectra, 1 - exponent, out=np.zeros_like(spectra), where=peak > 0)
+    if scaled.size <= 1:
+        return (scaled > 0).astype(float)
+    # Sum each spectrum in a fixed order so permuting bins preserves rotation ties.
+    axes = tuple(range(scaled.ndim)) if axis is None else tuple(np.atleast_1d(axis))
+    rows = np.moveaxis(scaled, axes, range(-len(axes), 0))
+    ordered = rows.copy(order="C").reshape(peak.size, -1)
+    ordered.sort(axis=1)
+    total = ordered.sum(axis=1).reshape(peak.shape)
     return np.divide(scaled, total, out=scaled, where=total > 0)
 
 

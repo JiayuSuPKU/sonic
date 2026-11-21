@@ -103,9 +103,10 @@ def _fourier_coefficients_2d(
             > np.abs(coefficients).max(axis=(0, 1))
         ):
             del coefficients
-            coefficients = transform(
-                x - x.mean(axis=(0, 1), keepdims=True), axes=(0, 1), workers=workers
-            )
+            # Pin a constant feature's mean to its input value before the FFT.
+            constant = x.min(axis=(0, 1)) == x.max(axis=(0, 1))
+            mean = np.where(constant, x[0, 0], x.mean(axis=(0, 1)))
+            coefficients = transform(x - mean, axes=(0, 1), workers=workers)
             coefficients[0, 0] = 0.0
 
     if squeeze:

@@ -425,6 +425,38 @@ class TestDetectorExplanation:
 class TestComparatorExplanation:
     REPRESENTATIONS = ["power", "power_norm", "cross", "coherency", "coherence"]
 
+    def test_backed_spectrum_explains_reversed_and_repeated_features(self, tmp_path):
+        from sonic import ComparatorIrregular
+
+        data = _adata()
+        path = tmp_path / "expression.h5ad"
+        data.write_h5ad(path)
+
+        def fit(sample):
+            return ComparatorIrregular(
+                [sample],
+                obsm_key="positions",
+                grid_shape=(9, 11),
+                spacing=(1, 1),
+                freq_edges=EDGES,
+                workers=1,
+            ).compute_cross_spectra([("a", "c")], progress=False)
+
+        backed = ad.read_h5ad(path, backed="r")
+        try:
+            memory, disk = fit(data), fit(backed)
+            for names in (["c", "a"], ["c", "c"]):
+                options = {"bands": [1], "representation": "coherence"}
+                expected = memory.explain_spectrum(names, **options)
+                actual = disk.explain_spectrum(names, **options)
+                np.testing.assert_array_equal(
+                    actual.values, data.X[:, data.var_names.get_indexer(names)]
+                )
+                np.testing.assert_allclose(actual.scores, expected.scores)
+                np.testing.assert_allclose(actual.contributions, expected.contributions)
+        finally:
+            backed.file.close()
+
     @staticmethod
     def _fit(comparator, angle=17):
         if comparator.feature_mode == "2d":

@@ -21,7 +21,8 @@ from sonic.comparators.binning import (
     _bin_radial_spectrum,
     _stream_polar_features,
 )
-from sonic.utils import _NUFFT_CHUNK_CAP
+from sonic.comparators.features import _center_observations
+from sonic.utils import _NUFFT_CHUNK_CAP, _take_feature_columns
 
 __all__ = ["ComparatorIrregular"]
 
@@ -249,7 +250,7 @@ class ComparatorIrregular(_ComparatorBase):
 
         adata = self.samples[i]
         X_src = adata.X if self._layer is None else adata.layers[self._layer]
-        X_src = X_src.tocsc() if sp.issparse(X_src) else np.asarray(X_src)
+        X_src = X_src.tocsc() if sp.issparse(X_src) else X_src
         columns = (
             np.arange(len(self.gene_names)) if gene_indices is None else np.asarray(gene_indices)
         )
@@ -261,7 +262,7 @@ class ComparatorIrregular(_ComparatorBase):
         padding = int(self.feature_mode == "2d")
 
         def _spec_chunk(start: int, stop: int) -> np.ndarray:
-            values = X_src[:, columns[start:stop]]
+            values = _take_feature_columns(X_src, columns[start:stop])
             block = np.array(
                 values.toarray() if sp.issparse(values) else values, dtype=float, copy=True
             )
@@ -269,7 +270,7 @@ class ComparatorIrregular(_ComparatorBase):
             presence[start:stop] = (
                 np.count_nonzero(block, axis=0) / max(n_spots, 1)
             ) >= self._presence_threshold
-            block -= dc[None, start:stop]
+            _center_observations(block)
             power = power_spectrum_2d_nufft(
                 self._coords[i],
                 block,

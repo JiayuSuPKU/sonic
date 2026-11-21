@@ -82,7 +82,7 @@ class TestComparisonOptions:
         groups = np.tile(["B", "A"], 5)
         design = np.column_stack((np.ones(10), np.linspace(-1, 1, 10), rng.normal(size=10)))
         contrast = np.array([0.0, -2.0, 0.5])
-        weights = np.array([2.0, 0.0, 1.0, 1.0])
+        weights = np.array([2.0, 0.5, 1.0, 1.0])
         presence = np.ones(spectra.shape[:2], dtype=bool)
         if masked:
             presence[1::3, 1] = False
@@ -137,6 +137,10 @@ class TestComparisonOptions:
             assert per_bin.shape == (8, 6)
             assert ((per_bin >= 0) & (per_bin <= 1)).all()
 
+    def test_binary_labels_must_be_observed(self):
+        with pytest.raises(ValueError, match="nonmissing"):
+            compare_two_groups(np.ones((4, 1, 3)), np.array([0, 0, np.nan, np.nan]))
+
     def test_unknown_statistic_raises(self):
         with pytest.raises(ValueError, match="Unknown statistic"):
             compare_two_groups(
@@ -153,7 +157,7 @@ class TestComparisonOptions:
         base[3:, 1, -2:] *= 3.0
         groups = np.array([0, 0, 0, 1, 1, 1])
         df_equal = compare_two_groups(base, groups, statistic="log_l2", n_perm=200, random_state=0)
-        low_pass = np.concatenate([np.ones(2), np.zeros(K - 2)])
+        low_pass = np.concatenate([np.ones(2), np.full(K - 2, 0.01)])
         df_low = compare_two_groups(
             base,
             groups,
@@ -177,7 +181,7 @@ class TestComparisonOptions:
                 n_perm=10,
                 freq_weights=np.ones(5),
             )
-        with pytest.raises(ValueError, match="non-negative"):
+        with pytest.raises(ValueError, match="strictly positive"):
             compare_two_groups(
                 spectra,
                 groups,
@@ -1271,7 +1275,7 @@ class TestLogTCauchy:
             args.append(presence)
         options = {"statistic": "log_t_cauchy", "normalize_shape": shape_only}
         original = fn(*args, **options).set_index("Feature").sort_index()
-        weights = np.array([1.0, 10.0, 3.0, 0.0])
+        weights = np.array([1.0, 10.0, 3.0, 0.25])
         actual = fn(*args, **options, freq_weights=weights).set_index("Feature").sort_index()
         uniform = fn(*args, **options, freq_weights=np.ones(4)).set_index("Feature").sort_index()
         np.testing.assert_allclose(uniform.P_value, original.P_value, rtol=1e-12)
@@ -1284,7 +1288,7 @@ class TestLogTCauchy:
             if shape_only:
                 values = normalize_shape(values)
             response = np.log(np.maximum(values[:, 0], 1e-12))
-            selected = np.any(response != response[:1], axis=0) & (weights > 0)
+            selected = np.any(response != response[:1], axis=0)
             assert (
                 actual.loc[str(gene), "Best_bin"]
                 == np.flatnonzero(selected)[
@@ -1297,7 +1301,7 @@ class TestLogTCauchy:
             np.testing.assert_allclose(actual.loc[str(gene), "P_value"], expected, rtol=1e-11)
 
     @pytest.mark.parametrize("glm", [False, True])
-    def test_zero_weight_signal_does_not_enter_feature_test(self, glm):
+    def test_sole_informative_bin_determines_result(self, glm):
         groups = np.repeat([0, 1], 6)
         spectra = np.exp(np.stack([groups * 2.0, np.zeros(12)], axis=-1))[:, None, :]
         result = (
@@ -1306,19 +1310,23 @@ class TestLogTCauchy:
                 pd.DataFrame({"group": groups}),
                 "group",
                 statistic="log_t_cauchy",
-                freq_weights=[0, 1],
+                freq_weights=[0.01, 1],
             )
             if glm
-            else compare_two_groups(spectra, groups, statistic="log_t_cauchy", freq_weights=[0, 1])
+            else compare_two_groups(
+                spectra, groups, statistic="log_t_cauchy", freq_weights=[0.01, 1]
+            )
         ).iloc[0]
-        assert result.P_value == 1.0
-        assert result.Statistic == 0.0
-        assert result.P_value_per_bin[0] < 1e-100
-        assert pd.isna(result.Best_bin)
+        np.testing.assert_allclose(
+            result.P_value, result.P_value_per_bin[0], atol=np.finfo(float).tiny
+        )
+        assert result.P_value < 1e-100
+        assert result.Statistic == abs(result.T_per_bin[0])
+        assert result.Best_bin == 0
 
     @pytest.mark.parametrize("glm", [False, True])
     @pytest.mark.parametrize(
-        "weights", [np.zeros(3), [1, -1, 1], [1, np.nan, 1], [1, np.inf, 1], [1, 1]]
+        "weights", [np.zeros(3), [1, 0, 1], [1, -1, 1], [1, np.nan, 1], [1, np.inf, 1], [1, 1]]
     )
     def test_invalid_bin_weights_raise(self, glm, weights):
         spectra = np.ones((8, 2, 3))

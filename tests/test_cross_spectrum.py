@@ -317,6 +317,33 @@ class TestPolarBinning:
 
 
 class TestCoherency:
+    @pytest.mark.parametrize("backend", ["fft", "nufft"])
+    def test_constant_features_have_zero_power_and_undefined_coherence(
+        self, backend, make_comparator
+    ):
+        rng = np.random.default_rng(53)
+        shape = (11, 13)
+        n = 100 if backend == "nufft" else np.prod(shape)
+        values = np.full((n, 3), [0.1, 0.2, 0.2])
+        values[:, 2] += np.spacing(0.2) * rng.integers(-4, 5, n)
+        if backend == "nufft":
+            comp = _irregular_points(values, rng.uniform(0, 10, (n, 2)))
+        else:
+            raster = values.T.reshape(3, *shape).copy()
+            raster[:, 0, 0] = np.nan
+            comp = make_comparator(raster)
+        pairs = [("a", "b"), ("a", "c"), ("c", "c")]
+        comp.compute_spectra(progress=False).compute_cross_spectra(pairs, progress=False)
+        result = comp.cross_spectra_
+        np.testing.assert_array_equal(result.auto_spectra[:, :2], 0)
+        np.testing.assert_array_equal(result.cross_spectra[:, :2], 0)
+        assert np.isnan(result.coherence[:, :2]).all()
+        np.testing.assert_allclose(result.coherence[:, 2], 1)
+        np.testing.assert_array_equal(comp.spectra_[:, :2], 0)
+        np.testing.assert_array_equal(comp.explain_spectrum("a", bands=[0]).scores, 0)
+        with pytest.raises(ValueError, match="invalid coherency"):
+            comp.explain_spectrum(["a", "b"], bands=[0], representation="coherence")
+
     def test_coherence_sign_scaling_and_degenerate_input(self, make_comparator):
         rng = np.random.default_rng(15)
         values = rng.normal(size=(3, 17, 19))
@@ -547,6 +574,21 @@ class TestChunking:
 
 
 class TestComparatorIntegration:
+    def test_parallel_cross_spectra_under_process_backend(self, make_comparator, monkeypatch):
+        from joblib import parallel_backend
+
+        monkeypatch.setattr("sonic.utils.os.cpu_count", lambda: 2)
+        rng = np.random.default_rng(24)
+        comp = make_comparator([rng.normal(size=(3, 9, 11)) for _ in range(2)], backend="nufft")
+        pairs = [("a", "b"), ("b", "c")]
+        serial = comp.compute_cross_spectra(pairs, n_jobs=1, progress=False).cross_spectra_
+        with parallel_backend("loky"):
+            parallel = comp.compute_cross_spectra(pairs, n_jobs=2, progress=False).cross_spectra_
+        assert serial.coherency_valid.all()
+        for key in ("auto_spectra", "cross_spectra", "coherence", "presence", "mode_pair_counts"):
+            np.testing.assert_allclose(getattr(parallel, key), getattr(serial, key))
+        assert parallel.chunk_schedules == serial.chunk_schedules
+
     @pytest.mark.parametrize("mode", ["radial", "2d"])
     @pytest.mark.parametrize("adaptive", [False, True])
     @pytest.mark.parametrize("backend", ["fft", "nufft"])

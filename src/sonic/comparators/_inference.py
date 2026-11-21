@@ -7,11 +7,13 @@ import logging
 import math
 import warnings
 from fractions import Fraction
+from functools import cache, partial
 from typing import Literal, TypedDict
 
 import numpy as np
 import pandas as pd
-from scipy.optimize import brentq
+from scipy.linalg import eigh
+from scipy.optimize import bisect, brentq
 from scipy.special import betainc
 from scipy.stats import norm
 
@@ -72,25 +74,21 @@ def _iter_mask_groups(masks):
 
 
 def _resolve_freq_weights(freq_weights: np.ndarray | None, n_bins: int) -> np.ndarray:
-    """Validate / normalize frequency-bin weights; return a length-``n_bins`` array.
-
-    Passing None yields uniform weights ``1/n_bins`` - recovering the unweighted
-    statistic. Any other input is cast to ``float``, required to be
-    non-negative and not all-zero, and rescaled to sum-1. Non-uniform
-    weights are how users express a kernel-like frequency preference (e.g.,
-    low-pass polynomial vs exponential decay) inside the spectral distance.
-    """
+    """Return strictly positive bin weights normalized to sum to one."""
     if freq_weights is None:
         return np.full(n_bins, 1.0 / n_bins)
     w = np.asarray(freq_weights, dtype=float).ravel()
     if w.shape != (n_bins,):
         raise ValueError(f"freq_weights must have length n_bins={n_bins}, got shape {w.shape}.")
-    if not np.all(np.isfinite(w)) or np.any(w < 0):
-        raise ValueError("freq_weights must be finite and non-negative.")
+    if not np.all(np.isfinite(w)) or np.any(w <= 0):
+        raise ValueError("freq_weights must be finite and strictly positive.")
     total = float(w.sum())
     if not np.isfinite(total) or total <= 0:
         raise ValueError("freq_weights must have a positive finite sum.")
-    return w / total
+    weights = w / total
+    if np.any(weights == 0):
+        raise ValueError("freq_weights must be strictly positive after normalization.")
+    return weights
 
 
 # Gaussian plug-in calibration with estimated covariance
@@ -146,7 +144,7 @@ class _PluginNullState(_PluginNullMetadata):
         bins, used to identify a numerically zero residual covariance. Per-gene
         mode uses a separate tolerance for each feature.
     freq_weights
-        Normalized non-negative bin weights, shape ``(n_bins,)``.
+        Normalized positive bin weights, shape ``(n_bins,)``.
     weighted_cov
         ``W^1/2 sigma_log W^1/2``, the covariance whose eigenstructure
         controls the weighted quadratic form. Its shape/storage follows ``sigma_log``.
@@ -296,9 +294,7 @@ def _store_per_gene_covariance(state, indices, residuals, weights, df_resid, sca
         state["effective_rank"][gene] = _effective_rank_from_eigenvalues(eigenvalues)
         state["roundoff"][gene] = tolerance
         variance = np.sum(residual**2, axis=0) / df_resid
-        state["zero_covariance"][gene] = (
-            np.max(variance, where=weights > 0, initial=0.0) <= tolerance**2
-        )
+        state["zero_covariance"][gene] = np.max(variance) <= tolerance**2
         if state["sigma_log"] is not None:
             covariance = residual.T @ residual / df_resid
             state["sigma_log"][gene] = covariance
@@ -312,6 +308,7 @@ def _estimate_two_group_null_covariance(
     freq_weights: np.ndarray | None = None,
     normalize_shape: bool = False,
     log_transform: bool = True,
+    min_samples_per_group: int = 2,
     covariance: str | None = None,
     store_covariance: bool = True,
     for_pooling: bool = False,
@@ -337,8 +334,8 @@ def _estimate_two_group_null_covariance(
     indicator = (groups == uniq[1]).astype(float)
     n_b = int(indicator.sum())
     n_a = n_samples - n_b
-    if n_samples <= 2:
-        raise ValueError("Plug-in two-group tests require positive residual degrees of freedom.")
+    if min(n_a, n_b) < min_samples_per_group:
+        raise ValueError(f"Each group requires at least {min_samples_per_group} observed samples.")
 
     state = _estimate_glm_null_covariance(
         spectra,
@@ -497,7 +494,7 @@ def _fit_glm_profiles(
         Validated output of ``_prepare_glm_design``: design matrix, column names,
         contrast vector, design pseudoinverse, and rank.
     freq_weights : np.ndarray, optional
-        Non-negative bin weights of shape ``(n_bins,)``, normalized to sum to one.
+        Positive bin weights of shape ``(n_bins,)``, normalized to sum to one.
         Defaults to equal weights.
     normalize_shape : bool, default False
         Normalize each sample/feature profile to sum to one before transformation.
@@ -511,7 +508,7 @@ def _fit_glm_profiles(
         Retain full covariance matrices in per-gene mode; otherwise their state
         entries are None. Pooled covariance is always retained.
     for_pooling : bool, default False
-        Return pooled covariance on positive-weight bins for later combination
+        Return pooled covariance for later combination
         across support groups. Defer the eigensystem until that pool is complete.
 
     Returns
@@ -542,8 +539,7 @@ def _fit_glm_profiles(
     observed = np.empty(n_features)
     estimates = np.empty((n_features, n_bins))
     beta = np.empty((n_terms, n_features, n_bins))
-    cov_bins = weights > 0 if for_pooling and np.any(weights == 0) else slice(None)
-    residual_cov = None if per_gene else np.zeros((weights[cov_bins].size,) * 2)
+    residual_cov = None if per_gene else np.zeros((n_bins, n_bins))
     roundoff = 0.0
     for block in _iter_feature_blocks(n_samples, n_features, n_bins, n_terms):
         # Transform feature blocks and flatten their feature/bin columns for GLM fitting.
@@ -551,13 +547,9 @@ def _fit_glm_profiles(
             profiles[:, block], normalize_shape, log_transform=log_transform
         ).reshape(n_samples, -1)
         # Compute global or per-feature numerical roundoff for numerically zero residual covariance.
-        roundoff = max(
-            roundoff, _profile_roundoff(response.reshape(n_samples, -1, n_bins)[..., weights > 0])
-        )
+        roundoff = max(roundoff, _profile_roundoff(response.reshape(n_samples, -1, n_bins)))
         tolerance = (
-            _profile_roundoff(
-                response.reshape(n_samples, -1, n_bins)[..., weights > 0], per_gene=True
-            )
+            _profile_roundoff(response.reshape(n_samples, -1, n_bins), per_gene=True)
             if per_gene
             else None
         )
@@ -580,7 +572,7 @@ def _fit_glm_profiles(
                 tolerance,
             )
         else:
-            residuals = residuals.reshape(-1, n_bins)[:, cov_bins]
+            residuals = residuals.reshape(-1, n_bins)
             residual_cov += residuals.T @ residuals
     if not per_gene:
         residual_cov /= n_features * df_resid
@@ -673,8 +665,7 @@ def _estimate_glm_masked_null_covariance(  # noqa: C901
     contrast_scale = np.full(n_genes, np.nan, dtype=float)
     beta = np.full((n_terms, n_genes, n_bins), np.nan, dtype=float)
     eligible = np.zeros(n_genes, dtype=bool)
-    cov_bins = weights > 0 if for_pooling and np.any(weights == 0) else slice(None)
-    sigma_acc = None if per_gene else np.zeros((weights[cov_bins].size,) * 2)
+    sigma_acc = None if per_gene else np.zeros((n_bins, n_bins))
     pooled_df = 0
     roundoff = 0.0
 
@@ -705,10 +696,8 @@ def _estimate_glm_masked_null_covariance(  # noqa: C901
             response = _prepare_profile_block(
                 spectra[rows[:, None], cols], normalize_shape, log_transform=log_transform
             )
-            roundoff = max(roundoff, _profile_roundoff(response[..., weights > 0]))
-            tolerance = (
-                _profile_roundoff(response[..., weights > 0], per_gene=True) if per_gene else None
-            )
+            roundoff = max(roundoff, _profile_roundoff(response))
+            tolerance = _profile_roundoff(response, per_gene=True) if per_gene else None
             gene_beta, residuals, theta = _lm._fit_glm_response(
                 response.reshape(count, -1), gene_design, design_inverse, contrast_vector, rank_gene
             )
@@ -727,7 +716,7 @@ def _estimate_glm_masked_null_covariance(  # noqa: C901
                     tolerance,
                 )
             else:
-                residuals = residuals.reshape(-1, n_bins)[:, cov_bins]
+                residuals = residuals.reshape(-1, n_bins)
                 sigma_acc += residuals.T @ residuals
         pooled_df += df_gene * len(genes)
         contrast_scale[genes] = scale
@@ -879,7 +868,7 @@ def _run_l2_permutations(
     group_codes: np.ndarray,
     perm_labels: np.ndarray,
     *,
-    freq_weights: np.ndarray | None = None,
+    freq_weights: np.ndarray,
     normalize_shape: bool = False,
     is_exact: bool = False,
     log_transform: bool = True,
@@ -897,22 +886,14 @@ def _run_l2_permutations(
     a_val = uniq[0]
     response = _prepare_profile_block(profiles, normalize_shape, log_transform=log_transform)
     response -= response[:1].copy()
-    weights = _resolve_freq_weights(freq_weights, profiles.shape[-1])
+    weights = freq_weights
 
     def difference(values, group_a):
         return values[group_a].mean(axis=0) - values[~group_a].mean(axis=0)
 
     group_a = group_codes == a_val
     estimates = difference(response, group_a)
-    active = weights > 0
-    effect = estimates
-    if not active.all():
-        response = np.ascontiguousarray(response[..., active])
-        weights = weights[active]
-        # Use the same reduction as the permutations so the observed labeling ties itself.
-        effect = difference(response, group_a)
-        estimates[:, active] = effect
-    observed = np.sqrt(np.sum(weights * effect**2, axis=-1))
+    observed = np.sqrt(np.sum(weights * estimates**2, axis=-1))
     # Comparing two L2 values rounds four group means and two weighted sums over bins.
     bin_scale = np.max(np.abs(response), axis=0)
     scale = np.sqrt(np.sum(weights * bin_scale**2, axis=-1))
@@ -941,6 +922,7 @@ def _run_two_group_permutations(
 ):
     """Run binary permutations, retaining feature order for masked RNG draws."""
     profiles = np.asarray(profiles, dtype=np.float64)
+    freq_weights = _resolve_freq_weights(freq_weights, profiles.shape[-1])
     rng = np.random.default_rng(random_state)
     if presence is None:
         labels, exact = _make_label_permutations(
@@ -1042,23 +1024,36 @@ def _exact_rotation_design(design, contrast, retained, residual_basis):
     return q, inverse, sample_weights, Fraction(norm), residual_axes
 
 
+def _rank_one_rotation(effect, residuals):
+    """Check exact proportionality to a nonzero contrast across the active bins."""
+    if len(effect) == 1:
+        return True
+    nonzero = np.flatnonzero(effect)
+    if not nonzero.size:
+        return False
+    k = nonzero[0]
+    return np.array_equal(residuals * effect[k], residuals[:, k, None] * effect)
+
+
 def _refine_rotation_fit(profiles, model, sqrt_weights):
-    """Recover the contrast and residuals before rescaling them together for the sphere."""
+    """Recheck a nearly perfect fit when its residuals are as small as rounding error.
+
+    Recompute the per-bin contrast and residuals using exact arithmetic on the
+    transformed profile. Scale their weighted values together before converting
+    to floats to preserve their relative sizes. Return the contrast, the rotation
+    coordinates, and whether a rank-one tail applies. Raise if rounding erases
+    the contribution of a nonzero contrast or residual.
+    """
     q, inverse, sample_weights, norm, residual_basis = model
     y = _as_fractions(profiles)
     effect = sample_weights @ y
     residuals = y - q @ (inverse @ y)
-    # Positive bin weights preserve rank. Test proportionality before rounding.
-    nonzero = np.flatnonzero(effect)
-    rank_one = profiles.shape[1] == 1
-    if not rank_one and nonzero.size:
-        k = nonzero[0]
-        rank_one = np.array_equal(residuals * effect[k], residuals[:, k, None] * effect)
+    rank_one = _rank_one_rotation(effect, residuals)
     weighted = np.vstack([effect / norm, residuals]) * sqrt_weights
     scale = np.max(np.abs(weighted))
     scaled = np.asarray(weighted / scale if scale else weighted, dtype=float)
     coordinates = np.vstack([scaled[0], residual_basis.T @ scaled[1:]])
-    if (nonzero.size and not np.any(coordinates[0] ** 2)) or (
+    if (effect.any() and not np.any(coordinates[0] ** 2)) or (
         residuals.any() and not np.any(coordinates[1:] ** 2)
     ):
         raise RuntimeError(
@@ -1067,38 +1062,134 @@ def _refine_rotation_fit(profiles, model, sqrt_weights):
     return np.asarray(effect, dtype=float), coordinates, rank_one
 
 
-def _refine_rotation_shift(profiles, weights, model):
-    """Recover the shifted eigenvalues of nearly constant forms before rounding."""
-    q, inverse, a, _, residual_basis = model
-    y = _as_fractions(profiles)
-    weights = _as_fractions(weights)
+def _rotation_inertia(matrix):
+    """Count negative and zero eigenvalues by exact symmetric elimination."""
+    negative = zero = 0
+    while matrix.size:
+        pivot = matrix[0, 0]
+        if pivot:
+            negative += pivot < 0
+            matrix = matrix[1:, 1:] - np.outer(matrix[1:, 0], matrix[0, 1:] / pivot)
+        elif matrix[0].any():
+            # A congruence preserves inertia. Combine two axes to get a nonzero pivot.
+            j = np.flatnonzero(matrix[0])[0]
+            sign = 1 if matrix[j, j] + 2 * matrix[0, j] else -1
+            matrix = matrix.copy()
+            matrix[:, 0] += sign * matrix[:, j]
+            matrix[0, :] += sign * matrix[j, :]
+        else:
+            zero += 1
+            matrix = matrix[1:, 1:]
+    return negative, zero
+
+
+def _refine_rotation_shift(
+    feature, gap, *, profiles, weights, exact_design, near_rank_one, shift_tolerance
+):
+    """Recheck apparent rank-one fits and ties that roundoff can create or hide.
+
+    Use the transformed profiles and original bin-weight ratios to check whether
+    the contrast is zero (p=1) or the adjusted bins vary along one direction
+    (beta tail). If a scatter eigenvalue is close to the observed statistic,
+    check which eigenvalues lie above, below, or exactly at that value. Return
+    the resulting tail coefficients, or ``None`` when the computed spectrum suffices.
+    """
+    ambiguous_shift = gap <= shift_tolerance[feature]
+    if not (near_rank_one[feature] or ambiguous_shift):
+        return None
+    q, inverse, a, _, residual_basis = exact_design()
+    y = _as_fractions(profiles[:, feature])
     effect = a @ y
+    if not effect.any():
+        return np.zeros(1)  # Every rotation attains at least the observed zero.
     contrast_energy = a @ a
     observed = (effect * weights) @ effect / contrast_energy
-    adjusted = y - q @ (inverse @ y) + np.outer(a, effect / contrast_energy)
-
-    # Apply the shifted form to a basis of the conditional space. A zero image
-    # means every direction ties, including the observed one.
-    residual = _as_fractions(residual_basis)
-    axes = np.column_stack([a, residual - q @ (inverse @ residual)])
-    image = (adjusted * weights) @ (y.T @ axes) - observed * axes
-    if not image.any():
-        return np.zeros(image.shape[1])
-
-    # Restrict diagonalization to the exact range so a zero eigenvalue cannot
-    # acquire a spurious sign at a spectral boundary.
-    _orthogonalize_columns(image, len(y))
-    scales = np.max(np.abs(image), axis=0)
-    keep = scales != 0
-    basis = image[:, keep] / scales[keep]
+    residuals = y - q @ (inverse @ y)
+    dimension = residual_basis.shape[1] + 1
+    if _rank_one_rotation(effect, residuals):
+        coefficients = np.full(dimension, -observed, dtype=object)
+        coefficients[0] = np.sum(residuals * residuals, axis=0) @ weights
+        scaled = np.asarray(coefficients / max(np.abs(coefficients)), dtype=float)
+        if np.any((coefficients != 0) & (scaled == 0)):
+            raise RuntimeError("Conditional tail cannot resolve the coefficient dynamic range.")
+        return scaled
+    if not ambiguous_shift:
+        return None
+    if y.shape[1] < dimension:
+        # Outside the profile span the scatter is zero, so every shift is -observed.
+        basis = residuals + np.outer(a, effect / contrast_energy)
+        _orthogonalize_columns(basis, len(y))
+        basis = basis[:, np.any(basis, axis=0)]
+    else:
+        residual = _as_fractions(residual_basis)
+        basis = np.column_stack([a, residual - q @ (inverse @ residual)])
+    basis /= np.max(np.abs(basis), axis=0)
     projected = basis.T @ y
-    shifted = (projected * weights) @ projected.T
-    squared = np.sum(basis * basis, axis=0)
-    shifted.flat[:: len(squared) + 1] -= observed * squared
-    normalized = np.asarray(shifted / np.max(np.abs(shifted)), dtype=float)
-    norms = np.sqrt(np.asarray(squared, dtype=float))
-    nonzero = np.linalg.eigvalsh(normalized / (norms[:, None] * norms))
-    return np.pad(nonzero, (0, len(keep) - len(nonzero)))
+    metric = basis.T @ basis
+    shifted = (projected * weights) @ projected.T - observed * metric
+    return _verified_shift_spectrum(shifted, metric, dimension - len(metric), observed)
+
+
+def _refine_shift_eigenvalue(shifted, scaled_metric, vector, index, bound, count):
+    """Certify the Rayleigh estimate with exact counts, or bisect for a clustered root."""
+    # Error in the Rayleigh quotient is second order in the eigenvector error.
+    v = _as_fractions(vector)
+    estimate = float((v @ shifted @ v) / (v @ scaled_metric @ v))
+    left, right = np.nextafter(estimate, [-np.inf, np.inf])
+    if estimate and count(left) <= index < count(right):
+        return estimate
+    value = bisect(
+        lambda x: 1 if count(x) > index else -1,
+        -bound,
+        bound,
+        xtol=np.nextafter(0.0, 1.0),
+        maxiter=1200,
+    )
+    if value == 0:
+        raise RuntimeError("Conditional tail cannot resolve a nonzero shifted eigenvalue.")
+    return value
+
+
+def _verified_shift_spectrum(shifted, metric, outside, observed):
+    """Solve the exact shifted pencil, retaining zero shifts and omitted sample directions."""
+    if not shifted.any():
+        return np.array([-1.0 if outside else 0.0])
+
+    scale = np.max(np.abs(shifted))
+    coefficients, vectors = eigh(
+        np.asarray(shifted / scale, dtype=float), np.asarray(metric, dtype=float)
+    )
+    # A backward-stable eigensolve can lose the sign of a tiny shift. Inertia
+    # identifies exact zeros and brackets each remaining ambiguous eigenvalue.
+    bound = 2 * np.max(np.abs(coefficients))
+    small = np.flatnonzero(np.abs(coefficients) <= np.sqrt(np.finfo(float).eps) * bound)
+    if small.size:
+        negative, zero = _rotation_inertia(shifted)
+        if negative + zero == len(metric):
+            return np.array([-1.0])
+        if negative == 0 and outside == 0:
+            return np.array([1.0])
+        scaled_metric = metric * scale
+
+        @cache
+        def count(value):
+            # The positive definite metric preserves the generalized eigenvalue count.
+            return sum(_rotation_inertia(shifted - Fraction(value) * scaled_metric))
+
+        coefficients[negative : negative + zero] = 0.0
+        nonzero = (small < negative) | (small >= negative + zero)
+        for i in small[nonzero]:
+            coefficients[i] = _refine_shift_eigenvalue(
+                shifted, scaled_metric, vectors[:, i], i, bound, count
+            )
+    if outside:
+        common = max(scale, observed)
+        inside = coefficients * float(scale / common)
+        omitted = -float(observed / common)
+        if not omitted or np.any((coefficients != 0) & (inside == 0)):
+            raise RuntimeError("Conditional tail cannot resolve the coefficient dynamic range.")
+        return np.r_[inside, np.full(outside, omitted)]
+    return coefficients
 
 
 def _conditional_scatter(coordinates):
@@ -1186,7 +1277,17 @@ def _saddlepoint_tail(coefficients):
     return pvalue
 
 
-def _conditional_tail(coefficients, *, integration_tol=1e-6):  # noqa: C901 — exact cases, one retry and marked fallback
+def _two_level_tail(positive, negative, n_positive, n_negative):
+    """Tail for two signed levels whose magnitudes have a common scale."""
+    total = positive + negative
+    p = betainc(n_negative / 2, n_positive / 2, positive / total)
+    if p > 0.5:
+        # The positive ratio can round to one while its complement is still resolved.
+        p = 1 - betainc(n_positive / 2, n_negative / 2, negative / total)
+    return float(p)
+
+
+def _conditional_tail(coefficients, *, integration_tol=1e-6):  # noqa: C901 — beta bounds, one retry and marked fallback
     """Evaluate ``P(sum(coefficients * Z**2) >= 0)`` for independent normal Z.
 
     Parameters
@@ -1205,7 +1306,8 @@ def _conditional_tail(coefficients, *, integration_tol=1e-6):  # noqa: C901 — 
     pvalue, error, method : tuple
         Tail, numerical error budget/estimate, and ``'davies'``, ``'saddlepoint'``,
         ``'beta'`` or ``'exact'``. Davies reports its accepted requested accuracy;
-        beta reports a roundoff estimate, and exact boundaries report zero.
+        beta includes the uncertainty from its probability bounds and roundoff.
+        Exact boundaries report zero.
         Unresolved Davies calls use marked saddlepoint with NaN error: the
         integration target does not bound approximation error. If this also
         fails, raise RuntimeError instead of returning a numerical zero.
@@ -1214,7 +1316,8 @@ def _conditional_tail(coefficients, *, integration_tol=1e-6):  # noqa: C901 — 
     -----
     Davies' AS 155 uses signed coefficients. Scale them before integration;
     never merge distinct levels or discard zero eigenvalue directions of A.
-    Exact sign boundaries and two-level beta laws bypass both evaluators.
+    Two beta laws bound the tail by replacing each signed coefficient with
+    the smallest or largest of its sign. Equal levels give the exact beta law.
     """
     _validate_integration_tol(integration_tol)
     coefficients = np.asarray(coefficients, dtype=float)
@@ -1225,42 +1328,26 @@ def _conditional_tail(coefficients, *, integration_tol=1e-6):  # noqa: C901 — 
     if np.all(coefficients <= 0):
         return 0.0, 0.0, "exact"
 
-    positive = coefficients[coefficients > 0]
-    negative = -coefficients[coefficients < 0]
-    two_levels = np.all(positive == positive[0]) and np.all(negative == negative[0])
     nonzero = coefficients[coefficients != 0]
     scaled = nonzero / np.max(np.abs(nonzero))
     if np.any(scaled == 0):
         raise RuntimeError("Conditional tail cannot resolve the coefficient dynamic range.")
     eps = np.finfo(float).eps
-    if two_levels:
-        positive_scale = np.max(scaled)
-        negative_scale = -np.min(scaled)
-        pvalue = float(
-            betainc(
-                len(negative) / 2,
-                len(positive) / 2,
-                positive_scale / (positive_scale + negative_scale),
-            )
-        )
-        if pvalue > 0.5:
-            # A ratio near one may round to one; its small complement remains resolved.
-            pvalue = float(
-                1
-                - betainc(
-                    len(positive) / 2,
-                    len(negative) / 2,
-                    negative_scale / (positive_scale + negative_scale),
-                )
-            )
-        error = max(32 * eps * len(nonzero) * pvalue, np.nextafter(0.0, 1.0))
-        if (
-            np.isfinite(pvalue)
-            and 0 < pvalue <= 1
-            and error <= integration_tol
-            and error <= 0.001 * pvalue
-        ):
-            return pvalue, error, "beta"
+    pos, neg = scaled[scaled > 0], -scaled[scaled < 0]
+    p_min, p_max = pos.min(), pos.max()
+    n_min, n_max = neg.min(), neg.max()
+    two_levels = p_min == p_max and n_min == n_max
+    lower = _two_level_tail(p_min, n_max, len(pos), len(neg))
+    upper = lower if two_levels else _two_level_tail(p_max, n_min, len(pos), len(neg))
+    pvalue = lower + (upper - lower) / 2
+    roundoff = max(32 * eps * len(nonzero) * upper, np.nextafter(0.0, 1.0))
+    half_width = max(abs(pvalue - lower), abs(upper - pvalue))
+    error = half_width + roundoff
+    if 0 < pvalue <= 1 and error <= min(integration_tol, 0.001 * pvalue):
+        return pvalue, error, "beta"
+    # At the roundoff floor, rounded eigenvalues can compare equal in just
+    # some sample orders. Apply the same resolution check to either case.
+    if two_levels or (pvalue > 0 and half_width <= roundoff):
         raise RuntimeError(
             "Conditional beta tail underflowed or fails absolute/relative resolution."
         )
@@ -1296,7 +1383,7 @@ def _integration_metadata(integration_tol):
     }
 
 
-def _conditional_tails(scatter, *, integration_tol=1e-6, rank_one=False, refined=None):
+def _conditional_tails(scatter, *, integration_tol=1e-6, rank_one=False, refine=None):
     """Evaluate prepared sphere tails by Davies integration with marked saddlepoint fallback.
 
     Parameters
@@ -1311,8 +1398,11 @@ def _conditional_tails(scatter, *, integration_tol=1e-6, rank_one=False, refined
     rank_one : bool or array of bool
         True for each scatter known to have rank at most one. Use exact
         beta coefficients from diagonal energies, without eigendecomposition.
-    refined : dict, optional
-        Shifted eigenvalues recomputed from profiles, keyed by block feature index.
+    refine : callable, optional
+        Called as ``refine(feature, gap)``, where ``gap`` is the distance from the
+        observed statistic to the nearest scatter eigenvalue. It can recheck a
+        possible rank-one fit or tie against the profiles. A returned array
+        replaces the computed tail coefficients. ``None`` keeps them.
 
     Returns
     -------
@@ -1333,9 +1423,7 @@ def _conditional_tails(scatter, *, integration_tol=1e-6, rank_one=False, refined
     rank_one = np.broadcast_to(rank_one, (len(scatter),))
     for feature, matrix in enumerate(scatter):
         try:
-            if refined and feature in refined:
-                coefficients = refined[feature]
-            elif rank_one[feature]:
+            if rank_one[feature]:
                 coefficients = np.full(len(matrix), -matrix[0, 0])
                 # lambda - q is residual energy; avoid subtracting nearly equal totals.
                 coefficients[0] = np.diag(matrix)[1:].sum()
@@ -1347,7 +1435,12 @@ def _conditional_tails(scatter, *, integration_tol=1e-6, rank_one=False, refined
                 if scale > 0:
                     shifted /= scale
                 coefficients = np.linalg.eigvalsh(shifted)
-                if coefficients.max() <= 0 and np.any(shifted[0, 1:] != 0):
+                verified = None
+                if refine is not None and matrix.any():
+                    verified = refine(feature, np.min(np.abs(coefficients)) * scale)
+                if verified is not None:
+                    coefficients = verified
+                elif coefficients.max() <= 0 and np.any(shifted[0, 1:] != 0):
                     raise RuntimeError("The upper spectral boundary is numerically unresolved.")
             pvalues[feature], errors[feature], methods[feature] = _conditional_tail(
                 coefficients, integration_tol=integration_tol
@@ -1428,11 +1521,11 @@ def _run_l2_conditional(  # noqa: C901
     presence : np.ndarray or None
         Optional sample-by-feature observation mask. False cells are never read.
     freq_weights : array-like, optional
-        Nonnegative bin weights, normalized to sum to one and applied after fitting
+        Positive bin weights, normalized to sum to one and applied after fitting
         to the observed L2 statistic and conditional scatter. None gives equal weights.
     normalize_shape : bool
         If True, scale each nonzero sample-feature profile to unit total across all
-        bins, including zero-weight bins, before fitting.
+        bins before fitting.
     log_transform : bool
         If True, fit ``log(max(profile, 1e-12))`` after any shape normalization.
     min_resid_df : int
@@ -1496,9 +1589,17 @@ def _run_l2_conditional(  # noqa: C901
             raise ValueError("contrast is not estimable from the supplied design matrix.")
     weights = _resolve_freq_weights(freq_weights, n_bins)
     sqrt_weights = np.sqrt(weights)
-    active = weights > 0
-    n_active = np.count_nonzero(active)
-    exact_weights = _as_fractions(sqrt_weights[active])
+    exact_sqrt_weights = _as_fractions(sqrt_weights)
+    # A common scale cancels from the tail. Rounding each normalized weight can break a tie.
+    raw_weights = (
+        weights if freq_weights is None else np.asarray(freq_weights, dtype=object).ravel()
+    )
+    shift_weights = np.array(
+        [
+            Fraction(int(w)) if isinstance(w, (int, np.integer)) else Fraction(float(w))
+            for w in raw_weights
+        ]
+    )
     observed = np.full(n_features, np.nan)
     estimates = np.full((n_features, n_bins), np.nan)
     pvals = np.full(n_features, np.nan)
@@ -1529,7 +1630,7 @@ def _run_l2_conditional(  # noqa: C901
         u, singular, vt = np.linalg.svd(x, full_matrices=True)
         residual_basis = u[:, rank:]
         basis = np.column_stack([a / contrast_norm, residual_basis])
-        exact_model = None
+        exact_design = cache(partial(_exact_rotation_design, x, vector, vt[:rank], residual_basis))
         column_scale = np.max(np.abs(x), axis=0)
         constant_nuisance = rank == x.shape[1] and np.any(
             np.all(x == x[0], axis=0) & (x[0] != 0) & (vector == 0)
@@ -1562,45 +1663,45 @@ def _run_l2_conditional(  # noqa: C901
             ) * np.sqrt(count)
             residual_scale = np.max(np.abs(coordinates[1:]), axis=(0, 2))
             small_residual = residual_scale <= roundoff
-            rank_one = np.full(len(cols), n_active == 1)
+            rank_one = np.full(len(cols), n_bins == 1)
             for j in np.flatnonzero(small_residual):
-                tested = profiles_block[:, j][:, active]
+                tested = profiles_block[:, j]
                 if constant_nuisance and np.all(tested == tested[0]):
-                    effect[j, active] = 0.0
+                    effect[j] = 0.0
                     coordinates[:, j] = 0.0
                     continue
-                if exact_model is None:
-                    exact_model = _exact_rotation_design(x, vector, vt[:rank], residual_basis)
-                effect[j, active], coordinates[:, j, active], rank_one[j] = _refine_rotation_fit(
-                    tested, exact_model, exact_weights
+                # Refit to distinguish a genuinely small residual from roundoff in an exact fit.
+                effect[j], coordinates[:, j], rank_one[j] = _refine_rotation_fit(
+                    tested, exact_design(), exact_sqrt_weights
                 )
             estimates[cols] = effect
             observed[cols] = np.sqrt(np.sum(weights * effect**2, axis=-1))
             scatter, effective_rank[cols] = _conditional_scatter(coordinates)
-            refined = {}
-            if n_rotations is None and n_active >= df + 1:
-                # sqrt(1 - effective_rank/d) is the relative Frobenius distance
-                # from scalar scatter. Allow for rounding in the rank and the fit.
-                dimension = df + 1
-                eps = np.finfo(float).eps
-                spread = np.sqrt(np.maximum(0, 1 - effective_rank[cols] / dimension))
-                projection_error = 32 * eps * singular[0] / singular[rank - 1]
-                tolerance = np.sqrt(32 * eps * dimension) + projection_error
-                # Refitted coordinates have already removed nuisance cancellation.
-                fit_error = np.where(small_residual, 0.0, roundoff) * np.sqrt(n_active)
-                nearly_constant = spread * residual_scale <= tolerance * residual_scale + fit_error
-                for j in np.flatnonzero(nearly_constant & ~rank_one):
-                    if exact_model is None:
-                        exact_model = _exact_rotation_design(x, vector, vt[:rank], residual_basis)
-                    refined[j] = _refine_rotation_shift(
-                        profiles_block[:, j][:, active], weights[active], exact_model
-                    )
             if n_rotations is None:
+                # Allow for fitting and projection error when screening the scatter.
+                eps = np.finfo(float).eps
+                fit_error = np.divide(
+                    roundoff, residual_scale, out=np.zeros_like(roundoff), where=~small_residual
+                )
+                projection_error = 32 * eps * singular[0] / singular[rank - 1]
+                tolerance = (
+                    np.sqrt(32 * eps * (df + 1)) + projection_error + fit_error * np.sqrt(n_bins)
+                )
+                trace = np.trace(scatter, axis1=1, axis2=2)
+                # Rounding can mimic a rank-one fit or a tie, so verify either on the profiles.
+                refine = partial(
+                    _refine_rotation_shift,
+                    profiles=profiles_block,
+                    weights=shift_weights,
+                    exact_design=exact_design,
+                    near_rank_one=np.sqrt(np.maximum(0, effective_rank[cols] - 1)) <= tolerance,
+                    shift_tolerance=tolerance * trace,
+                )
                 pvals[cols], pvalue_error[cols], pvalue_method[cols] = _conditional_tails(
                     scatter,
                     integration_tol=integration_tol,
                     rank_one=rank_one,
-                    refined=refined,
+                    refine=refine,
                 )
             else:
                 pvals[cols] = _rotation_tails(scatter, basis, metadata["n_rotations"], seed)
@@ -1653,7 +1754,7 @@ def _run_l2_test(  # noqa: C901 — binary/GLM and masked/unmasked null dispatch
     profiles : np.ndarray
         Raw spectra, shape ``(n_samples, n_features, n_bins)``.
     groups : np.ndarray or None
-        Validated binary labels. None selects ``design`` and ``contrast``.
+        Binary labels encoded as 0 and 1. None selects ``design`` and ``contrast``.
     design, contrast
         GLM inputs used when ``groups`` is None.
     presence : np.ndarray or None
@@ -1683,13 +1784,11 @@ def _run_l2_test(  # noqa: C901 — binary/GLM and masked/unmasked null dispatch
     if profiles.ndim != 3:
         raise ValueError(f"spectra must be 3D, got {profiles.shape}.")
     extra = {}
-    if binary:
-        groups = (groups == np.unique(groups)[1]).astype(int)
-        if presence is not None:
-            extra = {
-                "n_obs_A": presence[groups == 0].sum(axis=0),
-                "n_obs_B": presence[groups == 1].sum(axis=0),
-            }
+    if binary and presence is not None:
+        extra = {
+            "n_obs_A": presence[groups == 0].sum(axis=0),
+            "n_obs_B": presence[groups == 1].sum(axis=0),
+        }
 
     if null == "plugin":
         options = {
@@ -1730,8 +1829,6 @@ def _run_l2_test(  # noqa: C901 — binary/GLM and masked/unmasked null dispatch
             design = np.column_stack([np.ones(len(groups)), groups])
             contrast = np.array([0.0, 1.0])
             if presence is not None:
-                if int(min_samples_per_group) < 2:
-                    raise ValueError("min_samples_per_group must be >= 2.")
                 eligible = (extra["n_obs_A"] >= min_samples_per_group) & (
                     extra["n_obs_B"] >= min_samples_per_group
                 )

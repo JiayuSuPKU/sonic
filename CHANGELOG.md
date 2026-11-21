@@ -14,6 +14,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   to per gene for DF and DF-norm and per pair for cross-spectrum tests. Use
   `covariance="pooled"` to reproduce the previous pooled p-values.
   Binwise t-Cauchy tests continue to use `null="analytic"`.
+- L2 and t-Cauchy comparisons require finite, strictly positive frequency weights.
+  Binary L2 requires at least `min_samples_per_group` observations per group
+  (default 2), including complete data.
 - Replace `statistic="welch_t_cauchy"` with `"log_t_cauchy"` for binwise DF tests.
   Binary tests now compare mean log power instead of mean raw power, or mean
   log power share for DF-norm. GLMs use the specified contrast on that scale.

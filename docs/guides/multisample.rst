@@ -52,6 +52,9 @@ Both result tables contain ``Feature``, ``Statistic``, ``P_value``, and
 separates a rearranged pattern from a simple change in abundance.
 
 By default, DF and DF-norm use deterministic rotation to calibrate log L2.
+Binary L2 requires at least ``min_samples_per_group`` observed samples per arm
+(default 2) for each feature or pair, including complete data. L2 and t-Cauchy tests
+require finite, strictly positive ``freq_weights``. The default weights are uniform.
 Pass ``covariance="pooled"`` to reproduce p-values from Gaussian plug-in calibration
 with a pooled residual covariance.
 
@@ -137,21 +140,22 @@ respectively, and combines the p-values with Cauchy's rule as described below.
 
 Each pair uses samples where both genes are present and bins valid in all those
 samples. ``freq_weights`` sets bin weights in the original flattened bin order
-(radius then angle for polar features); zero weights exclude bins. For missing
-data, ``min_samples_per_group`` sets the minimum per arm in binary tests, and
-``min_resid_df`` sets the minimum residual degrees of freedom in GLMs.
+(radius then angle for polar features). Weights are renormalized over the
+retained bins. For masked GLMs, ``min_resid_df`` sets the minimum residual
+degrees of freedom.
 
 Results include pair names, the statistic, raw and BH-adjusted p-values, and
 sample/bin counts. ``Status`` identifies skipped pairs; ``N_pairs_pooled``
 reports the covariance pool size. Retained bins and samples are recorded in
 ``attrs["bin_indices"]`` and ``attrs["sample_indices"]``.
+To repeat a comparison with the same bin weights, pass
+``freq_weights=result.attrs["original_freq_weights"]``.
 
 Both statistics return ``Estimate_per_bin``: the mean for group A minus the mean
 for group B (sorted labels), or the specified GLM contrast. Coherence estimates
 use natural-log coherence; coherency estimates are differences on the signed real
-scale. L2 fits all supported bins together; only positive-weight bins contribute
-to the weighted RMS, pooled covariance, or null calibration. Unsupported bins
-and skipped pairs have NaN estimates.
+scale. L2 fits and tests all supported bins. Unsupported bins and skipped
+pairs have NaN estimates.
 
 
 Explain selected frequency bins
@@ -298,12 +302,10 @@ Log-scale effects concern mean log power, or mean log power share for DF-norm.
 
 Both DF ``log_t_cauchy`` and cross-spectrum ``t_cauchy`` require
 ``null="analytic"`` and ``covariance=None``.
-``freq_weights`` controls the Cauchy combination: None gives equal weights;
-nonnegative weights are renormalized over each feature's informative bins.
-Zero weights exclude bins from combination, the statistic summary and
-``Best_bin``. Choose
-weights independently of the observed signal, for example to emphasize
-prespecified spatial scales. Per-bin p-values remain unchanged.
+``freq_weights`` controls the Cauchy combination. None gives equal weights.
+Supply finite, strictly positive weights to emphasize prespecified spatial scales.
+Weights are renormalized over informative bins. The per-bin p-values and
+``Best_bin`` are independent of the weights.
 
 The combined statistic is ``sum(w[k] * cot(pi * p[k]))``, with retained weights
 summing to one. Its p-value uses the standard Cauchy tail, without estimating
@@ -321,13 +323,13 @@ Both Cauchy tests return the usual feature or pair identifiers, ``Statistic``,
 - ``T_per_bin``: signed t statistics.
 - ``P_value_per_bin``: unadjusted two-sided bin p-values.
 - ``Best_bin``: nullable, zero-based index of the smallest p-value among
-  informative, positive-weight bins. Ties use the first original index;
+  informative bins. Ties use the first original index;
   no eligible bin gives a missing value.
 
-Arrays preserve the original bin order, including valid zero-weight bins.
+Arrays preserve the original bin order.
 Cross-spectrum arrays use the original flattened radius/angle order, with
 NaNs for unsupported bins. ``Statistic`` is the maximum absolute t over
-positive-weight bins; ``P_value`` is the Cauchy-combined tail and ``P_adj`` is
+tested bins; ``P_value`` is the Cauchy-combined tail and ``P_adj`` is
 BH-adjusted across features or pairs. ``Best_bin`` is descriptive: feature-level
 significance does not establish significance of the selected bin.
 Cross-spectrum ``DF_resid`` reports design residual degrees of freedom, not
@@ -390,8 +392,11 @@ each feature's or pair's nuisance-adjusted scatter.
 The conditional null is exact under independent Gaussian errors on the tested profile
 scale, with common covariance across samples within each feature or pair.
 Cross-bin correlations are unrestricted, and covariance may differ between
-features or pairs. Rotation can remain well calibrated under non-Gaussian
-errors; robustness depends on the statistic, design and error distribution.
+features or pairs. For example, one feature may have noisier low-frequency bins
+than another, but both groups must have the same residual bin variances and
+cross-bin covariances for that feature under this model. Rotation can remain
+well calibrated under non-Gaussian errors, depending on the statistic, design
+and error distribution.
 
 .. code-block:: python
 
@@ -407,19 +412,24 @@ GLM designs, including masked data.
 (default 1e-6). Each call uses at most 10,000 terms. Accepted integration also
 requires a relative error budget at most ``0.001*p``; a valid result failing
 this check gets one retry at ``min(integration_tol, 1e-4*p)``. Exact beta cases
-and spectral boundaries bypass integration.
+and spectral boundaries bypass integration. For nearly equal coefficients of
+each sign, two beta tails bound the rotation p-value. SONIC reports their midpoint
+when its error meets both the absolute and relative targets. If the bounds agree
+to roundoff and the requested accuracy exceeds numerical precision, SONIC raises an error.
 
 When a fitted residual is comparable to rounding error, SONIC recomputes the
 contrast and residuals on the retained design using the transformed profile values.
 An exact fit gives p=1 for a zero contrast and p=0 for a nonzero contrast.
 If every rotation gives the same L2 statistic, the inclusive upper tail is p=1.
+SONIC checks ambiguous spectral endpoints using the supplied bin-weight ratios.
+A verified rank-one scatter uses the beta tail even when several bins carry the same signal.
 
 Unresolved tails use Kuonen's saddlepoint approximation.
 ``P_value_method`` identifies ``davies``, ``saddlepoint``, ``beta`` or ``exact``
 (missing for skipped rows). ``P_value_error`` reports the accepted Davies accuracy
-budget, a roundoff estimate for beta, or zero at exact boundaries. It is NaN for
-saddlepoint and skipped rows. The integration tolerance does not bound
-saddlepoint approximation error; neither quantity is statistical uncertainty.
+budget, the beta interval's half-width plus estimated roundoff, or zero at exact
+boundaries. It is NaN for saddlepoint and skipped rows. The integration tolerance
+does not bound saddlepoint approximation error; neither quantity is statistical uncertainty.
 A tail that cannot be evaluated by either route raises an error.
 
 Result ``attrs`` records ``method="davies"``, ``integration_tol``,

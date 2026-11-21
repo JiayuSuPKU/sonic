@@ -27,6 +27,7 @@ from sonic.utils import (
     _chunk_parameters,
     _parse_memory_budget,
     _require_finite,
+    _take_feature_columns,
     resolve_parallelism,
 )
 
@@ -1308,7 +1309,7 @@ class DetectorIrregular(Detector):
                         "Requested features not in adata.var_names: %s", sorted(missing)[:5]
                     )
                 idx = [names.index(g) for g in selected]
-                X = X[:, idx]
+                X = _take_feature_columns(X, idx)
                 names = selected
             X_csc = X.tocsc() if sp.issparse(X) else sp.csc_matrix(X)
         elif source == "obs":

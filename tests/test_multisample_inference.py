@@ -32,13 +32,10 @@ from sonic.statistics import apply_bh_correction, liu_sf
 class TestLiuCalibration:
     """Gaussian plug-in calibration of L2 tails, masking, and low-df behavior."""
 
-    def test_no_residual_df_rejects_plugin_but_allows_permutation(self):
-        spectra = np.array([[[1.0, 2.0, 3.0]], [[2.0, 3.0, 4.0]]])
-        groups = np.array([0, 1])
-        with pytest.raises(ValueError, match="positive residual degrees of freedom"):
-            compare_two_groups(spectra, groups, null="plugin")
-        result = compare_two_groups(spectra, groups, null="permutation")
-        np.testing.assert_array_equal(result["P_value"], 1.0)
+    def test_saturated_design_rejects_plugin(self):
+        spectra = np.ones((2, 1, 3))
+        with pytest.raises(ValueError, match="no residual degrees of freedom"):
+            compare_glm(spectra, np.eye(2), np.array([1, -1]), null="plugin")
 
     def test_synthetic_h0_pvalues_are_uniform(self):
         rng = np.random.default_rng(0)
@@ -92,7 +89,7 @@ class TestLiuCalibration:
         spectra = np.exp(rng.standard_normal((3, 50, 20)))
         groups = np.array([0, 1, 1])
         with pytest.warns(UserWarning, match="log_l2 \\+ null='plugin' at residual df=1"):
-            compare_two_groups(spectra, groups, statistic="log_l2", null="plugin")
+            compare_glm(spectra, np.c_[np.ones(3), groups], np.array([0, 1]), null="plugin")
         spectra = np.exp(rng.standard_normal((4, 50, 20)))
         groups = np.array([0, 0, 1, 1])
         with pytest.warns(UserWarning, match="log_l2 \\+ null='plugin' at residual df=2"):
@@ -362,7 +359,7 @@ class TestPermutationCalibration:
         spectra[:, 2] = 1  # Every permutation ties for this gene.
         original = spectra.copy()
         groups = np.repeat([0, 1], 4)
-        weights = np.array([0, 1, 2, 3, 4], dtype=float)
+        weights = np.arange(1.0, 6.0)
         weights /= weights.sum()
         presence = np.ones((8, 4), dtype=bool)
         if masked:
@@ -469,7 +466,7 @@ class TestCovarianceEstimation:
         kwargs = {
             "covariance": "per_gene",
             "normalize_shape": shape_only,
-            "freq_weights": np.arange(17),
+            "freq_weights": np.arange(1, 18),
         }
         binary = (
             compare_two_groups_masked(spectra, groups, presence, **kwargs)
@@ -511,11 +508,10 @@ class TestCovarianceEstimation:
         logs[:, 0] = 0.0
         logs[:, 1] = groups[:, None] * np.linspace(0, 1, 11)  # Perfect nonzero contrast.
         logs[:, 2] = 0.0
-        logs[:, 2, 0] = rng.normal(size=8)  # Variation only in a zero-weight bin.
+        logs[:, 2, 0] = np.tile([0.25, -0.25], 4)  # One informative bin.
         logs[:, 3] = 1e-7 + 1e-14 * rng.normal(size=(8, 11))
         spectra = np.exp(logs)
         weights = np.ones(11)
-        weights[0] = 0
         presence = np.ones((8, 5), bool)
         presence[0, :] = not masked
         design = np.column_stack([np.ones(8), groups])
@@ -535,7 +531,7 @@ class TestCovarianceEstimation:
         assert result.loc["0", "P_value"] == 1.0
         assert np.isnan(result.loc["1", "P_value"])
         assert np.isnan(result.loc["1", "P_adj"])
-        assert result.loc["2", "P_value"] == 1.0
+        assert np.isfinite(result.loc["2", "P_value"])
         assert np.isfinite(result.loc["3", "P_value"])
         # Other genes must not supply either covariance or numerical tolerance.
         for j in [3, 4]:
@@ -610,7 +606,7 @@ class TestCovarianceEstimation:
         assert all(call.args[0].shape == (8, 8) for call in eig.call_args_list)
 
     @pytest.mark.parametrize("covariance", ["pooled", "per_gene"])
-    @pytest.mark.parametrize("sizes", [(1, 7), (7, 1), (3, 5)])
+    @pytest.mark.parametrize("sizes", [(2, 6), (6, 2), (3, 5)])
     @pytest.mark.parametrize("profile_scale", ["df", "df_norm", "signed"])
     def test_binary_glm_adapter_preserves_null_and_metadata(self, covariance, sizes, profile_scale):
 
@@ -627,7 +623,7 @@ class TestCovarianceEstimation:
         spectra.setflags(write=False)
         kwargs = {
             "covariance": covariance,
-            "freq_weights": np.arange(17),
+            "freq_weights": np.arange(1, 18),
             "normalize_shape": profile_scale == "df_norm",
             "log_transform": profile_scale != "signed",
         }
@@ -680,7 +676,7 @@ class TestCovarianceEstimation:
         presence.setflags(write=False)
         kwargs = {
             "covariance": covariance,
-            "freq_weights": np.arange(17),
+            "freq_weights": np.arange(1, 18),
             "normalize_shape": profile_scale == "df_norm",
             "log_transform": profile_scale != "signed",
         }
@@ -792,7 +788,7 @@ class TestCovarianceEstimation:
         labels = np.tile([0, 1], 6)
         design = np.column_stack([np.ones(12), labels, rng.normal(size=12)])
         contrast = np.array([0.0, 1.0, 0.0])
-        weights = np.arange(n_bins, dtype=float)
+        weights = np.arange(1, n_bins + 1, dtype=float)
         weights /= weights.sum()
         presence = np.ones((12, 23), bool)
         if masked:
@@ -929,6 +925,96 @@ class TestCovarianceEstimation:
 class TestConditionalRotation:
     """Conditional tails, invariance, eligibility, and deterministic streaming."""
 
+    @pytest.mark.parametrize("shape_only", [False, True], ids=["DF", "DF-norm"])
+    def test_constant_companion_bin_retains_student_tail(self, shape_only):
+        a = np.array([-1, -1, 1, 1])
+        r = np.array([1, -1, -1, 1])
+        from scipy.stats import t
+
+        # Two distinct equal-total spectra span one direction even after normalization.
+        y = np.where(a + r > 0, 0.5, 0.25)
+        expected = 2 * t.sf(1, df=2)  # Pooled two-sample t for (low, low) vs (low, high).
+        spectra = np.column_stack([y, np.full(4, 0.25), 1 - y])[:, None]
+        for order in itertools.permutations(range(4)):
+            rows = list(order)
+            row = compare_two_groups(
+                spectra[rows], a[rows], normalize_shape=shape_only, freq_weights=[1, 2, 1]
+            ).iloc[0]
+            assert row.P_value_method == "beta"
+            np.testing.assert_allclose(row.P_value, expected, rtol=1e-13)
+
+    @pytest.mark.parametrize("shape_only", [False, True], ids=["DF", "DF-norm"])
+    def test_nearly_duplicate_bins_preserve_tail_across_sample_orders(self, shape_only):
+        a = np.array([-1, -1, 1, 1])
+        r = np.array([1, -1, -1, 1])
+        p = 0.049
+        y = np.exp(0.05 * ((1 - p) / np.sqrt(p * (2 - p)) * a + r) - 1)
+        other = y + 1e-12 * a * r
+        # A large constant bin keeps the two normalized signal bins nearly proportional.
+        spectra = np.column_stack([y, other, np.full(4, 1e7)])[:, None]
+        reference = np.log(y / spectra[:, 0].sum(axis=1)) if shape_only else np.log(y)
+        from scipy.stats import ttest_ind
+
+        expected = ttest_ind(reference[a < 0], reference[a > 0], equal_var=True).pvalue
+        for order in itertools.permutations(range(4)):
+            rows = list(order)
+            row = compare_two_groups(
+                spectra[rows], a[rows], normalize_shape=shape_only, freq_weights=[1, 3, 1]
+            ).iloc[0]
+            assert row.P_value_method == "beta"
+            np.testing.assert_allclose(row.P_value, expected, atol=1e-12, rtol=0)
+        # These orders formerly disagreed about whether the levels were equal.
+        for rows in ([0, 1, 2, 3], [0, 2, 1, 3]):
+            with pytest.raises(RuntimeError, match="resolution"):
+                compare_two_groups(
+                    spectra[rows],
+                    a[rows],
+                    normalize_shape=shape_only,
+                    freq_weights=[1, 3, 1],
+                    integration_tol=1e-20,
+                )
+
+    @pytest.mark.parametrize(
+        "shape_only,low,high",
+        [(False, 3.0, 7.0), (True, 3.0, 7.0), (True, 0.3, 0.7)],
+        ids=["DF", "DF-norm", "DF-norm-decimal"],
+    )
+    def test_df_rotation_is_invariant_to_bin_order(self, shape_only, low, high):
+        a = np.array([-1, -1, 1, 1])
+        r = np.array([1, -1, -1, 1])
+        design = np.column_stack([np.ones(4), a, a * r])
+        weights = np.array([1, 1, 2, 2])
+        # Every row has two of each power. The paired bins have equal energy on orthogonal axes.
+        tied = np.where(np.column_stack([a, r, -a, -r]) > 0, high, low)
+        nearby = tied.copy()
+        nearby[0, 0] += 1
+        profiles = np.stack([tied, nearby], axis=1)
+        # One residual df gives a circle. Its upper tail is the fraction of angles
+        # at or above the observed energy along the contrast direction.
+        values = nearby
+        if shape_only:
+            totals = 2 * (low + high) + np.array([1, 0, 0, 0])
+            values = nearby / totals[:, None]
+        u, v = np.stack([a, r]) @ np.log(values)
+        expected = (
+            np.arctan2(2 * abs((u * weights) @ v), (u * weights) @ u - (v * weights) @ v) / np.pi
+        )
+        tails = []
+        for order in itertools.permutations(range(4)):
+            bins = list(order)
+            frame = compare_glm(
+                profiles[:, :, bins],
+                design,
+                np.array([0, 1, 0]),
+                normalize_shape=shape_only,
+                freq_weights=weights[bins],
+            ).set_index("Feature")
+            assert frame.loc["0", "P_value"] == 1
+            assert frame.loc["0", "P_value_method"] == "exact"
+            tails.append(frame.loc["1", "P_value"])
+        assert 0 < expected < 1
+        np.testing.assert_allclose(tails, expected, rtol=1e-13)
+
     def test_conditional_scatter_retains_zero_directions_and_profile_scales(self):
         coordinates = np.random.default_rng(86).normal(size=(8, 1, 2))
         scales = np.array([1e-100, 1.0, 1e100, 0.0])
@@ -966,7 +1052,7 @@ class TestConditionalRotation:
         values[~presence] = np.nan
         original = values.copy()
         values.setflags(write=False)
-        weights = np.arange(bins, dtype=float)
+        weights = np.arange(1, bins + 1, dtype=float)
         weights /= weights.sum()
         expected_statistic = np.full(genes, np.nan)
         seen = []
@@ -1068,7 +1154,7 @@ class TestConditionalRotation:
         values[~presence] = np.nan
         original = values.copy()
         values.setflags(write=False)
-        weights = np.arange(bins, dtype=float)
+        weights = np.arange(1, bins + 1, dtype=float)
         weights /= weights.sum()
         result = l2._run_l2_conditional(
             values,
@@ -1105,7 +1191,7 @@ class TestConditionalRotation:
         if masked:
             presence[0, :2] = False
             presence[:4, -1] = False  # GLM-estimable, but binary threshold fails.
-        kwargs = {"freq_weights": np.arange(9), "normalize_shape": shape_only}
+        kwargs = {"freq_weights": np.arange(1, 10), "normalize_shape": shape_only}
         binary = ms.compare_two_groups_masked if masked else ms.compare_two_groups
         args = [values, groups, presence] if masked else [values, groups]
         result = binary(*args, null="rotation", **kwargs)
@@ -1195,8 +1281,6 @@ class TestConditionalRotation:
         y = np.repeat((3 + z)[:, None, None] * np.array([1.0, 0.5, -0.25]), 3, axis=1)
         y[:, 1] += x[:, 1, None] * np.array([0.75, -0.25, 0.5])
         y[:, 2] += rng.normal(scale=0.1, size=(10, 3))
-        # An ignored bin must not set the numerical-zero threshold.
-        y[:, :, -1] = 100 * x[:, 1, None]
         presence = np.ones((10, 3), bool)
         if masked:
             presence[0, 0] = False
@@ -1205,7 +1289,7 @@ class TestConditionalRotation:
             "log_transform": False,
             "n_rotations": 999,
             "random_state": 20,
-            "freq_weights": np.array([0.8, 0.2, 0.0]),
+            "freq_weights": np.array([0.7, 0.2, 0.1]),
         }
         result = l2._run_l2_conditional(y, x, c, presence if masked else None, **kwargs)
         assert result["pvals"][0] == 1.0
@@ -1221,13 +1305,12 @@ class TestConditionalRotation:
         y = rng.normal(size=(10, 1, 4)) + x[:, 1, None, None]
         scales = np.array([1e-100, 1.0, 1e100])
         profiles = y * scales[None, :, None]
-        profiles[:, :, -1] = 1e100 * x[:, 1, None]
         result = l2._run_l2_conditional(
             profiles,
             x,
             np.array([0.0, 1.0, 0.0]),
             log_transform=False,
-            freq_weights=np.array([0.2, 0.3, 0.5, 0.0]),
+            freq_weights=np.array([0.2, 0.3, 0.4, 0.1]),
             n_rotations=999,
             random_state=20,
         )
@@ -1268,25 +1351,23 @@ class TestConditionalRotation:
         reordered = run(values[:, order], presence[:, order], [str(i) for i in order])
         pd.testing.assert_frame_equal(reordered, expected, check_exact=False, atol=1e-12)
 
-    def test_constant_ties_perfect_fit_and_zero_weight_bins(self):
+    def test_constant_ties_and_perfect_fit(self):
         groups = np.repeat([0, 1], 3)
         x = np.c_[np.ones(6), groups]
         a = np.linalg.pinv(x)[1]
         basis = np.c_[a / np.linalg.norm(a), np.linalg.svd(x, full_matrices=True)[0][:, 2:]]
-        y = np.zeros((6, 4, 6))
+        y = np.zeros((6, 3, 5))
         y[:, 0] = 4.2
         y[:, 1, :5] = groups[:, None]
         y[:, 2, :5] = np.sqrt(5) * basis
-        y[:, 3, -1] = np.arange(6)
         result = l2._run_l2_conditional(
             np.exp(y),
             x,
             np.array([0.0, 1.0]),
             n_rotations=199,
             random_state=17,
-            freq_weights=np.r_[np.ones(5), 0],
         )
-        np.testing.assert_array_equal(result["pvals"], [1.0, 0.005, 1.0, 1.0])
+        np.testing.assert_array_equal(result["pvals"], [1.0, 0.005, 1.0])
         low_df = l2._run_l2_conditional(
             np.exp(y[:3]),
             np.c_[np.ones(3), [0, 1, 1]],
@@ -1361,12 +1442,7 @@ class TestConditionalIntegration:
         exact = np.array([[1.0, 2.0], [2.0, 1.0]])[groups]
         noisy = np.random.default_rng(92).uniform(1, 2, size=exact.shape)
         spectra = np.stack([exact, noisy], axis=1)
-        # Variation confined to a zero-weight bin does not enter the DF test.
-        weights = [1, 1]
-        if not normalize:
-            spectra = np.concatenate([spectra, spectra[:, ::-1, :1]], axis=2)
-            weights.append(0)
-        options = {"normalize_shape": normalize, "freq_weights": weights}
+        options = {"normalize_shape": normalize, "freq_weights": [1, 2]}
         result = compare_two_groups(spectra, groups, **options).set_index("Feature")
         alone = compare_two_groups(spectra[:, 1:], groups, **options).iloc[0]
         assert result.loc["0", "P_value"] == result.loc["0", "P_value_error"] == 0
@@ -1467,27 +1543,40 @@ class TestConditionalIntegration:
         return value / beta(k1 / 2, k0 / 2), error / beta(k1 / 2, k0 / 2)
 
     @pytest.mark.parametrize(
-        "counts,levels,fraction",
+        "counts,levels,fraction,method",
         [
-            pytest.param((1, 1, 1), (0.0, 0.2, 1.0), 0.25, id="low-df"),
-            pytest.param((5, 7, 5), (0.0, 0.2, 1.0), 0.9, id="repeated-levels"),
-            pytest.param((1, 1, 1), (0.0, 1e-10, 1.0), 1 - 1e-8, id="small-tail"),
-            pytest.param((2, 2, 3), (1.0, 1 + 2e-10, 1 + 1e-9), 0.25, id="nearly-constant"),
-            pytest.param((2, 2, 3), (0.0, 0.2, 1.0), 1 - 1e-8, id="unresolved-tail"),
+            pytest.param((1, 1, 1), (0.0, 0.2, 1.0), 0.25, "saddlepoint", id="low-df"),
+            pytest.param((5, 7, 5), (0.0, 0.2, 1.0), 0.9, "davies", id="repeated-levels"),
+            pytest.param((1, 1, 1), (0.0, 1e-10, 1.0), 1 - 1e-8, "beta", id="small-tail"),
+            pytest.param(
+                (2, 2, 3), (1.0, 1 + 2e-10, 1 + 1e-9), 0.25, "davies", id="nearly-constant"
+            ),
+            pytest.param((2, 2, 3), (0.0, 0.2, 1.0), 1 - 1e-8, "saddlepoint", id="unresolved-tail"),
         ],
     )
-    def test_three_levels_match_independent_integral(self, counts, levels, fraction):
+    def test_three_levels_match_independent_integral(self, counts, levels, fraction, method):
         q = levels[1] + fraction * (levels[2] - levels[1])
         expected, reference_error = self._three_level_reference(levels, counts, q)
         coefficients = np.repeat(levels, counts) - q
-        actual, error, method = l2._conditional_tail(coefficients)
-        if counts == (1, 1, 1) or expected < 1e-12:
-            assert method == "saddlepoint" and np.isnan(error)
+        actual, error, used = l2._conditional_tail(coefficients)
+        assert used == method
+        if method == "saddlepoint":
+            assert np.isnan(error)
             assert actual > 0 and abs(actual / expected - 1) < 0.2
         else:
-            assert method == "davies"
             assert abs(actual - expected) <= error + reference_error
             assert error <= min(1e-6, 0.001 * actual)
+
+    def test_beta_bounds_require_resolved_probability_width(self):
+        levels = np.array([0, 1e-5, 1.0])
+        q = 0.9
+        reference, reference_error = self._three_level_reference(levels, (1, 1, 1), q)
+        for sign, expected in [(1, reference), (-1, 1 - reference)]:
+            coefficients = sign * (levels - q)
+            p, error, method = l2._conditional_tail(coefficients)
+            assert method == "beta" and 1e-9 < error <= min(1e-6, 0.001 * p)
+            assert abs(p - expected) <= error + reference_error
+            assert l2._conditional_tail(coefficients, integration_tol=1e-10)[2] != "beta"
 
     @pytest.mark.parametrize(
         "coefficients,reference,integral_error",
@@ -1648,7 +1737,7 @@ class TestConditionalIntegration:
                 presence,
                 null="rotation",
                 normalize_shape=shape_only,
-                freq_weights=np.array([1, 2, 0, 3, 4]),
+                freq_weights=np.array([1, 2, 1, 3, 4]),
             )
             .set_index("Feature")
             .sort_index()
@@ -1728,8 +1817,7 @@ class TestConditionalIntegration:
                     (presence[groups == 0].sum(0) >= 2) & (presence[groups == 1].sum(0) >= 2)
                 )[None, :]
         mask = presence if masked else None
-        weights = np.arange(bins, dtype=float)
-        weights[::3] = 0
+        weights = np.arange(1, bins + 1, dtype=float)
         options = {"freq_weights": weights, "normalize_shape": shape_only}
         result = l2._run_l2_conditional(values, x, c, mask, **options)
         draws = 4999
@@ -1773,13 +1861,9 @@ class TestConditionalIntegration:
             se_factor = np.linalg.norm(c @ np.linalg.pinv(design)) / np.sqrt(df)
             y[rows, gene] = design[:, 1] + residual / (score * se_factor)
             expected[gene] = 2 * t.sf(score, df)
-        # Masked cases also exercise DF-norm with one positive-weight bin.
-        active = np.exp(y - y.max(axis=0) - 1)
-        values = np.stack([active, 1 - active], axis=-1) if masked else active[..., None]
+        values = np.exp(y - y.max(axis=0) - 1)[..., None]
         values[~presence] = np.nan
-        options = {"null": "rotation", "normalize_shape": masked}
-        if masked:
-            options["freq_weights"] = np.array([2.0, 0.0])
+        options = {"null": "rotation"}
 
         if glm:
             method = compare_glm_masked if masked else compare_glm
@@ -1825,7 +1909,7 @@ class TestConditionalIntegration:
         values[~presence] = np.nan
         options = {
             "normalize_shape": shape_only,
-            "freq_weights": np.arange(9),
+            "freq_weights": np.arange(1, 10),
             "null": "rotation",
         }
         expected = (
@@ -1896,7 +1980,7 @@ class TestConditionalIntegration:
 
 class TestTCauchyCalibration:
     @pytest.mark.parametrize("glm", [False, True])
-    @pytest.mark.parametrize("weights", [None, np.array([4.0, 2.0, 1.0, 0.0, 0.0])])
+    @pytest.mark.parametrize("weights", [None, np.array([4.0, 2.0, 1.0, 0.5, 0.25])])
     def test_independent_gaussian_log_errors_have_calibrated_tails(self, glm, weights):
         rng = np.random.default_rng(907)
         spectra = np.exp(rng.normal(size=(20, 6000, 5)))

@@ -170,9 +170,15 @@ def _compare_two_group_profiles(  # noqa: C901 — input validation and statisti
         raise ValueError(
             f"groups shape {groups.shape} does not match n_samples={spectra.shape[0]}."
         )
-    labels = np.unique(groups)
+    if pd.isna(groups).any():
+        raise ValueError("Binary labels must be nonmissing.")
+    labels, counts = np.unique(groups, return_counts=True)
     if len(labels) != 2:
         raise ValueError(f"groups must contain exactly two distinct values, got {labels}.")
+    if int(min_samples_per_group) < 2:
+        raise ValueError("min_samples_per_group must be >= 2.")
+    if statistic == "log_l2" and counts.min() < min_samples_per_group:
+        raise ValueError(f"Each group requires at least {min_samples_per_group} observed samples.")
     groups = (groups == labels[1]).astype(int)
     if presence is not None:
         presence = np.asarray(presence, dtype=bool)
@@ -360,7 +366,6 @@ def _run_t_cauchy_test(  # noqa: C901 — binary/GLM eligibility and masked fits
                 )
             t_stat = t_stat.reshape(-1, n_bins)
             effect = effect.reshape(-1, n_bins)
-            abs_t = np.abs(t_stat)
             bins = bins.reshape(-1, n_bins)
             # A constant response can still test a nonzero intercept contrast.
             informative = np.any(response != response[:1], axis=0) | (effect != 0)
@@ -370,12 +375,12 @@ def _run_t_cauchy_test(  # noqa: C901 — binary/GLM eligibility and masked fits
                 where=informative,
                 weights=weights if freq_weights is not None else None,
             )
-            observed[cols] = np.max(abs_t, axis=-1, where=weights > 0, initial=0.0)
+            observed[cols] = np.max(np.abs(t_stat), axis=-1)
             pvals[cols] = tail
             binwise["Estimate_per_bin"][cols] = effect
             binwise["T_per_bin"][cols] = t_stat
             binwise["P_value_per_bin"][cols] = bins
-            selected = informative & (weights > 0) & np.isfinite(bins)
+            selected = informative & np.isfinite(bins)
             best_bin[cols] = np.where(
                 selected.any(axis=-1), np.argmin(np.where(selected, bins, np.inf), axis=-1), np.nan
             )
@@ -402,6 +407,7 @@ def compare_two_groups(
     freq_weights: np.ndarray | None = None,
     normalize_shape: bool = False,
     *,
+    min_samples_per_group: int = 2,
     covariance: str | None = None,
     integration_tol: float = 1e-6,
 ) -> pd.DataFrame:
@@ -421,7 +427,7 @@ def compare_two_groups(
         ``'log_l2'`` (default) is the weighted L2 contrast of log spectra.
         ``'log_t_cauchy'`` combines per-bin Welch p-values on log profiles
         and also supports localizing the best bin by its smallest p-value
-        among positive-weight bins.
+        among informative bins.
         It requires two observations per arm and excludes constant bins.
     null : str, optional
         Null calibration depends on the statistic:
@@ -440,14 +446,13 @@ def compare_two_groups(
     random_state : int, optional
         Seed for binary label permutations; ignored by other nulls.
     freq_weights : np.ndarray, optional
-        Finite nonnegative weights of length ``n_bins``, normalized to sum
-        to one. None gives uniform weights. Log t-Cauchy renormalizes weights
-        over informative bins; zero weights exclude bins from combination and
-        the statistic summary. Per-bin p-values remain unchanged. Choose
-        weights independently of the observed signal.
+        Finite, strictly positive bin weights. None gives uniform weights.
+        Log t-Cauchy renormalizes weights over informative bins.
     normalize_shape : bool
         If True, divide each sample/feature spectrum by its total power
         before logging to test spectral shape (DF-norm). Default False.
+    min_samples_per_group : int
+        Minimum observations per group for L2 (default 2).
     covariance : str or None
         For plug-in L2 calibration, ``None`` or ``'per_gene'`` estimates residual covariance
         separately for each gene. ``'pooled'`` shares it across eligible genes.
@@ -465,18 +470,18 @@ def compare_two_groups(
         ``Estimate_per_bin`` gives the mean A minus mean B on natural-log profiles
         in original bin order, without frequency weights. For ``Statistic``, L2 reports the
         weighted RMS of these unweighted estimates, similar to an aggregated effect
-        size. Log t-Cauchy reports the largest absolute t over positive-weight bins.
+        size. Log t-Cauchy reports the largest absolute t across bins.
         It also adds signed ``T_per_bin`` and unadjusted ``P_value_per_bin``.
         ``Best_bin`` is the zero-based index with the smallest
-        p-value among informative, positive-weight bins (first index on ties),
+        p-value among informative bins (first index on ties),
         or missing if none. Skipped features have NaN per-bin arrays.
         Feature-level significance does not establish the selected bin's significance.
         Rows are sorted by descending statistic; BH uses finite p-values.
         Plug-in L2 results record ``null="plugin"`` and ``covariance`` in ``attrs``.
         Rotation adds ``P_value_method`` (``davies``, ``saddlepoint``, ``beta``
         or ``exact``; missing for skipped rows) and ``P_value_error``. The latter
-        is the accepted Davies absolute error budget, a roundoff estimate for
-        beta, or zero at exact boundaries; it is NaN for saddlepoint/skipped
+        is the Davies accuracy budget, the beta interval half-width plus estimated
+        roundoff, or zero at exact boundaries; it is NaN for saddlepoint/skipped
         rows and does not measure statistical uncertainty. ``attrs`` records
         ``method="davies"``, ``integration_tol``, ``integration_limit=10000``,
         ``n_saddlepoint`` and ``covariance=None``.
@@ -503,6 +508,7 @@ def compare_two_groups(
         covariance=covariance,
         normalize_shape=normalize_shape,
         freq_weights=freq_weights,
+        min_samples_per_group=min_samples_per_group,
         n_perm=n_perm,
         max_exact_permutations=max_exact_permutations,
         integration_tol=integration_tol,
@@ -546,7 +552,7 @@ def compare_two_groups_masked(
         ``'log_l2'`` (default) is the weighted L2 contrast of log spectra.
         ``'log_t_cauchy'`` combines per-bin Welch p-values on log profiles
         and also supports localizing the best bin by its smallest p-value
-        among positive-weight bins.
+        among informative bins.
         It requires two observations per arm and excludes constant bins.
     null : str, optional
         Null calibration depends on the statistic:
@@ -565,14 +571,14 @@ def compare_two_groups_masked(
     random_state : int, optional
         Seed for binary label permutations; ignored by other nulls.
     min_samples_per_group : int
-        Minimum observed samples per group for a masked binary test;
-        default 2. Features below either threshold receive NaN results.
+        Minimum observed samples per group for each feature (default 2).
+        L2 raises ValueError if either group has fewer labeled samples than
+        this minimum before masking. After masking, features below the minimum
+        in either group receive NaN results. Rotation and plug-in calibration
+        raise ValueError if no feature qualifies.
     freq_weights : np.ndarray, optional
-        Finite nonnegative weights of length ``n_bins``, normalized to sum
-        to one. None gives uniform weights. Log t-Cauchy renormalizes weights
-        over informative bins; zero weights exclude bins from combination and
-        the statistic summary. Per-bin p-values remain unchanged. Choose
-        weights independently of the observed signal.
+        Finite, strictly positive bin weights. None gives uniform weights.
+        Log t-Cauchy renormalizes weights over informative bins.
     normalize_shape : bool
         If True, divide each sample/feature spectrum by its total power
         before logging to test spectral shape (DF-norm). Default False.
@@ -593,10 +599,10 @@ def compare_two_groups_masked(
         ``Estimate_per_bin`` gives the mean A minus mean B on natural-log profiles
         in original bin order, without frequency weights. For ``Statistic``, L2 reports the
         weighted RMS of these unweighted estimates, similar to an aggregated effect
-        size. Log t-Cauchy reports the largest absolute t over positive-weight bins.
+        size. Log t-Cauchy reports the largest absolute t across bins.
         It also adds signed ``T_per_bin`` and unadjusted ``P_value_per_bin``.
         ``Best_bin`` is the zero-based index with the smallest
-        p-value among informative, positive-weight bins (first index on ties),
+        p-value among informative bins (first index on ties),
         or missing if none. Skipped features have NaN per-bin arrays.
         Feature-level significance does not establish the selected bin's significance.
         Includes ``n_obs_A`` and ``n_obs_B``; skipped genes retain NaN results.
@@ -604,8 +610,8 @@ def compare_two_groups_masked(
         Plug-in L2 results record ``null="plugin"`` and ``covariance`` in ``attrs``.
         Rotation adds ``P_value_method`` (``davies``, ``saddlepoint``, ``beta``
         or ``exact``; missing for skipped rows) and ``P_value_error``. The latter
-        is the accepted Davies absolute error budget, a roundoff estimate for
-        beta, or zero at exact boundaries; it is NaN for saddlepoint/skipped
+        is the Davies accuracy budget, the beta interval half-width plus estimated
+        roundoff, or zero at exact boundaries; it is NaN for saddlepoint/skipped
         rows and does not measure statistical uncertainty. ``attrs`` records
         ``method="davies"``, ``integration_tol``, ``integration_limit=10000``,
         ``n_saddlepoint`` and ``covariance=None``.
@@ -671,11 +677,8 @@ def compare_glm(
     gene_names : sequence of str, optional
         Feature names. Defaults to stringified zero-based indices.
     freq_weights : np.ndarray, optional
-        Finite nonnegative weights of length ``n_bins``, normalized to sum
-        to one. None gives uniform weights. Log t-Cauchy renormalizes weights
-        over informative bins; zero weights exclude bins from combination and
-        the statistic summary. Per-bin p-values remain unchanged. Choose
-        weights independently of the observed signal.
+        Finite, strictly positive bin weights. None gives uniform weights.
+        Log t-Cauchy renormalizes weights over informative bins.
     normalize_shape : bool
         If True, divide each sample/feature spectrum by its total power
         before logging to test spectral shape (DF-norm). Default False.
@@ -683,7 +686,7 @@ def compare_glm(
         ``'log_l2'`` (default) tests the weighted L2 contrast of log spectra.
         ``'log_t_cauchy'`` combines per-bin OLS contrast t-test p-values
         and also supports localizing the best bin by its smallest p-value
-        among positive-weight bins.
+        among informative bins.
     covariance : str or None
         For plug-in L2 calibration, ``None`` or ``'per_gene'`` estimates residual covariance
         separately for each gene. ``'pooled'`` shares it across eligible genes.
@@ -705,21 +708,23 @@ def compare_glm(
     -------
     pandas.DataFrame
         Columns ``Feature``, ``Statistic``, ``P_value`` and ``P_adj``.
-        ``Estimate_per_bin`` gives the mean A minus mean B on natural-log profiles
-        in original bin order, without frequency weights. For ``Statistic``, L2 reports the
-        weighted RMS of these unweighted estimates, similar to an aggregated effect
-        size. Log t-Cauchy reports the largest absolute t over positive-weight bins.
+        ``Estimate_per_bin`` gives the fitted contrast on the natural-log profile
+        scale for each bin, in original order and without frequency weights.
+        A unit contrast on a 0/1 predictor gives the fitted difference from 0 to 1.
+        On a continuous predictor it gives the slope per unit increase.
+        For ``Statistic``, L2 reports the weighted RMS of the per-bin estimates.
+        Log t-Cauchy reports the largest absolute t across bins.
         It also adds signed ``T_per_bin`` and unadjusted ``P_value_per_bin``.
         ``Best_bin`` is the zero-based index with the smallest p-value among
-        informative, positive-weight bins (first index on ties), or missing
+        informative bins (first index on ties), or missing
         if none. Skipped features have NaN per-bin arrays.
         Feature-level significance does not establish the selected bin's significance.
         Rows are sorted by descending statistic; BH uses finite p-values.
         Plug-in L2 results record ``null="plugin"`` and ``covariance`` in ``attrs``.
         Rotation adds ``P_value_method`` (``davies``, ``saddlepoint``, ``beta``
         or ``exact``; missing for skipped rows) and ``P_value_error``. The latter
-        is the accepted Davies absolute error budget, a roundoff estimate for
-        beta, or zero at exact boundaries; it is NaN for saddlepoint/skipped
+        is the Davies accuracy budget, the beta interval half-width plus estimated
+        roundoff, or zero at exact boundaries; it is NaN for saddlepoint/skipped
         rows and does not measure statistical uncertainty. ``attrs`` records
         ``method="davies"``, ``integration_tol``, ``integration_limit=10000``,
         ``n_saddlepoint`` and ``covariance=None``.
@@ -803,11 +808,8 @@ def compare_glm_masked(
     gene_names : sequence of str, optional
         Feature names. Defaults to stringified zero-based indices.
     freq_weights : np.ndarray, optional
-        Finite nonnegative weights of length ``n_bins``, normalized to sum
-        to one. None gives uniform weights. Log t-Cauchy renormalizes weights
-        over informative bins; zero weights exclude bins from combination and
-        the statistic summary. Per-bin p-values remain unchanged. Choose
-        weights independently of the observed signal.
+        Finite, strictly positive bin weights. None gives uniform weights.
+        Log t-Cauchy renormalizes weights over informative bins.
     normalize_shape : bool
         If True, divide each sample/feature spectrum by its total power
         before logging to test spectral shape (DF-norm). Default False.
@@ -818,7 +820,7 @@ def compare_glm_masked(
         ``'log_l2'`` (default) tests the weighted L2 contrast of log spectra.
         ``'log_t_cauchy'`` combines per-bin OLS contrast t-test p-values
         and also supports localizing the best bin by its smallest p-value
-        among positive-weight bins.
+        among informative bins.
     covariance : str or None
         For plug-in L2 calibration, ``None`` or ``'per_gene'`` estimates residual covariance
         separately for each gene. ``'pooled'`` shares it across eligible genes.
@@ -840,13 +842,15 @@ def compare_glm_masked(
     -------
     pandas.DataFrame
         Columns ``Feature``, ``Statistic``, ``P_value`` and ``P_adj``.
-        ``Estimate_per_bin`` gives the mean A minus mean B on natural-log profiles
-        in original bin order, without frequency weights. For ``Statistic``, L2 reports the
-        weighted RMS of these unweighted estimates, similar to an aggregated effect
-        size. Log t-Cauchy reports the largest absolute t over positive-weight bins.
+        ``Estimate_per_bin`` gives the fitted contrast on the natural-log profile
+        scale for each bin, in original order and without frequency weights.
+        A unit contrast on a 0/1 predictor gives the fitted difference from 0 to 1.
+        On a continuous predictor it gives the slope per unit increase.
+        For ``Statistic``, L2 reports the weighted RMS of the per-bin estimates.
+        Log t-Cauchy reports the largest absolute t across bins.
         It also adds signed ``T_per_bin`` and unadjusted ``P_value_per_bin``.
         ``Best_bin`` is the zero-based index with the smallest p-value among
-        informative, positive-weight bins (first index on ties), or missing
+        informative bins (first index on ties), or missing
         if none. Skipped features have NaN per-bin arrays.
         Feature-level significance does not establish the selected bin's significance.
         Includes ``n_obs`` and ``df_resid``; skipped genes retain NaN results.
@@ -854,8 +858,8 @@ def compare_glm_masked(
         Plug-in L2 results record ``null="plugin"`` and ``covariance`` in ``attrs``.
         Rotation adds ``P_value_method`` (``davies``, ``saddlepoint``, ``beta``
         or ``exact``; missing for skipped rows) and ``P_value_error``. The latter
-        is the accepted Davies absolute error budget, a roundoff estimate for
-        beta, or zero at exact boundaries; it is NaN for saddlepoint/skipped
+        is the Davies accuracy budget, the beta interval half-width plus estimated
+        roundoff, or zero at exact boundaries; it is NaN for saddlepoint/skipped
         rows and does not measure statistical uncertainty. ``attrs`` records
         ``method="davies"``, ``integration_tol``, ``integration_limit=10000``,
         ``n_saddlepoint`` and ``covariance=None``.

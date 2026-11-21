@@ -111,8 +111,9 @@ def _run_per_sample(
     desc: str,
     n_jobs: int,
     progress: bool,
+    shared_output: bool = False,
 ) -> list[Any]:
-    """Invoke ``worker(i, pbar)`` for each sample, preserving sample order."""
+    """Preserve sample order and require shared memory for workers that fill caller-owned arrays."""
     out: list[Any] = [None] * n_samples_total
 
     run_sequential = progress or n_jobs == 1
@@ -126,7 +127,8 @@ def _run_per_sample(
         if pbar is not None:
             pbar.close()
     else:
-        results = Parallel(n_jobs=n_jobs, prefer="threads")(
+        constraints = {"require": "sharedmem"} if shared_output else {}
+        results = Parallel(n_jobs=n_jobs, prefer="threads", **constraints)(
             delayed(worker)(i, None) for i in range(n_samples_total)
         )
         for i, r in enumerate(results):
@@ -1186,7 +1188,7 @@ class _ComparatorBase:
             ``'log_t_cauchy'`` combines per-bin p-values on log profiles using
             Welch for binary labels or OLS contrast t tests for a GLM. It also
             supports localizing the best bin by its smallest per-bin p-value
-            among positive-weight bins.
+            among informative bins.
         null : str, optional
             Null calibration depends on the statistic:
 
@@ -1201,10 +1203,8 @@ class _ComparatorBase:
         random_state : int, optional
             Seed for binary label permutations; ignored by other nulls.
         freq_weights : np.ndarray, optional
-            Nonnegative weights in the fitted frequency-bin order, normalized
-            to sum to one. None gives uniform weights. Log t-Cauchy renormalizes
-            over informative bins; zero weights exclude bins from combination,
-            the statistic summary, and ``Best_bin``. Per-bin outputs are unchanged.
+            Finite, strictly positive weights in fitted bin order. None gives uniform
+            weights. Log t-Cauchy renormalizes weights over informative bins.
             Choose weights independently of the observed signal.
         max_exact_permutations : int
             Enumerate all binary label assignments when their number is at
@@ -1213,8 +1213,8 @@ class _ComparatorBase:
             If True, divide each sample/feature spectrum by its total power
             before logging to test spectral shape (DF-norm). Default False.
         min_samples_per_group : int
-            Minimum observations per arm in masked binary tests; default 2.
-            Ignored for unmasked or GLM comparisons.
+            Minimum observed samples per arm for binary L2 and masked binary t-Cauchy
+            tests. Defaults to 2.
         min_resid_df : int
             Minimum residual degrees of freedom in masked GLM tests; default 1.
             Ignored for unmasked or binary comparisons.
@@ -1238,18 +1238,18 @@ class _ComparatorBase:
             (sorted binary labels), or the specified GLM contrast, on natural-log
             profiles in original bin order. For ``Statistic``, L2 reports the
             weighted RMS of these unweighted estimates, similar to an aggregated effect
-            size. Log t-Cauchy reports the largest absolute t over positive-weight bins.
+            size. Log t-Cauchy reports the largest absolute t across bins.
             It also adds signed ``T_per_bin`` and raw ``P_value_per_bin``.
             ``Best_bin`` is the zero-based index with the smallest p-value among
-            informative, positive-weight bins (first index on ties), or missing
+            informative bins (first index on ties), or missing
             if none. Skipped genes have NaN per-bin arrays. Feature-level
             significance does not establish the selected bin's significance.
             BH uses finite feature p-values.
             Plug-in L2 results record ``null="plugin"`` and ``covariance`` in ``attrs``.
             Rotation adds ``P_value_method`` (``davies``, ``saddlepoint``, ``beta``
             or ``exact``; missing for skipped rows) and ``P_value_error``. The latter
-            is the accepted Davies absolute error budget, a roundoff estimate for
-            beta, or zero at exact boundaries; it is NaN for saddlepoint/skipped
+            is the Davies accuracy budget, the beta interval half-width plus estimated
+            roundoff, or zero at exact boundaries; it is NaN for saddlepoint/skipped
             rows and does not measure statistical uncertainty. ``attrs`` records
             ``method="davies"``, ``integration_tol``, ``integration_limit=10000``,
             ``n_saddlepoint`` and ``covariance=None``.
@@ -1341,6 +1341,7 @@ class _ComparatorBase:
         return compare_two_groups(
             self.spectra_,
             groups,
+            min_samples_per_group=int(min_samples_per_group),
             n_perm=n_perm,
             max_exact_permutations=max_exact_permutations,
             **options,
@@ -1382,7 +1383,7 @@ class _ComparatorBase:
             ``'l2'`` (default) is the weighted L2 contrast on the selected scale.
             ``'t_cauchy'`` combines per-bin p-values using Welch for binary
             labels or OLS contrast t tests for a GLM. It also localizes the
-            best bin by its smallest p-value among positive-weight bins.
+            best bin by its smallest p-value among informative bins.
         null : str, optional
             Null calibration depends on the statistic:
 
@@ -1397,18 +1398,16 @@ class _ComparatorBase:
         random_state : int, optional
             Seed for binary label permutations; ignored by other nulls.
         freq_weights : np.ndarray, optional
-            Nonnegative weights on the original flattened bins (radius then
-            angle for polar features); None gives uniform weights. Weights are
-            normalized over retained bins, and over informative bins for
-            t-Cauchy. Zero weights exclude bins from the test and ``Best_bin``;
-            valid per-bin outputs are retained. Choose weights independently
-            of the observed signal.
+            Finite, strictly positive weights in original bin order (radius then angle
+            for polar features). None gives uniform weights. Weights are normalized
+            over supported bins for L2 and informative supported bins for t-Cauchy.
+            Choose weights independently of the observed signal.
         max_exact_permutations : int
             Enumerate all binary label assignments when their number is at
             most this threshold; default 10000. Zero forces sampling.
         min_samples_per_group : int
-            Minimum observations per arm in masked binary tests; default 2.
-            Ignored for unmasked or GLM comparisons.
+            Minimum observed samples per arm for binary L2 and masked binary t-Cauchy
+            tests. Defaults to 2.
         min_resid_df : int
             Minimum residual degrees of freedom in masked GLM tests; default 1.
             Ignored for unmasked or binary comparisons.
@@ -1428,7 +1427,7 @@ class _ComparatorBase:
         pandas.DataFrame
             ``Feature_1``, ``Feature_2``, ``Statistic``, ``P_value`` and ``P_adj``,
             sorted by descending statistic. L2 reports the weighted distance;
-            t-Cauchy reports the largest absolute t over positive-weight bins.
+            t-Cauchy reports the largest absolute t across bins.
             Includes sample/bin counts, ``DF_resid`` (design residual df),
             ``Effective_rank``, ``N_pairs_pooled`` and ``Status``. Binary tests
             also return ``n_obs_A`` and ``n_obs_B``. Skipped and self-pair rows
@@ -1437,24 +1436,26 @@ class _ComparatorBase:
             Both statistics return signed ``Estimate_per_bin``: mean A minus mean B
             (sorted binary labels), or the specified GLM contrast, on natural-log
             coherence or untransformed real coherency. Estimates include supported
-            zero-weight bins in original bin order; unsupported bins and skipped
+            bins in original bin order; unsupported bins and skipped
             pairs have NaNs. t-Cauchy adds signed ``T_per_bin`` and raw ``P_value_per_bin``.
             ``Best_bin`` is the zero-based index with the smallest p-value among
-            informative, positive-weight bins (first index on ties), or missing
+            informative bins (first index on ties), or missing
             if none. Pair-level significance does not establish the selected
             bin's significance. Welch degrees of freedom vary by bin;
             ``DF_resid`` is not the df used for its tails.
 
-            ``attrs`` records retained sample/bin indices, weights, representation
-            and design. ``covariance`` is ``'pooled_across_valid_bins_psd'``,
+            ``attrs`` records retained sample/bin indices, representation and design.
+            Pass ``attrs["original_freq_weights"]`` (a tuple or None) as ``freq_weights``
+            to replay the comparison. ``attrs["freq_weights"]`` holds normalized weights.
+            ``covariance`` is ``'pooled_across_valid_bins_psd'``,
             ``'per_pair'``, or None. Per-pair fits have one pooled contributor;
             skipped, rotation, permutation and t-Cauchy pairs have zero. t-Cauchy has no
             covariance or effective rank and records ``per_bin_test`` as
             ``welch`` or ``ols``. Rotation effective ranks describe the
             conditional scatter. Rotation adds ``P_value_method`` (``davies``, ``saddlepoint``, ``beta``
             or ``exact``; missing for skipped rows) and ``P_value_error``. The latter
-            is the accepted Davies absolute error budget, a roundoff estimate for
-            beta, or zero at exact boundaries; it is NaN for saddlepoint/skipped
+            is the Davies accuracy budget, the beta interval half-width plus estimated
+            roundoff, or zero at exact boundaries; it is NaN for saddlepoint/skipped
             rows and does not measure statistical uncertainty. ``attrs`` records
             ``method="davies"``, ``integration_tol``, ``integration_limit=10000``,
             ``n_saddlepoint`` and ``covariance=None``.
@@ -1523,14 +1524,13 @@ class _ComparatorBase:
             One linear contrast, required on the GLM path. Names, coefficient
             dictionaries, and arrays follow :func:`~sonic.comparators.multisample.compare_glm`.
         freq_weights : np.ndarray, optional
-            Nonnegative bin weights, normalized to sum to one.
+            Finite, strictly positive bin weights, normalized to sum to one.
             None gives uniform weights.
         normalize_shape : bool
             If True, divide each sample/feature spectrum by its total power
             before logging to test spectral shape (DF-norm). Default False.
         min_samples_per_group : int
-            Minimum observations per arm in masked binary tests; default 2.
-            Ignored for unmasked or GLM comparisons.
+            Minimum observed samples per arm in binary comparisons. Defaults to 2.
         min_resid_df : int
             Minimum residual degrees of freedom in masked GLM tests; default 1.
             Ignored for unmasked or binary comparisons.
@@ -1615,7 +1615,9 @@ class _ComparatorBase:
                 **options,
             )
         else:
-            state = _estimate_two_group_null_covariance(self.spectra_, groups, **options)
+            state = _estimate_two_group_null_covariance(
+                self.spectra_, groups, min_samples_per_group=int(min_samples_per_group), **options
+            )
         del state["estimate_per_bin"]
         return state
 

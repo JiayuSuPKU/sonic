@@ -47,6 +47,22 @@ __all__ = [
 adapt_frequency_edges = _adapt_radial_edges
 
 
+def _shared_observation_mask(values: np.ndarray) -> np.ndarray:
+    """Return the observed raster locations shared by all requested features."""
+    observed = np.isfinite(values)
+    if np.isinf(values).any() or not np.all(observed == observed[:, :1]):
+        raise ValueError(
+            "FFT features require identical finite support; only shared NaN holes are allowed"
+        )
+    return observed[:, 0]
+
+
+def _center_observations(values: np.ndarray) -> None:
+    """Center an observed location-by-feature block in place, keeping constants exactly zero."""
+    values -= values[0]
+    values -= values.mean(axis=0)
+
+
 def radial_bin_spectrum(
     spectrum: np.ndarray,
     grid_shape: tuple[int, int],

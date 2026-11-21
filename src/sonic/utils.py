@@ -37,6 +37,14 @@ __all__ = [
 logger = logging.getLogger(__name__)
 
 
+def _take_feature_columns(matrix, columns):
+    """Read selected columns in request order, including repeats on HDF5-backed data."""
+    if isinstance(matrix, np.ndarray) or sp.issparse(matrix) or np.all(np.diff(columns) > 0):
+        return matrix[:, columns]
+    unique, order = np.unique(columns, return_inverse=True)
+    return matrix[:, unique][:, order]
+
+
 def _require_finite(values, name: str = "Data") -> None:
     """Reject invalid observations without a full-size validation workspace."""
     if sp.issparse(values):

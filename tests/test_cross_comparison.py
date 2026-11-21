@@ -8,6 +8,7 @@ from unittest.mock import patch
 import numpy as np
 import pandas as pd
 import pytest
+from scipy.linalg import hadamard
 from scipy.stats import beta, kstest, t, ttest_ind
 
 from sonic import ComparatorIrregular
@@ -116,7 +117,7 @@ def _permutation_reference(profiles, groups, weights, *, exact, n_perm=0, seed=N
 
 
 @pytest.mark.parametrize("representation", ["coherence", "coherency"])
-class TestAnalyticNull:
+class TestPluginNull:
     @pytest.mark.parametrize("glm", [False, True])
     def test_pooled_null_matches_direct_ols_with_more_bins_than_samples(self, representation, glm):
         rng = np.random.default_rng(829)
@@ -140,7 +141,11 @@ class TestAnalyticNull:
         expected_p = liu_sf(expected_stat**2, eigen * scale)
         args = {"contrast": contrast} if glm else {}
         actual = comparator.test_cross_diff_freq(
-            matrix if glm else groups, representation=representation, freq_weights=weights, **args
+            matrix if glm else groups,
+            representation=representation,
+            freq_weights=weights,
+            covariance="pooled",
+            **args,
         )
         actual = actual.set_index("Feature_1").loc[[f"g{i}" for i in range(0, 2 * p, 2)]]
         np.testing.assert_allclose(actual.Statistic, expected_stat, rtol=1e-12)
@@ -165,6 +170,7 @@ class TestAnalyticNull:
                 comparator.test_cross_diff_freq(
                     design,
                     contrast="condition",
+                    covariance="pooled",
                     representation=representation,
                 )
             )
@@ -204,7 +210,7 @@ class TestAnalyticNull:
         assert np.max(np.abs(values)) < 1
         comparator = _comparison(values)
         frame = comparator.test_cross_diff_freq(
-            np.repeat([0, 1], n // 2), representation=representation
+            np.repeat([0, 1], n // 2), representation=representation, covariance="pooled"
         )
         if not shared_noise:
             assert kstest(frame.P_value, "uniform").pvalue > 0.001
@@ -216,7 +222,7 @@ class TestAnalyticNull:
     @pytest.mark.parametrize("glm", [False, True])
     @pytest.mark.parametrize("masked", [False, True])
     @pytest.mark.parametrize("retained", [4, 6])
-    @pytest.mark.parametrize("covariance", [None, "per_pair"])
+    @pytest.mark.parametrize("covariance", ["pooled", "per_pair"])
     def test_cross_small_df_warning_policy_is_unchanged(
         self, representation, glm, masked, retained, covariance
     ):
@@ -239,11 +245,11 @@ class TestAnalyticNull:
         if retained == 4:
             assert messages
             prefix = "log_l2" if representation == "coherence" else "l2"
-            assert all(f"{prefix} + null='analytic' at residual df=2" in m for m in messages)
+            assert all(f"{prefix} + null='plugin' at residual df=2" in m for m in messages)
         else:
             assert not messages
 
-    @pytest.mark.parametrize("covariance", [None, "per_pair"])
+    @pytest.mark.parametrize("covariance", ["pooled", "per_pair"])
     def test_covariance_chunking_and_readonly_caches(self, monkeypatch, representation, covariance):
         rng = np.random.default_rng(73)
         comparator = _comparison(rng.uniform(0.1, 0.9, (10, 13, 9)))
@@ -287,11 +293,15 @@ class TestCovariancePooling:
         weights = np.zeros(64)
         weights[[4, 25, 53]] = [2, 1, 4]
         with patch.object(np.linalg, "eigvalsh", wraps=np.linalg.eigvalsh) as eig:
-            result = _ordered(comp.test_cross_diff_freq(groups, freq_weights=weights))
+            result = _ordered(
+                comp.test_cross_diff_freq(groups, freq_weights=weights, covariance="pooled")
+            )
         assert [call.args[0].shape for call in eig.call_args_list] == [(3, 3)]
         assert np.isfinite(np.stack(result.Estimate_per_bin)).all()
         comp.cross_spectra_.coherency_valid[..., weights == 0] = False
-        compact = _ordered(comp.test_cross_diff_freq(groups, freq_weights=weights))
+        compact = _ordered(
+            comp.test_cross_diff_freq(groups, freq_weights=weights, covariance="pooled")
+        )
         np.testing.assert_allclose(
             result[["Statistic", "P_value"]], compact[["Statistic", "P_value"]]
         )
@@ -312,6 +322,7 @@ class TestCovariancePooling:
                 groups,
                 representation=representation,
                 freq_weights=weights,
+                covariance="pooled",
             )
         )
         values = _profiles(cross.coherency, representation)
@@ -373,6 +384,7 @@ class TestCovariancePooling:
                 matrix if glm else groups,
                 representation=representation,
                 freq_weights=weights,
+                covariance="pooled",
                 **kwargs,
             )
         )
@@ -432,7 +444,11 @@ class TestCovariancePooling:
         comparator = _comparison(values)
         comparator.cross_spectra_.coherency_valid &= support[None]
         comparator.cross_spectra_.cross_spectra[~comparator.cross_spectra_.coherency_valid] = np.nan
-        actual = _ordered(comparator.test_cross_diff_freq(groups, representation=representation))
+        actual = _ordered(
+            comparator.test_cross_diff_freq(
+                groups, representation=representation, covariance="pooled"
+            )
+        )
         # The corrected shared correlation has off-diagonals +.5, +.5, -.5.
         expected_covariance = 0.005 * np.array([[2, 1, 1], [1, 2, -1], [1, -1, 2.0]])
         statistic = np.sqrt(np.mean(np.array([0.1, 0.2]) ** 2))
@@ -528,7 +544,9 @@ class TestSamplePresence:
         if glm:
             matrix = np.column_stack([matrix, rng.normal(size=n)])
         contrast = np.eye(matrix.shape[1])[1]
-        kwargs = {"contrast": contrast} if glm else {}
+        kwargs = {"covariance": "pooled"}
+        if glm:
+            kwargs["contrast"] = contrast
         design = matrix if glm else groups
         weights = np.arange(1, b + 1, dtype=float)
         weights /= weights.sum()
@@ -592,7 +610,7 @@ class TestSamplePresence:
             np.testing.assert_array_equal(getattr(cross, name), getattr(original, name))
 
     @pytest.mark.parametrize("glm", [False, True])
-    @pytest.mark.parametrize("covariance", [None, "per_pair"])
+    @pytest.mark.parametrize("covariance", ["pooled", "per_pair"])
     def test_empty_masked_pool_does_not_abort_other_bin_groups(self, glm, covariance):
         comparator = _comparison(np.random.default_rng(28).uniform(0.1, 0.8, (10, 2, 4)))
         cross = comparator.cross_spectra_
@@ -623,14 +641,18 @@ class TestSamplePresence:
         cross.presence[:, 2] = False
         _mask_missing_pairs(cross)
         groups = np.repeat([0, 1], 4)
-        actual = _ordered(comparator.test_cross_diff_freq(groups, representation=representation))
+        actual = _ordered(
+            comparator.test_cross_diff_freq(groups, representation=representation, null="plugin")
+        )
         assert actual.P_value.iloc[0] == 1  # Valid zero coupling remains observed.
         assert actual.N_samples.iloc[0] == 7
         assert actual.Status.iloc[1] == "insufficient_samples"
         assert actual.N_samples.iloc[1] == 0
         assert actual.N_bins.iloc[1] == 0
         cross.cross_spectra[4:, 0] = 0.5
-        changed = _ordered(comparator.test_cross_diff_freq(groups, representation=representation))
+        changed = _ordered(
+            comparator.test_cross_diff_freq(groups, representation=representation, null="plugin")
+        )
         assert changed.Status.iloc[0] == "degenerate_null"
         assert np.isnan(changed.P_value.iloc[0])
 
@@ -800,10 +822,11 @@ class TestValidation:
         [
             ({"representation": "cross"}, ValueError, "representation"),
             ({"null": "foo"}, ValueError, "null"),
+            ({"null": "analytic"}, ValueError, "plugin"),
             ({"covariance": "per_gene"}, ValueError, "covariance"),
             ({"covariance": "typo"}, ValueError, "covariance"),
-            ({"null": "permutation", "covariance": "per_pair"}, ValueError, "analytic"),
-            ({"null": "permutation", "covariance": "pooled"}, ValueError, "analytic"),
+            ({"null": "permutation", "covariance": "per_pair"}, ValueError, "plugin"),
+            ({"null": "permutation", "covariance": "pooled"}, ValueError, "plugin"),
             ({"freq_weights": [0, 0, 0]}, ValueError, "positive finite sum"),
             ({"freq_weights": [1, np.nan, 1]}, ValueError, "finite"),
             ({"null": "permutation", "n_perm": 0}, ValueError, "positive integer"),
@@ -813,7 +836,7 @@ class TestValidation:
                 ValueError,
                 "nonnegative integer",
             ),
-            ({"null": "permutation", "contrast": "group"}, NotImplementedError, "analytic"),
+            ({"null": "permutation", "contrast": "group"}, NotImplementedError, "plugin"),
         ],
     )
     def test_invalid_test_options_fail_before_testing(self, kwargs, error, match):
@@ -871,14 +894,18 @@ class TestValidation:
         cross.pairs = (("g0", "g0"), ("g2", "g3"))
         cross.pair_indices[0] = (0, 0)
         frame = _ordered(
-            comparator.test_cross_diff_freq(design, representation=representation, **kwargs)
+            comparator.test_cross_diff_freq(
+                design, representation=representation, null="plugin", **kwargs
+            )
         )
         assert frame.iloc[0].Status == "self_pair"
         assert np.isnan(frame.iloc[0].P_value)
         assert frame.iloc[1].P_value == 1
         cross.cross_spectra[4:, 1] = 0.2
         frame = _ordered(
-            comparator.test_cross_diff_freq(design, representation=representation, **kwargs)
+            comparator.test_cross_diff_freq(
+                design, representation=representation, null="plugin", **kwargs
+            )
         )
         assert frame.iloc[1].Status == "degenerate_null"
         assert np.isnan(frame.iloc[1].P_value)
@@ -910,7 +937,8 @@ class TestIntegration:
             assert len(frame) == 2
             assert (frame.Status == "ok").all()
             assert frame.P_value.between(0, 1).all()
-            assert (frame.N_pairs_pooled == 2).all()
+            assert frame.attrs["null"] == "rotation"
+            assert (frame.N_pairs_pooled == 0).all()
 
     def test_pair_presence_extraction_and_subsetting(self, make_comparator, backend, mode):  # noqa: F811
         rng = np.random.default_rng(73)
@@ -962,6 +990,7 @@ def test_df_and_cross_share_degenerate_null_policy(representation, glm, masked, 
     groups = np.repeat([0, 1], 4)
     design = pd.DataFrame({"condition": groups}) if glm else groups
     kwargs = {"contrast": "condition"} if glm else {}
+    kwargs["covariance"] = "pooled"
     kwargs["freq_weights"] = np.array([1.0, 2.0, 0.0])
     auto = (
         comparator.test_diff_freq(design, **kwargs).set_index("Feature").loc[comparator.gene_names]
@@ -985,7 +1014,7 @@ def test_df_and_cross_share_degenerate_null_policy(representation, glm, masked, 
 
 
 @pytest.mark.parametrize("sizes", [(1, 7), (7, 1), (1, 1)])
-@pytest.mark.parametrize("null", ["analytic", "permutation"])
+@pytest.mark.parametrize("null", ["plugin", "permutation"])
 def test_unmasked_singleton_groups_follow_df(sizes, null):
     n = sum(sizes)
     values = np.random.default_rng(720).uniform(0.1, 0.8, (n, 2, 4))
@@ -995,7 +1024,7 @@ def test_unmasked_singleton_groups_follow_df(sizes, null):
     comparator.gene_names = [pair[0] for pair in comparator.cross_spectra_.pairs]
     groups = np.repeat([0, 1], sizes)
     kwargs = {"null": null, "min_samples_per_group": 50}
-    if n == 2 and null == "analytic":
+    if n == 2 and null == "plugin":
         for method in (comparator.test_diff_freq, comparator.test_cross_diff_freq):
             with pytest.raises(ValueError, match="positive residual degrees of freedom"):
                 method(groups, **kwargs)
@@ -1059,7 +1088,7 @@ def test_per_pair_matches_independent_ols_with_sample_and_bin_masks(representati
             assert init.call_count
             assert all(call.args[2] is False for call in init.call_args_list)
     assert frame.attrs["covariance"] == "per_pair"
-    assert frame.attrs["null"] == "analytic"
+    assert frame.attrs["null"] == "plugin"
     actual = _ordered(frame).loc[list(cross.pairs)]
     profiles = _profiles(values, representation)
     for j, pair in enumerate(cross.pairs):
@@ -1093,15 +1122,11 @@ def test_per_pair_matches_independent_ols_with_sample_and_bin_masks(representati
         assert row.N_pairs_pooled == 1
         assert row.Status == "ok"
     np.testing.assert_allclose(actual.P_adj, apply_bh_correction(actual.P_value), equal_nan=True)
-    # Adding the selector must not change the established pooled default or metadata.
-    default = comparator.test_cross_diff_freq(
-        design, representation=representation, freq_weights=weights, **kwargs
+    plugin = comparator.test_cross_diff_freq(
+        design, representation=representation, null="plugin", freq_weights=weights, **kwargs
     )
-    explicit = comparator.test_cross_diff_freq(
-        design, representation=representation, covariance="pooled", freq_weights=weights, **kwargs
-    )
-    pd.testing.assert_frame_equal(default, explicit)
-    assert explicit.attrs["covariance"] == "pooled_across_valid_bins_psd"
+    pd.testing.assert_frame_equal(plugin, frame)
+    assert plugin.attrs == frame.attrs
 
 
 @pytest.mark.parametrize("representation", ["coherence", "coherency"])
@@ -1182,12 +1207,12 @@ def test_per_pair_raw_results_do_not_borrow_from_other_pairs(representation, glm
 @pytest.mark.parametrize(
     "glm,null,covariance",
     [
-        (False, "analytic", None),
-        (False, "analytic", "per_pair"),
+        (False, "plugin", None),
+        (False, "plugin", "per_pair"),
         (False, "rotation", None),
         (False, "permutation", None),
-        (True, "analytic", None),
-        (True, "analytic", "per_pair"),
+        (True, "plugin", None),
+        (True, "plugin", "per_pair"),
         (True, "rotation", None),
     ],
 )
@@ -1317,7 +1342,6 @@ class TestCrossRotation:
                 x if glm else groups,
                 **({"contrast": c} if glm else {}),
                 representation=representation,
-                null="rotation",
                 freq_weights=np.array([2.0, 0.0, 5.0]),
             )
         )
@@ -1463,11 +1487,13 @@ class TestCrossRotation:
     @pytest.mark.parametrize("representation", ["coherence", "coherency"])
     @pytest.mark.parametrize("masked", [False, True])
     def test_nuisance_only_profiles_have_no_rotation_signal(self, representation, masked):
-        z = np.random.default_rng(1).normal(size=10)
-        x = np.c_[np.ones(10), np.linspace(-1, 1, 10), z]
-        y = np.repeat(0.2 * z[:, None, None] * np.array([1.0, 0.5, -0.2]), 2, axis=1)
-        y[:, 1] += 0.1 * x[:, 1, None]
-        values = np.exp((y - 2) / 2) if representation == "coherence" else y
+        rng = np.random.default_rng(7)
+        groups = np.tile([0, 1], 6)
+        z = rng.integers(-8, 9, size=12) / 16
+        h = rng.integers(0, 2, size=12)
+        x = np.c_[np.ones(12), groups, z, z + h / 4096]
+        # Each pair has just two levels, also after the coherence log transform.
+        values = np.stack([0.25 + h / 4, 0.25 + groups / 4], axis=1)[:, :, None]
         comparator = _comparison(values)
         if masked:
             comparator.cross_spectra_.presence[0, 0] = False
@@ -1475,38 +1501,150 @@ class TestCrossRotation:
         result = _ordered(
             comparator.test_cross_diff_freq(
                 x,
-                contrast=np.array([0.0, 1.0, 0.0]),
+                contrast=np.array([0.0, 1.0, 0.0, 0.0]),
                 representation=representation,
-                null="rotation",
-                freq_weights=np.array([1.0, 0.0, 0.0]),
             )
         )
-        np.testing.assert_allclose(result.P_value, [1.0, 0.0], atol=1e-10)
-        assert (result.P_value_error.dropna() <= 1e-6).all()
+        np.testing.assert_array_equal(result.P_value, [1.0, 0.0])
+        assert (result.P_value_method == "exact").all()
         assert np.isnan(result.Effective_rank.iloc[0])
         assert result.Effective_rank.iloc[1] == pytest.approx(1.0)
         assert (result.Status == "ok").all()
 
+    @pytest.mark.parametrize("with_nuisance", [False, True], ids=["binary", "glm"])
+    def test_exact_coherency_contrast_survives_shared_offset(self, with_nuisance):
+        groups = np.tile([0, 1], 6)
+        step = 2.0**-50
+        profiles = np.zeros((len(groups), 2, 2))
+        profiles[:, 0] = groups[:, None] * np.array([-step, step])
+        design, options = groups, {}
+        if with_nuisance:
+            nuisance = np.repeat(np.arange(6), 2) / 32
+            profiles += nuisance[:, None, None]
+            design = np.column_stack([np.ones(len(groups)), groups, nuisance])
+            options = {"contrast": np.array([0.0, 1.0, 0.0])}
+
+        for offset in (0.0, 0.5):
+            result = _ordered(
+                _comparison(profiles + offset).test_cross_diff_freq(
+                    design, representation="coherency", **options
+                )
+            )
+            np.testing.assert_allclose(result.Statistic, [step, 0.0], rtol=1e-14, atol=0)
+            np.testing.assert_array_equal(result.P_value, [0.0, 1.0])
+            np.testing.assert_array_equal(result.P_value_error, [0.0, 0.0])
+            assert (result.P_value_method == "exact").all()
+
+    def test_noisy_coherency_contrast_after_nuisance_recoding(self):
+        groups = np.tile([0, 1], 6)
+        z, w = np.random.default_rng(16).integers(-8, 9, size=(2, 12)) / 16
+        pattern = 8 * groups
+        pattern[0] += 1
+        contrast = np.array([0, 1, 0, 0])
+        design = np.c_[np.ones(12), groups, z, w]
+        # Remove the exact nuisance and common scale analytically for the t reference.
+        inverse = np.linalg.pinv(design)
+        beta = inverse @ pattern
+        se = np.linalg.norm(inverse[1]) * np.linalg.norm(pattern - design @ beta) / np.sqrt(8)
+        expected = 2 * t.sf(abs(beta[1]) / se, 8)
+        # Duplicate bins still span one direction even with unequal weights.
+        profiles = np.repeat((w / 2 + pattern * 2.0**-53)[:, None, None], 2, axis=2)
+        comparator = _comparison(profiles)
+        for nuisance in (w, z + w / 512, z + w * 2.0**-44):
+            design[:, -1] = nuisance
+            row = comparator.test_cross_diff_freq(
+                design, contrast=contrast, representation="coherency", freq_weights=[1, 3]
+            ).iloc[0]
+            np.testing.assert_allclose(row.P_value, expected, rtol=1e-10, atol=0)
+            assert row.P_value_method == "beta"
+
+    @pytest.mark.parametrize("order", [[0, 1, 2, 3], [2, 0, 3, 1]])
+    def test_constant_and_one_ulp_nonconstant_rotation(self, order):
+        groups = np.array([0, 0, 1, 1])
+        design = np.c_[np.ones(4), groups, [-1, 1, -1, 1]]
+        a, r = 2 * groups - 1, np.array([1, -1, -1, 1])
+        constant = np.column_stack([a, r]) / 4
+        nearby = constant.copy()
+        nearby[0, 0] = np.nextafter(nearby[0, 0], np.inf)
+        delta = nearby[0, 0] - constant[0, 0]
+        # The circle coordinates change from (1,0), (0,1) to (1-d,0), (d,1).
+        # The common factor of 2d cancels from the circle-tail angle.
+        expected = np.arctan2(1 - delta, -1) / np.pi
+        profiles = np.stack([constant, nearby], axis=1)
+        result = _ordered(
+            _comparison(profiles[order]).test_cross_diff_freq(
+                design[order], contrast=np.array([0, 1, 0]), representation="coherency"
+            )
+        )
+        assert result.P_value.iloc[0] == 1
+        assert result.P_value_error.iloc[0] == 0
+        assert result.P_value_method.tolist() == ["exact", "beta"]
+        assert abs(result.P_value.iloc[1] - expected) <= result.P_value_error.iloc[1]
+
+    def test_constant_rotation_boundaries_with_recoded_nuisance(self):
+        intercept, a, z, w, x, y, r, s = hadamard(8)
+        design = np.column_stack([intercept, a, z, z + w * 2.0**-40, x, y])
+        # a, r and s span the sphere. Change only the energy along r by one ULP.
+        levels = [0.25, np.nextafter(0.25, np.inf), np.nextafter(0.25, 0)]
+        profiles = np.stack(
+            [np.column_stack([a / 4, r * level, s / 4]) for level in levels], axis=1
+        )
+        result = _ordered(
+            _comparison(profiles).test_cross_diff_freq(
+                design, contrast=np.array([0, 1, 0, 0, 0, 0]), representation="coherency"
+            )
+        )
+        np.testing.assert_array_equal(result.P_value, [1, 1, 0])
+        np.testing.assert_array_equal(result.P_value_error, 0)
+        assert result.P_value_method.tolist() == ["exact"] * 3
+
+    def test_two_bin_rotation_matches_circle_tail_after_offset(self):
+        groups = np.array([0, 0, 1, 1])
+        design = np.c_[np.ones(4), groups, [-1, 1, -1, 1]]
+        a, r = np.array([-1, -1, 1, 1]), np.array([1, -1, -1, 1])
+        pattern = a[:, None] * [5, 9] + r[:, None] * [2, -1]
+        weights = np.array([1, 3])
+        # In two sample dimensions the tail is the angle between equal-level directions / pi.
+        u, v = a @ pattern, r @ pattern
+        expected = (
+            np.arctan2(2 * abs((u * weights) @ v), (u * weights) @ u - (v * weights) @ v) / np.pi
+        )
+        for offset in (0.0, 0.5):
+            values = offset + np.spacing(0.5) * pattern
+            row = (
+                _comparison(values[:, None])
+                .test_cross_diff_freq(
+                    design,
+                    contrast=np.array([0, 1, 0]),
+                    representation="coherency",
+                    freq_weights=weights,
+                )
+                .iloc[0]
+            )
+            np.testing.assert_allclose(row.P_value, expected, atol=1e-14)
+
     @pytest.mark.parametrize("glm", [False, True])
-    def test_empty_support_and_perfect_fit(self, glm):
-        groups = np.repeat([0, 1], 3)
-        values = np.ones((6, 3, 4)) * 0.3
-        values[3:, 1] = -0.3
+    @pytest.mark.parametrize("representation", ["coherence", "coherency"])
+    def test_empty_support_and_perfect_fit(self, glm, representation):
+        groups = np.tile([0, 1], 6)
+        values = np.full((12, 3, 4), 0.3)
+        values[:, 1, :2] = np.array([[0.25, 0.5], [0.5, 0.25]])[groups]
         comparator = _comparison(values)
         comparator.cross_spectra_.presence[:, 4] = False
         _mask_missing_pairs(comparator.cross_spectra_)
-        design = np.c_[np.ones(6), groups] if glm else groups
+        design = np.c_[np.ones(12), groups] if glm else groups
         kwargs = {"contrast": np.array([0.0, 1.0])} if glm else {}
         result = _ordered(
             comparator.test_cross_diff_freq(
                 design,
-                representation="coherency",
+                representation=representation,
                 null="rotation",
-                freq_weights=np.array([1.0, 0.0, 0.0, 0.0]),
+                freq_weights=np.array([1.0, 1.0, 0.0, 0.0]),
                 **kwargs,
             )
         )
-        np.testing.assert_allclose(result.P_value, [1.0, 0.0, np.nan], atol=1e-10, equal_nan=True)
+        np.testing.assert_array_equal(result.P_value, [1.0, 0.0, np.nan])
+        assert result.P_value_method.iloc[:2].tolist() == ["exact", "exact"]
         assert np.isnan(result.P_value_error.iloc[-1])
         comparator.cross_spectra_.coherency_valid[:] = False
         empty = comparator.test_cross_diff_freq(
@@ -1622,6 +1760,7 @@ class TestCrossTCauchy:
                 design if glm else groups,
                 representation=representation,
                 statistic="t_cauchy",
+                null="analytic",
                 freq_weights=weights,
                 **args,
             )
@@ -1670,6 +1809,7 @@ class TestCrossTCauchy:
         np.testing.assert_allclose(result.P_adj, apply_bh_correction(expected_p), rtol=1e-10)
         assert result.Best_bin.dtype == pd.Int64Dtype()
         assert result.attrs["statistic"] == "t_cauchy"
+        assert result.attrs["null"] == "analytic"
         assert result.attrs["per_bin_test"] == ("ols" if glm else "welch")
         assert result.attrs["covariance"] is None
         assert (result.N_pairs_pooled == 0).all()
@@ -1785,6 +1925,7 @@ class TestCrossTCauchy:
         [
             {"statistic": "log_t_cauchy"},
             {"statistic": "invalid"},
+            {"null": "plugin"},
             {"null": "rotation"},
             {"null": "permutation"},
             {"covariance": "pooled"},
@@ -1808,14 +1949,16 @@ class TestCrossTCauchy:
             comparator.test_cross_diff_freq([0, 1, 1, 1, 1], statistic="t_cauchy")
 
     @pytest.mark.parametrize("representation", ["coherence", "coherency"])
-    def test_default_remains_l2(self, representation):
+    def test_default_is_l2_rotation(self, representation):
         comparator = _comparison(np.random.default_rng(147).uniform(0.1, 0.8, (12, 3, 4)))
         groups = np.repeat([0, 1], 6)
         default = comparator.test_cross_diff_freq(groups, representation=representation)
         explicit = comparator.test_cross_diff_freq(
-            groups, statistic="l2", representation=representation
+            groups, statistic="l2", null="rotation", representation=representation
         )
         pd.testing.assert_frame_equal(default, explicit)
+        assert default.attrs == explicit.attrs
+        assert default.attrs["covariance"] is None
         assert "Best_bin" not in default
 
     @pytest.mark.parametrize("glm", [False, True])

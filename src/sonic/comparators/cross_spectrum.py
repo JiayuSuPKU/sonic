@@ -9,7 +9,7 @@ import pandas as pd
 from scipy.sparse import issparse
 
 from sonic.comparators._inference import (
-    _NULL_OPTIONS,
+    _L2_NULL_OPTIONS,
     _estimate_glm_masked_null_covariance,
     _estimate_two_group_masked_null_covariance,
     _estimate_two_group_null_covariance,
@@ -36,7 +36,11 @@ from sonic.comparators.binning import (
     _polar_bin_reducer,
     _radial_bin_reducer,
 )
-from sonic.comparators.multisample import _BINWISE_COLUMNS, _run_t_cauchy_test
+from sonic.comparators.multisample import (
+    _BINWISE_COLUMNS,
+    _resolve_profile_null,
+    _run_t_cauchy_test,
+)
 from sonic.kernels.fft import _fourier_coefficients_2d
 from sonic.kernels.nufft import _fourier_coefficients_2d_nufft
 from sonic.statistics import apply_bh_correction
@@ -115,12 +119,18 @@ class CrossSpectra:
     @property
     def coherency(self):
         """Cross-spectrum / sqrt(matched auto powers); radial values are signed."""
-        left = self.auto_spectra[:, self.pair_indices[:, 0]]
-        right = self.auto_spectra[:, self.pair_indices[:, 1]]
+        return self._coherency_block(slice(None))
+
+    def _coherency_block(self, pairs):
+        """Compute and check coherency for a slice of pairs."""
+        left = self.auto_spectra[:, self.pair_indices[pairs, 0]]
+        right = self.auto_spectra[:, self.pair_indices[pairs, 1]]
         denominator = np.sqrt(left) * np.sqrt(right)
-        result = np.full_like(self.cross_spectra, np.nan)
-        np.divide(self.cross_spectra, denominator, out=result, where=self.coherency_valid)
-        if np.any(np.abs(result[self.coherency_valid]) > 1 + 1e-8):
+        cross = self.cross_spectra[:, pairs]
+        valid = self.coherency_valid[:, pairs]
+        result = np.full_like(cross, np.nan)
+        np.divide(cross, denominator, out=result, where=valid)
+        if np.any(np.abs(result[valid]) > 1 + 1e-8):
             raise ArithmeticError("Cross/auto reduction violated the coherence bound")
         return result
 
@@ -452,7 +462,8 @@ def _compute_cross_spectra(  # noqa: C901 — validation and two backend schedul
         feature_mode=comparator.feature_mode,
         chunk_schedules=chunk_schedules,
     )
-    _ = result.coherency
+    for block in _iter_feature_blocks(n_samples, len(pairs), cross_spectra.shape[-1]):
+        result._coherency_block(block)
     return result
 
 
@@ -519,6 +530,7 @@ def _cross_pvalues_from_covariance(observed, scales, covariance, weights, roundo
     _, eigenvalues, effective_rank = _weighted_covariance_eigensystem(covariance, weights)
     pvals = _l2_pvalues_from_state(
         {
+            "covariance": "pooled",
             "observed": observed,
             "sigma_log": covariance,
             "roundoff": roundoff,
@@ -532,7 +544,7 @@ def _cross_pvalues_from_covariance(observed, scales, covariance, weights, roundo
     return pvals, effective_rank, np.where(np.isnan(pvals), "degenerate_null", "ok")
 
 
-def _run_cross_analytic(  # noqa: C901 — shared fits across covariance modes and design paths
+def _run_cross_plugin(  # noqa: C901 — shared fits across covariance modes and design paths
     result,
     pair_presence,
     support,
@@ -595,7 +607,7 @@ def _run_cross_analytic(  # noqa: C901 — shared fits across covariance modes a
         ``observed`` (weighted L2 statistic), ``pvals``, ``pooled_pairs``,
         ``effective_rank``, ``df_resid``, and ``status``. Skipped fits retain
         NaN statistics; untestable p-values remain NaN. ``permutation_counts``
-        is zero and ``exact_permutations`` is False on this analytic path.
+        is zero and ``exact_permutations`` is False on this plug-in path.
         ``pooled_pairs`` counts all eligible contributors to the shared matrix;
         the contributors to each individual entry depend on bin overlap.
         Per-pair fits count one contributor for each eligible pair, zero otherwise.
@@ -649,7 +661,7 @@ def _run_cross_analytic(  # noqa: C901 — shared fits across covariance modes a
         if per_pair:
             kwargs.update(covariance="per_gene", store_covariance=False)
         else:
-            kwargs["for_pooling"] = True
+            kwargs.update(covariance="pooled", for_pooling=True)
         if use_masked:
             if use_glm:
                 state = _estimate_glm_masked_null_covariance(
@@ -755,7 +767,7 @@ def _run_cross_permutations(
     """Calibrate binary L2 contrasts by permuting sample labels.
 
     Shared input shapes, sample/bin masks, representations and masked
-    eligibility thresholds follow :func:`_run_cross_analytic`. Unmasked
+    eligibility thresholds follow :func:`_run_cross_plugin`. Unmasked
     permutations require at least one sample per arm, without a residual-df
     requirement. Support and weights stay fixed across relabellings.
 
@@ -779,7 +791,7 @@ def _run_cross_permutations(
     -------
     dict of ndarray
         Arrays of shape ``(n_pairs,)`` in original pair order, with the same
-        keys as :func:`_run_cross_analytic`. ``observed`` is weighted L2;
+        keys as :func:`_run_cross_plugin`. ``observed`` is weighted L2;
         ``pvals`` uses exact exceedance fractions or sampled tails with a +1
         correction. ``permutation_counts`` and ``exact_permutations`` record
         each pair's calibration. ``df_resid`` records binary-design residual df;
@@ -861,7 +873,7 @@ def _run_cross_rotations(
     """Calibrate weighted L2 contrasts with the conditional rotation null.
 
     Shared input shapes, sample/bin masks, representations and eligibility
-    thresholds follow :func:`_run_cross_analytic`. ``prepared_design`` supplies
+    thresholds follow :func:`_run_cross_plugin`. ``prepared_design`` supplies
     the GLM matrix and contrast; the rotation engine refits retained-sample
     designs. Binary labels use an intercept and a group indicator.
 
@@ -877,7 +889,7 @@ def _run_cross_rotations(
     -------
     dict
         Arrays of shape ``(n_pairs,)`` in original pair order, with the same
-        keys as :func:`_run_cross_analytic`. ``observed`` is weighted L2 and
+        keys as :func:`_run_cross_plugin`. ``observed`` is weighted L2 and
         ``pvals`` contains deterministic conditional tails.
         ``effective_rank`` describes each pair's nuisance-adjusted scatter.
         ``pooled_pairs`` and ``permutation_counts`` are zero;
@@ -980,7 +992,7 @@ def _run_cross_t_cauchy(
     """Fit binwise t tests and combine their p-values for each pair.
 
     Shared input shapes, sample masks, representations and design eligibility
-    follow :func:`_run_cross_analytic`. Binary labels select Welch tests;
+    follow :func:`_run_cross_plugin`. Binary labels select Welch tests;
     ``prepared_design`` selects OLS contrast t tests. Both use the shared
     :func:`~sonic.comparators.multisample._run_t_cauchy_test` engine.
 
@@ -999,7 +1011,7 @@ def _run_cross_t_cauchy(
     -------
     dict
         Arrays in original pair order, with the same keys as
-        :func:`_run_cross_analytic`. ``observed`` is the maximum absolute t
+        :func:`_run_cross_plugin`. ``observed`` is the maximum absolute t
         over positive-weight bins; ``pvals`` contains Cauchy-combined tails.
         ``df_resid`` records design residual df, not the bin-specific Welch df.
         ``pooled_pairs`` and ``permutation_counts`` are zero,
@@ -1129,7 +1141,7 @@ def _cross_comparison_frame(
         null=null,
         covariance=(
             ("per_pair" if covariance_mode == "per_pair" else "pooled_across_valid_bins_psd")
-            if null == "analytic" and statistic == "l2"
+            if null == "plugin"
             else None
         ),
         bin_indices={p: tuple(np.flatnonzero(common[i])) for i, p in enumerate(result.pairs)},
@@ -1164,7 +1176,7 @@ def _compare_cross_spectra(  # noqa: C901 — validation and dispatch over binar
     contrast=None,
     representation="coherence",
     statistic="l2",
-    null="analytic",
+    null=None,
     n_perm=1000,
     random_state=None,
     freq_weights=None,
@@ -1188,7 +1200,7 @@ def _compare_cross_spectra(  # noqa: C901 — validation and dispatch over binar
         used as supplied. Ignored on the binary path without ``contrast``.
     groups : ndarray, optional
         Binary labels of length ``n_samples``. Without an explicit contrast,
-        these select the two-group path. Unmasked analytic tests require
+        these select the two-group path. Unmasked plug-in tests require
         positive residual degrees of freedom; masked tests additionally apply
         ``min_samples_per_group``. Otherwise ``design`` and ``contrast``
         determine the GLM test.
@@ -1204,18 +1216,19 @@ def _compare_cross_spectra(  # noqa: C901 — validation and dispatch over binar
         t-Cauchy uses Welch for binary labels and OLS for a GLM, requires
         ``null='analytic'`` and ``covariance=None``, and returns bin diagnostics
         as documented in ``test_cross_diff_freq``.
-    null : str
-        For L2, ``'analytic'`` (default) uses Liu; ``'rotation'`` deterministically
-        integrates each pair's conditional null. Both support GLM contrasts.
+    null : str, optional
+        For L2, ``'rotation'`` (default) integrates each pair's conditional null.
+        ``'plugin'`` uses Gaussian plug-in calibration with the estimated covariance.
+        Both support GLM contrasts.
         ``'permutation'`` is available only for binary
         comparisons with group labels and no explicit contrast.
     covariance : {None, 'pooled', 'per_pair'}, optional
-        ``None`` retains pooling across eligible pairs. ``'per_pair'`` uses
-        each pair's residual covariance and Liu tail separately. An explicit
-        choice requires an analytic L2 test.
+        For plug-in L2 calibration, ``None`` or ``'per_pair'`` uses each pair's residual
+        covariance. ``'pooled'`` shares it across eligible pairs. Specifying a
+        covariance selects plug-in calibration when ``null`` is omitted.
     n_perm : int, default 1000
         Number of sampled relabellings when exact enumeration is too large.
-        Ignored for analytic tests and overridden by exact enumeration.
+        Used only for sampled permutations.
     random_state : int, optional
         Seed for binary label permutations; ignored by other nulls.
     integration_tol : float
@@ -1247,7 +1260,7 @@ def _compare_cross_spectra(  # noqa: C901 — validation and dispatch over binar
         ``Estimate_per_bin`` on the tested scale. t-Cauchy adds signed t
         statistics, p-values, and the original ``Best_bin`` index.
         ``N_samples`` and ``N_bins`` record the support. ``DF_resid``,
-        ``N_pairs_pooled`` and ``Effective_rank`` describe the analytic fit;
+        ``N_pairs_pooled`` and ``Effective_rank`` describe the plug-in fit;
         per-pair fits count one contributor per eligible pair, while
         permutations and t-Cauchy use zero pooled pairs and NaN effective rank.
         Rotation uses zero pooled pairs and the conditional scatter's effective
@@ -1274,7 +1287,7 @@ def _compare_cross_spectra(  # noqa: C901 — validation and dispatch over binar
     For transformed profiles Y, let d_p be the difference of group means or
     the fitted GLM contrast for pair p. For L2, the reported statistic is
     ``T_p = sqrt(d_p.T @ W @ d_p)``, with sum-one diagonal bin weights W.
-    By default, the shared estimators fit each pair's retained-sample
+    With ``covariance='pooled'``, the shared estimators fit each pair's retained-sample
     condition/nuisance design and pool each covariance entry as
     ``Sigma[j,k] = sum_p(E_p[:,j].T @ E_p[:,k]) / sum_p(nu_p)``, including
     only eligible pairs supporting both j and k in those sums.
@@ -1311,17 +1324,18 @@ def _compare_cross_spectra(  # noqa: C901 — validation and dispatch over binar
     """
     if statistic not in ("l2", "t_cauchy"):
         raise ValueError("statistic must be 'l2' or 't_cauchy'.")
+    null = _resolve_profile_null(null, statistic, covariance)
     if statistic == "t_cauchy" and (null != "analytic" or covariance is not None):
         raise ValueError("statistic='t_cauchy' requires null='analytic' and covariance=None.")
     if representation not in ("coherence", "coherency"):
         raise ValueError("representation must be 'coherence' or 'coherency'.")
-    if null not in _NULL_OPTIONS:
-        raise ValueError("null must be 'analytic', 'permutation', or 'rotation'.")
+    if statistic == "l2" and null not in _L2_NULL_OPTIONS:
+        raise ValueError(f"Unknown null='{null}' for L2. Options: {list(_L2_NULL_OPTIONS)}.")
     if covariance not in (None, "pooled", "per_pair"):
         raise ValueError("covariance must be None, 'pooled', or 'per_pair'.")
-    if covariance is not None and null != "analytic":
-        raise ValueError("covariance is only supported with null='analytic'.")
-    covariance_mode = "pooled" if covariance is None else covariance
+    if covariance is not None and null != "plugin":
+        raise ValueError("covariance is only supported with null='plugin'.")
+    covariance_mode = "per_pair" if covariance is None else covariance
     n_samples, _, n_bins = result.cross_spectra.shape
     if n_samples == 0 or n_bins == 0:
         raise ValueError("Cross-spectrum tests require samples and frequency bins.")
@@ -1343,9 +1357,9 @@ def _compare_cross_spectra(  # noqa: C901 — validation and dispatch over binar
     count_columns = {}
     prepared_design = None
     if use_glm:
-        if null not in ("analytic", "rotation"):
+        if null == "permutation":
             raise NotImplementedError(
-                "Only null='analytic' or 'rotation' is supported with a design matrix or explicit contrast; "
+                "Only null='plugin' or 'rotation' is supported for L2 with a design matrix or explicit contrast; "
                 "permutations require binary labels without contrast=."
             )
         if contrast is None:
@@ -1430,7 +1444,7 @@ def _compare_cross_spectra(  # noqa: C901 — validation and dispatch over binar
             integration_tol=integration_tol,
         )
     else:
-        inference = _run_cross_analytic(
+        inference = _run_cross_plugin(
             result,
             pair_presence,
             support,

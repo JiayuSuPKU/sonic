@@ -6,6 +6,7 @@ import itertools
 import logging
 import math
 import warnings
+from fractions import Fraction
 from typing import Literal, TypedDict
 
 import numpy as np
@@ -20,8 +21,8 @@ from sonic.comparators.normalization import _normalize_shape_apply
 from sonic.statistics import liu_sf
 
 logger = logging.getLogger(__name__)
-_NULL_OPTIONS = ("permutation", "analytic", "rotation")
-_ANALYTIC_MIN_DF_NO_WARN = 3
+_L2_NULL_OPTIONS = ("permutation", "plugin", "rotation")
+_PLUGIN_MIN_DF_NO_WARN = 3
 
 # Bound scratch space for eight float64 arrays; at least one feature is processed.
 # Inputs, returned diagnostics, and the bin covariance are outside this target.
@@ -43,6 +44,8 @@ def _prepare_profile_block(profiles, normalize_shape, *, log_transform=True):
         block = _normalize_shape_apply(profiles)
     else:
         block = np.array(profiles, dtype=np.float64, copy=True)
+        if not np.isfinite(block).all():
+            raise ValueError("Tests require finite profiles for observed samples.")
     if log_transform:
         np.maximum(block, 1e-12, out=block)
         np.log(block, out=block)
@@ -90,10 +93,10 @@ def _resolve_freq_weights(freq_weights: np.ndarray | None, n_bins: int) -> np.nd
     return w / total
 
 
-# Analytic covariance and Liu calibration
+# Gaussian plug-in calibration with estimated covariance
 
 
-class _AnalyticNullMetadata(TypedDict, total=False):
+class _PluginNullMetadata(TypedDict, total=False):
     """Optional metadata, using the TypedDict syntax supported by Python 3.10."""
 
     n_obs_A: int | np.ndarray
@@ -105,10 +108,10 @@ class _AnalyticNullMetadata(TypedDict, total=False):
     estimate_per_bin: np.ndarray
 
 
-class _AnalyticNullState(_AnalyticNullMetadata):
-    """Internal contract shared by analytic DF tests and covariance diagnostics.
+class _PluginNullState(_PluginNullMetadata):
+    """Internal contract shared by plug-in DF tests and covariance diagnostics.
 
-    The common fields below are returned by every analytic null estimator and
+    The common fields below are returned by every plug-in null estimator and
     by ``Comparator.estimate_null_covariance``. They are intentionally a little
     richer than the minimum needed for p-values. The selected covariance,
     profile-scale roundoff and sample counts also identify contrasts whose
@@ -202,27 +205,27 @@ class _AnalyticNullState(_AnalyticNullMetadata):
     eligible: np.ndarray
 
 
-def _resolve_covariance(covariance, *, statistic="log_l2", null="analytic"):
-    """Keep the default implicit for tests that do not use a covariance choice."""
+def _resolve_covariance(covariance, *, statistic="log_l2", null="plugin"):
+    """Validate the covariance option and select the plug-in L2 estimator."""
     if covariance not in (None, "pooled", "per_gene"):
         raise ValueError("covariance must be None, 'pooled', or 'per_gene'.")
-    if covariance is not None and (statistic != "log_l2" or null != "analytic"):
-        raise ValueError("covariance is only supported with statistic='log_l2', null='analytic'.")
-    return "pooled" if covariance is None else covariance
+    if covariance is not None and (statistic != "log_l2" or null != "plugin"):
+        raise ValueError("covariance is only supported with statistic='log_l2', null='plugin'.")
+    return "per_gene" if covariance is None else covariance
 
 
-def _maybe_warn_small_df_analytic(df_resid: int, *, log_transform: bool = True) -> None:
-    """Warn the user when running the analytic path at very small residual df.
+def _maybe_warn_small_df_plugin(df_resid: int, *, log_transform: bool = True) -> None:
+    """Warn the user when running Gaussian plug-in calibration at very small residual df.
 
     Suppress with ``warnings.filterwarnings('ignore',
-    message="log_l2 + null='analytic'")`` if you accept the calibration risk.
+    message="log_l2 [+] null='plugin'")`` if you accept the calibration risk.
     """
-    if df_resid < _ANALYTIC_MIN_DF_NO_WARN:
+    if df_resid < _PLUGIN_MIN_DF_NO_WARN:
         rel_noise_pct = 100.0 * (2.0 / max(df_resid, 1)) ** 0.5
         warnings.warn(
-            f"{'log_l2' if log_transform else 'l2'} + null='analytic' at residual df={df_resid}: "
+            f"{'log_l2' if log_transform else 'l2'} + null='plugin' at residual df={df_resid}: "
             f"Variance estimator σ̂² has ~{rel_noise_pct:.0f}% relative noise, "
-            f"so the analytic null may be anti-conservative on a per-test basis. "
+            f"so Gaussian plug-in calibration may be anti-conservative. "
             "Check calibration with binary-label permutations when samples are exchangeable.",
             UserWarning,
             stacklevel=3,
@@ -312,7 +315,7 @@ def _estimate_two_group_null_covariance(
     covariance: str | None = None,
     store_covariance: bool = True,
     for_pooling: bool = False,
-) -> _AnalyticNullState:
+) -> _PluginNullState:
     """Fit the unmasked binary null as an intercept-plus-indicator GLM.
 
     Two group case-control comparison is a special case of the GLM.
@@ -335,7 +338,7 @@ def _estimate_two_group_null_covariance(
     n_b = int(indicator.sum())
     n_a = n_samples - n_b
     if n_samples <= 2:
-        raise ValueError("Analytic two-group tests require positive residual degrees of freedom.")
+        raise ValueError("Plug-in two-group tests require positive residual degrees of freedom.")
 
     state = _estimate_glm_null_covariance(
         spectra,
@@ -367,7 +370,7 @@ def _estimate_two_group_masked_null_covariance(
     covariance: str | None = None,
     store_covariance: bool = True,
     for_pooling: bool = False,
-) -> _AnalyticNullState:
+) -> _PluginNullState:
     """Estimate a masked two-group null through the shared GLM estimator.
 
     Two group case-control comparison is a special case of the GLM.
@@ -443,13 +446,13 @@ def _estimate_glm_null_covariance(
     covariance: str | None = None,
     store_covariance: bool = True,
     for_pooling: bool = False,
-) -> _AnalyticNullState:
-    """Compute analytic null state for unmasked GLM ``log_l2`` tests.
+) -> _PluginNullState:
+    """Compute plug-in null state for unmasked GLM ``log_l2`` tests.
 
     The design matrix is fit once against all flattened ``(gene, bin)``
     log-spectrum responses. The returned state includes the per-gene contrast
-    effect converted to log-L2 ``observed`` values, the pooled residual
-    covariance across genes (or separate per-gene estimates), and the
+    effect converted to log-L2 ``observed`` values, the per-gene or pooled
+    residual covariance, and the
     contrast variance scale ``c'(X'X)^+c`` applied to the Liu eigenvalues.
 
     Set ``log_transform=False`` for signed cross-spectrum profiles; in that
@@ -482,7 +485,7 @@ def _fit_glm_profiles(
     covariance: str | None = None,
     store_covariance: bool = True,
     for_pooling: bool = False,
-) -> _AnalyticNullState:
+) -> _PluginNullState:
     """Build the unmasked L2 null state from 3D spectral profiles.
 
     Parameters
@@ -503,7 +506,7 @@ def _fit_glm_profiles(
         Set to False for signed profiles.
     covariance : {None, 'pooled', 'per_gene'}, optional
         Pool residual covariance across features, or estimate it per feature.
-        None selects pooled covariance.
+        None selects per-gene covariance.
     store_covariance : bool, default True
         Retain full covariance matrices in per-gene mode; otherwise their state
         entries are None. Pooled covariance is always retained.
@@ -513,7 +516,7 @@ def _fit_glm_profiles(
 
     Returns
     -------
-    state : _AnalyticNullState
+    state : _PluginNullState
         Weighted L2 distances, signed per-bin contrasts, residual covariance diagnostics,
         contrast-scaled eigenvalues for Liu calibration, and design metadata.
         Fitted ``beta`` coefficients have shape ``(n_terms, n_features, n_bins)``.
@@ -581,7 +584,7 @@ def _fit_glm_profiles(
             residual_cov += residuals.T @ residuals
     if not per_gene:
         residual_cov /= n_features * df_resid
-    _maybe_warn_small_df_analytic(df_resid, log_transform=log_transform)
+    _maybe_warn_small_df_plugin(df_resid, log_transform=log_transform)
 
     # Calibrate the L2 statistic on the tested profile scale.
     contrast_scale = float(np.sum((contrast_vector @ design_inverse) ** 2))
@@ -622,15 +625,14 @@ def _estimate_glm_masked_null_covariance(  # noqa: C901
     covariance: str | None = None,
     store_covariance: bool = True,
     for_pooling: bool = False,
-) -> _AnalyticNullState:
-    """Compute analytic null state for masked GLM ``log_l2`` tests.
+) -> _PluginNullState:
+    """Compute plug-in null state for masked GLM ``log_l2`` tests.
 
     A separate OLS fit is performed for each gene's observed samples. Eligible
     genes must have enough residual degrees of freedom, an estimable contrast,
-    and a positive finite contrast variance. Residual cross-products are pooled
-    by default; per-gene mode retains separate covariances. ``observed`` and
-    contrast-scaled ``eigenvalues`` remain per-gene in both modes because
-    missingness changes the design.
+    and a positive finite contrast variance. By default each gene has its own
+    residual covariance. Both modes return per-gene ``observed`` and contrast-scaled
+    ``eigenvalues`` because missingness changes the design.
     ``log_transform=False`` fits signed profiles without the log floor.
     ``allow_empty=True`` returns an ineligible state for an empty covariance
     pool, allowing cross-spectrum callers to report other support groups.
@@ -658,7 +660,7 @@ def _estimate_glm_masked_null_covariance(  # noqa: C901
     if contrast_vector.shape != (n_terms,):
         raise ValueError(f"contrast length {contrast_vector.shape} != design cols ({n_terms},).")
 
-    # Compute the OLS fit for each gene and estimate the pooled residual covariance.
+    # Fit each gene on its observed samples.
     weights = _resolve_freq_weights(freq_weights, n_bins)
     per_gene = covariance == "per_gene"
     covariance_state = (
@@ -739,9 +741,7 @@ def _estimate_glm_masked_null_covariance(  # noqa: C901
 
     # Calibrate the L2 statistic on the tested profile scale.
     if eligible.any():
-        _maybe_warn_small_df_analytic(
-            int(np.median(df_resid[eligible])), log_transform=log_transform
-        )
+        _maybe_warn_small_df_plugin(int(np.median(df_resid[eligible])), log_transform=log_transform)
     if not per_gene:
         residual_cov = sigma_acc / max(pooled_df, 1)
         covariance_state = _pooled_covariance_state(
@@ -766,8 +766,8 @@ def _estimate_glm_masked_null_covariance(  # noqa: C901
     }
 
 
-def _l2_pvalues_from_state(state: _AnalyticNullState) -> np.ndarray:
-    """Evaluate Liu-tail p-values from shared analytic null state.
+def _l2_pvalues_from_state(state: _PluginNullState) -> np.ndarray:
+    """Evaluate Liu-tail p-values from the plug-in null state.
 
     The state must already contain the observed L2 statistic and the
     contrast-scaled Liu eigenvalues produced by one of the
@@ -880,6 +880,7 @@ def _run_l2_permutations(
     perm_labels: np.ndarray,
     *,
     freq_weights: np.ndarray | None = None,
+    normalize_shape: bool = False,
     is_exact: bool = False,
     log_transform: bool = True,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
@@ -892,11 +893,9 @@ def _run_l2_permutations(
     counts are retained; no permutations-by-features null matrix is allocated.
     Exhaustive enumeration uses the exact tail; sampled nulls get +1 correction.
     """
-    if not np.all(np.isfinite(profiles)):
-        raise ValueError("Permutation tests require finite spectra for observed samples.")
     uniq = np.unique(group_codes)
     a_val = uniq[0]
-    response = _prepare_profile_block(profiles, False, log_transform=log_transform)
+    response = _prepare_profile_block(profiles, normalize_shape, log_transform=log_transform)
     response -= response[:1].copy()
     weights = _resolve_freq_weights(freq_weights, profiles.shape[-1])
 
@@ -942,8 +941,6 @@ def _run_two_group_permutations(
 ):
     """Run binary permutations, retaining feature order for masked RNG draws."""
     profiles = np.asarray(profiles, dtype=np.float64)
-    if normalize_shape:
-        profiles = _normalize_shape_apply(profiles)
     rng = np.random.default_rng(random_state)
     if presence is None:
         labels, exact = _make_label_permutations(
@@ -962,6 +959,7 @@ def _run_two_group_permutations(
             labels,
             freq_weights=freq_weights,
             is_exact=exact,
+            normalize_shape=normalize_shape,
         )
 
     observed = np.full(profiles.shape[1], np.nan)
@@ -981,6 +979,7 @@ def _run_two_group_permutations(
             labels,
             freq_weights=freq_weights,
             is_exact=exact,
+            normalize_shape=normalize_shape,
         )
         observed[gene], pvals[gene], estimates[gene] = statistic[0], tail[0], effect[0]
     return observed, pvals, estimates
@@ -1005,6 +1004,101 @@ def _rotation_metadata(n_rotations, random_state):
         "random_state": int(seed),
         "min_p_value": 1.0 / (int(n_rotations) + 1),
     }
+
+
+_as_fractions = np.frompyfunc(Fraction, 1, 1)
+
+
+def _orthogonalize_columns(columns, n_samples):
+    """Rational Gram-Schmidt in place, using the sample rows for inner products."""
+    samples = columns[:n_samples]
+    for j in range(columns.shape[1] - 1):
+        column = samples[:, j]
+        squared = column @ column
+        if squared:
+            slopes = (column @ samples[:, j + 1 :]) / squared
+            columns[:, j + 1 :] -= columns[:, j, None] * slopes
+
+
+def _exact_rotation_design(design, contrast, retained, residual_basis):
+    """Orthogonalize the retained model exactly for refitting roundoff-sized residuals."""
+    augmented = _as_fractions(np.vstack([design, contrast]))
+    if len(retained) < design.shape[1]:
+        # Restrict coefficients to the same right-singular subspace as the OLS fit.
+        augmented = augmented @ _as_fractions(retained.T)
+
+    # Apply the design column operations to the contrast as well. Rational
+    # Gram-Schmidt needs no square roots or tolerance-based pivot decisions.
+    _orthogonalize_columns(augmented, len(design))
+    q = augmented[:-1]
+    inverse = q.T / np.sum(q * q, axis=0)[:, None]
+    sample_weights = augmented[-1] @ inverse
+    norm = math.hypot(*np.asarray(sample_weights, dtype=float))
+    # Complete the well-conditioned design basis along the original rotation axes.
+    # The original SVD complement can lose residual energy for nearly collinear designs.
+    columns = np.asarray(q / np.max(np.abs(q), axis=0), dtype=float)
+    basis, r = np.linalg.qr(np.column_stack([columns, residual_basis]))
+    residual_axes = basis[:, len(retained) :] * np.copysign(1.0, np.diag(r)[len(retained) :])
+    return q, inverse, sample_weights, Fraction(norm), residual_axes
+
+
+def _refine_rotation_fit(profiles, model, sqrt_weights):
+    """Recover the contrast and residuals before rescaling them together for the sphere."""
+    q, inverse, sample_weights, norm, residual_basis = model
+    y = _as_fractions(profiles)
+    effect = sample_weights @ y
+    residuals = y - q @ (inverse @ y)
+    # Positive bin weights preserve rank. Test proportionality before rounding.
+    nonzero = np.flatnonzero(effect)
+    rank_one = profiles.shape[1] == 1
+    if not rank_one and nonzero.size:
+        k = nonzero[0]
+        rank_one = np.array_equal(residuals * effect[k], residuals[:, k, None] * effect)
+    weighted = np.vstack([effect / norm, residuals]) * sqrt_weights
+    scale = np.max(np.abs(weighted))
+    scaled = np.asarray(weighted / scale if scale else weighted, dtype=float)
+    coordinates = np.vstack([scaled[0], residual_basis.T @ scaled[1:]])
+    if (nonzero.size and not np.any(coordinates[0] ** 2)) or (
+        residuals.any() and not np.any(coordinates[1:] ** 2)
+    ):
+        raise RuntimeError(
+            "Conditional scatter cannot resolve a nonzero contrast or residual energy."
+        )
+    return np.asarray(effect, dtype=float), coordinates, rank_one
+
+
+def _refine_rotation_shift(profiles, weights, model):
+    """Recover the shifted eigenvalues of nearly constant forms before rounding."""
+    q, inverse, a, _, residual_basis = model
+    y = _as_fractions(profiles)
+    weights = _as_fractions(weights)
+    effect = a @ y
+    contrast_energy = a @ a
+    observed = (effect * weights) @ effect / contrast_energy
+    adjusted = y - q @ (inverse @ y) + np.outer(a, effect / contrast_energy)
+
+    # Apply the shifted form to a basis of the conditional space. A zero image
+    # means every direction ties, including the observed one.
+    residual = _as_fractions(residual_basis)
+    axes = np.column_stack([a, residual - q @ (inverse @ residual)])
+    image = (adjusted * weights) @ (y.T @ axes) - observed * axes
+    if not image.any():
+        return np.zeros(image.shape[1])
+
+    # Restrict diagonalization to the exact range so a zero eigenvalue cannot
+    # acquire a spurious sign at a spectral boundary.
+    _orthogonalize_columns(image, len(y))
+    scales = np.max(np.abs(image), axis=0)
+    keep = scales != 0
+    basis = image[:, keep] / scales[keep]
+    projected = basis.T @ y
+    shifted = (projected * weights) @ projected.T
+    squared = np.sum(basis * basis, axis=0)
+    shifted.flat[:: len(squared) + 1] -= observed * squared
+    normalized = np.asarray(shifted / np.max(np.abs(shifted)), dtype=float)
+    norms = np.sqrt(np.asarray(squared, dtype=float))
+    nonzero = np.linalg.eigvalsh(normalized / (norms[:, None] * norms))
+    return np.pad(nonzero, (0, len(keep) - len(nonzero)))
 
 
 def _conditional_scatter(coordinates):
@@ -1202,7 +1296,7 @@ def _integration_metadata(integration_tol):
     }
 
 
-def _conditional_tails(scatter, *, integration_tol=1e-6, rank_one=False):
+def _conditional_tails(scatter, *, integration_tol=1e-6, rank_one=False, refined=None):
     """Evaluate prepared sphere tails by Davies integration with marked saddlepoint fallback.
 
     Parameters
@@ -1214,9 +1308,11 @@ def _conditional_tails(scatter, *, integration_tol=1e-6, rank_one=False):
     integration_tol : float
         Absolute p-value error target; see :func:`_conditional_tail` for acceptance
         checks and explicit resolution failures.
-    rank_one : bool
-        True when a single active bin guarantees rank at most one. Use exact
+    rank_one : bool or array of bool
+        True for each scatter known to have rank at most one. Use exact
         beta coefficients from diagonal energies, without eigendecomposition.
+    refined : dict, optional
+        Shifted eigenvalues recomputed from profiles, keyed by block feature index.
 
     Returns
     -------
@@ -1234,9 +1330,12 @@ def _conditional_tails(scatter, *, integration_tol=1e-6, rank_one=False):
         raise ValueError("Conditional scatter must contain finite square matrices.")
     pvalues, errors = np.empty(len(scatter)), np.empty(len(scatter))
     methods = np.empty(len(scatter), dtype=object)
+    rank_one = np.broadcast_to(rank_one, (len(scatter),))
     for feature, matrix in enumerate(scatter):
         try:
-            if rank_one:
+            if refined and feature in refined:
+                coefficients = refined[feature]
+            elif rank_one[feature]:
                 coefficients = np.full(len(matrix), -matrix[0, 0])
                 # lambda - q is residual energy; avoid subtracting nearly equal totals.
                 coefficients[0] = np.diag(matrix)[1:].sum()
@@ -1328,8 +1427,14 @@ def _run_l2_conditional(  # noqa: C901
         Design and scalar contrast accepted by ``compare_glm``.
     presence : np.ndarray or None
         Optional sample-by-feature observation mask. False cells are never read.
-    freq_weights, normalize_shape, log_transform
-        Bin weights and profile transformations used by the analytic estimators.
+    freq_weights : array-like, optional
+        Nonnegative bin weights, normalized to sum to one and applied after fitting
+        to the observed L2 statistic and conditional scatter. None gives equal weights.
+    normalize_shape : bool
+        If True, scale each nonzero sample-feature profile to unit total across all
+        bins, including zero-weight bins, before fitting.
+    log_transform : bool
+        If True, fit ``log(max(profile, 1e-12))`` after any shape normalization.
     min_resid_df : int
         Minimum residual degrees of freedom per observed design.
     allow_empty : bool
@@ -1391,6 +1496,9 @@ def _run_l2_conditional(  # noqa: C901
             raise ValueError("contrast is not estimable from the supplied design matrix.")
     weights = _resolve_freq_weights(freq_weights, n_bins)
     sqrt_weights = np.sqrt(weights)
+    active = weights > 0
+    n_active = np.count_nonzero(active)
+    exact_weights = _as_fractions(sqrt_weights[active])
     observed = np.full(n_features, np.nan)
     estimates = np.full((n_features, n_bins), np.nan)
     pvals = np.full(n_features, np.nan)
@@ -1418,8 +1526,14 @@ def _run_l2_conditional(  # noqa: C901
         if not np.isfinite(contrast_norm) or contrast_norm <= 0:
             continue
         # Unit contrast + residual axes span the sample space after nuisance removal.
-        residual_basis = np.linalg.svd(x, full_matrices=True)[0][:, rank:]
+        u, singular, vt = np.linalg.svd(x, full_matrices=True)
+        residual_basis = u[:, rank:]
         basis = np.column_stack([a / contrast_norm, residual_basis])
+        exact_model = None
+        column_scale = np.max(np.abs(x), axis=0)
+        constant_nuisance = rank == x.shape[1] and np.any(
+            np.all(x == x[0], axis=0) & (x[0] != 0) & (vector == 0)
+        )
         if n_rotations is not None:
             # Reuse this mask's seed across feature blocks to preserve seeded results.
             seed = np.random.SeedSequence(
@@ -1429,35 +1543,64 @@ def _run_l2_conditional(  # noqa: C901
         for block in _iter_feature_blocks(count, len(genes), max(n_bins, df + 1), matrix.shape[1]):
             cols = genes[block]
             values = profiles[rows[:, None], cols]
-            if not np.isfinite(values).all():
-                raise ValueError("Rotation tests require finite profiles for observed samples.")
             response = _prepare_profile_block(
                 values, normalize_shape, log_transform=log_transform
             ).reshape(count, -1)
-            _, residuals, theta = _lm._fit_glm_response(response, x, inverse, vector, rank)
-            # theta = c^T beta_hat; report its weighted L2 before geometric normalization.
+            beta, residuals, theta = _lm._fit_glm_response(response, x, inverse, vector, rank)
             effect = theta.reshape(-1, n_bins)
-            observed[cols] = np.sqrt(np.sum(weights * effect**2, axis=-1))
-            estimates[cols] = effect
             # Dividing by ||a|| makes the contrast axis unit length; it is not an SE.
             coordinates = np.concatenate(
                 [theta[None, :] / contrast_norm, residual_basis.T @ residuals]
             )
             # C = B^T Y W^(1/2): one contrast row and df orthogonal residual rows.
             coordinates = coordinates.reshape(df + 1, len(cols), n_bins) * sqrt_weights
-            # A unit sample direction can accumulate sqrt(n) times the profile roundoff.
+            # Opposing fitted terms can dwarf both the response and its residual.
+            fitted_scale = (column_scale @ np.abs(beta)).reshape(1, len(cols), n_bins)
+            profiles_block = response.reshape(count, len(cols), n_bins)
             roundoff = _profile_roundoff(
-                response.reshape(count, len(cols), n_bins) * sqrt_weights, per_gene=True
+                profiles_block * sqrt_weights, fitted_scale * sqrt_weights, per_gene=True
             ) * np.sqrt(count)
-            # Remove numerical-zero scatter before rescaling can amplify fit roundoff.
-            zero_scatter = np.max(np.abs(coordinates), axis=(0, 2)) <= roundoff
-            coordinates[:, zero_scatter] = 0.0
+            residual_scale = np.max(np.abs(coordinates[1:]), axis=(0, 2))
+            small_residual = residual_scale <= roundoff
+            rank_one = np.full(len(cols), n_active == 1)
+            for j in np.flatnonzero(small_residual):
+                tested = profiles_block[:, j][:, active]
+                if constant_nuisance and np.all(tested == tested[0]):
+                    effect[j, active] = 0.0
+                    coordinates[:, j] = 0.0
+                    continue
+                if exact_model is None:
+                    exact_model = _exact_rotation_design(x, vector, vt[:rank], residual_basis)
+                effect[j, active], coordinates[:, j, active], rank_one[j] = _refine_rotation_fit(
+                    tested, exact_model, exact_weights
+                )
+            estimates[cols] = effect
+            observed[cols] = np.sqrt(np.sum(weights * effect**2, axis=-1))
             scatter, effective_rank[cols] = _conditional_scatter(coordinates)
+            refined = {}
+            if n_rotations is None and n_active >= df + 1:
+                # sqrt(1 - effective_rank/d) is the relative Frobenius distance
+                # from scalar scatter. Allow for rounding in the rank and the fit.
+                dimension = df + 1
+                eps = np.finfo(float).eps
+                spread = np.sqrt(np.maximum(0, 1 - effective_rank[cols] / dimension))
+                projection_error = 32 * eps * singular[0] / singular[rank - 1]
+                tolerance = np.sqrt(32 * eps * dimension) + projection_error
+                # Refitted coordinates have already removed nuisance cancellation.
+                fit_error = np.where(small_residual, 0.0, roundoff) * np.sqrt(n_active)
+                nearly_constant = spread * residual_scale <= tolerance * residual_scale + fit_error
+                for j in np.flatnonzero(nearly_constant & ~rank_one):
+                    if exact_model is None:
+                        exact_model = _exact_rotation_design(x, vector, vt[:rank], residual_basis)
+                    refined[j] = _refine_rotation_shift(
+                        profiles_block[:, j][:, active], weights[active], exact_model
+                    )
             if n_rotations is None:
                 pvals[cols], pvalue_error[cols], pvalue_method[cols] = _conditional_tails(
                     scatter,
                     integration_tol=integration_tol,
-                    rank_one=np.count_nonzero(weights) == 1,
+                    rank_one=rank_one,
+                    refined=refined,
                 )
             else:
                 pvals[cols] = _rotation_tails(scatter, basis, metadata["n_rotations"], seed)
@@ -1492,7 +1635,7 @@ def _run_l2_test(  # noqa: C901 — binary/GLM and masked/unmasked null dispatch
     design=None,
     contrast=None,
     presence=None,
-    null="analytic",
+    null,
     covariance=None,
     freq_weights=None,
     normalize_shape=False,
@@ -1531,10 +1674,10 @@ def _run_l2_test(  # noqa: C901 — binary/GLM and masked/unmasked null dispatch
         Binary bin estimates use A minus B (the negative of the indicator slope).
     """
     binary = groups is not None
-    if not binary and null not in ("analytic", "rotation"):
-        raise ValueError("GLM null must be 'analytic' or 'rotation'.")
-    if null not in _NULL_OPTIONS:
-        raise ValueError(f"Unknown null='{null}'. Options: {list(_NULL_OPTIONS)}.")
+    if not binary and null not in ("plugin", "rotation"):
+        raise ValueError("GLM null must be 'plugin' or 'rotation'.")
+    if null not in _L2_NULL_OPTIONS:
+        raise ValueError(f"Unknown null='{null}'. Options: {list(_L2_NULL_OPTIONS)}.")
     _resolve_covariance(covariance, null=null)
     profiles = np.asarray(profiles)
     if profiles.ndim != 3:
@@ -1548,7 +1691,7 @@ def _run_l2_test(  # noqa: C901 — binary/GLM and masked/unmasked null dispatch
                 "n_obs_B": presence[groups == 1].sum(axis=0),
             }
 
-    if null == "analytic":
+    if null == "plugin":
         options = {
             "freq_weights": freq_weights,
             "normalize_shape": normalize_shape,
@@ -1580,7 +1723,7 @@ def _run_l2_test(  # noqa: C901 — binary/GLM and masked/unmasked null dispatch
         observed = state["observed"]
         estimates = state["estimate_per_bin"]
         pvals = _l2_pvalues_from_state(state)
-        metadata = {"covariance": state["covariance"], "null": "analytic"}
+        metadata = {"covariance": state["covariance"], "null": "plugin"}
 
     elif null == "rotation":
         if binary:

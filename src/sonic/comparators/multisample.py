@@ -104,7 +104,7 @@ def _comparison_frame(
     df["P_adj"] = apply_bh_correction(df["P_value"])
     if covariance is not None:
         df.attrs["covariance"] = covariance
-        df.attrs["null"] = "analytic"
+        df.attrs["null"] = "plugin"
     if attrs is not None:
         df.attrs.update(attrs)
     return df.sort_values("Statistic", ascending=False, na_position="last").reset_index(drop=True)
@@ -127,6 +127,14 @@ def _maybe_log_expression(
     return np.log(values + eps)
 
 
+def _resolve_profile_null(null, statistic, covariance):
+    if null is not None:
+        return null
+    if statistic in ("log_l2", "l2"):
+        return "rotation" if covariance is None else "plugin"
+    return "analytic"
+
+
 def _compare_two_group_profiles(  # noqa: C901 — input validation and statistic routing
     spectra,
     groups,
@@ -134,7 +142,7 @@ def _compare_two_group_profiles(  # noqa: C901 — input validation and statisti
     *,
     gene_names=None,
     statistic="log_l2",
-    null="analytic",
+    null=None,
     covariance=None,
     normalize_shape=False,
     freq_weights=None,
@@ -145,12 +153,11 @@ def _compare_two_group_profiles(  # noqa: C901 — input validation and statisti
     random_state=None,
 ):
     """Validate binary inputs, select the statistic, and build one result table."""
+    null = _resolve_profile_null(null, statistic, covariance)
     if statistic not in _AVAILABLE_STATISTICS:
         raise ValueError(
             f"Unknown statistic '{statistic}'. Options: {list(_AVAILABLE_STATISTICS)}."
         )
-    if null not in _l2._NULL_OPTIONS:
-        raise ValueError(f"Unknown null='{null}'. Options: {list(_l2._NULL_OPTIONS)}.")
     if statistic == "log_t_cauchy":
         _validate_log_t_cauchy_options(null, covariance)
     else:
@@ -342,8 +349,6 @@ def _run_t_cauchy_test(  # noqa: C901 — binary/GLM eligibility and masked fits
         for block in _l2._iter_feature_blocks(count, len(genes), n_bins, n_terms):
             cols = genes[block]
             values = spectra[rows[:, None], cols]
-            if not np.isfinite(values).all():
-                raise ValueError("Observed profiles must contain finite values.")
             response = _l2._prepare_profile_block(
                 values, normalize_shape, log_transform=log_transform
             )
@@ -390,7 +395,7 @@ def compare_two_groups(
     groups: np.ndarray,
     gene_names: Sequence[str] | None = None,
     statistic: str = "log_l2",
-    null: str = "analytic",
+    null: str | None = None,
     n_perm: int = 1000,
     max_exact_permutations: int = 10000,
     random_state: int | None = None,
@@ -418,11 +423,11 @@ def compare_two_groups(
         and also supports localizing the best bin by its smallest p-value
         among positive-weight bins.
         It requires two observations per arm and excludes constant bins.
-    null : str
-        Null calibration (default ``'analytic'``), selected by ``statistic``:
+    null : str, optional
+        Null calibration depends on the statistic:
 
-        - ``'log_l2'``: ``'analytic'`` (selected covariance and Liu tail),
-          ``'rotation'`` (deterministic conditional integration), or
+        - ``'log_l2'``: ``'rotation'`` (default, deterministic conditional integration),
+          ``'plugin'`` (Gaussian plug-in calibration using the estimated covariance), or
           ``'permutation'`` (shuffled binary labels).
         - ``'log_t_cauchy'``: ``'analytic'`` only (per-bin t tails and
           Cauchy combination).
@@ -444,9 +449,9 @@ def compare_two_groups(
         If True, divide each sample/feature spectrum by its total power
         before logging to test spectral shape (DF-norm). Default False.
     covariance : str or None
-        ``None`` (default) or ``'pooled'`` shares residual covariance across
-        eligible genes. ``'per_gene'`` estimates it separately for each gene.
-        An explicit choice requires an analytic L2 test.
+        For plug-in L2 calibration, ``None`` or ``'per_gene'`` estimates residual covariance
+        separately for each gene. ``'pooled'`` shares it across eligible genes.
+        Specifying a covariance selects plug-in calibration when ``null`` is omitted.
     integration_tol : float
         Initial Davies absolute p-value error target for rotation; default 1e-6.
         Use at most 10,000 terms per call and one accuracy retry. Accepted
@@ -467,7 +472,7 @@ def compare_two_groups(
         or missing if none. Skipped features have NaN per-bin arrays.
         Feature-level significance does not establish the selected bin's significance.
         Rows are sorted by descending statistic; BH uses finite p-values.
-        Analytic L2 results record ``null`` and ``covariance`` in ``attrs``.
+        Plug-in L2 results record ``null="plugin"`` and ``covariance`` in ``attrs``.
         Rotation adds ``P_value_method`` (``davies``, ``saddlepoint``, ``beta``
         or ``exact``; missing for skipped rows) and ``P_value_error``. The latter
         is the accepted Davies absolute error budget, a roundoff estimate for
@@ -511,7 +516,7 @@ def compare_two_groups_masked(
     presence: np.ndarray,
     gene_names: Sequence[str] | None = None,
     statistic: str = "log_l2",
-    null: str = "analytic",
+    null: str | None = None,
     n_perm: int = 1000,
     max_exact_permutations: int = 10000,
     random_state: int | None = None,
@@ -543,11 +548,11 @@ def compare_two_groups_masked(
         and also supports localizing the best bin by its smallest p-value
         among positive-weight bins.
         It requires two observations per arm and excludes constant bins.
-    null : str
-        Null calibration (default ``'analytic'``), selected by ``statistic``:
+    null : str, optional
+        Null calibration depends on the statistic:
 
-        - ``'log_l2'``: ``'analytic'`` (selected covariance and Liu tail),
-          ``'rotation'`` (deterministic conditional integration), or
+        - ``'log_l2'``: ``'rotation'`` (default, deterministic conditional integration),
+          ``'plugin'`` (Gaussian plug-in calibration using the estimated covariance), or
           ``'permutation'`` (shuffled binary labels).
         - ``'log_t_cauchy'``: ``'analytic'`` only (per-bin t tails and
           Cauchy combination).
@@ -572,9 +577,9 @@ def compare_two_groups_masked(
         If True, divide each sample/feature spectrum by its total power
         before logging to test spectral shape (DF-norm). Default False.
     covariance : str or None
-        ``None`` (default) or ``'pooled'`` shares residual covariance across
-        eligible genes. ``'per_gene'`` estimates it separately for each gene.
-        An explicit choice requires an analytic L2 test.
+        For plug-in L2 calibration, ``None`` or ``'per_gene'`` estimates residual covariance
+        separately for each gene. ``'pooled'`` shares it across eligible genes.
+        Specifying a covariance selects plug-in calibration when ``null`` is omitted.
     integration_tol : float
         Initial Davies absolute p-value error target for rotation; default 1e-6.
         Use at most 10,000 terms per call and one accuracy retry. Accepted
@@ -596,7 +601,7 @@ def compare_two_groups_masked(
         Feature-level significance does not establish the selected bin's significance.
         Includes ``n_obs_A`` and ``n_obs_B``; skipped genes retain NaN results.
         Rows are sorted by descending statistic; BH uses finite p-values.
-        Analytic L2 results record ``null`` and ``covariance`` in ``attrs``.
+        Plug-in L2 results record ``null="plugin"`` and ``covariance`` in ``attrs``.
         Rotation adds ``P_value_method`` (``davies``, ``saddlepoint``, ``beta``
         or ``exact``; missing for skipped rows) and ``P_value_error``. The latter
         is the accepted Davies absolute error budget, a roundoff estimate for
@@ -645,7 +650,7 @@ def compare_glm(
     *,
     statistic: str = "log_l2",
     covariance: str | None = None,
-    null: str = "analytic",
+    null: str | None = None,
     integration_tol: float = 1e-6,
 ) -> pd.DataFrame:
     """Test one spectral linear-model contrast for each gene.
@@ -680,14 +685,14 @@ def compare_glm(
         and also supports localizing the best bin by its smallest p-value
         among positive-weight bins.
     covariance : str or None
-        ``None`` (default) or ``'pooled'`` shares residual covariance across
-        eligible genes. ``'per_gene'`` estimates it separately for each gene.
-        An explicit choice requires an analytic L2 test.
-    null : str
-        Null calibration (default ``'analytic'``), selected by ``statistic``:
+        For plug-in L2 calibration, ``None`` or ``'per_gene'`` estimates residual covariance
+        separately for each gene. ``'pooled'`` shares it across eligible genes.
+        Specifying a covariance selects plug-in calibration when ``null`` is omitted.
+    null : str, optional
+        Null calibration depends on the statistic:
 
-        - ``'log_l2'``: ``'analytic'`` (selected covariance and Liu tail),
-          ``'rotation'`` (deterministic conditional integration).
+        - ``'log_l2'``: ``'rotation'`` (default, deterministic conditional integration),
+          ``'plugin'`` (Gaussian plug-in calibration using the estimated covariance).
         - ``'log_t_cauchy'``: ``'analytic'`` only (per-bin t tails and
           Cauchy combination).
     integration_tol : float
@@ -710,7 +715,7 @@ def compare_glm(
         if none. Skipped features have NaN per-bin arrays.
         Feature-level significance does not establish the selected bin's significance.
         Rows are sorted by descending statistic; BH uses finite p-values.
-        Analytic L2 results record ``null`` and ``covariance`` in ``attrs``.
+        Plug-in L2 results record ``null="plugin"`` and ``covariance`` in ``attrs``.
         Rotation adds ``P_value_method`` (``davies``, ``saddlepoint``, ``beta``
         or ``exact``; missing for skipped rows) and ``P_value_error``. The latter
         is the accepted Davies absolute error budget, a roundoff estimate for
@@ -733,6 +738,7 @@ def compare_glm(
     For calibration assumptions and zero-variance behavior, see
     :doc:`/guides/multisample`.
     """
+    null = _resolve_profile_null(null, statistic, covariance)
     if statistic == "log_t_cauchy":
         _validate_log_t_cauchy_options(null, covariance)
         observed, pvals, extra = _run_t_cauchy_test(
@@ -773,7 +779,7 @@ def compare_glm_masked(
     *,
     statistic: str = "log_l2",
     covariance: str | None = None,
-    null: str = "analytic",
+    null: str | None = None,
     integration_tol: float = 1e-6,
 ) -> pd.DataFrame:
     """Test one spectral linear-model contrast using each gene's observed samples.
@@ -814,14 +820,14 @@ def compare_glm_masked(
         and also supports localizing the best bin by its smallest p-value
         among positive-weight bins.
     covariance : str or None
-        ``None`` (default) or ``'pooled'`` shares residual covariance across
-        eligible genes. ``'per_gene'`` estimates it separately for each gene.
-        An explicit choice requires an analytic L2 test.
-    null : str
-        Null calibration (default ``'analytic'``), selected by ``statistic``:
+        For plug-in L2 calibration, ``None`` or ``'per_gene'`` estimates residual covariance
+        separately for each gene. ``'pooled'`` shares it across eligible genes.
+        Specifying a covariance selects plug-in calibration when ``null`` is omitted.
+    null : str, optional
+        Null calibration depends on the statistic:
 
-        - ``'log_l2'``: ``'analytic'`` (selected covariance and Liu tail),
-          ``'rotation'`` (deterministic conditional integration).
+        - ``'log_l2'``: ``'rotation'`` (default, deterministic conditional integration),
+          ``'plugin'`` (Gaussian plug-in calibration using the estimated covariance).
         - ``'log_t_cauchy'``: ``'analytic'`` only (per-bin t tails and
           Cauchy combination).
     integration_tol : float
@@ -845,7 +851,7 @@ def compare_glm_masked(
         Feature-level significance does not establish the selected bin's significance.
         Includes ``n_obs`` and ``df_resid``; skipped genes retain NaN results.
         Rows are sorted by descending statistic; BH uses finite p-values.
-        Analytic L2 results record ``null`` and ``covariance`` in ``attrs``.
+        Plug-in L2 results record ``null="plugin"`` and ``covariance`` in ``attrs``.
         Rotation adds ``P_value_method`` (``davies``, ``saddlepoint``, ``beta``
         or ``exact``; missing for skipped rows) and ``P_value_error``. The latter
         is the accepted Davies absolute error budget, a roundoff estimate for
@@ -868,6 +874,7 @@ def compare_glm_masked(
     For calibration assumptions and zero-variance behavior, see
     :doc:`/guides/multisample`.
     """
+    null = _resolve_profile_null(null, statistic, covariance)
     if statistic == "log_t_cauchy":
         _validate_log_t_cauchy_options(null, covariance)
         observed, pvals, extra = _run_t_cauchy_test(

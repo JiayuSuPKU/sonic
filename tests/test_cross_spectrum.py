@@ -69,6 +69,28 @@ def _cross_at_angle(comparator, pairs, *, angle_deg, **kwargs):
 
 
 class TestFourierConsistency:
+    def test_extraction_checks_coherency_in_pair_blocks(self, make_comparator, monkeypatch):
+        from sonic.comparators import _inference, cross_spectrum
+
+        values = np.random.default_rng(43).normal(size=(3, 17, 19))
+        comp = make_comparator(values)
+        monkeypatch.setattr(_inference, "_COMPARISON_WORKSPACE_BYTES", 1)
+        original = cross_spectrum.CrossSpectra._coherency_block
+        checked = []
+
+        def check(result, pairs):
+            checked.append((pairs.start, pairs.stop))
+            return original(result, pairs)
+
+        monkeypatch.setattr(cross_spectrum.CrossSpectra, "_coherency_block", check)
+        result = _compute_cross_spectra(comp, [("a", "b"), ("b", "c"), ("c", "a")])
+        assert checked == [(0, 1), (1, 2), (2, 3)]
+        valid = result.coherency_valid[:, -1]
+        assert valid.any()
+        result.cross_spectra[:, -1][valid] = 1e10
+        with pytest.raises(ArithmeticError, match="coherence bound"):
+            original(result, slice(2, 3))
+
     @pytest.mark.parametrize("mode", ["radial", "2d"])
     @pytest.mark.parametrize("shape", [(17, 19), (16, 18)])
     def test_fft_nufft_chunks_and_order(self, make_comparator, mode, shape):

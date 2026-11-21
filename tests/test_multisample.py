@@ -30,17 +30,48 @@ def _stub_spectra_groups(seed: int = 0, n_a: int = 4, n_b: int = 4, n_genes: int
 class TestComparisonOptions:
     """Public options, result schemas, and spectrum transformations."""
 
+    @pytest.mark.parametrize(
+        "options",
+        [
+            {"covariance": "per_gene"},
+            {"null": "plugin"},
+            {"null": "permutation"},
+            {},
+            {"statistic": "log_t_cauchy"},
+        ],
+    )
+    @pytest.mark.parametrize("bad", [np.nan, np.inf, -np.inf])
+    @pytest.mark.parametrize("shape_only", [False, True])
+    def test_comparisons_check_observed_profiles(self, options, bad, shape_only):
+        groups = np.repeat([0, 1], 6)
+        spectra = np.tile([1.0, 2.0, 3.0], (12, 1, 1))
+        spectra[1:6, 0, 1] = bad
+        with pytest.raises(ValueError, match="finite"):
+            compare_two_groups(spectra, groups, normalize_shape=shape_only, **options)
+        # Leave enough samples in each arm for the masked comparison.
+        spectra[4:6, 0, 1] = 2.0
+        presence = np.isfinite(spectra).all(axis=-1)
+        masked = compare_two_groups_masked(
+            spectra, groups, presence, normalize_shape=shape_only, **options
+        )
+        assert masked.P_value.item() == 1
+        presence[1] = True
+        with pytest.raises(ValueError, match="finite"):
+            compare_two_groups_masked(
+                spectra, groups, presence, normalize_shape=shape_only, **options
+            )
+
     @pytest.mark.parametrize("masked", [False, True])
     @pytest.mark.parametrize("shape_only", [False, True])
     @pytest.mark.parametrize(
         "glm,null,covariance",
         [
-            (False, "analytic", None),
-            (False, "analytic", "per_gene"),
+            (False, "plugin", None),
+            (False, "plugin", "per_gene"),
             (False, "rotation", None),
             (False, "permutation", None),
-            (True, "analytic", None),
-            (True, "analytic", "per_gene"),
+            (True, "plugin", None),
+            (True, "plugin", "per_gene"),
             (True, "rotation", None),
         ],
     )
@@ -219,7 +250,7 @@ class TestComparisonOptions:
     @pytest.mark.parametrize(
         "statistic,null",
         [
-            ("log_l2", "analytic"),
+            ("log_l2", "plugin"),
             ("log_l2", "permutation"),
             ("log_t_cauchy", "analytic"),
         ],
@@ -247,7 +278,7 @@ class TestComparisonOptions:
     @pytest.mark.parametrize(
         "statistic,null",
         [
-            ("log_l2", "analytic"),
+            ("log_l2", "plugin"),
             ("log_l2", "permutation"),
             ("log_t_cauchy", "analytic"),
         ],
@@ -317,7 +348,7 @@ class TestComparisonOptions:
             elif mode == "masked_glm":
                 result = compare_glm_masked(values, design, "group", presence, **kwargs)
             else:
-                kwargs["null"] = "permutation" if "permutation" in mode else "analytic"
+                kwargs["null"] = "permutation" if "permutation" in mode else "plugin"
                 if mode.startswith("masked"):
                     result = compare_two_groups_masked(values, groups, presence, **kwargs)
                 else:
@@ -383,20 +414,20 @@ class TestGLMComparison:
     """Design encoding, scalar contrasts, and stable OLS fits."""
 
     def test_binary_design_matches_groups_path_byte_close(self):
-        """A binary GLM design should match the two-group analytic path."""
+        """A binary GLM design should match the two-group plug-in calibration."""
         rng = np.random.default_rng(0)
         spectra = np.exp(rng.standard_normal((8, 200, 25)))
         groups = np.array(["WT"] * 4 + ["TG"] * 4)
 
         df_g = (
-            compare_two_groups(spectra, groups, statistic="log_l2", null="analytic")
+            compare_two_groups(spectra, groups, statistic="log_l2", null="plugin")
             .sort_values("Feature")
             .reset_index(drop=True)
         )
 
         design = pd.DataFrame({"genotype": groups})
         df_d = (
-            compare_glm(spectra, design, contrast="genotype")
+            compare_glm(spectra, design, contrast="genotype", null="plugin")
             .sort_values("Feature")
             .reset_index(drop=True)
         )
@@ -477,18 +508,16 @@ class TestGLMComparison:
         with pytest.raises(ValueError, match="not estimable"):
             compare_glm(spectra, X, contrast=np.array([0.0, 1.0, 0.0]))
 
-    def test_glm_functions_default_to_log_l2_and_analytic(self):
-        """The new statistic is keyword-only and leaves existing defaults intact."""
+    def test_glm_statistic_stays_keyword_only(self):
         import inspect
 
         for fn in (compare_glm, compare_glm_masked):
             sig = inspect.signature(fn)
             assert sig.parameters["statistic"].default == "log_l2"
             assert sig.parameters["statistic"].kind == inspect.Parameter.KEYWORD_ONLY
-            assert sig.parameters["null"].default == "analytic"
 
     def test_masked_glm_matches_unmasked_when_complete(self):
-        """A fully present mask should recover the ordinary GLM analytic result."""
+        """A fully present mask should recover the unmasked GLM result."""
         rng = np.random.default_rng(11)
         spectra = np.exp(rng.standard_normal((8, 80, 18)))
         design = pd.DataFrame({"time": np.linspace(0.0, 1.0, 8)})
@@ -1147,6 +1176,7 @@ class TestLogTCauchy:
         [
             ({"null": "permutation"}, "analytic"),
             ({"null": "rotation"}, "analytic"),
+            ({"null": "plugin"}, "analytic"),
             ({"covariance": "pooled"}, "covariance"),
         ],
     )

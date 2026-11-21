@@ -92,7 +92,7 @@ from sonic.comparators.normalization import (
 )
 
 if TYPE_CHECKING:
-    from sonic.comparators._inference import _AnalyticNullState
+    from sonic.comparators._inference import _PluginNullState
     from sonic.comparators.cross_spectrum import CrossSpectra
     from sonic.explanation import SpatialExplanation
 
@@ -1158,7 +1158,7 @@ class _ComparatorBase:
         *,
         contrast: str | dict[str, float] | np.ndarray | None = None,
         statistic: str = "log_l2",
-        null: str = "analytic",
+        null: str | None = None,
         n_perm: int = 1000,
         random_state: int | None = None,
         freq_weights: np.ndarray | None = None,
@@ -1187,11 +1187,11 @@ class _ComparatorBase:
             Welch for binary labels or OLS contrast t tests for a GLM. It also
             supports localizing the best bin by its smallest per-bin p-value
             among positive-weight bins.
-        null : str
-            Null calibration (default ``'analytic'``), selected by ``statistic``:
+        null : str, optional
+            Null calibration depends on the statistic:
 
-            - ``'log_l2'``: ``'analytic'`` (selected covariance and Liu tail),
-              ``'rotation'`` (deterministic conditional integration), or
+            - ``'log_l2'``: ``'rotation'`` (default, deterministic conditional integration),
+              ``'plugin'`` (Gaussian plug-in calibration using the estimated covariance), or
               ``'permutation'`` (binary labels only, without ``contrast``).
             - ``'log_t_cauchy'``: ``'analytic'`` only (per-bin t tails and
               Cauchy combination).
@@ -1219,9 +1219,9 @@ class _ComparatorBase:
             Minimum residual degrees of freedom in masked GLM tests; default 1.
             Ignored for unmasked or binary comparisons.
         covariance : str or None
-            ``None`` (default) or ``'pooled'`` shares residual covariance across
-            eligible genes. ``'per_gene'`` estimates it separately for each gene.
-            An explicit choice requires an analytic L2 test.
+            For plug-in L2 calibration, ``None`` or ``'per_gene'`` estimates residual covariance
+            separately for each gene. ``'pooled'`` shares it across eligible genes.
+            Specifying a covariance selects plug-in calibration when ``null`` is omitted.
         integration_tol : float
             Initial Davies absolute p-value error target for rotation; default 1e-6.
             Use at most 10,000 terms per call and one accuracy retry. Accepted
@@ -1245,7 +1245,7 @@ class _ComparatorBase:
             if none. Skipped genes have NaN per-bin arrays. Feature-level
             significance does not establish the selected bin's significance.
             BH uses finite feature p-values.
-            Analytic L2 results record ``null`` and ``covariance`` in ``attrs``.
+            Plug-in L2 results record ``null="plugin"`` and ``covariance`` in ``attrs``.
             Rotation adds ``P_value_method`` (``davies``, ``saddlepoint``, ``beta``
             or ``exact``; missing for skipped rows) and ``P_value_error``. The latter
             is the accepted Davies absolute error budget, a roundoff estimate for
@@ -1298,9 +1298,9 @@ class _ComparatorBase:
                     "contrast= is provided or `design` is a multi-column / "
                     f"continuous design, got statistic={statistic!r}."
                 )
-            if statistic == "log_l2" and null not in ("analytic", "rotation"):
+            if statistic == "log_l2" and null == "permutation":
                 raise NotImplementedError(
-                    "Only null='analytic' or 'rotation' is supported when "
+                    "Only null='plugin' or 'rotation' is supported for L2 when "
                     "contrast= is provided or `design` is a multi-column / "
                     "continuous design. For label permutations, pass a 1-D "
                     "binary `design` without `contrast=`."
@@ -1353,7 +1353,7 @@ class _ComparatorBase:
         contrast: str | dict[str, float] | np.ndarray | None = None,
         representation: str = "coherence",
         statistic: str = "l2",
-        null: str = "analytic",
+        null: str | None = None,
         n_perm: int = 1000,
         random_state: int | None = None,
         freq_weights: np.ndarray | None = None,
@@ -1383,11 +1383,11 @@ class _ComparatorBase:
             ``'t_cauchy'`` combines per-bin p-values using Welch for binary
             labels or OLS contrast t tests for a GLM. It also localizes the
             best bin by its smallest p-value among positive-weight bins.
-        null : str
-            Null calibration (default ``'analytic'``), selected by ``statistic``:
+        null : str, optional
+            Null calibration depends on the statistic:
 
-            - ``'l2'``: ``'analytic'`` (selected covariance and Liu tail),
-              ``'rotation'`` (deterministic conditional integration), or
+            - ``'l2'``: ``'rotation'`` (default, deterministic conditional integration),
+              ``'plugin'`` (Gaussian plug-in calibration using the estimated covariance), or
               ``'permutation'`` (binary labels only, without ``contrast``).
             - ``'t_cauchy'``: ``'analytic'`` only (per-bin t tails and
               Cauchy combination).
@@ -1413,10 +1413,10 @@ class _ComparatorBase:
             Minimum residual degrees of freedom in masked GLM tests; default 1.
             Ignored for unmasked or binary comparisons.
         covariance : str or None
-            ``None`` (default) or ``'pooled'`` shares residual covariance across
-            eligible pairs and PSD-corrects the pooled matrix. ``'per_pair'``
-            estimates it separately on each pair's retained samples and bins.
-            An explicit choice requires an analytic L2 test.
+            For plug-in L2 calibration, ``None`` or ``'per_pair'`` estimates residual covariance
+            on each pair's retained samples and bins. ``'pooled'`` shares it across
+            eligible pairs and PSD-corrects the pooled matrix. Specifying a
+            covariance selects plug-in calibration when ``null`` is omitted.
         integration_tol : float
             Initial Davies absolute p-value error target for rotation; default 1e-6.
             Use at most 10,000 terms per call and one accuracy retry. Accepted
@@ -1509,8 +1509,8 @@ class _ComparatorBase:
         min_samples_per_group: int = 2,
         min_resid_df: int = 1,
         covariance: str | None = None,
-    ) -> _AnalyticNullState:
-        """Estimate the analytic L2 null covariance and fitted coefficients.
+    ) -> _PluginNullState:
+        """Estimate the covariance for Gaussian plug-in calibration of L2 and return fitted coefficients.
 
         Parameters
         ----------
@@ -1535,18 +1535,17 @@ class _ComparatorBase:
             Minimum residual degrees of freedom in masked GLM tests; default 1.
             Ignored for unmasked or binary comparisons.
         covariance : str or None
-            ``None`` (default) or ``'pooled'`` shares residual covariance across
-            eligible genes. ``'per_gene'`` estimates it separately for each gene.
-            An explicit choice requires an analytic L2 test.
+            ``None`` or ``'per_gene'`` estimates residual covariance separately for
+            each gene (default). ``'pooled'`` shares it across eligible genes.
 
         Returns
         -------
         dict
-            Analytic-null state with common keys ``mode``, ``masked``,
+            Plug-in null state with common keys ``mode``, ``masked``,
             ``observed``, ``beta``, ``sigma_log``, ``freq_weights``, ``weighted_cov``,
             ``eigenvalues``, ``effective_rank``, ``contrast_scale``,
             ``df_resid``, ``eligible``, and the effective ``covariance`` choice.
-            With ``covariance="per_gene"``, ``sigma_log`` and ``weighted_cov``
+            With per-gene covariance, ``sigma_log`` and ``weighted_cov``
             have shape ``(n_genes, n_bins, n_bins)``, ``eigenvalues`` has shape
             ``(n_genes, n_bins)``, and ``effective_rank`` and ``roundoff`` are
             per-gene vectors. Ineligible covariance/eigenvalue rows are NaN.

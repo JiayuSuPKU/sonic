@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+- DF, DF-norm, coherence, and coherency L2 tests now default to deterministic
+  rotation. P-values and BH calls can change. For Gaussian plug-in calibration,
+  replace `null="analytic"` with `null="plugin"` in L2 calls. Covariance defaults
+  to per gene for DF and DF-norm and per pair for cross-spectrum tests. Use
+  `covariance="pooled"` to reproduce the previous pooled p-values.
+  Binwise t-Cauchy tests continue to use `null="analytic"`.
+- Replace `statistic="welch_t_cauchy"` with `"log_t_cauchy"` for binwise DF tests.
+  Binary tests now compare mean log power instead of mean raw power, or mean
+  log power share for DF-norm. GLMs use the specified contrast on that scale.
+  Rerun the analysis when migrating because bin estimates and p-values can change.
+
+### Fixed
+- DF and DF-norm reject nonfinite observed spectra before logging or shape normalization. Samples
+  marked absent for a feature are excluded from its comparison.
+
 ## [1.0.0rc2] - 2026-10-07
 
 This release corrects spatial-test calibration and comparison numerics. Rerun

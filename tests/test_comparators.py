@@ -883,12 +883,12 @@ class TestComparatorIrregularWorkflow:
 
         with pytest.raises(ValueError, match="statistic='log_l2'"):
             cmp.test_diff_freq(design, contrast="x", statistic="welch_t_cauchy")
-        with pytest.raises(NotImplementedError, match="null='analytic'"):
+        with pytest.raises(NotImplementedError, match="null='plugin'"):
             cmp.test_diff_freq(design, contrast="x", null="permutation")
 
 
 class TestComparatorNullCovariance:
-    """Covariance diagnostics should reproduce analytic ``test_diff_freq`` p-values."""
+    """Covariance diagnostics should reproduce Gaussian plug-in calibration p-values."""
 
     common_state_keys = {
         "beta",
@@ -930,7 +930,7 @@ class TestComparatorNullCovariance:
             expected = liu_sf(np.array([row.Statistic * row.Statistic]), lambs)[0]
             assert row.P_value == pytest.approx(expected)
 
-    def test_two_group_covariance_reproduces_analytic_pvalues(self):
+    def test_two_group_covariance_reproduces_plugin_pvalues(self):
         rng = np.random.default_rng(20)
         spectra = np.exp(rng.normal(size=(6, 8, 5)))
         groups = np.array([0, 0, 0, 1, 1, 1])
@@ -939,11 +939,13 @@ class TestComparatorNullCovariance:
 
         diag = cmp.estimate_null_covariance(
             groups,
+            covariance="pooled",
             freq_weights=weights,
             normalize_shape=True,
         )
         df = cmp.test_diff_freq(
             groups,
+            covariance="pooled",
             freq_weights=weights,
             normalize_shape=True,
         )
@@ -958,14 +960,14 @@ class TestComparatorNullCovariance:
         assert 1.0 <= diag["effective_rank"] <= 5.0
         self._assert_diag_reproduces_pvalues(cmp, df, diag)
 
-    def test_glm_covariance_reproduces_analytic_pvalues(self):
+    def test_glm_covariance_reproduces_plugin_pvalues(self):
         rng = np.random.default_rng(21)
         spectra = np.exp(rng.normal(size=(7, 6, 4)))
         design = pd.DataFrame({"time": np.linspace(0.0, 1.0, spectra.shape[0])})
         cmp = _comparator_from_spectra(spectra)
 
-        diag = cmp.estimate_null_covariance(design, contrast="time")
-        df = cmp.test_diff_freq(design, contrast="time")
+        diag = cmp.estimate_null_covariance(design, contrast="time", covariance="pooled")
+        df = cmp.test_diff_freq(design, contrast="time", covariance="pooled")
 
         assert diag["mode"] == "glm"
         assert not diag["masked"]
@@ -977,7 +979,7 @@ class TestComparatorNullCovariance:
         assert 1.0 <= diag["effective_rank"] <= 4.0
         self._assert_diag_reproduces_pvalues(cmp, df, diag)
 
-    def test_masked_two_group_covariance_reproduces_analytic_pvalues(self):
+    def test_masked_two_group_covariance_reproduces_plugin_pvalues(self):
         rng = np.random.default_rng(22)
         spectra = np.exp(rng.normal(size=(6, 5, 4)))
         groups = np.array([0, 0, 0, 1, 1, 1])
@@ -985,8 +987,8 @@ class TestComparatorNullCovariance:
         presence[3:, 0] = False
         cmp = _comparator_from_spectra(spectra, presence=presence)
 
-        diag = cmp.estimate_null_covariance(groups)
-        df = cmp.test_diff_freq(groups)
+        diag = cmp.estimate_null_covariance(groups, covariance="pooled")
+        df = cmp.test_diff_freq(groups, covariance="pooled")
 
         assert diag["mode"] == "two_group"
         assert diag["masked"]
@@ -996,7 +998,7 @@ class TestComparatorNullCovariance:
         assert 1.0 <= diag["effective_rank"] <= 4.0
         self._assert_diag_reproduces_pvalues(cmp, df, diag)
 
-    def test_masked_glm_covariance_reproduces_analytic_pvalues(self):
+    def test_masked_glm_covariance_reproduces_plugin_pvalues(self):
         rng = np.random.default_rng(23)
         spectra = np.exp(rng.normal(size=(6, 5, 4)))
         design = pd.DataFrame({"time": np.linspace(0.0, 1.0, spectra.shape[0])})
@@ -1004,8 +1006,8 @@ class TestComparatorNullCovariance:
         presence[1:, 0] = False
         cmp = _comparator_from_spectra(spectra, presence=presence)
 
-        diag = cmp.estimate_null_covariance(design, contrast="time")
-        df = cmp.test_diff_freq(design, contrast="time")
+        diag = cmp.estimate_null_covariance(design, contrast="time", covariance="pooled")
+        df = cmp.test_diff_freq(design, contrast="time", covariance="pooled")
 
         assert diag["mode"] == "glm"
         assert diag["masked"]
@@ -1241,7 +1243,7 @@ class TestComparatorIrregularDcPatternSeparation:
         de = cmp.test_diff_expr(groups)
         pattern_df = cmp.test_diff_freq(
             groups,
-            null="analytic",
+            null="plugin",
         )
 
         de_g0 = de.set_index("Feature").loc["g0"]
@@ -1267,16 +1269,14 @@ class TestComparatorIrregularNormalizeShape:
             .normalize_background()
         )
         before = cmp.spectra_.copy()
-        df_kw = cmp.test_diff_freq(
-            groups, statistic="log_l2", null="analytic", normalize_shape=True
-        )
+        df_kw = cmp.test_diff_freq(groups, statistic="log_l2", null="plugin", normalize_shape=True)
         # The lower-level helper is the oracle for wrapper dispatch correctness.
         df_manual = compare_two_groups(
             cmp.spectra_,
             groups,
             gene_names=cmp.gene_names,
             statistic="log_l2",
-            null="analytic",
+            null="plugin",
             normalize_shape=True,
         )
         df_kw = df_kw.sort_values("Feature").reset_index(drop=True)
@@ -1745,14 +1745,13 @@ def test_per_gene_covariance_public_dispatch_and_diagnostics(glm, masked, shape_
     original = cmp.spectra_.copy()
     design = pd.DataFrame({"time": np.linspace(0, 1, 8)}) if glm else np.repeat([0, 1], 4)
     kwargs = {
-        "covariance": "per_gene",
         "normalize_shape": shape_only,
         "freq_weights": np.arange(11),
     }
     if glm:
         kwargs["contrast"] = "time"
     diag = cmp.estimate_null_covariance(design, **kwargs)
-    result = cmp.test_diff_freq(design, **kwargs)
+    result = cmp.test_diff_freq(design, null="plugin", **kwargs)
     TestComparatorNullCovariance._assert_diag_reproduces_pvalues(cmp, result, diag)
     assert result.attrs["covariance"] == diag["covariance"] == "per_gene"
     assert diag["sigma_log"].shape == diag["weighted_cov"].shape == (5, 11, 11)
@@ -1782,7 +1781,6 @@ class TestComparatorRotation:
         comparator = _comparator_from_spectra(spectra, presence=presence)
         x = pd.DataFrame({"age": np.arange(10.0)}) if glm else groups
         kwargs = {
-            "null": "rotation",
             "integration_tol": 5e-11,
             "normalize_shape": shape_only,
             "freq_weights": np.arange(5),
@@ -1792,7 +1790,9 @@ class TestComparatorRotation:
         args = [spectra, x, "age"] if glm else [spectra, x]
         if masked:
             args.append(presence)
-        expected = getattr(ms, method)(*args, gene_names=comparator.gene_names, **kwargs)
+        expected = getattr(ms, method)(
+            *args, gene_names=comparator.gene_names, null="rotation", **kwargs
+        )
         pd.testing.assert_frame_equal(actual, expected)
         assert actual.attrs == expected.attrs
         assert actual.attrs["method"] == "davies"

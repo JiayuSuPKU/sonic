@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import itertools
+import warnings
 from unittest.mock import patch
 
 import numpy as np
@@ -13,10 +14,10 @@ from scipy.stats import kstest
 from sonic.comparators import _inference as l2
 from sonic.comparators import _regression as lm
 from sonic.comparators._inference import (
-    _AnalyticNullState,
     _estimate_glm_masked_null_covariance,
     _estimate_two_group_masked_null_covariance,
     _l2_pvalues_from_state,
+    _PluginNullState,
 )
 from sonic.comparators.multisample import (
     compare_glm,
@@ -29,13 +30,13 @@ from sonic.statistics import apply_bh_correction, liu_sf
 
 
 class TestLiuCalibration:
-    """Analytic L2 tails, masking, and low-df behavior."""
+    """Gaussian plug-in calibration of L2 tails, masking, and low-df behavior."""
 
-    def test_no_residual_df_rejects_analytic_but_allows_permutation(self):
+    def test_no_residual_df_rejects_plugin_but_allows_permutation(self):
         spectra = np.array([[[1.0, 2.0, 3.0]], [[2.0, 3.0, 4.0]]])
         groups = np.array([0, 1])
         with pytest.raises(ValueError, match="positive residual degrees of freedom"):
-            compare_two_groups(spectra, groups)
+            compare_two_groups(spectra, groups, null="plugin")
         result = compare_two_groups(spectra, groups, null="permutation")
         np.testing.assert_array_equal(result["P_value"], 1.0)
 
@@ -44,13 +45,13 @@ class TestLiuCalibration:
         n_a, n_b, K = 4, 4, 30
         spectra = np.exp(rng.standard_normal((n_a + n_b, 5000, K)))
         groups = np.array([0] * n_a + [1] * n_b)
-        df = compare_two_groups(spectra, groups, statistic="log_l2", null="analytic")
+        df = compare_two_groups(spectra, groups, statistic="log_l2", covariance="pooled")
         _, ks_p = kstest(df["P_value"].to_numpy(), "uniform")
-        assert ks_p > 0.01, f"analytic p-values not uniform under H0: KS p={ks_p:.4f}"
+        assert ks_p > 0.01, f"plug-in p-values not uniform under H0: KS p={ks_p:.4f}"
         assert 0.45 < df["P_value"].mean() < 0.55
 
-    def test_analytic_breaks_permutation_floor_on_implanted_signal(self):
-        """Analytic p-values can beat the exact-permutation floor on strong signals."""
+    def test_plugin_breaks_permutation_floor_on_implanted_signal(self):
+        """Plug-in p-values can beat the exact-permutation floor on strong signals."""
         rng = np.random.default_rng(7)
         n_per = 4
         n_genes, K = 50, 30
@@ -62,14 +63,12 @@ class TestLiuCalibration:
         df_perm = compare_two_groups(
             spectra, groups, statistic="log_l2", null="permutation", random_state=0
         )
-        df_analytic = compare_two_groups(spectra, groups, statistic="log_l2", null="analytic")
+        df_plugin = compare_two_groups(spectra, groups, statistic="log_l2", null="plugin")
         for g in ("0", "1", "2", "3", "4"):
             p_perm = df_perm.loc[df_perm["Feature"] == g, "P_value"].iloc[0]
-            p_analytic = df_analytic.loc[df_analytic["Feature"] == g, "P_value"].iloc[0]
-            assert p_analytic < p_perm, (
-                f"gene {g}: analytic={p_analytic:.3g} not < perm={p_perm:.3g}"
-            )
-            assert p_analytic < 1.0 / 71.0, f"gene {g}: analytic={p_analytic:.3g} above perm floor"
+            p_plugin = df_plugin.loc[df_plugin["Feature"] == g, "P_value"].iloc[0]
+            assert p_plugin < p_perm, f"gene {g}: plugin={p_plugin:.3g} not < perm={p_perm:.3g}"
+            assert p_plugin < 1.0 / 71.0, f"gene {g}: plugin={p_plugin:.3g} above perm floor"
 
     def test_log_t_cauchy_analytic_schema(self):
         """Analytic log t-Cauchy retains the feature and per-bin result schema."""
@@ -88,26 +87,28 @@ class TestLiuCalibration:
             compare_two_groups(spectra, groups, statistic="log_l2", null="bootstrap")
 
     def test_small_df_emits_user_warning(self):
-        """Analytic null warns when residual df makes variance estimates unstable."""
+        """Plug-in null warns when residual df makes variance estimates unstable."""
         rng = np.random.default_rng(0)
         spectra = np.exp(rng.standard_normal((3, 50, 20)))
         groups = np.array([0, 1, 1])
-        with pytest.warns(UserWarning, match="log_l2 \\+ null='analytic' at residual df=1"):
-            compare_two_groups(spectra, groups, statistic="log_l2", null="analytic")
+        with pytest.warns(UserWarning, match="log_l2 \\+ null='plugin' at residual df=1"):
+            compare_two_groups(spectra, groups, statistic="log_l2", null="plugin")
         spectra = np.exp(rng.standard_normal((4, 50, 20)))
         groups = np.array([0, 0, 1, 1])
-        with pytest.warns(UserWarning, match="log_l2 \\+ null='analytic' at residual df=2"):
-            compare_two_groups(spectra, groups, statistic="log_l2", null="analytic")
+        with pytest.warns(UserWarning, match="log_l2 \\+ null='plugin' at residual df=2"):
+            compare_two_groups(spectra, groups, statistic="log_l2", null="plugin")
+        with warnings.catch_warnings():
+            warnings.simplefilter("error", UserWarning)
+            warnings.filterwarnings("ignore", message="log_l2 [+] null='plugin'")
+            compare_two_groups(spectra, groups, statistic="log_l2", null="plugin")
         spectra = np.exp(rng.standard_normal((6, 50, 20)))
         groups = np.array([0, 0, 0, 1, 1, 1])
-        import warnings as _w
-
-        with _w.catch_warnings():
-            _w.simplefilter("error", UserWarning)
-            compare_two_groups(spectra, groups, statistic="log_l2", null="analytic")
+        with warnings.catch_warnings():
+            warnings.simplefilter("error", UserWarning)
+            compare_two_groups(spectra, groups, statistic="log_l2", null="plugin")
 
     def test_full_sigma_calibrates_under_correlated_bins(self):
-        """Full-covariance analytic p-values should stay calibrated with correlated bins."""
+        """Full-covariance plug-in p-values should stay calibrated with correlated bins."""
         rng = np.random.default_rng(42)
         n_a, n_b, G, K = 4, 4, 2000, 30
         # Shared noise creates near rank-1 covariance across bins.
@@ -116,32 +117,30 @@ class TestLiuCalibration:
         log_y = shared + per_bin
         spectra = np.exp(log_y)
         groups = np.array([0] * n_a + [1] * n_b)
-        df = compare_two_groups(spectra, groups, statistic="log_l2", null="analytic")
+        df = compare_two_groups(spectra, groups, statistic="log_l2", covariance="pooled")
         ks_p = kstest(df["P_value"].to_numpy(), "uniform")[1]
         fpr05 = (df["P_value"] < 0.05).mean()
         assert fpr05 < 0.10, (
-            f"Full-Sigma analytic p-values should be near-calibrated; got Pr(p<.05)={fpr05:.3f}"
+            f"Full-Sigma plug-in p-values should be near-calibrated; got Pr(p<.05)={fpr05:.3f}"
         )
         assert ks_p > 1e-3 or fpr05 < 0.07, (
-            f"Full-Sigma analytic p-values should be roughly uniform; KS_p={ks_p:.3g} fpr05={fpr05:.3f}"
+            f"Full-Sigma plug-in p-values should be roughly uniform; KS_p={ks_p:.3g} fpr05={fpr05:.3f}"
         )
 
-    def test_masked_analytic_parity_with_unmasked_when_complete(self):
-        """All-present masks should match the unmasked analytic path."""
+    def test_masked_plugin_parity_with_unmasked_when_complete(self):
+        """All-present masks should match the unmasked plug-in path."""
         rng = np.random.default_rng(5)
         n_samples, n_genes, K = 6, 100, 20
         spectra = np.exp(rng.standard_normal((n_samples, n_genes, K)))
         groups = np.array([0, 0, 0, 1, 1, 1])
         presence = np.ones((n_samples, n_genes), dtype=bool)
         df_un = (
-            compare_two_groups(spectra, groups, statistic="log_l2", null="analytic")
+            compare_two_groups(spectra, groups, statistic="log_l2", null="plugin")
             .sort_values("Feature")
             .reset_index(drop=True)
         )
         df_m = (
-            compare_two_groups_masked(
-                spectra, groups, presence, statistic="log_l2", null="analytic"
-            )
+            compare_two_groups_masked(spectra, groups, presence, statistic="log_l2", null="plugin")
             .sort_values("Feature")
             .reset_index(drop=True)
         )
@@ -152,14 +151,14 @@ class TestLiuCalibration:
             df_un["P_value"].to_numpy(), df_m["P_value"].to_numpy(), atol=1e-12
         )
 
-    def test_masked_analytic_calibration_under_synthetic_missingness(self):
+    def test_masked_plugin_calibration_under_synthetic_missingness(self):
         """Random missingness should not strongly distort H0 false positives."""
         rng = np.random.default_rng(0)
         n_samples, n_genes, K = 8, 800, 20
         spectra = np.exp(rng.standard_normal((n_samples, n_genes, K)))
         groups = np.array([0] * 4 + [1] * 4)
 
-        df_full = compare_two_groups(spectra, groups, statistic="log_l2", null="analytic")
+        df_full = compare_two_groups(spectra, groups, statistic="log_l2", covariance="pooled")
         fpr_full = (df_full["P_value"] < 0.05).mean()
 
         presence = rng.uniform(size=(n_samples, n_genes)) >= 0.25
@@ -168,7 +167,7 @@ class TestLiuCalibration:
             groups,
             presence,
             statistic="log_l2",
-            null="analytic",
+            covariance="pooled",
             min_samples_per_group=2,
         )
         valid = df_m["P_value"].notna()
@@ -180,7 +179,7 @@ class TestLiuCalibration:
             f"masked vs unmasked FPR mismatch: masked={fpr_m:.3f} unmasked={fpr_full:.3f}"
         )
 
-    def test_masked_analytic_skips_genes_with_insufficient_presence(self):
+    def test_masked_plugin_skips_genes_with_insufficient_presence(self):
         """Genes below per-group presence thresholds should report NaN p-values."""
         rng = np.random.default_rng(7)
         n_samples, n_genes, K = 6, 20, 12
@@ -193,7 +192,7 @@ class TestLiuCalibration:
             groups,
             presence,
             statistic="log_l2",
-            null="analytic",
+            null="plugin",
             min_samples_per_group=2,
         )
         row = df[df["Feature"] == "0"].iloc[0]
@@ -202,7 +201,7 @@ class TestLiuCalibration:
         valid_genes = df[df["Feature"] != "0"]
         assert valid_genes["P_value"].notna().all()
 
-    def test_masked_analytic_raises_when_no_eligible_genes(self):
+    def test_masked_plugin_raises_when_no_eligible_genes(self):
         """A fully ineligible mask should raise instead of returning all-NaN results."""
         rng = np.random.default_rng(8)
         n_samples, n_genes, K = 6, 10, 12
@@ -216,7 +215,7 @@ class TestLiuCalibration:
                 groups,
                 presence,
                 statistic="log_l2",
-                null="analytic",
+                null="plugin",
                 min_samples_per_group=2,
             )
 
@@ -248,11 +247,13 @@ class TestLiuCalibration:
         presence[6, 4:8] = False
         presence[:, -1] = False
         if mode == "two_group":
-            state = _estimate_two_group_masked_null_covariance(spectra, groups, presence)
+            state = _estimate_two_group_masked_null_covariance(
+                spectra, groups, presence, covariance="pooled"
+            )
         else:
             design = np.column_stack([np.ones(12), groups, rng.normal(size=12)])
             state = _estimate_glm_masked_null_covariance(
-                spectra, design, np.array([0.0, 1.0, 0.0]), presence
+                spectra, design, np.array([0.0, 1.0, 0.0]), presence, covariance="pooled"
             )
         expected = np.full(12, np.nan)
         for j in np.flatnonzero(state["eligible"]):
@@ -540,8 +541,8 @@ class TestCovarianceEstimation:
         for j in [3, 4]:
             alone = run(spectra[:, j : j + 1], presence[:, j : j + 1])
             np.testing.assert_allclose(
-                result.loc[str(j), ["Statistic", "P_value"]],
-                alone.loc["0", ["Statistic", "P_value"]],
+                result.loc[str(j), ["Statistic", "P_value"]].to_numpy(dtype=float),
+                alone.loc["0", ["Statistic", "P_value"]].to_numpy(dtype=float),
                 atol=1e-12,
             )
         enlarged = np.concatenate([spectra, np.exp(100 + rng.normal(size=(8, 1, 11)))], axis=1)
@@ -553,7 +554,7 @@ class TestCovarianceEstimation:
             equal_nan=True,
         )
 
-    def test_per_gene_low_df_retains_analytic_warning(self):
+    def test_per_gene_low_df_retains_plugin_warning(self):
         rng = np.random.default_rng(5)
         with pytest.warns(UserWarning, match="residual df=2"):
             result = compare_two_groups(
@@ -591,7 +592,13 @@ class TestCovarianceEstimation:
         fn = getattr(ms, "compare_" + ("glm" if glm else "two_groups") + suffix)
         with pytest.raises(ValueError, match="covariance must be"):
             fn(*args, covariance="typo")
-        pd.testing.assert_frame_equal(fn(*args), fn(*args, covariance="pooled"))
+        pd.testing.assert_frame_equal(fn(*args), fn(*args, null="rotation"))
+        with pytest.raises(ValueError, match="plugin"):
+            fn(*args, null="analytic")
+        plugin = fn(*args, null="plugin")
+        pd.testing.assert_frame_equal(plugin, fn(*args, covariance="per_gene"))
+        assert plugin.attrs["null"] == "plugin"
+        assert plugin.attrs["covariance"] == "per_gene"
         estimate = getattr(
             l2, "_estimate_" + ("glm" if glm else "two_group") + suffix + "_null_covariance"
         )
@@ -745,10 +752,10 @@ class TestCovarianceEstimation:
                 spectra, groups, presence, freq_weights=-np.ones(5), allow_empty=True, **kwargs
             )
 
-    def test_analytic_null_metadata_stays_optional_on_python_310(
+    def test_plugin_null_metadata_stays_optional_on_python_310(
         self,
     ):
-        assert _AnalyticNullState.__optional_keys__ == {
+        assert _PluginNullState.__optional_keys__ == {
             "estimate_per_bin",
             "n_obs_A",
             "n_obs_B",
@@ -762,12 +769,12 @@ class TestCovarianceEstimation:
             "beta",
             "eigenvalues",
             "eligible",
-        } <= _AnalyticNullState.__required_keys__
+        } <= _PluginNullState.__required_keys__
 
     @pytest.mark.parametrize("masked", [False, True])
     @pytest.mark.parametrize("glm", [False, True])
     @pytest.mark.parametrize("shape_only", [False, True])
-    @pytest.mark.parametrize("covariance_mode", [None, "per_gene"])
+    @pytest.mark.parametrize("covariance_mode", ["pooled", "per_gene"])
     @pytest.mark.parametrize("n_bins", [7, 17])
     def test_blocked_covariance_matches_independent_per_gene_fits(  # noqa: C901
         self,
@@ -889,7 +896,11 @@ class TestCovarianceEstimation:
         comparison = "compare_" + ("glm" if glm else "two_groups") + ("_masked" if masked else "")
         result = (
             getattr(ms, comparison)(
-                *args, freq_weights=weights, normalize_shape=shape_only, covariance=covariance_mode
+                *args,
+                null="plugin",
+                freq_weights=weights,
+                normalize_shape=shape_only,
+                covariance=covariance_mode,
             )
             .set_index("Feature")
             .loc[[str(i) for i in range(23)]]
@@ -898,12 +909,16 @@ class TestCovarianceEstimation:
         np.testing.assert_allclose(
             result.P_adj, apply_bh_correction(pvalues), atol=1e-12, equal_nan=True
         )
-        assert result.attrs["covariance"] == (covariance_mode or "pooled")
-        assert result.attrs["null"] == "analytic"
+        assert result.attrs["covariance"] == covariance_mode
+        assert result.attrs["null"] == "plugin"
         monkeypatch.setattr(l2, "_COMPARISON_WORKSPACE_BYTES", 32 * (1 << 20))
         whole = (
             getattr(ms, comparison)(
-                *args, freq_weights=weights, normalize_shape=shape_only, covariance=covariance_mode
+                *args,
+                null="plugin",
+                freq_weights=weights,
+                normalize_shape=shape_only,
+                covariance=covariance_mode,
             )
             .set_index("Feature")
             .loc[result.index]
@@ -1094,10 +1109,10 @@ class TestConditionalRotation:
         binary = ms.compare_two_groups_masked if masked else ms.compare_two_groups
         args = [values, groups, presence] if masked else [values, groups]
         result = binary(*args, null="rotation", **kwargs)
-        analytic = binary(*args, covariance="per_gene", **kwargs)
+        plugin = binary(*args, covariance="per_gene", **kwargs)
         pd.testing.assert_series_equal(
             result.set_index("Feature").Statistic.sort_index(),
-            analytic.set_index("Feature").Statistic.sort_index(),
+            plugin.set_index("Feature").Statistic.sort_index(),
         )
         glm = ms.compare_glm_masked if masked else ms.compare_glm
         glm_args = [values, np.c_[np.ones(10), groups], np.array([0.0, 1.0])]
@@ -1174,11 +1189,11 @@ class TestConditionalRotation:
     @pytest.mark.parametrize("contrast_scale", [1.0, 1e-12])
     def test_nuisance_only_profiles_and_nonzero_perfect_fits(self, masked, contrast_scale):
         rng = np.random.default_rng(1)
-        z = rng.normal(size=10)
-        x = np.c_[np.ones(10), np.linspace(-1, 1, 10), z]
+        z = rng.integers(-8, 9, size=10) / 8
+        x = np.c_[np.ones(10), np.arange(10) / 8, z]
         c = np.array([0.0, contrast_scale, 0.0])
-        y = np.repeat((3 + z)[:, None, None] * np.array([1.0, 0.5, -0.2]), 3, axis=1)
-        y[:, 1] += x[:, 1, None] * np.array([0.8, -0.3, 0.4])
+        y = np.repeat((3 + z)[:, None, None] * np.array([1.0, 0.5, -0.25]), 3, axis=1)
+        y[:, 1] += x[:, 1, None] * np.array([0.75, -0.25, 0.5])
         y[:, 2] += rng.normal(scale=0.1, size=(10, 3))
         # An ignored bin must not set the numerical-zero threshold.
         y[:, :, -1] = 100 * x[:, 1, None]
@@ -1186,17 +1201,17 @@ class TestConditionalRotation:
         if masked:
             presence[0, 0] = False
             y[~presence] = np.nan
-        values = np.exp(y)
         kwargs = {
+            "log_transform": False,
             "n_rotations": 999,
             "random_state": 20,
             "freq_weights": np.array([0.8, 0.2, 0.0]),
         }
-        result = l2._run_l2_conditional(values, x, c, presence if masked else None, **kwargs)
+        result = l2._run_l2_conditional(y, x, c, presence if masked else None, **kwargs)
         assert result["pvals"][0] == 1.0
         assert result["pvals"][1] == 0.001
         assert result["observed"][1] > 0
-        reference = l2._run_l2_conditional(values[:, 2:3], x, c, **kwargs)
+        reference = l2._run_l2_conditional(y[:, 2:3], x, c, **kwargs)
         assert result["pvals"][2] == reference["pvals"][0]
 
     def test_roundoff_guard_preserves_tiny_and_large_profile_scales(self):
@@ -1339,6 +1354,65 @@ class TestConditionalRotation:
 
 class TestConditionalIntegration:
     """Synthetic accuracy gates for the private deterministic rotation evaluator."""
+
+    @pytest.mark.parametrize("normalize", [False, True], ids=["DF", "DF-norm"])
+    def test_exact_fit_next_to_noisy_feature(self, normalize):
+        groups = np.tile([0, 1], 6)
+        exact = np.array([[1.0, 2.0], [2.0, 1.0]])[groups]
+        noisy = np.random.default_rng(92).uniform(1, 2, size=exact.shape)
+        spectra = np.stack([exact, noisy], axis=1)
+        # Variation confined to a zero-weight bin does not enter the DF test.
+        weights = [1, 1]
+        if not normalize:
+            spectra = np.concatenate([spectra, spectra[:, ::-1, :1]], axis=2)
+            weights.append(0)
+        options = {"normalize_shape": normalize, "freq_weights": weights}
+        result = compare_two_groups(spectra, groups, **options).set_index("Feature")
+        alone = compare_two_groups(spectra[:, 1:], groups, **options).iloc[0]
+        assert result.loc["0", "P_value"] == result.loc["0", "P_value_error"] == 0
+        assert result.loc["0", "P_value_method"] == "exact"
+        assert 0 < alone.P_value < 1
+        assert result.loc["1", "P_value"] == pytest.approx(alone.P_value, rel=1e-12)
+
+    def test_continuous_exact_fit_and_one_ulp_residual(self):
+        from scipy.stats import t
+
+        x = np.arange(8.0)
+        design = np.c_[np.ones(8), x]
+        response = np.tile((1 + x / 8)[:, None, None], (1, 2, 1))
+        response[1, 1, 0] = np.nextafter(response[1, 1, 0], np.inf)
+        result = l2._run_l2_conditional(response, design, np.array([0, 1]), log_transform=False)
+        assert result["pvals"][0] == result["pvalue_error"][0] == 0
+        assert result["pvalue_method"].tolist() == ["exact", "beta"]
+        # A perturbation at sample 1 leaves RSS = delta² (1 - leverage[1]).
+        delta = np.spacing(1 + x[1] / 8)
+        centered = x[1] - x.mean()
+        sxx = np.sum((x - x.mean()) ** 2)
+        leverage = 1 / len(x) + centered**2 / sxx
+        slope = 1 / 8 + delta * centered / sxx
+        se = delta * np.sqrt((1 - leverage) / (6 * sxx))
+        np.testing.assert_allclose(result["pvals"][1], 2 * t.sf(slope / se, 6), rtol=1e-12, atol=0)
+
+    @pytest.mark.parametrize("aliased", [False, True], ids=["truncated", "aliased"])
+    def test_refinement_respects_retained_rank(self, aliased):
+        from scipy.stats import t
+
+        g = np.tile([-1, 1], 6)
+        noise = np.tile([-1, -1, 1, 1], 3)
+        # The third column either duplicates the contrast or falls below the SVD cutoff.
+        x = np.c_[np.ones(12), g, 2 * g if aliased else noise * 2.0**-60]
+        c = np.array([0, 1, 2 if aliased else 0])
+        y = 0.5 + np.spacing(0.5) * (3 * g + noise)
+        result = l2._run_l2_conditional(y[:, None, None], x, c, log_transform=False)
+        assert result["df_resid"][0] == 10
+        expected = 2 * t.sf(3 * np.sqrt(10), 10)
+        np.testing.assert_allclose(result["pvals"], expected, rtol=1e-12, atol=0)
+
+    def test_refined_positive_residual_energy_underflow_is_explicit(self):
+        x = np.c_[np.ones(4), [0, 0, 1, 1]]
+        y = np.array([1e-200, 0, 1, 1])[:, None, None]
+        with pytest.raises(RuntimeError, match="cannot resolve a nonzero contrast or residual"):
+            l2._run_l2_conditional(y, x, np.array([0, 1]), log_transform=False)
 
     @pytest.mark.parametrize(
         "dimension,rank,q",

@@ -51,6 +51,10 @@ Both result tables contain ``Feature``, ``Statistic``, ``P_value``, and
 ``expression_results`` tests sample-level mean expression. Looking at both
 separates a rearranged pattern from a simple change in abundance.
 
+By default, DF and DF-norm use deterministic rotation to calibrate log L2.
+Pass ``covariance="pooled"`` to reproduce p-values from Gaussian plug-in calibration
+with a pooled residual covariance.
+
 DF and DF-norm return signed ``Estimate_per_bin`` for every null: mean A minus
 mean B (sorted binary labels), or the specified GLM contrast. Estimates are
 in natural-log power units (log power share for DF-norm); divide by ``ln(2)``
@@ -65,7 +69,8 @@ runs before testing.
 
 ``normalize_shape=True`` compares the distribution of power across spatial
 scales after removing total spectrum amplitude. Leave it off when amplitude is
-part of the pattern you want to compare. Every nonzero spectrum is normalized
+part of the pattern you want to compare. Observed spectra must be finite.
+Samples marked absent are excluded for that feature. Every nonzero spectrum is normalized
 to unit total, including very small powers; all-zero spectra remain zero.
 
 For 2D NUFFT features and rotation landmarks, SONIC evaluates an extra border
@@ -73,7 +78,7 @@ of Fourier modes for interpolation at the sampling Nyquist boundary. The
 original frequency bins and physical units stay unchanged. FFT spectra use
 their periodic frequency boundary.
 
-With the analytic null, DF tests return NaN p-values for nonzero contrasts
+With ``null="plugin"``, DF tests return NaN p-values for nonzero contrasts
 when the selected residual covariance is numerically zero; zero contrasts
 return p=1.
 Untestable features are excluded from BH correction.
@@ -102,20 +107,21 @@ conditions. Compute the requested pairs once, then select a representation:
 - ``representation="coherency"`` compares the real part of normalized
   cross-spectra, retaining the sign of in-phase coupling.
 
-Both default to ``statistic="l2"``. For ``null="analytic"``, choose
-how to estimate the cross-bin residual covariance used by the Liu approximation:
+Both default to ``statistic="l2"`` with deterministic rotation. For Gaussian
+plug-in calibration (``null="plugin"``), choose how to estimate residual covariance:
 
-- ``covariance=None`` or ``"pooled"`` (default) shares covariance across eligible
-  pairs to stabilize estimation when their covariance is similar.
-- ``covariance="per_pair"`` estimates covariance separately for each pair,
+- ``None`` or ``"per_pair"`` (default) estimates covariance for each pair,
   retaining pair-specific variance and cross-bin correlation.
+- ``"pooled"`` shares covariance across eligible pairs.
+
+Specifying a covariance selects ``null="plugin"`` when ``null`` is omitted.
 
 .. code-block:: python
 
    coupling = comparison.test_cross_diff_freq(groups, covariance="per_pair")
 
 Design matrices and continuous ``contrast=`` terms work as in ``test_diff_freq``.
-L2 supports ``null="analytic"`` and ``null="rotation"`` for either design;
+L2 supports ``null="plugin"`` and ``null="rotation"`` for either design;
 ``null="permutation"`` is available only for binary comparisons. To also
 localize the best bin, use ``statistic="t_cauchy"`` with ``null="analytic"``:
 
@@ -338,19 +344,20 @@ The standalone ``compare_two_groups``, ``compare_glm``, and their masked
 variants accept ``statistic="log_t_cauchy"`` with the same binwise outputs.
 
 
-Choose the analytic DF covariance
----------------------------------
+Gaussian plug-in calibration
+----------------------------
 
-For analytic L2 DF and DF-norm tests, ``covariance`` controls how cross-bin
-residual covariance is estimated:
+For ``null="plugin"``, SONIC treats the estimated residual covariance as fixed.
+It uses the Liu approximation to evaluate the weighted chi-square tail of the
+squared L2 statistic under a Gaussian null.
+For DF and DF-norm, the covariance options are:
 
-- ``None`` or ``"pooled"`` (default) shares covariance across eligible genes to
-  stabilize estimation when their covariance is similar.
-- ``"per_gene"`` estimates covariance separately for each gene, retaining
-  gene-specific variance and cross-bin correlation.
+- ``None`` or ``"per_gene"`` (default) estimates covariance for each gene, retaining
+  its variance and cross-bin correlation.
+- ``"pooled"`` shares covariance across eligible genes.
 
-Both use the same weighted L2 statistic and Liu null approximation. The options
-support binary groups, continuous contrasts, and gene-specific missing samples.
+Specifying a covariance selects ``null="plugin"`` when ``null`` is omitted.
+Both estimators support binary groups, continuous contrasts, and gene-specific missing samples.
 
 .. code-block:: python
 
@@ -377,9 +384,9 @@ Cross-spectrum tests use ``covariance="per_pair"`` for separate pair estimates.
 Conditional rotation tests
 --------------------------
 
-For DF and DF-norm, ``null="rotation"`` evaluates the conditional rotation
-null by deterministic integration. It tests the same weighted L2 statistic,
-conditioning on each feature's nuisance-adjusted scatter.
+DF, DF-norm, coherence, and coherency L2 tests default to ``null="rotation"``.
+Deterministic integration evaluates the weighted L2 statistic conditional on
+each feature's or pair's nuisance-adjusted scatter.
 The conditional null is exact under independent Gaussian errors on the tested profile
 scale, with common covariance across samples within each feature or pair.
 Cross-bin correlations are unrestricted, and covariance may differ between
@@ -393,13 +400,19 @@ errors; robustness depends on the statistic, design and error distribution.
        null="rotation", integration_tol=1e-6,
    )
 
-Use ``statistic="log_l2"`` and leave ``covariance=None``. The four standalone
-binary/GLM comparison functions accept the same option, including masked data.
+Use ``statistic="log_l2"`` for DF or ``"l2"`` for cross-spectrum tests, and leave
+``covariance=None``. The standalone DF functions support rotation for binary and
+GLM designs, including masked data.
 ``integration_tol`` is the initial Davies absolute p-value error target
 (default 1e-6). Each call uses at most 10,000 terms. Accepted integration also
 requires a relative error budget at most ``0.001*p``; a valid result failing
 this check gets one retry at ``min(integration_tol, 1e-4*p)``. Exact beta cases
 and spectral boundaries bypass integration.
+
+When a fitted residual is comparable to rounding error, SONIC recomputes the
+contrast and residuals on the retained design using the transformed profile values.
+An exact fit gives p=1 for a zero contrast and p=0 for a nonzero contrast.
+If every rotation gives the same L2 statistic, the inclusive upper tail is p=1.
 
 Unresolved tails use Kuonen's saddlepoint approximation.
 ``P_value_method`` identifies ``davies``, ``saddlepoint``, ``beta`` or ``exact``
@@ -441,7 +454,7 @@ Permutation tests
 ``test_diff_freq`` and ``test_cross_diff_freq``, including masked comparisons.
 Pass one-dimensional labels for two exchangeable groups and omit ``contrast``.
 GLM designs, including continuous predictors, nuisance covariates, or an explicit
-contrast, support ``null="analytic"`` (default) and ``null="rotation"`` for L2.
+contrast, support both rotation and Gaussian plug-in calibration for L2.
 Log t-Cauchy supports its analytic calibration only.
 
 For a binary comparison, permutation calibration relabels samples:

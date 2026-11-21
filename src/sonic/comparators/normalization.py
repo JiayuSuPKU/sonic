@@ -300,7 +300,7 @@ def normalize_shape(
     Parameters
     ----------
     spectra : np.ndarray
-        Non-negative spectra. Any leading dimensions are preserved.
+        Finite non-negative spectra. Any leading dimensions are preserved.
     axis : int, default -1
         Frequency axis to normalize.
     eps : float, default 1e-12
@@ -321,6 +321,8 @@ def normalize_shape(
     within each sample.
     """
     spectra = np.asarray(spectra, dtype=np.float64)
+    if not np.isfinite(spectra).all():
+        raise ValueError("Shape normalization requires finite profiles for observed samples.")
     scale = spectra.max(axis=axis, keepdims=True, initial=0.0)
     scaled = np.divide(spectra, scale, out=np.zeros_like(spectra), where=scale > 0)
     total = scaled.sum(axis=axis, keepdims=True)

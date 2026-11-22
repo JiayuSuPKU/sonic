@@ -14,6 +14,7 @@ from typing import TYPE_CHECKING, Any
 
 import numpy as np
 from joblib import Parallel, delayed
+from pandas import Index
 from tqdm.auto import tqdm
 
 from sonic.comparators.binning import (
@@ -34,6 +35,7 @@ from sonic.comparators._inference import (
     _estimate_glm_null_covariance,
     _estimate_two_group_masked_null_covariance,
     _estimate_two_group_null_covariance,
+    _resolve_covariance,
 )
 from sonic.comparators.features import (
     _ALIGNMENT_N_RADIUS,
@@ -185,6 +187,20 @@ class _ComparatorBase:
     # the 2-D feature axis is ``n_radius_bins × _n_theta_bins`` over the
     # half-plane ``[0, π)``. Subclasses may override.
     _n_theta_bins: int = 36
+
+    def _gene_indices(self, names: Sequence[str]) -> np.ndarray:
+        """Resolve names in request order, including repeated requests for a unique gene."""
+        genes = Index(self.gene_names)
+        if not genes.is_unique:
+            ambiguous = genes[genes.duplicated() & genes.isin(names)].unique().tolist()
+            if ambiguous:
+                raise ValueError(
+                    f"Ambiguous feature names {ambiguous}. Use unique feature identifiers."
+                )
+        indices = genes.get_indexer_for(names)
+        if (indices < 0).any():
+            raise ValueError("All requested features must exist in the comparator.")
+        return indices
 
     # ------------------------------------------------------------------
     def _prepare_frequency_grid(self) -> None:
@@ -733,6 +749,7 @@ class _ComparatorBase:
         ----------
         features : str or sequence of str
             One gene for a power map, or an ordered pair for a cross-spectrum map.
+            Each requested name must identify exactly one input column.
         sample_index : int, default 0
             Zero-based sample index in this comparator.
         bands : sequence of int
@@ -1327,6 +1344,29 @@ class _ComparatorBase:
             integration_tol=integration_tol,
         )
 
+    def _covariance_columns(self, features, covariance, memory_budget_bytes):
+        """Check the two returned covariance arrays before copying or fitting any profiles."""
+        _, n_genes, n_bins = self.spectra_.shape
+        columns = slice(None)
+        if features is not None:
+            names = (features,) if isinstance(features, str) else tuple(features)
+            if not names or len(set(names)) != len(names):
+                raise ValueError("Select at least one feature and supply each name only once.")
+            columns = self._gene_indices(names)
+            n_genes = len(columns)
+        per_gene = covariance == "per_gene"
+        required = 2 * np.dtype(np.float64).itemsize * n_bins**2 * (n_genes if per_gene else 1)
+        budget = _parse_memory_budget(memory_budget_bytes)
+        if required > budget:
+            hint = (
+                "Select fewer features or use covariance='pooled'" if per_gene else "Use fewer bins"
+            )
+            raise MemoryError(
+                f"The covariance matrices require {required} bytes (budget {budget} bytes). "
+                f"{hint}, or increase memory_budget_bytes."
+            )
+        return columns
+
     def estimate_null_covariance(
         self,
         design: Any,
@@ -1337,6 +1377,8 @@ class _ComparatorBase:
         min_samples_per_group: int = 2,
         min_resid_df: int = 1,
         covariance: str | None = None,
+        features: str | Sequence[str] | None = None,
+        memory_budget_bytes: int | str = _DEFAULT_CHUNK_BUDGET,
     ) -> _PluginNullState:
         """Estimate residual covariance across bins for Gaussian plug-in calibration.
 
@@ -1364,6 +1406,13 @@ class _ComparatorBase:
         covariance : str, optional
             Use ``'per_gene'`` (default) for separate gene covariance estimates.
             Use ``'pooled'`` for a shared estimate across eligible genes.
+        features : str or sequence of str, optional
+            Inspect these genes in the requested order. Each name must identify one
+            input column. Pooled covariance uses only the selected genes. By default,
+            use every gene in input order.
+        memory_budget_bytes : int or str, default '2 GiB'
+            Maximum combined size of the returned float64 ``sigma_log`` and
+            ``weighted_cov`` matrices. Other outputs and fitting workspace are additional.
 
         Returns
         -------
@@ -1382,6 +1431,8 @@ class _ComparatorBase:
 
         Raises
         ------
+        MemoryError
+            If the covariance matrices would exceed the budget.
         RuntimeError
             Compute spectra before calling this method.
         ValueError
@@ -1399,7 +1450,11 @@ class _ComparatorBase:
             raise ValueError(f"min_resid_df must be >= 1, got {min_resid_df}.")
 
         groups, design_obj = _validate_design(design, len(self.samples))
+        covariance = _resolve_covariance(covariance)
+        columns = self._covariance_columns(features, covariance, memory_budget_bytes)
+        spectra = self.spectra_[:, columns]
         use_masked = self.presence_ is not None and not self.presence_.all()
+        presence = self.presence_[:, columns] if use_masked else None
         options = {
             "freq_weights": freq_weights,
             "normalize_shape": normalize_shape,
@@ -1415,28 +1470,26 @@ class _ComparatorBase:
                 )
             if use_masked:
                 state = _estimate_glm_masked_null_covariance(
-                    self.spectra_,
+                    spectra,
                     design_obj,
                     contrast,
-                    self.presence_,
+                    presence,
                     min_resid_df=int(min_resid_df),
                     **options,
                 )
             else:
-                state = _estimate_glm_null_covariance(
-                    self.spectra_, design_obj, contrast, **options
-                )
+                state = _estimate_glm_null_covariance(spectra, design_obj, contrast, **options)
         elif use_masked:
             state = _estimate_two_group_masked_null_covariance(
-                self.spectra_,
+                spectra,
                 groups,
-                self.presence_,
+                presence,
                 min_samples_per_group=int(min_samples_per_group),
                 **options,
             )
         else:
             state = _estimate_two_group_null_covariance(
-                self.spectra_, groups, min_samples_per_group=int(min_samples_per_group), **options
+                spectra, groups, min_samples_per_group=int(min_samples_per_group), **options
             )
         del state["estimate_per_bin"]
         return state

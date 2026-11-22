@@ -383,6 +383,22 @@ def test_parallelism_rejects_invalid_settings(kwargs):
         resolve_parallelism(**kwargs)
 
 
+def test_nufft_chunk_size_charges_only_simultaneous_fine_grids():
+    from sonic.kernels import NUFFTKernel
+
+    shape = (64, 128)
+    coords = np.random.default_rng(12).uniform((0, 0), shape, size=(64, 2))
+    kernel = NUFFTKernel(coords, grid_shape=shape, spacing=(1, 1), eps=1e-9, nthreads=1)
+    # One transform needs 1154 KiB. Two serial transforms reuse the 1024 KiB fine-grid workspace.
+    with pytest.raises(ValueError, match="cannot fit one feature"):
+        auto_chunk_size(kernel, budget_bytes="1153 KiB")
+    assert auto_chunk_size(kernel, budget_bytes="1154 KiB") == 1
+    assert auto_chunk_size(kernel, budget_bytes="1300 KiB") == 2
+    kernel.nthreads = 2
+    assert auto_chunk_size(kernel, budget_bytes="1300 KiB") == 1
+    assert auto_chunk_size(kernel, n_jobs=2, budget_bytes="2600 KiB") == 1
+
+
 @pytest.mark.parametrize("backend,cap", [("fft", 32), ("nufft", 32), ("precision", 4)])
 def test_auto_chunk_backend_workspace_budget(backend, cap):
     from sonic.kernels import FFTKernel, NUFFTKernel

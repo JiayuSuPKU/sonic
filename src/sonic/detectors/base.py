@@ -24,11 +24,15 @@ and :meth:`compute_rstat`.
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import pandas as pd
 
 from sonic.kernels import Kernel
+from sonic.utils import _DEFAULT_CHUNK_BUDGET
+
+if TYPE_CHECKING:
+    from sonic.explanation import SpatialExplanation
 
 __all__ = ["Detector"]
 
@@ -62,8 +66,7 @@ class Detector(ABC):
     def __init__(self, kernel_method: str, **kernel_params: Any) -> None:
         if kernel_method not in self._available_kernels:
             raise ValueError(
-                f"kernel_method must be one of {self._available_kernels}, "
-                f"got {kernel_method!r}."
+                f"kernel_method must be one of {self._available_kernels}, got {kernel_method!r}."
             )
         self.kernel_method_: str = kernel_method
         self.kernel_params_: dict = self._merge_kernel_defaults(kernel_method, dict(kernel_params))
@@ -103,6 +106,60 @@ class Detector(ABC):
     # ------------------------------------------------------------------
     # Shared helpers
     # ------------------------------------------------------------------
+    def explain_qstat(
+        self,
+        feature: str,
+        *,
+        source: str = "var",
+        layer: str | None = None,
+        memory_budget_bytes: int | str = _DEFAULT_CHUNK_BUDGET,
+    ) -> SpatialExplanation:
+        """Explain one feature's observed Q as per-observation contributions.
+
+        Uses the same kernel configs and feature preparation as compute_qstat,
+        but does not require existing Q/R computation.
+        Returns a :class:`sonic.explanation.SpatialExplanation` with original
+        values, kernel responses and contributions summing to Q.
+
+        ``source`` ('var' or numeric 'obs') and ``layer`` follow DetectorIrregular;
+        DetectorGrid uses its setup-time raster and accepts only source='var',
+        layer=None. Categorical obs columns must first be encoded as individual
+        numeric columns so a call identifies exactly one feature.
+        ``memory_budget_bytes`` bounds estimated workspace and returned arrays.
+        Only the requested feature is densified.
+        """
+        self._require_setup()
+        if not isinstance(feature, str):
+            raise TypeError("feature must be a single feature name.")
+        return self._explain_statistic((feature,), "Q", source, layer, memory_budget_bytes)
+
+    def explain_rstat(
+        self,
+        feature_x: str,
+        feature_y: str,
+        *,
+        source: str = "var",
+        layer: str | None = None,
+        memory_budget_bytes: int | str = _DEFAULT_CHUNK_BUDGET,
+    ) -> SpatialExplanation:
+        """Explain one pair's observed R with a symmetric spatial allocation.
+
+        Contributions are (z_x * Kz_y + z_y * Kz_x) / 2 and sum to R.
+        Requires a symmetric real kernel; reconstruction is checked before
+        returning. Self-pairs are allowed.
+        Selection, memory and result conventions follow :meth:`explain_qstat`.
+        """
+        self._require_setup()
+        if not isinstance(feature_x, str) or not isinstance(feature_y, str):
+            raise TypeError("feature_x and feature_y must be single feature names.")
+        return self._explain_statistic(
+            (feature_x, feature_y), "R", source, layer, memory_budget_bytes
+        )
+
+    def _explain_statistic(self, features, statistic, source, layer, memory_budget_bytes):
+        """Prepare backend-specific observations and apply the fitted operator."""
+        raise NotImplementedError(f"{type(self).__name__} does not implement explanation maps.")
+
     def _require_setup(self) -> None:
         """Raise if :meth:`setup_data` has not been called."""
         if not self._data_ready or self.kernel_ is None:

@@ -6,7 +6,38 @@ import numpy as np
 import pytest
 
 from sonic.kernels.fft import power_spectrum_2d
-from sonic.kernels.nufft import power_spectrum_2d_nufft
+from sonic.kernels.nufft import _fourier_coefficients_2d_nufft, power_spectrum_2d_nufft
+
+
+def test_trace_probe_batches_include_fourier_grid(monkeypatch):
+    from sonic import statistics
+    from sonic.kernels import NUFFTKernel
+
+    rng = np.random.default_rng(41)
+    shape = (32, 64)
+    kernel = NUFFTKernel(rng.uniform(0, 32, (64, 2)), shape, (1, 1), bandwidth=2.0, eps=1e-12)
+    reference = statistics._estimate_kernel_traces(
+        kernel, n_probes=7, centered=True, use_analytic_traces=False
+    )
+    # Two high-precision transforms share the native grid on this one-thread kernel.
+    monkeypatch.setattr(statistics, "_TRACE_PROBE_BUDGET_BYTES", 340 * 1024)
+    apply = kernel.Kx
+    widths = []
+
+    def observe(values):
+        widths.append(values.shape[1])
+        return apply(values)
+
+    monkeypatch.setattr(kernel, "Kx", observe)
+    actual = statistics._estimate_kernel_traces(
+        kernel, n_probes=7, centered=True, use_analytic_traces=False
+    )
+    assert max(widths) == 2
+    for order in (2, 3, 4):
+        np.testing.assert_allclose(
+            actual["powers"][order] * actual["scale"] ** order,
+            reference["powers"][order] * reference["scale"] ** order,
+        )
 
 
 @pytest.mark.parametrize("bandwidth", [100.0, 1e5])
@@ -38,8 +69,11 @@ class TestNufftMatchesFft:
     @pytest.mark.parametrize("shape", [(8, 10), (7, 9), (8, 9)])
     @pytest.mark.parametrize("n_features", [None, 1, 3])
     @pytest.mark.parametrize("center_coords", [False, True])
-    def test_native_fft_order_matches_direct_transform(self, shape, n_features, center_coords):
-        """Check mode ordering, shapes, strided inputs, and input immutability."""
+    @pytest.mark.parametrize("padding", [0, 1])
+    def test_native_fft_order_matches_direct_transform(
+        self, shape, n_features, center_coords, padding
+    ):
+        """Check complex phase, mode ordering, padding, and input immutability."""
         rng = np.random.default_rng(83)
         coords = rng.uniform(-3, 3, size=(23, 2))
         values = rng.normal(size=(23, 6))[:, ::2]
@@ -59,18 +93,37 @@ class TestNufftMatchesFft:
             unit_scale=unit_scale,
             center_coords=center_coords,
             eps=1e-12,
+            frequency_padding=padding,
+        )
+        coefficients = _fourier_coefficients_2d_nufft(
+            coords,
+            values,
+            shape,
+            spacing,
+            unit_scale=unit_scale,
+            center_coords=center_coords,
+            eps=1e-12,
+            frequency_padding=padding,
         )
 
         points = coords * unit_scale
         if center_coords:
             points -= points.mean(axis=0)
         ky, kx = np.meshgrid(
-            np.fft.fftfreq(shape[0], d=spacing[0]),
-            np.fft.fftfreq(shape[1], d=spacing[1]),
+            np.fft.fftfreq(shape[0] + 2 * padding)
+            * (shape[0] + 2 * padding)
+            / (shape[0] * spacing[0]),
+            np.fft.fftfreq(shape[1] + 2 * padding)
+            * (shape[1] + 2 * padding)
+            / (shape[1] * spacing[1]),
             indexing="ij",
         )
         phase = ky[..., None] * points[:, 0] + kx[..., None] * points[:, 1]
-        expected = np.abs(np.exp(-2j * np.pi * phase) @ values) ** 2
+        expected_coefficients = np.exp(-2j * np.pi * phase) @ values
+        expected = np.abs(expected_coefficients) ** 2
+        assert coefficients.shape == expected_coefficients.shape
+        assert coefficients.dtype == np.complex128
+        np.testing.assert_allclose(coefficients, expected_coefficients, rtol=1e-9, atol=1e-9)
         assert actual.shape == expected.shape
         assert actual.dtype == np.float64
         np.testing.assert_allclose(actual, expected, rtol=1e-9, atol=1e-9)
@@ -574,9 +627,9 @@ class TestNUFFTTwoPathsAgree:
             x = rng.standard_normal(ny * nx)
             Q_a = k.xtKx(x)
             Q_b = k.xtKx_matmul(x)
-            assert (
-                abs(Q_a - Q_b) / max(abs(Q_a), 1e-30) < 1e-8
-            ), f"seed={seed}: Q_a={Q_a:.6e}, Q_b={Q_b:.6e}"
+            assert abs(Q_a - Q_b) / max(abs(Q_a), 1e-30) < 1e-8, (
+                f"seed={seed}: Q_a={Q_a:.6e}, Q_b={Q_b:.6e}"
+            )
 
     def test_trace_takes_no_kwargs(self):
         """``NUFFTKernel.trace`` / ``square_trace`` are closed-form on the

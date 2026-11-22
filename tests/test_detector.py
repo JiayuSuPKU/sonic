@@ -16,6 +16,50 @@ from sonic.detectors.irregular import DetectorIrregular
 from sonic.statistics import spatial_r_test
 
 
+def test_backed_nufft_qstat_preserves_reordered_and_duplicate_features(tmp_path):
+    rng = np.random.default_rng(27)
+    data = anndata.AnnData(rng.uniform(0, 1, (40, 3)))
+    data.var_names = ["a", "b", "c"]
+    data.obsm["spatial"] = rng.uniform(0, 8, (40, 2))
+    path = tmp_path / "expression.h5ad"
+    data.write_h5ad(path)
+
+    def qstat(sample, features):
+        detector = DetectorIrregular(backend="nufft", grid_shape=(8, 8), spacing=(1, 1))
+        return detector.setup_data(sample).compute_qstat(
+            features=features, return_pval=False, show_progress=False, n_jobs=1, workers=1
+        )
+
+    backed = anndata.read_h5ad(path, backed="r")
+    try:
+        actual = qstat(backed, ["c", "a", "c"])
+    finally:
+        backed.file.close()
+    assert sorted(actual.Feature) == ["a", "c", "c"]
+    expected = qstat(data, ["a", "c"]).set_index("Feature").Q
+    np.testing.assert_allclose(actual.Q, expected.loc[actual.Feature])
+
+
+def test_nufft_named_features_reject_ambiguity_and_skip_missing(caplog):
+    rng = np.random.default_rng(31)
+    data = anndata.AnnData(rng.normal(size=(40, 3)))
+    data.var_names = ["dup", "unique", "dup"]
+    data.obsm["spatial"] = rng.uniform(0, 8, (40, 2))
+    detector = DetectorIrregular(backend="nufft", grid_shape=(8, 8), spacing=(1, 1)).setup_data(
+        data
+    )
+    options = {"n_jobs": 1, "workers": 1, "return_pval": False, "show_progress": False}
+    expected = detector.compute_qstat(**options)
+    result = detector.compute_qstat(features=["missing", "unique", "unique"], **options)
+    assert result.Feature.tolist() == ["unique", "unique"]
+    np.testing.assert_allclose(result.Q, expected.loc[expected.Feature == "unique", "Q"].item())
+    assert "Requested features not in adata.var_names: ['missing']" in caplog.text
+    with pytest.raises(ValueError, match="Ambiguous feature names.*dup"):
+        detector.compute_qstat(features=["dup"], **options)
+    with pytest.raises(ValueError, match="Ambiguous feature names.*dup"):
+        detector.explain_qstat("dup")
+
+
 def test_dense_float32_detector_matches_identical_float64_values():
     rng = np.random.default_rng(166)
     coords = rng.uniform(0, 10, (256, 2))

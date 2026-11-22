@@ -7,6 +7,63 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- `compute_cross_spectra(pairs)` computes spectra for selected gene pairs
+  on regular grids or at irregular coordinates. The fitted `cross_spectra_`
+  stores the cross-spectra and matching gene powers in radial or aligned
+  directional frequency bins.
+- `test_cross_diff_freq()` compares spatial coupling between two groups or
+  tests a linear contrast with covariates. The default, `representation="coherence"`,
+  tests coupling strength using the log of squared-magnitude coherency. Use
+  `representation="coherency"` to test signed, in-phase alignment. Each pair
+  uses samples where both genes are present and bins with valid coherency across
+  those samples. P-values are adjusted across tested pairs.
+- All four spectral tests report signed effects in `Estimate_per_bin`.
+  For two groups, the effect is the first sorted group's mean minus the second's.
+  For a linear model, the sign follows the specified contrast.
+  The binwise tests (`log_t_cauchy` for genes and `t_cauchy` for pairs) combine
+  two-sided p-values with optional frequency weights. They report `T_per_bin`,
+  `P_value_per_bin`, and `Best_bin`, the index of the contributing bin with
+  the smallest unadjusted p-value.
+- Detector methods `explain_qstat()` and `explain_rstat()` map each location's
+  contribution to a gene's Q score or a pair's R score. The signed contributions
+  sum to the observed score.
+- The comparator method `explain_spectrum()` maps selected frequency bins in
+  one sample. It supports gene power and power share, and a pair's real
+  cross-spectrum, coherence, or real coherency. Each map sums to its bin value.
+  Both sets of methods return a `SpatialExplanation`. Use `select_regions()`
+  to rank nonoverlapping windows by their summed contributions
+  and `plot()` to view expression, filtered values, and contributions.
+
+### Changed
+- DF, DF-norm, coherence, and coherency L2 tests now default to deterministic
+  rotation. P-values and BH calls can change. For Gaussian plug-in calibration,
+  replace `null="analytic"` with `null="plugin"` in L2 calls. Covariance defaults
+  to per gene for DF and DF-norm and per pair for cross-spectrum tests. Use
+  `null="plugin", covariance="pooled"` for the previous pooled calibration method.
+  Under plug-in calibration, a nonzero DF contrast with numerically zero covariance
+  now returns a NaN p-value. Binwise t-Cauchy tests use `null="analytic"`.
+- Rotation results report `P_value_method` and `P_value_error`. The method marks
+  saddlepoint approximations when Davies integration cannot resolve the tail.
+  Binary wheels include the Davies integrator. Source and editable installs
+  require a C compiler.
+- Recomputing `feature_mode="2d"` spectra can change results because each
+  polar bin now uses its area-weighted sector mean in place of the value at its center.
+- L2 and t-Cauchy comparisons require finite, strictly positive frequency weights.
+  Binary L2 requires at least `min_samples_per_group` observations per group
+  (default 2), including complete data.
+- Replace `statistic="welch_t_cauchy"` with `"log_t_cauchy"` for binwise DF tests.
+  Binary tests now compare mean log power instead of mean raw power, or mean
+  log power share for DF-norm. GLMs use the specified contrast on that scale.
+  Rerun the analysis when migrating because bin estimates and p-values can change.
+
+### Fixed
+- DF and DF-norm reject negative or nonfinite observed powers before logging or
+  shape normalization. Samples marked absent for a feature are excluded from
+  its comparison.
+- GLM fits preserve the intercept across changes in timestamp units and reject
+  contrasts that the design cannot distinguish from other predictors.
+
 ## [1.0.0rc2] - 2026-10-07
 
 This release corrects spatial-test calibration and comparison numerics. Rerun

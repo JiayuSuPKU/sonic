@@ -10,6 +10,8 @@ permissions:
 jobs:
   build:
     runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.release.outputs.version }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -34,7 +36,7 @@ jobs:
             "dependencies = [\"sonic-spatial==${version}\"]" \
             compat/quadsv/pyproject.toml
           echo "version=$version" >> "$GITHUB_OUTPUT"
-      - run: python -m build
+      - run: python -m build --sdist
         env:
           SETUPTOOLS_SCM_PRETEND_VERSION: ${{ steps.release.outputs.version }}
       - run: python -m build compat/quadsv --outdir compat-dist
@@ -46,12 +48,9 @@ jobs:
           RELEASE_VERSION: ${{ steps.release.outputs.version }}
         run: |
           version="$RELEASE_VERSION"
-          sonic_wheel="dist/sonic_spatial-${version}-py3-none-any.whl"
           quadsv_wheel="compat-dist/quadsv-${version}-py3-none-any.whl"
-          test -f "$sonic_wheel"
+          test -f "dist/sonic_spatial-${version}.tar.gz"
           test -f "$quadsv_wheel"
-          unzip -Z1 "$sonic_wheel" | grep -qx 'sonic/__init__.py'
-          ! unzip -Z1 "$sonic_wheel" | grep -q '^quadsv/'
           unzip -Z1 "$quadsv_wheel" | grep -qx 'quadsv/__init__.py'
           unzip -p "$quadsv_wheel" 'quadsv-*.dist-info/METADATA' |
             grep -Fx "Requires-Dist: sonic-spatial==${version}"
@@ -64,8 +63,40 @@ jobs:
           name: quadsv-dist
           path: compat-dist/
 
-  publish-sonic:
+  build-wheels:
     needs: build
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-15-intel, macos-15]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: pypa/cibuildwheel@v3.3.0
+        env:
+          # Match the Python versions declared in pyproject.toml.
+          CIBW_BUILD: "cp3{10,11,12}-*"
+          CIBW_SKIP: "*-musllinux_*"
+          CIBW_ARCHS: native
+          SETUPTOOLS_SCM_PRETEND_VERSION: ${{ needs.build.outputs.version }}
+          CIBW_ENVIRONMENT_PASS_LINUX: SETUPTOOLS_SCM_PRETEND_VERSION
+          # Exercise the installed extension without the spatial-analysis dependencies.
+          CIBW_TEST_ENVIRONMENT: PIP_NO_DEPS=1
+          CIBW_TEST_COMMAND: >-
+            python -c "import sys; from importlib.metadata import distribution;
+            sys.path.insert(0, str(distribution('sonic-spatial').locate_file('sonic')));
+            import _davies; p, fault = _davies.sf([-3, -1, 0.2, 0.8, 2], 1e-6, 10000);
+            assert fault == 0 and abs(p - 0.449828725949695) <= 1e-6"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: sonic-wheels-${{ matrix.os }}
+          path: wheelhouse/*.whl
+          if-no-files-found: error
+
+  publish-sonic:
+    needs: [build, build-wheels]
     runs-on: ubuntu-latest
     environment: pypi
     permissions:
@@ -75,6 +106,43 @@ jobs:
         with:
           name: sonic-dist
           path: dist/
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: sonic-wheels-*
+          merge-multiple: true
+          path: dist/
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: python -m pip install twine
+      - name: Verify native wheels
+        env:
+          RELEASE_VERSION: ${{ needs.build.outputs.version }}
+        run: |
+          python -m twine check dist/*
+          python - <<'PY'
+          import os
+          from email.parser import BytesParser
+          from pathlib import Path
+          from zipfile import ZipFile
+
+          version = os.environ["RELEASE_VERSION"]
+          wheels = list(Path("dist").glob("*.whl"))
+          assert wheels, "No SONIC wheels were built"
+          for wheel in wheels:
+              assert wheel.name.startswith(f"sonic_spatial-{version}-"), wheel
+              assert not wheel.name.endswith("-none-any.whl"), wheel
+              assert "-linux_" not in wheel.name, "Linux wheels must be repaired to manylinux"
+              with ZipFile(wheel) as archive:
+                  names = archive.namelist()
+                  assert "sonic/__init__.py" in names, wheel
+                  assert not any(name.startswith("quadsv/") for name in names), wheel
+                  assert any(name.startswith("sonic/_davies.") and name.endswith((".so", ".pyd"))
+                             for name in names), wheel
+                  metadata = BytesParser().parsebytes(archive.read(
+                      next(name for name in names if name.endswith(".dist-info/METADATA"))))
+                  assert metadata["Version"] == version, wheel
+          PY
       - name: Publish SONIC
         uses: pypa/gh-action-pypi-publish@release/v1
         with:

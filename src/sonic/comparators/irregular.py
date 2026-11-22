@@ -1,7 +1,4 @@
-"""
-:class:`ComparatorIrregular` — cross-sample pattern comparison on a
-list of :class:`anndata.AnnData` (irregular spots, NUFFT backend).
-"""
+"""Compare spectra from irregular locations stored in :class:`anndata.AnnData`."""
 
 from __future__ import annotations
 
@@ -15,18 +12,14 @@ import scipy.sparse as sp
 
 from sonic.comparators.base import (
     _ComparatorBase,
-    _run_per_sample,
-    _unpack_sample_triples,
     _validate_common,
 )
-from sonic.comparators.features import (
-    estimate_rotations_from_landmarks,
-    radial_bin_spectrum,
-    stream_geomean_landmark,
-    stream_polar_features,
-    stream_radial_features,
+from sonic.comparators.binning import (
+    _bin_radial_spectrum,
+    _stream_polar_features,
 )
-from sonic.utils import _NUFFT_CHUNK_CAP
+from sonic.comparators.features import _center_observations
+from sonic.utils import _NUFFT_CHUNK_CAP, _gene_indices, _take_feature_columns
 
 __all__ = ["ComparatorIrregular"]
 
@@ -39,101 +32,55 @@ logger = logging.getLogger(__name__)
 
 
 class ComparatorIrregular(_ComparatorBase):
-    """
-    Cross-sample pattern comparison on irregular spots via NUFFT.
+    """Compare spatial power spectra at irregular sample coordinates.
 
-    Accepts a list of :class:`anndata.AnnData` (one per sample). For each
-    sample, the per-sample ``obsm[obsm_key]`` supplies the irregular
-    ``(y, x)`` coordinates and ``.X`` (or ``.layers[layer]`` when set) is the
-    expression matrix. Spectra are evaluated with a batched type-1 NUFFT
-    (``finufft.nufft2d1``), densifying at most :attr:`nufft_chunk_size`
-    columns of ``.X`` at a time so the full slab is never materialized.
+    See :doc:`/comparator_api` for methods and return values.
 
     Parameters
     ----------
-    samples : sequence of :class:`anndata.AnnData`
+    samples : sequence of anndata.AnnData
+        One object per sample. Each expression matrix has locations in rows
+        and genes in columns.
     gene_names : sequence of str, optional
-        If None, inferred from the first sample; every other sample must share
-        the same ``var_names``.
+        Gene names in input column order. By default, use the first sample's
+        ``var_names``. All samples must have the same names in the same order.
     feature_mode : {'radial', '2d'}, default 'radial'
+        Radial bins average power over directions at each spatial scale.
+        Use ``'2d'`` to retain direction after aligning the sample spectra.
     n_radial_bins : int, default 30
-        Number of radial frequency intervals used when ``freq_edges`` is not
-        supplied. Radial mode excludes only the DC cell from the first interval,
-        so the automatic radial feature count is ``n_radial_bins``.
+        Number of requested radial intervals when ``freq_edges`` is omitted.
     n_theta_bins : int, default 36
-        Number of angular bins on the half-plane ``[0, π)`` for
-        ``feature_mode='2d'``. Ignored by radial mode. The 2D feature
-        count is ``n_radius_bins * n_theta_bins``, where
-        ``n_radius_bins = len(freq_edges) - 1`` (or ``n_radial_bins`` when
-        edges are auto-generated).
-    obsm_key : str, default 'spatial'. Key for the spatial coordinates in ``obsm``.
+        Number of angular intervals over a half turn for ``feature_mode='2d'``.
+    obsm_key : str, default 'spatial'
+        Key in ``obsm`` for the two spatial coordinates per location.
     layer : str, optional
+        Expression layer in each sample. The default uses ``X``.
     unit_scales : sequence of float, optional
-        Per-sample multiplier applied to coords before NUFFT (e.g. pixels→μm).
-    grid_shape, spacing : optional
-        Internal NUFFT k-grid definition. Each argument may be a single pair
-        applied to every sample — ``grid_shape=(ny, nx)`` and
-        ``spacing=(dy, dx)`` — or a per-sample sequence of pairs of length
-        ``n_samples``. ``spacing`` is in the same physical units as
-        ``coords * unit_scale`` and sets the frequency unit used downstream
-        (for example cycles/μm when coordinates are scaled to μm).
-
-        Manual grid control is used only when **both** ``grid_shape`` and
-        ``spacing`` are supplied. If either is omitted, both values are
-        auto-inferred independently for each sample from its unit-scaled
-        coordinates with :func:`sonic.kernels.nufft._infer_grid_from_coords`.
-
-        These values define each sample's raw NUFFT lattice; they do not by
-        themselves choose the comparison bins. Unless ``freq_edges`` is given,
-        :meth:`compute_spectra` builds one shared physical-frequency bin grid
-        from all resolved spacings: edges span ``[0, min Nyquist]``, where each
-        sample's Nyquist is ``1 / (2 * max(dy, dx))``. Radial features bin each
-        sample's spectrum onto those shared edges; ``feature_mode='2d'`` uses
-        the same edges as the polar radius grid after rotation alignment.
-        The 2D path evaluates one extra Fourier mode on each side of both axes
-        for interpolation at the Nyquist boundary. This preserves the original
-        physical frequencies without periodically wrapping off-grid spectra.
+        One coordinate multiplier per sample to convert to common physical units.
+    grid_shape : pair of ints or sequence of pairs, optional
+        Grid height and width for the nonuniform Fourier transform (NUFFT).
+        Supply both ``grid_shape`` and ``spacing`` for a manual grid. Otherwise,
+        SONIC infers both from each sample's coordinates.
+    spacing : pair of floats or sequence of pairs, optional
+        Grid spacing in the scaled coordinate units, in ``(dy, dx)`` order.
+        For both grid options, supply one pair for all samples or one per sample.
     freq_edges : np.ndarray, optional
-        Explicit shared radial-frequency bin edges. When supplied, these edges
-        are used as-is for all samples and override the automatic
-        ``[0, min Nyquist]`` construction. Edges must be in the same units as
-        ``spacing``. With the default DC exclusion, only the zero-frequency cell
-        is removed before bin averaging, so radial output has
-        ``len(freq_edges) - 1`` columns; automatic edges produce
-        ``n_radial_bins`` radial columns. In ``feature_mode='2d'``, the number
-        of radius bins is ``len(freq_edges) - 1`` and the feature axis has
-        ``(len(freq_edges) - 1) * n_theta_bins`` columns.
+        Shared radial bin edges in cycles per spatial unit. The automatic edges
+        cover the frequency range common to all samples.
     adaptive_freq_edges : bool, default False
-        If True, collapse radial bins that are empty for any sample's Fourier
-        grid by merging each empty bin into its right neighbour. Otherwise,
-        empty bins will be dropped across all samples. Regardless of the setting,
-        the retained final bins will always have support in every sample.
-        The fitted comparator records per-sample bin occupancy for the original
-        requested grid in ``frequency_bin_counts_``,
-        the pre-adaptation edge grid in ``freq_edges_requested_``, and
-        feature-axis-aligned intervals in ``frequency_bin_intervals_``.
+        Merge adjacent radial intervals when a sample lacks frequency support.
+        By default, omit unsupported radial intervals. The retained intervals
+        are available in ``frequency_bin_intervals_``.
     eps : float, default 1e-6
-        NUFFT tolerance.
+        Requested NUFFT accuracy.
     presence_threshold : float, default 0.0
-        Minimum fraction of non-zero spots for a gene to count as "observed"
-        in a sample (feeds :attr:`presence_` and, transitively, the masked
-        pattern test).
+        Minimum fraction of spots with nonzero expression for a gene
+        to count as present in a sample.
     nufft_chunk_size : int or 'auto', default 'auto'
-        Number of genes per batched NUFFT call. Automatic batches are capped
-        at 32 features and share the estimated workspace across sample jobs.
-        ``'auto'`` sizes the chunk from the per-sample k-grid shapes via
-        :func:`sonic.utils.resolve_chunk_size` — the NUFFT cache
-        cap (32) is reduced further by the live-memory budget.
+        Genes per transform block. The automatic size uses the memory budget.
     workers : int, 'auto', or None, default 'auto'
-        FINUFFT threads per sample job. Automatic threads use spare CPUs,
-        capped at four; ``None`` selects one.
-
-    Notes
-    -----
-    The comparator carries no design / contrast state — supply the
-    cross-sample contrast directly to :meth:`test_diff_freq` /
-    :meth:`test_diff_expr`. A single fitted comparator can therefore
-    serve any number of unrelated comparisons on the same spectra.
+        Threads per sample for the NUFFT. Use ``None`` for one thread or
+        ``'auto'`` to share available CPUs with concurrent sample jobs.
     """
 
     # NUFFT cache sweet-spot cap for nufft_chunk_size='auto' (utils.auto_chunk_size).
@@ -230,8 +177,7 @@ class ComparatorIrregular(_ComparatorBase):
         for i, ad_s in enumerate(samples_list):
             if obsm_key not in ad_s.obsm:
                 raise KeyError(
-                    f"sample {i} has no obsm['{obsm_key}']; "
-                    f"available: {list(ad_s.obsm.keys())}."
+                    f"sample {i} has no obsm['{obsm_key}']; available: {list(ad_s.obsm.keys())}."
                 )
             c = np.asarray(ad_s.obsm[obsm_key], dtype=np.float64)
             if c.ndim != 2 or c.shape[1] != 2:
@@ -248,223 +194,78 @@ class ComparatorIrregular(_ComparatorBase):
         self._grid_shapes = grids
         self._spacings = spacings
 
-    def _nufft_spectrum_chunker(self, i: int, *, frequency_padding: int = 0):
-        """Build ``(spectrum_chunk_fn, dc, presence, n_genes, grid)`` for sample ``i``.
+    def _feature_reader(self, i, columns, chunk_size, cache_budget):
+        """Read writable float blocks and optionally index repeated CSR reads by column."""
+        sample = self.samples[i]
+        matrix = sample.X if self._layer is None else sample.layers[self._layer]
+        cache_bytes = 0
+        if sp.issparse(matrix) and matrix.format == "csr" and len(columns) > chunk_size:
+            rows, cols = matrix.shape
+            index_bytes = matrix.indices.itemsize
+            entry_bytes = index_bytes + matrix.dtype.itemsize
+            if len(columns) >= cols:
+                needed = matrix.nnz * entry_bytes + (cols + 1) * index_bytes
+                if needed <= cache_budget:
+                    matrix = matrix.tocsc()
+                    cache_bytes = needed
+            elif matrix.has_canonical_format:
+                # Allow the selected CSR and CSC to coexist during conversion.
+                entries = (
+                    min(matrix.nnz, rows * len(columns))
+                    if np.all(np.diff(columns) > 0)
+                    else rows * len(columns)
+                )
+                needed = 2 * entries * entry_bytes + (rows + cols + len(columns) + 3) * index_bytes
+                if needed <= cache_budget:
+                    matrix = matrix[:, columns].tocsc()
+                    columns = np.arange(len(columns))
+                    cache_bytes = matrix.data.nbytes + matrix.indices.nbytes + matrix.indptr.nbytes
 
-        ``spectrum_chunk_fn(start, stop)`` mean-centres + NUFFTs just that
-        gene-chunk to its ``(stop-start, ny, nx)`` power spectrum, filling the
-        shared ``dc`` / ``presence`` arrays on the way. The dense
-        ``(n_genes, ny, nx)`` spectrum is never assembled by the caller.
-        With ``frequency_padding=1``, each chunk includes an evaluated border
-        of Fourier modes for polar interpolation; the returned grid is unpadded.
-        """
+        def read(block):
+            values = _take_feature_columns(matrix, columns[block])
+            if sp.issparse(values):
+                return values.toarray().astype(float, copy=False)
+            return np.array(values, dtype=float, copy=True)
+
+        return read, cache_bytes
+
+    def _sample_spectrum_chunker(self, i: int, *, chunk_size, cache_budget, gene_indices=None):
+        """Stream selected genes' powers, collecting DC/presence only for each batch."""
         from sonic.kernels.nufft import power_spectrum_2d_nufft
 
-        adata = self.samples[i]
-        pts = self._coords[i]
-        scale = self._unit_scales[i]
+        columns = (
+            np.arange(len(self.gene_names)) if gene_indices is None else np.asarray(gene_indices)
+        )
+        read, _ = self._feature_reader(i, columns, chunk_size, cache_budget)
+        n_genes = len(columns)
+        n_spots = len(self._coords[i])
         grid_i = self._grid_shapes[i]
-        spacing_i = self._spacings[i]
-        X_src = adata.X if self._layer is None else adata.layers[self._layer]
-        n_genes = len(self.gene_names)
-        n_spots = X_src.shape[0]
-
-        if sp.issparse(X_src):
-            X_src = X_src.astype(np.float64, copy=False)
-            dc = np.asarray(X_src.mean(axis=0)).ravel()
-            nnz_per = np.asarray((X_src != 0).sum(axis=0)).ravel()
-            X_csc = X_src.tocsc()
-            X_dense = None
-        else:
-            X_dense = np.asarray(X_src, dtype=np.float64)
-            dc = X_dense.mean(axis=0)
-            nnz_per = (X_dense != 0).sum(axis=0)
-            X_csc = None
-        presence = (nnz_per / max(n_spots, 1)) >= self._presence_threshold
+        dc = np.empty(n_genes, dtype=float)
+        presence = np.empty(n_genes, dtype=bool)
+        padding = int(self.feature_mode == "2d")
 
         def _spec_chunk(start: int, stop: int) -> np.ndarray:
-            cols = slice(start, stop)
-            if X_csc is not None:
-                block = np.asarray(X_csc[:, cols].toarray(), dtype=np.float64)
-            else:
-                block = X_dense[:, cols].astype(np.float64, copy=True)
-            # Per-gene mean centering removes the DC bin and prevents per-sample
-            # mean-shift leakage into low-frequency bins. Raw DC scalars are kept
-            # on ``self.dc_`` for the complementary :meth:`test_diff_expr` path.
-            block -= dc[None, cols]
-            p_chunk = power_spectrum_2d_nufft(
-                pts,
+            block = read(slice(start, stop))
+            dc[start:stop] = block.mean(axis=0)
+            presence[start:stop] = (
+                np.count_nonzero(block, axis=0) / max(n_spots, 1)
+            ) >= self._presence_threshold
+            _center_observations(block)
+            power = power_spectrum_2d_nufft(
+                self._coords[i],
                 block,
                 grid_shape=grid_i,
-                spacing=spacing_i,
-                unit_scale=scale,
+                spacing=self._spacings[i],
+                unit_scale=self._unit_scales[i],
                 eps=self._nufft_eps,
                 nthreads=self._workers,
                 center_coords=True,
-                frequency_padding=frequency_padding,
+                frequency_padding=padding,
             )
-            p_chunk /= n_spots**2
-            return np.moveaxis(p_chunk, -1, 0)  # (chunk, ny, nx)
+            power /= n_spots**2
+            return np.moveaxis(power, -1, 0)
 
         return _spec_chunk, dc, presence, n_genes, grid_i
-
-    def _compute_spectra(  # noqa: C901 — radial-stream / 2d two-pass dispatch
-        self,
-        n_jobs: int,
-        progress: bool,
-        landmark_genes: Sequence[str] | None = None,
-    ) -> tuple[list[np.ndarray], np.ndarray, np.ndarray]:
-        padding = 1 if self.feature_mode == "2d" else 0
-        work_grids = [(ny + 2 * padding, nx + 2 * padding) for ny, nx in self._grid_shapes]
-        n_jobs, self._nufft_chunk_size = self._resolve_spectrum_schedule(
-            self._nufft_chunk_size_spec, work_grids, n_jobs=n_jobs
-        )
-        chunk_size = self._nufft_chunk_size
-        n_samples_total = len(self.samples)
-        self._resolve_freq_edges()
-
-        if self.feature_mode != "radial":
-            return self._compute_spectra_2d(n_jobs, progress, landmark_genes)
-
-        # Per-sample parallelism helper
-        def _one(i: int, pbar: Any = None) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-            spec_chunk_fn, dc, presence, n_genes, grid_i = self._nufft_spectrum_chunker(i)
-            spacing_i = self._spacings[i]
-            # Within each sample, compute the radial spectrum sequentially, chunk by chunk
-            feat = stream_radial_features(
-                spec_chunk_fn,
-                n_genes,
-                grid_i,
-                chunk_size=chunk_size,
-                fft_solver=self._spectrum_fft_solver,
-                spacing=spacing_i,
-                # Shared edges were resolved at the top of this backend dispatcher.
-                edges=self.freq_edges,
-                pbar=pbar,
-            )
-            return feat, dc, presence
-
-        return _unpack_sample_triples(
-            _run_per_sample(
-                _one,
-                n_samples_total,
-                n_chunks_per_sample=int(np.ceil(len(self.gene_names) / chunk_size)),
-                desc="NUFFT spectra (per-gene chunks)",
-                n_jobs=n_jobs,
-                progress=progress,
-            )
-        )
-
-    def _compute_spectra_2d(  # noqa: C901 — two-pass landmark/feature worker setup
-        self,
-        n_jobs: int,
-        progress: bool,
-        landmark_genes: Sequence[str] | None,
-    ) -> tuple[list[np.ndarray], np.ndarray, np.ndarray]:
-        """Two-pass streamed rotation alignment (mirrors ``ComparatorGrid``)."""
-        chunk_size = self._nufft_chunk_size
-        n_samples = len(self.samples)
-        name_to_idx = {g: j for j, g in enumerate(self.gene_names)}
-        lm_idx: np.ndarray | None = None
-        if landmark_genes is not None:
-            missing = [g for g in landmark_genes if g not in name_to_idx]
-            if missing:
-                raise KeyError(f"landmark_genes not in gene_names: {missing}")
-            lm_idx = np.asarray([name_to_idx[g] for g in landmark_genes], dtype=int)
-        # Cache explicit landmark spectra only within budget; else warn + use a
-        # single streamed geometric-mean of the landmark genes.
-        cache_landmarks = lm_idx is not None and self._landmark_cache_fits(
-            len(lm_idx), frequency_padding=1
-        )
-
-        # Pass A: landmark + dc/presence per sample.
-        grids = list(self._grid_shapes)
-
-        # Per-sample parallelism helper for landmark spectra
-        def _landmark_one(i: int, pbar: Any = None) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-            spec_chunk_fn, dc, presence, n_genes, grid_i = self._nufft_spectrum_chunker(
-                i, frequency_padding=1
-            )
-            if lm_idx is None:
-                lm = stream_geomean_landmark(
-                    spec_chunk_fn, n_genes, grid_i, chunk_size=chunk_size, pbar=pbar
-                )
-            else:
-                if cache_landmarks:
-                    parts = []
-                    for j in lm_idx:
-                        parts.append(spec_chunk_fn(int(j), int(j) + 1))
-                        if pbar is not None:
-                            pbar.update(1)
-                    lm = np.concatenate(parts, axis=0)
-                else:
-                    lm = stream_geomean_landmark(
-                        spec_chunk_fn,
-                        n_genes,
-                        grid_i,
-                        chunk_size=chunk_size,
-                        gene_subset=lm_idx,
-                        pbar=pbar,
-                    )
-            return lm, dc, presence
-
-        if lm_idx is None:
-            n_pass_a_chunks = int(np.ceil(len(self.gene_names) / chunk_size))
-        elif cache_landmarks:
-            n_pass_a_chunks = int(len(lm_idx))
-        else:
-            n_pass_a_chunks = int(np.ceil(len(lm_idx) / chunk_size))
-        landmarks, dc, presence = _unpack_sample_triples(
-            _run_per_sample(
-                _landmark_one,
-                n_samples,
-                n_chunks_per_sample=max(1, n_pass_a_chunks),
-                desc="NUFFT 2D landmarks (per-sample chunks)",
-                n_jobs=n_jobs,
-                progress=progress,
-            )
-        )
-
-        angles = estimate_rotations_from_landmarks(
-            landmarks,
-            grids,
-            fft_solver=self._spectrum_fft_solver,
-            spacings=self._spacings,
-            progress=progress,
-            frequency_padding=1,
-        )
-        self.rotation_angles_ = angles
-
-        # Pass B: re-stream, rotate, physical-frequency polar resample.
-        # Per-sample parallelism helper for feature spectra (binned)
-        def _feature_one(i: int, pbar: Any = None) -> np.ndarray:
-            spec_chunk_fn, _dc, _pres, n_genes, grid_i = self._nufft_spectrum_chunker(
-                i, frequency_padding=1
-            )
-            return stream_polar_features(
-                spec_chunk_fn,
-                n_genes,
-                grid_i,
-                float(angles[i]),
-                chunk_size=chunk_size,
-                # Shared edges were resolved at the top of this backend dispatcher.
-                freq_edges=self.freq_edges,
-                spacing=self._spacings[i],
-                n_theta=self._n_theta_bins,
-                fft_solver=self._spectrum_fft_solver,
-                pbar=pbar,
-                frequency_padding=1,
-            )
-
-        feats = _run_per_sample(
-            _feature_one,
-            n_samples,
-            n_chunks_per_sample=int(np.ceil(len(self.gene_names) / chunk_size)),
-            desc="NUFFT 2D features (per-sample chunks)",
-            n_jobs=n_jobs,
-            progress=progress,
-        )
-        return [np.asarray(f) for f in feats], dc, presence
 
     # ------------------------------------------------------------------
     def _covariate_features_from_keys(  # noqa: C901 — per-key obs/var dispatch + per-sample loop
@@ -497,8 +298,8 @@ class ComparatorIrregular(_ComparatorBase):
             ``adata.var_names`` in any sample, or if a key resolves to
             different sources across samples.
         ValueError
-            If an obs column cannot be cast to float (e.g., string
-            categoricals — encode them first).
+            If a requested gene name is ambiguous or an obs column cannot
+            be cast to float (e.g., string categoricals).
         """
         from sonic.kernels.nufft import power_spectrum_2d_nufft
 
@@ -519,8 +320,21 @@ class ComparatorIrregular(_ComparatorBase):
                 )
             sources[k] = "obs" if in_obs else "var"
 
+        gene_keys = [k for k in sources if sources[k] == "var"]
         out: list[np.ndarray] = []
         for i, adata in enumerate(self.samples):
+            if gene_keys:
+                for k in gene_keys:
+                    if k not in adata.var_names:
+                        raise KeyError(
+                            f"sample {i} resolves covariate {k!r} differently from "
+                            f"sample 0 (sample 0 → var_names, sample {i} → not in var_names)."
+                        )
+                matrix = adata.X if self._layer is None else adata.layers[self._layer]
+                values = _take_feature_columns(matrix, _gene_indices(adata.var_names, gene_keys))
+                if sp.issparse(values):
+                    values = values.toarray()
+                genes = dict(zip(gene_keys, values.T, strict=True))
             cols: list[np.ndarray] = []
             for k in keys:
                 src = sources[k]
@@ -537,20 +351,9 @@ class ComparatorIrregular(_ComparatorBase):
                             f"sample {i} obs[{k!r}] cannot be cast to float "
                             f"({type(exc).__name__}); encode categoricals before passing."
                         ) from exc
-                else:  # var_names path
-                    if k not in adata.var_names:
-                        raise KeyError(
-                            f"sample {i} resolves covariate {k!r} differently from "
-                            f"sample 0 (sample 0 → var_names, sample {i} → not in "
-                            "var_names)."
-                        )
-                    idx = adata.var_names.get_loc(k)
-                    X_src = adata.X if self._layer is None else adata.layers[self._layer]
-                    col = X_src[:, idx]
-                    if sp.issparse(col):
-                        col = col.toarray()
-                    cols.append(np.asarray(col, dtype=np.float64).ravel())
-            block = np.column_stack(cols)  # (n_obs, n_cov)
+                else:
+                    cols.append(genes[k])
+            block = np.asarray(np.column_stack(cols), dtype=np.float64)  # (n_obs, n_cov)
             # Mean-centre each column, matching the gene panel's per-column DC removal.
             block = block - block.mean(axis=0, keepdims=True)
 
@@ -570,7 +373,7 @@ class ComparatorIrregular(_ComparatorBase):
             cov_2d = np.moveaxis(p, -1, 0)  # (n_cov, ny, nx)
             ny, nx = self._grid_shapes[i]
             if self.feature_mode == "radial":
-                cov_feat = radial_bin_spectrum(
+                cov_feat = _bin_radial_spectrum(
                     cov_2d,
                     grid_shape=(ny, nx),
                     n_bins=self._n_radial_bins,
@@ -586,13 +389,13 @@ class ComparatorIrregular(_ComparatorBase):
                 def _cov_chunk(start: int, stop: int, _cov_2d: np.ndarray = cov_2d) -> np.ndarray:
                     return _cov_2d[start:stop]
 
-                cov_feat = stream_polar_features(
+                cov_feat = _stream_polar_features(
                     _cov_chunk,
                     cov_2d.shape[0],
                     (ny, nx),
-                    angle,
+                    angle_deg=angle,
                     chunk_size=max(1, cov_2d.shape[0]),
-                    freq_edges=self.freq_edges,
+                    edges=self.freq_edges,
                     spacing=self._spacings[i],
                     n_theta=self._n_theta_bins,
                     fft_solver=self._spectrum_fft_solver,

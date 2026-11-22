@@ -114,7 +114,7 @@ intersphinx_mapping = {
     "scipy": ("https://docs.scipy.org/doc/scipy/", None),
     "pandas": ("https://pandas.pydata.org/docs/", None),
     "sphinx": ("https://www.sphinx-doc.org/en/master/", None),
-    "anndata": ("https://anndata.readthedocs.io/en/stable/", None),
+    "anndata": ("https://anndata.scverse.org/en/stable/", None),
     "spatialdata": ("https://spatialdata.scverse.org/en/latest/", None),
     "scanpy": ("https://scanpy.readthedocs.io/en/stable/", None),
 }

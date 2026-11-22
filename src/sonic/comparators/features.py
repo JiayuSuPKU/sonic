@@ -1,26 +1,5 @@
-"""Spectral feature construction and diagnostics for comparator backends.
-
-The comparator classes operate on per-sample 2-D power spectra before reducing
-them to cross-sample features. This module owns those array-level operations:
-
-- :func:`compute_sample_spectrum` builds mean-centered per-gene power spectra
-  and optionally returns the separated DC expression means.
-- :func:`radial_bin_spectrum` and :func:`stream_radial_features` collapse 2-D
-  spectra to rotation-invariant radial profiles.
-- :func:`adapt_frequency_edges` merges radial intervals until every sample's
-  FFT grid supports every retained interval.
-- :func:`estimate_rotations_from_landmarks` plus the polar streaming helpers
-  keep directional information for ``feature_mode="2d"`` while aligning sample
-  orientation.
-- :func:`power_spectrum_anisotropy` reports a compact second-angular-moment
-  diagnostic for raw 2-D spectra before radial collapse.
-- :func:`effective_rank` and :func:`gene_pattern_diversity` summarize how many
-  independent frequency directions contribute to observed pattern variation.
-
-All helpers are pure array transforms. Container handling, covariate lookup,
-and statistical tests live in the comparator backends and
-:mod:`sonic.comparators.multisample`.
-"""
+"""Compute spatial power spectra, align directional spectra, and measure variation
+across gene profiles. See :mod:`sonic.comparators.binning` for frequency bins."""
 
 from __future__ import annotations
 
@@ -30,30 +9,269 @@ from typing import Any
 import numpy as np
 import pandas as pd
 import scipy.ndimage
-from scipy.sparse import csr_matrix
 from tqdm.auto import tqdm
 
+from sonic.comparators.binning import (
+    _adapt_radial_edges,
+    _as_full_power_spectrum,
+    _bin_radial_spectrum,
+    _layout_frequency_grid,
+    _polar_bin_center_coords,
+    _radial_bin_cell_counts,
+    _resolve_power_layout,
+    _stream_polar_features,
+    _stream_radial_features,
+    _validate_grid_shape,
+    _validate_spacing,
+)
 from sonic.kernels.fft import power_spectrum_2d
 
 __all__ = [
-    "adapt_frequency_edges",
     "compute_sample_spectrum",
     "effective_rank",
     "gene_pattern_diversity",
     "power_spectrum_anisotropy",
-    "radial_bin_counts",
-    "radial_bin_spectrum",
-    "stream_radial_features",
     "stream_geomean_landmark",
-    "stream_polar_features",
     "estimate_rotations_from_landmarks",
     "apply_rotations_to_spectra",
     "align_spectra_by_rotation",
 ]
 
 
+# Compatibility imports from releases before binning became private.
+adapt_frequency_edges = _adapt_radial_edges
+
+
+def _shared_observation_mask(values: np.ndarray) -> np.ndarray:
+    """Return the observed raster locations shared by all requested features."""
+    observed = np.isfinite(values)
+    if np.isinf(values).any() or not np.all(observed == observed[:, :1]):
+        raise ValueError(
+            "FFT features require identical finite support; only shared NaN holes are allowed"
+        )
+    return observed[:, 0]
+
+
+def _center_observations(values: np.ndarray) -> None:
+    """Center an observed location-by-feature block in place, keeping constants exactly zero."""
+    values -= values[0]
+    values -= values.mean(axis=0)
+
+
+def radial_bin_spectrum(
+    spectrum: np.ndarray,
+    grid_shape: tuple[int, int],
+    n_bins: int = 30,
+    fft_solver: str = "rfft2",
+    exclude_dc: bool = True,
+    spacing: tuple[float, float] | None = None,
+    edges: np.ndarray | None = None,
+) -> np.ndarray:
+    """Average a power spectrum over radial frequency intervals (legacy API).
+
+    Parameters
+    ----------
+    spectrum : ndarray, shape (..., ny, n_kx)
+        Real power in native FFT order. Leading dimensions are preserved.
+    grid_shape : pair of int
+        Original spatial dimensions (ny, nx).
+    n_bins : int, default 30
+        Number of equal-width intervals when edges is omitted.
+    fft_solver : {'fft2', 'rfft2'}, default 'rfft2'
+        Input layout; n_kx is nx or nx // 2 + 1. Implicit rfft2 cells receive
+        their full-spectrum multiplicity.
+    exclude_dc : bool, default True
+        Exclude the zero-frequency cell. Nyquist cells remain eligible.
+    spacing : pair of float or None, default None
+        Spatial pitches (dy, dx). None means (1, 1), giving cycles per pixel.
+    edges : ndarray or None, default None
+        Increasing radial edges in cycles per spatial unit. Overrides n_bins.
+        Intervals are [left, right), with the final edge included.
+
+    Returns
+    -------
+    ndarray, shape (..., n_radius)
+        Mean power per interval. Out-of-range cells are ignored; intervals
+        without eligible cells are NaN.
+
+    Notes
+    -----
+    Retained for existing imports. For sample analysis, prefer the comparator's
+    compute_spectra() method, which resolves shared edges and spacing.
+    """
+    return _bin_radial_spectrum(
+        spectrum,
+        grid_shape,
+        edges=edges,
+        spacing=(1.0, 1.0) if spacing is None else spacing,
+        fft_solver=fft_solver,
+        n_bins=n_bins,
+        exclude_dc=exclude_dc,
+    )
+
+
+def radial_bin_counts(
+    grid_shape: tuple[int, int],
+    n_bins: int = 30,
+    fft_solver: str = "rfft2",
+    exclude_dc: bool = True,
+    spacing: tuple[float, float] | None = None,
+    edges: np.ndarray | None = None,
+) -> np.ndarray:
+    """Count Fourier cells per radial interval (legacy API).
+
+    Parameters
+    ----------
+    grid_shape : pair of int
+        Original spatial dimensions (ny, nx).
+    n_bins : int, default 30
+        Number of equal-width intervals when edges is omitted.
+    fft_solver : {'fft2', 'rfft2'}, default 'rfft2'
+        FFT layout; implicit rfft2 cells count with full-spectrum multiplicity.
+    exclude_dc : bool, default True
+        Exclude the zero-frequency cell. Nyquist cells remain eligible.
+    spacing : pair of float or None, default None
+        Spatial pitches (dy, dx). None means (1, 1), giving cycles per pixel.
+    edges : ndarray or None, default None
+        Increasing radial edges in cycles per spatial unit. Overrides n_bins;
+        the final edge is included.
+
+    Returns
+    -------
+    ndarray, shape (n_radius,)
+        Full-spectrum-equivalent cell counts. Zero means an unsupported
+        interval; counts are not independent observations or mode pairs.
+    """
+    return _radial_bin_cell_counts(
+        grid_shape,
+        edges=edges,
+        spacing=(1.0, 1.0) if spacing is None else spacing,
+        fft_solver=fft_solver,
+        n_bins=n_bins,
+        exclude_dc=exclude_dc,
+    )
+
+
+def stream_radial_features(
+    spectrum_chunk_fn: Any,
+    n_genes: int,
+    grid_shape: tuple[int, int],
+    *,
+    chunk_size: int,
+    fft_solver: str,
+    spacing: tuple[float, float] | None,
+    edges: np.ndarray,
+    pbar: Any = None,
+) -> np.ndarray:
+    """Stream power chunks into radial means (legacy API).
+
+    Parameters
+    ----------
+    spectrum_chunk_fn : callable
+        (start, stop) -> real power, shape (stop-start, ny, n_kx), in native
+        FFT order. n_kx is nx for fft2 or nx // 2 + 1 for rfft2.
+    n_genes : int
+        Total number of features supplied by the callback.
+    grid_shape : pair of int
+        Original spatial dimensions (ny, nx).
+    chunk_size : int
+        Features per callback block.
+    fft_solver : {'fft2', 'rfft2'}
+        Layout supplied by the callback.
+    spacing : pair of float or None
+        Spatial pitches (dy, dx). None means (1, 1), giving cycles per pixel.
+    edges : ndarray, shape (n_radius + 1,)
+        Shared radial edges in cycles per spatial unit; final edge included.
+    pbar : progress bar, optional
+        Updated once per block.
+
+    Returns
+    -------
+    ndarray, shape (n_genes, n_radius)
+        Radial means, excluding DC and retaining Nyquist. Unsupported bins
+        are NaN. This function computes no FFTs.
+    """
+    return _stream_radial_features(
+        spectrum_chunk_fn,
+        n_genes,
+        grid_shape,
+        edges=edges,
+        spacing=(1.0, 1.0) if spacing is None else spacing,
+        fft_solver=fft_solver,
+        chunk_size=chunk_size,
+        pbar=pbar,
+    )
+
+
+def stream_polar_features(
+    spectrum_chunk_fn: Any,
+    n_genes: int,
+    grid_shape: tuple[int, int],
+    angle_deg: float,
+    *,
+    chunk_size: int,
+    freq_edges: np.ndarray,
+    spacing: tuple[float, float] | None,
+    n_theta: int,
+    fft_solver: str,
+    pbar: Any = None,
+    frequency_padding: int = 0,
+) -> np.ndarray:
+    """Stream power chunks into aligned polar-sector means (legacy API).
+
+    Parameters
+    ----------
+    spectrum_chunk_fn : callable
+        (start, stop) -> real power, shape (stop-start, ny, n_kx), in native
+        FFT order. Padded inputs use (ny + 2*p, nx + 2*p) with fft2 layout.
+    n_genes : int
+        Total number of features supplied by the callback.
+    grid_shape : pair of int
+        Original spatial dimensions (ny, nx), before Fourier-mode padding.
+    angle_deg : float
+        Alignment angle in degrees; sampling uses the inverse rotation.
+    chunk_size : int
+        Features per callback block.
+    freq_edges : ndarray, shape (n_radius + 1,)
+        Shared radial edges in cycles per spatial unit.
+    spacing : pair of float or None
+        Spatial pitches (dy, dx). For compatibility, None means
+        (1 / ny, 1 / nx): each axis spans one unit, unlike the radial helper.
+    n_theta : int
+        Angular sectors over [0, pi), centered at j * pi / n_theta.
+    fft_solver : {'fft2', 'rfft2'}
+        Input layout. Unpadded n_kx is nx or nx // 2 + 1.
+    pbar : progress bar, optional
+        Updated once per block.
+    frequency_padding : int, default 0
+        Evaluated NUFFT modes p on each edge. Padded interpolation uses the
+        evaluated border; unpadded FFT interpolation wraps periodically.
+
+    Returns
+    -------
+    ndarray, shape (n_genes, n_radius * n_theta)
+        Area-weighted sector means, with angle varying fastest. Unsupported
+        bands are NaN. Inputs must already be centered and normalized.
+    """
+    if spacing is None:
+        spacing = (1.0 / grid_shape[0], 1.0 / grid_shape[1])
+    return _stream_polar_features(
+        spectrum_chunk_fn,
+        n_genes,
+        grid_shape,
+        edges=freq_edges,
+        spacing=spacing,
+        fft_solver=fft_solver,
+        chunk_size=chunk_size,
+        n_theta=n_theta,
+        angle_deg=angle_deg,
+        frequency_padding=frequency_padding,
+        pbar=pbar,
+    )
+
+
 # ---------------------------------------------------------------------------
-# Per-sample spectra and radial binning
+# Per-sample spectra
 # ---------------------------------------------------------------------------
 
 
@@ -118,108 +336,6 @@ def compute_sample_spectrum(
     return spec
 
 
-def _radial_frequency_grid(
-    ny: int,
-    nx: int,
-    fft_solver: str,
-    spacing: tuple[float, float] | None = None,
-) -> np.ndarray:
-    """Radial frequency for each spectrum bin, shape ``(ny, n_kx)``.
-
-    If ``spacing=(dy, dx)`` is given, frequencies are in **cycles per unit length**
-    (e.g., cycles/μm if ``spacing`` is in μm). Otherwise the result is in
-    cycles/pixel with both axes normalized by their grid length, i.e.
-    :math:`\\sqrt{(k_x/n_x)^2 + (k_y/n_y)^2}`.
-    """
-    if spacing is None:
-        dy = 1.0 / ny
-        dx = 1.0 / nx
-        # Equivalent: scale fftfreq(..., d=1) by 1/n to get "normalized" frequency.
-        ky = np.fft.fftfreq(ny) * (1.0 / dy) * dy  # == np.fft.fftfreq(ny)
-        kx_full = np.fft.fftfreq(nx)
-        kx_rfft = np.fft.rfftfreq(nx)
-    else:
-        dy, dx = spacing
-        ky = np.fft.fftfreq(ny, d=dy)
-        kx_full = np.fft.fftfreq(nx, d=dx)
-        kx_rfft = np.fft.rfftfreq(nx, d=dx)
-    if fft_solver == "fft2":
-        kx = kx_full
-    elif fft_solver == "rfft2":
-        kx = kx_rfft
-    else:
-        raise ValueError(f"fft_solver must be 'fft2' or 'rfft2', got '{fft_solver}'")
-    kx_grid, ky_grid = np.meshgrid(kx, ky)
-    return np.sqrt(kx_grid**2 + ky_grid**2)
-
-
-def _validate_grid_shape(grid_shape: tuple[int, int]) -> tuple[int, int]:
-    """Return a validated ``(ny, nx)`` pair."""
-    if len(grid_shape) != 2:
-        raise ValueError(f"grid_shape must be a pair (ny, nx), got {grid_shape!r}.")
-    ny, nx = int(grid_shape[0]), int(grid_shape[1])
-    if ny <= 0 or nx <= 0:
-        raise ValueError(f"grid_shape values must be positive, got {grid_shape!r}.")
-    return ny, nx
-
-
-def _validate_spacing(spacing: tuple[float, float]) -> tuple[float, float]:
-    """Return a validated ``(dy, dx)`` pair."""
-    if len(spacing) != 2:
-        raise ValueError(f"spacing must be a pair (dy, dx), got {spacing!r}.")
-    dy, dx = float(spacing[0]), float(spacing[1])
-    if dy <= 0 or dx <= 0:
-        raise ValueError(f"spacing values must be positive, got {spacing!r}.")
-    return dy, dx
-
-
-def _resolve_power_layout(n_kx: int, nx: int, fft_solver: str) -> tuple[str, int]:
-    """Resolve a power-spectrum layout and expected ``kx`` length."""
-    rfft_kx = nx // 2 + 1
-    if fft_solver == "auto":
-        if n_kx == nx:
-            return "fft2", nx
-        if n_kx == rfft_kx:
-            return "rfft2", rfft_kx
-        raise ValueError(
-            f"power last axis {n_kx} is incompatible with grid width {nx}; "
-            f"expected {nx} for fft2 or {rfft_kx} for rfft2."
-        )
-    if fft_solver not in {"fft2", "rfft2"}:
-        raise ValueError(f"fft_solver must be 'auto', 'fft2', or 'rfft2', got {fft_solver!r}.")
-    expected_kx = nx if fft_solver == "fft2" else rfft_kx
-    if n_kx != expected_kx:
-        raise ValueError(
-            f"power last axis {n_kx} does not match {fft_solver} layout for "
-            f"grid width {nx}; expected {expected_kx}."
-        )
-    return fft_solver, expected_kx
-
-
-def _layout_frequency_grid(
-    ny: int,
-    nx: int,
-    expected_kx: int,
-    dy: float,
-    dx: float,
-    fft_solver: str,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """Frequency angle grid plus full-spectrum-equivalent layout weights."""
-    ky = np.fft.fftfreq(ny, d=dy)
-    if fft_solver == "fft2":
-        kx = np.fft.fftfreq(nx, d=dx)
-        layout_weights = np.ones((ny, expected_kx), dtype=float)
-    else:
-        kx = np.fft.rfftfreq(nx, d=dx)
-        col_weights = np.full(expected_kx, 2.0)
-        col_weights[0] = 1.0
-        if nx % 2 == 0:
-            col_weights[-1] = 1.0
-        layout_weights = np.broadcast_to(col_weights, (ny, expected_kx))
-    kx_grid, ky_grid = np.meshgrid(kx, ky)
-    return kx_grid, ky_grid, layout_weights
-
-
 def power_spectrum_anisotropy(
     power: np.ndarray,
     grid_shape: tuple[int, int],
@@ -281,7 +397,7 @@ def power_spectrum_anisotropy(
         # Expanding avoids subtle even-grid Nyquist sign conventions. In
         # particular, doubling the stored half-plane at the stored angle is not
         # equivalent to the full fftfreq layout on the Nyquist row.
-        power = _to_full_2d(power, (ny, nx), "rfft2")
+        power = _as_full_power_spectrum(power, (ny, nx), fft_solver="rfft2")
         resolved_solver = "fft2"
         expected_kx = nx
     kx_grid, ky_grid, layout_weights = _layout_frequency_grid(
@@ -409,40 +525,25 @@ def gene_pattern_diversity(
     *,
     eps: float = 1e-12,
 ) -> float:
-    r"""Spatial-pattern diversity across genes within a single sample.
-
-    Quantifies how heterogeneous the per-gene spatial-frequency profiles
-    are within one sample. Computes the cross-gene covariance of the
-    log-spectra,
-
-    .. math::
-        \hat\Sigma_\mathrm{genes} \;=\; \frac{1}{G - 1}
-            \sum_g \big(\ell_g - \bar\ell\big)\big(\ell_g - \bar\ell\big)^\top
-
-    where :math:`\ell_g \in \mathbb{R}^K` is gene :math:`g`'s
-    radially-binned log-spectrum and :math:`\bar\ell` the mean across
-    genes, then returns ``effective_rank(Σ_genes, weights)``.
-
-    Interpretation:
-
-    - **Low diversity** (:math:`K_\mathrm{eff} \approx 1`): most genes
-      share the same spatial-frequency profile — the sample's spatial
-      patterns collapse onto a single dominant mode (e.g. all "smooth"
-      or all "punctate").
-    - **High diversity** (:math:`K_\mathrm{eff} \approx K`): genes vary
-      widely in their spatial structure — the sample carries a rich
-      mix of spatial scales.
+    """Measure how variation in log power across genes is distributed across bins.
 
     Parameters
     ----------
     spectra : np.ndarray
-        ``(n_genes, n_bins)`` raw spectrum matrix (typically a single sample's
-        radially-binned spectrum). Log is taken internally with an ``eps``
-        floor.
+        Power spectra for one sample with shape ``(n_genes, n_bins)``.
     weights : np.ndarray, optional
-        Per-bin weights, same semantics as :func:`effective_rank`.
+        Nonnegative weights for the frequency bins. The default gives each
+        bin equal weight.
     eps : float, default 1e-12
-        Floor for ``log(spectra)`` to handle exact-zero bins.
+        Lower bound on power before taking the natural logarithm.
+
+    Returns
+    -------
+    float
+        Effective rank of the covariance of log power across genes. A value
+        near one means that one linear combination of bins accounts for most
+        of the variance. Equal positive eigenvalues give a rank equal to
+        the number of bins.
     """
     if spectra.ndim != 2:
         raise ValueError(f"spectra must be (n_genes, n_bins), got shape {spectra.shape}.")
@@ -451,324 +552,6 @@ def gene_pattern_diversity(
     G = log_s.shape[0]
     cov = (centred.T @ centred) / max(G - 1, 1)
     return effective_rank(cov, weights=weights, assume_psd=True)
-
-
-def radial_bin_spectrum(
-    spectrum: np.ndarray,
-    grid_shape: tuple[int, int],
-    n_bins: int = 30,
-    fft_solver: str = "rfft2",
-    exclude_dc: bool = True,
-    spacing: tuple[float, float] | None = None,
-    edges: np.ndarray | None = None,
-) -> np.ndarray:
-    """
-    Bin a 2D power spectrum into ``n_bins`` radial frequency bins.
-
-    By default the binning axis is the **normalized** radial frequency
-    :math:`k = \\sqrt{(k_x/n_x)^2 + (k_y/n_y)^2} \\in [0,\\,\\sqrt{0.5}]`, so spectra
-    from samples with different ``(ny, nx)`` map onto the same radial bin grid. Passing
-    ``spacing=(dy, dx)`` (in physical units, e.g. μm per cell) switches the binning
-    axis to **cycles per unit length** (cycles/μm → multiply by 1000 for cycles/mm),
-    so bins are directly comparable across samples with different physical
-    resolutions. In that case, also pass ``edges`` to enforce a common bin grid
-    across samples.
-
-    Parameters
-    ----------
-    spectrum : np.ndarray
-        Power spectrum of shape ``(..., ny, n_kx)``. Leading dims (e.g., genes,
-        samples) are preserved.
-    grid_shape : tuple[int, int]
-        Original ``(ny, nx)`` of the rasterized image (needed because ``rfft2`` only
-        stores half of the kx axis).
-    n_bins : int, default 30
-        Number of radial bins. Ignored when ``edges`` is supplied.
-    fft_solver : {'fft2', 'rfft2'}, default 'rfft2'
-        FFT solver used to produce ``spectrum``. Must match.
-    exclude_dc : bool, default True
-        If True, exclude only the zero-frequency (DC) cell before bin averaging.
-        The number of radial bins in the output is unchanged.
-    spacing : tuple[float, float], optional
-        Physical spacing ``(dy, dx)`` per grid cell (e.g., μm). If given, the
-        binning axis is physical frequency in cycles per unit length.
-    edges : np.ndarray, optional
-        Explicit monotonically increasing bin edges (length ``n_bins + 1``) in the
-        same frequency units as ``spacing`` (or normalized if ``spacing`` is None).
-        When supplied, this overrides ``n_bins`` and gives every sample identical
-        bin boundaries — required for cross-sample comparisons in physical units.
-        Frequencies outside the edges are discarded; the final edge is included.
-
-    Returns
-    -------
-    np.ndarray
-        Radial spectra of shape ``(..., n_bins)``.
-
-    Raises
-    ------
-    ValueError
-        If ``spectrum``'s last two dims do not match the expected shape implied by
-        ``grid_shape`` and ``fft_solver``.
-    """
-    reducer, counts = _radial_bin_reducer(
-        grid_shape,
-        n_bins=n_bins,
-        fft_solver=fft_solver,
-        exclude_dc=exclude_dc,
-        spacing=spacing,
-        edges=edges,
-    )
-
-    return _apply_radial_reducer(spectrum, grid_shape, fft_solver, reducer, counts)
-
-
-def _radial_bin_reducer(
-    grid_shape: tuple[int, int],
-    *,
-    n_bins: int = 30,
-    fft_solver: str = "rfft2",
-    exclude_dc: bool = True,
-    spacing: tuple[float, float] | None = None,
-    edges: np.ndarray | None = None,
-) -> tuple[csr_matrix, np.ndarray]:
-    """Build a sparse bin-mean operator, reusable across a sample's chunks."""
-    idx, weights, counts, n_bins, keep = _radial_bin_index_and_counts(
-        grid_shape,
-        n_bins=n_bins,
-        fft_solver=fft_solver,
-        exclude_dc=exclude_dc,
-        spacing=spacing,
-        edges=edges,
-    )
-    reducer = csr_matrix(
-        (weights / counts[idx], (idx, np.flatnonzero(keep))),
-        shape=(n_bins, keep.size),
-    )
-    return reducer, counts
-
-
-def _apply_radial_reducer(
-    spectrum: np.ndarray,
-    grid_shape: tuple[int, int],
-    fft_solver: str,
-    reducer: csr_matrix,
-    counts: np.ndarray,
-) -> np.ndarray:
-    """Reduce a spectrum batch while preserving leading axes and empty bins."""
-    ny, nx = grid_shape
-    expected_kx = nx if fft_solver == "fft2" else nx // 2 + 1
-    if spectrum.shape[-2:] != (ny, expected_kx):
-        raise ValueError(
-            f"spectrum last two dims {spectrum.shape[-2:]} do not match "
-            f"expected ({ny}, {expected_kx}) for fft_solver='{fft_solver}'."
-        )
-    flat = spectrum.reshape(-1, reducer.shape[1])
-    out = (reducer @ flat.T).T
-    out[:, counts == 0] = np.nan
-    return out.reshape(*spectrum.shape[:-2], reducer.shape[0])
-
-
-def _radial_bin_index_and_counts(
-    grid_shape: tuple[int, int],
-    *,
-    n_bins: int = 30,
-    fft_solver: str = "rfft2",
-    exclude_dc: bool = True,
-    spacing: tuple[float, float] | None = None,
-    edges: np.ndarray | None = None,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray, int, np.ndarray]:
-    """Return bin indices, weights, counts, bin count, and the FFT-cell mask."""
-    # Compute the radial frequency for each 2D FFT cell.
-    ny, nx = grid_shape
-    expected_kx = nx if fft_solver == "fft2" else nx // 2 + 1
-    k = _radial_frequency_grid(ny, nx, fft_solver, spacing=spacing)
-    k_max = float(k.max())
-
-    # Determine the bin edges
-    if edges is None:
-        # Edges include 0; right edge slightly past k_max so the last bin is closed.
-        # Each bin is equally spaced in frequency, but will contain different numbers of FFT cells.
-        edges = np.linspace(0.0, k_max * (1.0 + 1e-9), n_bins + 1)
-    else:
-        edges = np.asarray(edges, dtype=float)
-        if edges.ndim != 1 or edges.size < 2 or not np.all(np.diff(edges) > 0):
-            raise ValueError("edges must be a 1D monotonically increasing array of length >= 2.")
-        n_bins = len(edges) - 1
-
-    # Bin index for each spectrum cell (0..n_bins-1).
-    k_flat = k.ravel()
-    # Match histogram intervals: [left, right), with the final edge included.
-    keep = (k_flat >= edges[0]) & (k_flat <= edges[-1])
-    if exclude_dc:
-        keep &= k_flat > 0.0
-    idx = np.minimum(np.digitize(k_flat[keep], edges) - 1, n_bins - 1)
-
-    # For rfft2 the negative-kx half is implicit but corresponds to conjugate
-    # entries with identical |X|^2. To make per-bin sums match what fft2 would
-    # give, double-count interior columns and single-count DC + Nyquist (if even).
-    if fft_solver == "rfft2":
-        col_weights = np.full(expected_kx, 2.0)
-        col_weights[0] = 1.0
-        if nx % 2 == 0:
-            col_weights[-1] = 1.0
-        weights2d = np.broadcast_to(col_weights, (ny, expected_kx)).ravel()  # flattened
-    else:
-        weights2d = np.ones(ny * expected_kx)
-
-    weights2d = weights2d[keep]
-
-    # Count the number of FFT cells in each bin.
-    counts = np.zeros(n_bins)
-    np.add.at(counts, idx, weights2d)
-
-    return idx, weights2d, counts, n_bins, keep
-
-
-def radial_bin_counts(
-    grid_shape: tuple[int, int],
-    n_bins: int = 30,
-    fft_solver: str = "rfft2",
-    exclude_dc: bool = True,
-    spacing: tuple[float, float] | None = None,
-    edges: np.ndarray | None = None,
-) -> np.ndarray:
-    """Return FFT-cell counts for each radial frequency bin.
-
-    Counts are independent of the gene expression values. A zero count means
-    the sample's Fourier grid has no cells in that bin, so a corresponding
-    :func:`radial_bin_spectrum` entry is NaN rather than a measured zero-power
-    feature.
-    """
-    return _radial_bin_index_and_counts(
-        grid_shape,
-        n_bins=n_bins,
-        fft_solver=fft_solver,
-        exclude_dc=exclude_dc,
-        spacing=spacing,
-        edges=edges,
-    )[2]
-
-
-def adapt_frequency_edges(
-    grid_shapes: Sequence[tuple[int, int]],
-    spacings: Sequence[tuple[float, float]],
-    edges: np.ndarray,
-    *,
-    fft_solver: str = "rfft2",
-) -> np.ndarray:
-    """Merge radial bins until every interval has support in every FFT grid.
-
-    Parameters
-    ----------
-    grid_shapes
-        Spatial lattice shape for each sample.
-    spacings
-        Physical ``(dy, dx)`` spacing for each sample.
-    edges
-        Strictly increasing candidate frequency-bin edges.
-    fft_solver
-        FFT layout used to count frequency cells.
-    """
-    shapes = list(grid_shapes)
-    sample_spacings = list(spacings)
-    if not shapes or len(shapes) != len(sample_spacings):
-        raise ValueError("grid_shapes and spacings must have the same nonzero length.")
-    requested_edges = np.asarray(edges, dtype=float)
-    if (
-        requested_edges.ndim != 1
-        or requested_edges.size < 2
-        or not np.isfinite(requested_edges).all()
-        or np.any(np.diff(requested_edges) <= 0)
-    ):
-        raise ValueError("edges must be a finite, strictly increasing 1D array.")
-
-    # For each sample and each bin, count number of supporting cells
-    counts = np.vstack(
-        [
-            radial_bin_counts(
-                shape,
-                n_bins=requested_edges.size - 1,
-                fft_solver=fft_solver,
-                spacing=spacing,
-                edges=requested_edges,
-            )
-            for shape, spacing in zip(shapes, sample_spacings, strict=True)
-        ]
-    )
-    # If any sample has zero support for the current bin, merge the bin to its right
-    merged = [float(requested_edges[0])]
-    running = np.zeros(counts.shape[0], dtype=float)
-    for bin_idx in range(requested_edges.size - 1):
-        running += counts[:, bin_idx]
-        if np.all(running > 0):
-            merged.append(float(requested_edges[bin_idx + 1]))
-            running.fill(0.0)
-
-    if len(merged) == 1:
-        merged.append(float(requested_edges[-1]))
-    elif merged[-1] != float(requested_edges[-1]):
-        merged[-1] = float(requested_edges[-1])
-    return np.asarray(merged)
-
-
-def stream_radial_features(
-    spectrum_chunk_fn: Any,
-    n_genes: int,
-    grid_shape: tuple[int, int],
-    *,
-    chunk_size: int,
-    fft_solver: str,
-    spacing: tuple[float, float] | None,
-    edges: np.ndarray,
-    pbar: Any = None,
-) -> np.ndarray:
-    """Stream a sample's spectrum gene-chunk-by-gene-chunk into radial features.
-
-    Computes the radial-binned ``(n_genes, n_feature_bins)`` feature matrix without ever
-    holding the full ``(n_genes, ny, n_kx)`` 2D spectrum: for each gene-chunk,
-    ``spectrum_chunk_fn(start, stop)`` returns that chunk's 2D power spectrum
-    ``(stop-start, ny, n_kx)``, which is immediately radial-binned and the dense
-    2D block discarded. Peak memory is therefore ``O(chunk · ny · nx)``.
-
-    Parameters
-    ----------
-    spectrum_chunk_fn : callable
-        ``(start, stop) -> np.ndarray`` of shape ``(stop-start, ny, n_kx)``.
-    n_genes : int
-        Total genes (features) in the sample.
-    grid_shape : tuple[int, int]
-        ``(ny, nx)`` of the rasterized image.
-    chunk_size : int
-        Genes per chunk.
-    fft_solver, spacing
-        Forwarded to :func:`radial_bin_spectrum`.
-    edges : np.ndarray
-        Explicit shared radial bin edges. This streamed helper is intended for
-        comparator paths where cross-sample binning has already been resolved;
-        use :func:`radial_bin_spectrum` directly for ``n_bins``-based binning.
-    pbar : tqdm, optional
-        Progress bar; ``.update(1)`` is called once per chunk.
-
-    Returns
-    -------
-    np.ndarray
-        Radial features of shape ``(n_genes, n_feature_bins)``.
-    """
-    if edges is None:
-        raise ValueError("stream_radial_features requires explicit radial bin edges.")
-
-    reducer, counts = _radial_bin_reducer(
-        grid_shape, fft_solver=fft_solver, spacing=spacing, edges=edges
-    )
-    out = np.empty((n_genes, reducer.shape[0]), dtype=float)
-    for start in range(0, n_genes, chunk_size):
-        stop = min(start + chunk_size, n_genes)
-        spec_chunk = spectrum_chunk_fn(start, stop)
-        out[start:stop] = _apply_radial_reducer(spec_chunk, grid_shape, fft_solver, reducer, counts)
-        del spec_chunk
-        if pbar is not None:
-            pbar.update(1)
-    return out
 
 
 def stream_geomean_landmark(
@@ -796,8 +579,12 @@ def stream_geomean_landmark(
     ----------
     spectrum_chunk_fn : callable
         ``(start, stop) -> (stop-start, ny, n_kx)`` power-spectrum chunk.
-    n_genes, grid_shape, chunk_size
-        As in :func:`stream_radial_features`.
+    n_genes : int
+        Total genes supplied by the callback.
+    grid_shape : pair of int
+        Original spatial dimensions (ny, nx).
+    chunk_size : int
+        Genes per callback block.
     gene_subset : np.ndarray, optional
         If given, the geometric mean is taken over only these gene indices
         (into ``0..n_genes-1``), chunked so the subset is never fully cached.
@@ -845,159 +632,12 @@ def stream_geomean_landmark(
     return np.exp(log_sum / float(count))[None, ...]
 
 
-def _physical_polar_coords(
-    grid_shape: tuple[int, int],
-    spacing: tuple[float, float] | None,
-    freq_edges: np.ndarray,
-    n_theta: int,
-    *,
-    angle_deg: float = 0.0,
-    frequency_padding: int = 0,
-) -> tuple[np.ndarray, int]:
-    """Pixel sample coords for a **physical-frequency** polar grid.
-
-    Builds the ``(2, n_radius·n_theta)`` ``(yy, xx)`` coordinate stack into the
-    fftshifted full ``(ny, nx)`` spectrum, where the radius axis samples the
-    *shared physical* frequencies — the bin centres of ``freq_edges`` (cycles
-    per unit length) — and ``theta`` spans the half-plane ``[0, π)`` (a real
-    signal's power spectrum is centrosymmetric). Because a physical frequency
-    ``f`` is converted to a pixel offset using this sample's own
-    ``spacing=(dy, dx)`` and ``(ny, nx)`` (``offset_y = f·sin θ·ny·dy``),
-    samples with **different lattices map the same physical frequency to the
-    same radius bin** — the 2-D analogue of the radial path's shared bin grid.
-    Bin centres must fit inside both sampling Nyquist limits; interpolation
-    within that band wraps across the periodic FFT array boundary.
-
-    Returns ``(coords, n_radius)`` with ``coords`` of shape
-    ``(2, n_radius·n_theta)`` in ``(radius, theta)`` row-major order.
-    """
-    if frequency_padding < 0 or int(frequency_padding) != frequency_padding:
-        raise ValueError("frequency_padding must be a non-negative integer.")
-    ny, nx = grid_shape
-    dy, dx = spacing if spacing is not None else (1.0 / ny, 1.0 / nx)
-    edges = np.asarray(freq_edges, dtype=float)
-    radii = 0.5 * (edges[:-1] + edges[1:])  # (n_radius,) cycles/unit
-    if np.any(radii > min(0.5 / dy, 0.5 / dx) * (1 + 1e-12)):
-        raise ValueError("2D frequency-bin centres must lie within both sampling Nyquist limits.")
-    # Sample the original spectrum at the inverse rotation. Applying the
-    # angle here preserves physical directions on anisotropic FFT grids.
-    thetas = np.linspace(0.0, np.pi, n_theta, endpoint=False) - np.deg2rad(angle_deg)
-    rr, tt = np.meshgrid(radii, thetas, indexing="ij")  # (n_radius, n_theta)
-    cy, cx = ny // 2 + frequency_padding, nx // 2 + frequency_padding
-    yy = cy + rr * np.sin(tt) * ny * dy
-    xx = cx + rr * np.cos(tt) * nx * dx
-    return np.stack([yy.ravel(), xx.ravel()], axis=0), len(radii)
-
-
-def stream_polar_features(
-    spectrum_chunk_fn: Any,
-    n_genes: int,
-    grid_shape: tuple[int, int],
-    angle_deg: float,
-    *,
-    chunk_size: int,
-    freq_edges: np.ndarray,
-    spacing: tuple[float, float] | None,
-    n_theta: int,
-    fft_solver: str,
-    pbar: Any = None,
-    frequency_padding: int = 0,
-) -> np.ndarray:
-    """Stream rotate → **physical-frequency polar resample** per gene-chunk.
-
-    The ``feature_mode='2d'`` path keeps *directional* content, so each gene's
-    spectrum is rotation-aligned (not radial-collapsed) and then resampled onto
-    a polar grid whose **radius axis is the shared physical-frequency grid
-    (``freq_edges`` bin centres, of length ``n_radius``) and whose ``theta`` axis
-    carries direction. This is a 2-D generalisation of :func:`radial_bin_spectrum`.
-    Because the radius axis is in cycles/unit and shared across samples (see
-    :func:`_physical_polar_coords`), different lattices are **cross-sample
-    aligned**, exactly as the radial path is.
-
-    For each gene-chunk: 2D power spectrum → :func:`_to_full_2d` (mirror the
-    rfft half-plane) → fftshift → resample at the rotated physical-frequency
-    polar coordinates → flatten, discarding the dense 2D block. The
-    full ``(n_genes, ny, n_kx)`` aligned stack is never held. Returns
-    ``(n_genes, n_radius·n_theta)``.
-
-    ``frequency_padding`` describes an evaluated Fourier-mode border around
-    the original grid, as returned by ``power_spectrum_2d_nufft``. Padded
-    spectra use that border instead of FFT-periodic boundary interpolation.
-    """
-    coords, n_radius = _physical_polar_coords(
-        grid_shape,
-        spacing,
-        freq_edges,
-        n_theta,
-        angle_deg=angle_deg,
-        frequency_padding=frequency_padding,
-    )
-    feat_len = n_radius * n_theta
-    out = np.empty((n_genes, feat_len), dtype=np.float64)
-    for start in range(0, n_genes, chunk_size):
-        stop = min(start + chunk_size, n_genes)
-        spec_chunk = spectrum_chunk_fn(start, stop)
-        full = _to_full_2d(spec_chunk, grid_shape, fft_solver, frequency_padding)
-        shifted = np.fft.fftshift(full, axes=(-2, -1))
-        m = shifted.shape[0]
-        for j in range(m):
-            out[start + j] = scipy.ndimage.map_coordinates(
-                shifted[j],
-                coords,
-                order=1,
-                mode="nearest" if frequency_padding else "grid-wrap",
-            )
-        del spec_chunk, full, shifted
-        if pbar is not None:
-            pbar.update(1)
-    return out
-
-
 # ---------------------------------------------------------------------------
 # Optional 2D rotation alignment
 # ---------------------------------------------------------------------------
 
-
-def _to_full_2d(
-    power: np.ndarray,
-    grid_shape: tuple[int, int],
-    fft_solver: str,
-    frequency_padding: int = 0,
-) -> np.ndarray:
-    """Mirror an ``rfft2`` half-spectrum into a full ``(ny, nx)`` spectrum.
-
-    Uses the Hermitian symmetry of the FFT of a real signal: ``|X[ky, kx]|² ==
-    |X[(ny - ky) % ny, (nx - kx) % nx]|²``. For ``fft2`` input, returns ``power``
-    unchanged.
-    """
-    if frequency_padding and (
-        fft_solver != "fft2"
-        or power.shape[-2:] != tuple(n + 2 * frequency_padding for n in grid_shape)
-    ):
-        raise ValueError(
-            "Padded polar spectra require fft2 layout and the evaluated frequency border."
-        )
-    if fft_solver == "fft2":
-        return power
-    ny, nx = grid_shape
-    half = power.shape[-1]
-    full = np.zeros(power.shape[:-1] + (nx,), dtype=power.dtype)
-    full[..., :half] = power
-
-    # Build the (-ky)-flipped version of `power` (axis -2): keep ky=0 fixed,
-    # reverse the order of ky=1..ny-1.
-    flipped_ky = np.empty_like(power)
-    flipped_ky[..., 0, :] = power[..., 0, :]
-    if ny > 1:
-        flipped_ky[..., 1:, :] = power[..., :0:-1, :]
-
-    # Mirror interior columns. Column j (1 <= j < last_interior) lives at column
-    # nx - j with the ky axis reversed. Skip DC (j=0) and Nyquist (j=nx/2 when
-    # nx is even) since both are self-conjugate.
-    last_interior = half - 1 if nx % 2 == 0 else half
-    for j in range(1, last_interior):
-        full[..., nx - j] = flipped_ky[..., j]
-    return full
+_ALIGNMENT_N_THETA = 180
+_ALIGNMENT_N_RADIUS = 64
 
 
 def _build_landmark_polar_stack(
@@ -1015,25 +655,53 @@ def _build_landmark_polar_stack(
     the polar grid, and zero-meaned along theta so the DC angular component
     doesn't dominate the cross-correlation.
     """
-    full = _to_full_2d(spectra, grid_shape, fft_solver, frequency_padding)
-    shifted = np.fft.fftshift(full, axes=(-2, -1))
-    coords, n_radius = _physical_polar_coords(
-        grid_shape, spacing, freq_edges, n_theta, frequency_padding=frequency_padding
+    full = _as_full_power_spectrum(
+        spectra, grid_shape, fft_solver=fft_solver, frequency_padding=frequency_padding
     )
-    out = np.empty((shifted.shape[0], n_theta, n_radius), dtype=float)
+    shifted = np.fft.fftshift(full, axes=(-2, -1))
+    coords, n_radius = _polar_bin_center_coords(
+        grid_shape,
+        spacing=spacing,
+        edges=freq_edges,
+        n_theta=n_theta,
+        frequency_padding=frequency_padding,
+    )
+    out = np.empty((shifted.shape[0], n_radius, n_theta), dtype=float)
     for j in range(shifted.shape[0]):
-        polar = (
-            scipy.ndimage.map_coordinates(
-                shifted[j],
-                coords,
-                order=1,
-                mode="nearest" if frequency_padding else "grid-wrap",
-            )
-            .reshape(n_radius, n_theta)
-            .T
+        scipy.ndimage.map_coordinates(
+            shifted[j],
+            coords,
+            output=out[j].ravel(),
+            order=1,
+            mode="nearest" if frequency_padding else "grid-wrap",
         )
-        out[j] = polar - polar.mean(axis=0, keepdims=True)
-    return out
+        out[j] -= out[j].mean(axis=1, keepdims=True)
+    return out.transpose(0, 2, 1)
+
+
+def _stream_landmark_polar(
+    spectrum_chunk_fn: Any,
+    n_genes: int,
+    grid_shape: tuple[int, int],
+    *,
+    chunk_size: int,
+    fft_solver: str,
+    freq_edges: np.ndarray,
+    spacing: tuple[float, float],
+    geomean: bool,
+    frequency_padding: int = 0,
+) -> np.ndarray:
+    """Interpolate one selected block or the streamed Cartesian geometric mean."""
+    if geomean:
+        # Geometric averaging must precede interpolation; these operations do not commute.
+        power = stream_geomean_landmark(
+            spectrum_chunk_fn, n_genes, grid_shape, chunk_size=chunk_size
+        )
+    else:
+        power = spectrum_chunk_fn(0, n_genes)
+    return _build_landmark_polar_stack(
+        power, grid_shape, fft_solver, _ALIGNMENT_N_THETA, freq_edges, spacing, frequency_padding
+    )
 
 
 def estimate_rotations_from_landmarks(
@@ -1042,8 +710,8 @@ def estimate_rotations_from_landmarks(
     *,
     fft_solver: str = "fft2",
     reference_index: int = 0,
-    n_theta: int = 180,
-    n_radius: int = 64,
+    n_theta: int = _ALIGNMENT_N_THETA,
+    n_radius: int = _ALIGNMENT_N_RADIUS,
     spacings: Sequence[tuple[float, float]] | None = None,
     progress: bool = False,
     frequency_padding: int = 0,
@@ -1087,9 +755,9 @@ def estimate_rotations_from_landmarks(
     progress : bool, default False
         If True, show a tqdm bar over non-reference samples.
     frequency_padding : int, default 0
-        Evaluated Fourier-mode border per axis, as in
-        :func:`stream_polar_features`. Grid shapes and spacings describe the
-        original unpadded grid so alignment retains its physical frequency band.
+        Evaluated Fourier-mode border on each edge. Padded input has
+        shape (n_landmarks, ny + 2*p, nx + 2*p), where p is the border width.
+        Grid shapes and spacings describe the original unpadded grid.
 
     Returns
     -------
@@ -1124,41 +792,46 @@ def estimate_rotations_from_landmarks(
                 f"expected {n_landmarks} (must match across samples)."
             )
 
-    ref_polar = _build_landmark_polar_stack(
-        landmark_spectra[reference_index],
-        grid_shapes[reference_index],
-        fft_solver,
-        n_theta,
-        freq_edges,
-        spacings[reference_index],
-        frequency_padding,
-    )
-    ref_hat = np.fft.fft(ref_polar, axis=1)  # (n_landmarks, n_theta, n_radius)
-
-    angles = np.zeros(n_samples)
-    iter_samples: Any = range(n_samples)
-    if progress:
-        iter_samples = tqdm(iter_samples, total=n_samples, desc="Rotation estimation")
-    for i in iter_samples:
-        if i == reference_index:
-            continue
-        cur_polar = _build_landmark_polar_stack(
-            landmark_spectra[i],
-            grid_shapes[i],
-            fft_solver,
-            n_theta,
-            freq_edges,
-            spacings[i],
-            frequency_padding,
+    polar = [
+        _build_landmark_polar_stack(
+            spectrum, shape, fft_solver, n_theta, freq_edges, spacing, frequency_padding
         )
-        cur_hat = np.fft.fft(cur_polar, axis=1)
-        # Per-landmark circular cross-correlation along theta; sum across
-        # landmarks AND radii → best rotation common to every landmark.
-        corr = np.real(np.fft.ifft(ref_hat * np.conj(cur_hat), axis=1))
-        total = corr.sum(axis=(0, 2))  # (n_theta,)
-        k_best = int(np.argmax(total))
-        angles[i] = k_best * 180.0 / n_theta
-    return angles
+        for spectrum, shape, spacing in zip(landmark_spectra, grid_shapes, spacings, strict=True)
+    ]
+    return _estimate_rotations_from_polar(polar, reference_index=reference_index, progress=progress)
+
+
+def _landmark_cross_sum(reference, current):
+    np.conjugate(current, out=current)
+    current *= reference
+    return current.sum(axis=(0, 2))
+
+
+def _landmark_angles(cross, n_theta):
+    correlations = np.fft.irfft(cross, n=n_theta, axis=1)
+    return correlations.argmax(axis=1) * (180.0 / n_theta)
+
+
+def _estimate_rotations_from_polar(
+    landmarks: Sequence[np.ndarray], *, reference_index: int = 0, progress: bool = False
+) -> np.ndarray:
+    """Correlate compact (landmark, angle, radius) stacks along the angle axis."""
+    n_genes, n_theta, n_radius = landmarks[reference_index].shape
+    n_freq = n_theta // 2 + 1
+    cross = np.zeros((len(landmarks), n_freq), dtype=complex)
+    # Bound the two complex FFT blocks independently of the retained landmark panels.
+    chunk = max(1, (8 << 20) // (2 * 16 * n_freq * n_radius))
+    starts = range(0, n_genes, chunk)
+    for start in tqdm(starts, desc="Rotation estimation", disable=not progress):
+        genes = slice(start, start + chunk)
+        reference = np.fft.rfft(landmarks[reference_index][genes], axis=1)
+        for i, stack in enumerate(landmarks):
+            if i == reference_index:
+                continue
+            current = np.fft.rfft(stack[genes], axis=1)
+            cross[i] += _landmark_cross_sum(reference, current)
+            del current
+    return _landmark_angles(cross, n_theta)
 
 
 def apply_rotations_to_spectra(
@@ -1228,7 +901,7 @@ def apply_rotations_to_spectra(
         if angle_deg == 0.0:
             out.append(np.asarray(spec_i).copy())
             continue
-        full = _to_full_2d(spec_i, shape, fft_solver)  # (n, ny, nx)
+        full = _as_full_power_spectrum(spec_i, shape, fft_solver=fft_solver)  # (n, ny, nx)
         full_shift = np.fft.fftshift(full, axes=(-2, -1))
         # Convert the inverse physical rotation into FFT-pixel coordinates.
         # fftshift's DC is at floor(n/2), including for even dimensions.
@@ -1264,8 +937,8 @@ def align_spectra_by_rotation(
     target_spectra: Sequence[np.ndarray] | None = None,
     fft_solver: str = "fft2",
     reference_index: int = 0,
-    n_theta: int = 180,
-    n_radius: int = 64,
+    n_theta: int = _ALIGNMENT_N_THETA,
+    n_radius: int = _ALIGNMENT_N_RADIUS,
     spacings: Sequence[tuple[float, float]] | None = None,
     progress: bool = False,
 ) -> tuple[list[np.ndarray] | None, np.ndarray]:

@@ -1,5 +1,5 @@
 [build-system]
-requires = ["setuptools>=64", "setuptools-scm>=8", "wheel"]
+requires = ["setuptools>=77", "setuptools-scm>=8", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
@@ -9,6 +9,7 @@ description = "Consistent and scalable spatial pattern detection and comparison.
 readme = "README.md"
 requires-python = ">=3.10"
 license = "BSD-3-Clause"
+license-files = ["LICENSE", "licenses/*.txt"]
 authors = [
     {name = "Jiayu Su"}
 ]
@@ -63,7 +64,6 @@ dev = [
     "pytest-cov>=3.0",
     "pytest-xdist>=3.0",
     # Linting / formatting
-    "black>=22.0",
     "ruff>=0.1",
     # Packaging
     "build>=1.0",
@@ -93,26 +93,6 @@ Repository = "https://github.com/JiayuSuPKU/sonic"
 "Bug Tracker" = "https://github.com/JiayuSuPKU/sonic/issues"
 "Source Code" = "https://github.com/JiayuSuPKU/sonic"
 
-[tool.black]
-line-length = 100
-target-version = ['py310', 'py311', 'py312']
-include = '\.pyi?$'
-extend-exclude = '''
-/(
-  # directories
-  \.git
-  | \.hg
-  | \.mypy_cache
-  | \.tox
-  | \.venv
-  | _build
-  | buck-out
-  | build
-  | dist
-  | docs
-)/
-'''
-
 [tool.ruff]
 line-length = 100
 target-version = "py310"
@@ -126,11 +106,15 @@ lint.select = [
     "UP",     # pyupgrade
 ]
 lint.ignore = [
-    "E501",   # line too long (handled by black)
+    "E501",   # line too long (handled by Ruff formatter)
     "B008",   # do not perform function calls in argument defaults,
     "E741",   # ambiguous variable name,
     "E402",   # module level import not at top of file
 ]
+
+[tool.ruff.format]
+# Preserve the Python-only formatting scope and skip generated version metadata.
+exclude = ["_build", "buck-out", "docs", "*.ipynb", "src/sonic/_version.py"]
 
 [tool.ruff.lint.per-file-ignores]
 "__init__.py" = ["F401", "E402"]

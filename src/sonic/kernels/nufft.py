@@ -16,8 +16,8 @@ evaluates the type-1 NUFFT
 on the same uniform ``(ny, nx)`` k-space grid that :func:`power_spectrum_2d`
 would produce for a rasterized input of the same physical extent, and returns
 :math:`|\\hat c|^2` in the scipy FFT layout (DC at ``[0, 0]``). Anything
-downstream — :func:`sonic.comparators.features.radial_bin_spectrum`,
-:class:`sonic.ComparatorIrregular` — works identically.
+downstream in :class:`sonic.ComparatorIrregular` uses that same layout
+for radial or aligned polar features.
 
 Notation (shared across this module)
 ------------------------------------
@@ -283,6 +283,35 @@ def power_spectrum_2d_nufft(
     >>> P.shape
     (32, 32)
     """
+    coefficients = _fourier_coefficients_2d_nufft(
+        coords,
+        values,
+        grid_shape,
+        spacing,
+        unit_scale,
+        eps,
+        center_coords,
+        nthreads,
+        frequency_padding,
+    )
+    power = np.abs(coefficients)
+    del coefficients
+    np.square(power, out=power)
+    return power
+
+
+def _fourier_coefficients_2d_nufft(
+    coords: np.ndarray,
+    values: np.ndarray,
+    grid_shape: tuple[int, int],
+    spacing: tuple[float, float],
+    unit_scale: float = 1.0,
+    eps: float = 1e-6,
+    center_coords: bool = True,
+    nthreads: int = 1,
+    frequency_padding: int = 0,
+) -> np.ndarray:
+    """Unnormalized complex NUFFT in ``(ny, nx[, M])`` native FFT order."""
     if nthreads < 1 or int(nthreads) != nthreads:
         raise ValueError("nthreads must be a positive integer.")
     nthreads = int(nthreads)
@@ -335,14 +364,10 @@ def power_spectrum_2d_nufft(
         nthreads=nthreads,
     )
 
-    power = np.abs(f_hat)
-    del f_hat
-    np.square(power, out=power)
-
     if squeeze:
-        return power
+        return f_hat
     # Put the feature axis back at the end to match power_spectrum_2d(x=(ny, nx, M)).
-    return np.moveaxis(power, 0, -1)
+    return np.moveaxis(f_hat, 0, -1)
 
 
 # ---------------------------------------------------------------------------
@@ -863,7 +888,7 @@ class NUFFTKernel(Kernel):
             raise ValueError(f"x first dim {x.shape[0]} does not match n={self.n}.")
         ny, nx = self.grid_shape
         x_in = x[:, None] if x.ndim == 1 else x
-        c = np.ascontiguousarray(x_in.T.astype(np.complex128))  # (M, N)
+        c = np.asarray(x_in.T, dtype=np.complex128, order="C")  # (M, N)
         return finufft.nufft2d1(
             self._y_scaled,
             self._x_scaled,
@@ -1014,13 +1039,12 @@ class NUFFTKernel(Kernel):
         z_hat = self._nufft_type1(z)  # (M, ny, nx) complex, DC centred
         if self.centering:
             z_hat[:, ny // 2, nx // 2] = 0.0
-        out_k = np.ascontiguousarray(
-            (lam_centred[None, :, :] * z_hat / (ny * nx)).astype(np.complex128)
-        )
+        z_hat *= lam_centred
+        z_hat /= ny * nx
         Kz = finufft.nufft2d2(
             self._y_scaled,
             self._x_scaled,
-            out_k,
+            z_hat,
             eps=self._eps,
             isign=+1,
             nthreads=self.nthreads,
@@ -1341,8 +1365,7 @@ def _r_test_nufft(
         Yn = Yn[:, None]
     if Xn.shape[0] != kernel.n or Yn.shape[0] != kernel.n:
         raise ValueError(
-            f"Xn, Yn first dim must equal kernel.n={kernel.n}; "
-            f"got {Xn.shape[0]}, {Yn.shape[0]}."
+            f"Xn, Yn first dim must equal kernel.n={kernel.n}; got {Xn.shape[0]}, {Yn.shape[0]}."
         )
 
     Xz = Xn if is_standardized else _standardize_features(Xn)

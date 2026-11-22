@@ -78,6 +78,9 @@ in ``benchmarks/benchmark_scheduling.py``; they are conservative defaults, not
 runtime autotuning. A shared 2 GiB estimated transient-workspace budget can
 reduce them further. It excludes stored inputs, kernel matrices/factorizations
 and retained results, so it is not a total-process memory limit.
+For NUFFT tolerances at or below ``1e-9``, sizing also accounts for the
+oversampled Fourier grids in use at the same time. Serial transforms reuse
+that workspace within a batch.
 
 Override that fixed budget with ``memory_budget_bytes`` on ``compute_qstat``,
 ``compute_rstat``, ``compute_spectra``, or the standalone ``spatial_q_test`` /

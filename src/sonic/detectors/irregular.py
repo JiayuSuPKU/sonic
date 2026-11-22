@@ -24,9 +24,11 @@ from sonic.statistics import (
 )
 from sonic.utils import (
     _DEFAULT_CHUNK_BUDGET,
-    _chunk_parameters,
+    _gene_indices,
+    _kernel_workspace_bytes,
     _parse_memory_budget,
     _require_finite,
+    _take_feature_columns,
     resolve_parallelism,
 )
 
@@ -452,6 +454,8 @@ class DetectorIrregular(Detector):
         """
         self.adata = adata
         self.n = adata.shape[0]
+        self._observation_indices = np.arange(self.n)
+        self._explanation_obsm_key = obsm_key
 
         if obsp_key is not None:
             if self.backend_ == "nufft":
@@ -489,8 +493,7 @@ class DetectorIrregular(Detector):
         """
         if obsm_key not in self.adata.obsm:
             raise KeyError(
-                f"adata.obsm has no key '{obsm_key}'; "
-                f"available: {list(self.adata.obsm.keys())}."
+                f"adata.obsm has no key '{obsm_key}'; available: {list(self.adata.obsm.keys())}."
             )
         coords = np.asarray(self.adata.obsm[obsm_key], dtype=np.float64)
         if coords.ndim != 2 or coords.shape[1] != 2:
@@ -617,6 +620,7 @@ class DetectorIrregular(Detector):
                 )
                 W = W[keep_mask][:, keep_mask]
                 self.adata = self.adata[keep_mask].copy()
+                self._observation_indices = self._observation_indices[keep_mask]
                 self.n = W.shape[0]
 
             # Symmetric normalization after removing truly isolated nodes.
@@ -734,7 +738,7 @@ class DetectorIrregular(Detector):
             # check if keys are in var
             if keys is not None:
                 valid = [g for g in keys if g in self.adata.var_names]
-                adata_tmp = self.adata[:, valid]
+                adata_tmp = self.adata[:, _gene_indices(self.adata.var_names, valid)]
             else:
                 adata_tmp = self.adata
 
@@ -769,6 +773,80 @@ class DetectorIrregular(Detector):
         stds = stds[to_keep]
 
         return X_csc, names, means, stds
+
+    def _explain_statistic(  # noqa: C901 — source validation and matrix/NUFFT preparation
+        self, features, statistic, source, layer, memory_budget_bytes
+    ):
+        from sonic.explanation import _check_explanation_budget, _explanation_from_responses
+
+        _check_explanation_budget(self.kernel_, len(features), memory_budget_bytes)
+        keys = list(dict.fromkeys(features))
+        if source not in ("var", "obs"):
+            raise ValueError("source must be 'var' or 'obs'.")
+        available = self.adata.var_names if source == "var" else self.adata.obs.columns
+        if any(name not in available for name in keys):
+            raise ValueError("Every requested feature must exist in the selected source.")
+        if source == "obs":
+            if layer is not None:
+                raise ValueError("layer applies only to source='var'.")
+            if any(not pd.api.types.is_numeric_dtype(self.adata.obs[name].dtype) for name in keys):
+                raise ValueError(
+                    "Explain numeric obs columns; encode categorical levels separately."
+                )
+        if self.n < 2:
+            raise ValueError("Explanation maps require at least two retained observations.")
+        if self.backend_ == "nufft":
+            matrix, names, means, stds = self._prepare_features_nufft(source, keys, layer)
+        else:
+            matrix, names, means, stds = self._prepare_data(source, keys, self.min_cells, layer)
+        if any(name not in names for name in keys):
+            raise ValueError("Requested feature was excluded by expression/variance filters.")
+
+        # Densify only the requested features (columns) and compute preprocessed feature values
+        columns = [names.index(name) for name in features]
+        matrix = matrix[:, columns]
+        values = matrix.toarray()
+        if self.backend_ == "nufft":
+            prepared = _standardize_features(values)
+        else:
+            valid = stds[columns] > 1e-12
+            prepared = np.zeros_like(values)
+            np.divide(values - means[columns], stds[columns], out=prepared, where=valid)
+
+        # Compute the reference statistic (Q or R) for the standardized features
+        kernel = self.kernel_
+        if statistic == "Q" and self.backend_ == "matrix":
+            reference = kernel.xtKx_standardized(matrix, means[columns], stds[columns])
+        elif statistic == "Q":
+            reference = np.atleast_1d(kernel.xtKx(prepared))
+        else:
+            reference = np.atleast_1d(kernel.xtKy(prepared[:, 0], prepared[:, 1]))
+
+        # Compute the kernel-filtered feature values and SpatialExplanation metadata
+        response = kernel.Kx(prepared)
+        coords = self.adata.obsm.get(self._explanation_obsm_key)
+        return _explanation_from_responses(
+            values,
+            prepared,
+            response[None],
+            reference,
+            feature_names=features,
+            observation_indices=self._observation_indices,
+            coordinates=coords,
+            metadata={
+                "statistic": statistic,
+                "backend": self.backend_,
+                "kernel_method": self.kernel_method_,
+                "source": source,
+                "layer": layer,
+                "coordinate_source": None
+                if coords is None
+                else f"obsm[{self._explanation_obsm_key!r}]",
+                "observation_index_basis": "setup_data AnnData rows",
+                "normalization": "sample standard deviation (ddof=1)",
+            },
+            rtol=max(1e-9, 50 * getattr(kernel, "_eps", 0)),
+        )
 
     def compute_qstat(  # noqa: C901
         self,
@@ -875,7 +953,9 @@ class DetectorIrregular(Detector):
         n_features = (
             len(features)
             if features is not None
-            else self.adata.n_vars if source == "var" else len(self.adata.obs.columns)
+            else self.adata.n_vars
+            if source == "var"
+            else len(self.adata.obs.columns)
         )
         n_batches = max(1, (n_features + chunk_size - 1) // chunk_size)
         n_jobs, n_workers = resolve_parallelism(
@@ -883,7 +963,7 @@ class DetectorIrregular(Detector):
             workers if self.backend_ == "nufft" else 1,
             backend="nufft" if self.backend_ == "nufft" else "matrix",
             n_tasks=n_batches,
-            per_feat_bytes=_chunk_parameters(self.kernel_)[1] if auto_chunk else None,
+            per_feat_bytes=_kernel_workspace_bytes(self.kernel_) if auto_chunk else None,
             budget_bytes=memory_budget_bytes,
         )
         if self.backend_ == "nufft":
@@ -1087,7 +1167,7 @@ class DetectorIrregular(Detector):
             workers if self.backend_ == "nufft" else 1,
             backend="nufft" if self.backend_ == "nufft" else "matrix",
             n_tasks=1 if self.backend_ == "nufft" else n_batches,
-            per_feat_bytes=_chunk_parameters(self.kernel_)[1] if auto_chunk else None,
+            per_feat_bytes=_kernel_workspace_bytes(self.kernel_) if auto_chunk else None,
             budget_bytes=memory_budget_bytes,
         )
         if self.backend_ == "nufft":
@@ -1221,8 +1301,7 @@ class DetectorIrregular(Detector):
         never materializes a full dense ``X``."""
         if source == "var":
             X = self.adata.X if layer is None else self.adata.layers[layer]
-            X_csc = X.tocsc() if sp.issparse(X) else sp.csc_matrix(X)
-            names = list(self.adata.var_names)
+            names = self.adata.var_names
             if features is not None:
                 selected = [g for g in features if g in names]
                 missing = set(features) - set(selected)
@@ -1230,9 +1309,10 @@ class DetectorIrregular(Detector):
                     logger.warning(
                         "Requested features not in adata.var_names: %s", sorted(missing)[:5]
                     )
-                idx = [names.index(g) for g in selected]
-                X_csc = X_csc[:, idx]
+                idx = _gene_indices(names, selected)
+                X = _take_feature_columns(X, idx)
                 names = selected
+            X_csc = X.tocsc() if sp.issparse(X) else sp.csc_matrix(X)
         elif source == "obs":
             if features is None:
                 raise ValueError("source='obs' requires `features` (obs column names).")

@@ -1,31 +1,24 @@
 Quick Start
 ===========
 
-Use SONIC for two main tasks:
+Use :func:`~sonic.api.Detector` to find spatial patterns in one sample.
+Use :func:`~sonic.api.Comparator` to test whether those patterns change between
+groups of biological samples.
+Both accept irregular coordinates in :class:`anndata.AnnData` or a regular
+rectangular grid in :class:`spatialdata.SpatialData`.
 
-1. Detect spatial patterns within one sample.
-2. Compare spatial patterns across several samples.
+.. _pattern-detection:
 
-The examples use the :func:`~sonic.Detector` and
-:func:`~sonic.Comparator` factories. They select the coordinate or grid
-implementation from the input type.
+Detect spatial patterns in one sample
+-------------------------------------
 
+Find spatially variable genes with the Q-test
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
-Pattern detection
------------------
-
-The Q-test finds features whose values depend on location. The R-test finds
-pairs of features that share a spatial pattern. Use
-:func:`~sonic.Detector` to run either test across an entire dataset.
-
-
-AnnData with coordinates
-~~~~~~~~~~~~~~~~~~~~~~~~
-
-The input is an :class:`anndata.AnnData` with expression values in ``adata.X``
-or a layer and coordinates in ``adata.obsm["spatial"]``. Start with NUFFT and a
-Matérn kernel for two-dimensional spatial coordinates. Choose ``bandwidth`` in
-coordinate units to match the spatial scale of interest.
+The Q-test asks whether a gene's expression varies with location. The kernel
+determines which patterns the test detects. This example uses a Matérn kernel
+for smooth patterns at irregular coordinates. Choose ``bandwidth`` in the
+same units as the coordinates.
 
 .. code-block:: python
 
@@ -33,214 +26,167 @@ coordinate units to match the spatial scale of interest.
    from sonic import Detector
 
    adata = ad.read_h5ad("spatial_tissue.h5ad")
-   print(f"{adata.n_obs} spots × {adata.n_vars} genes")
-
    detector = Detector(
-       adata,
-       kernel_method="matern",
-       backend="nufft",
-       bandwidth=2.0,
-       nu=1.5,
-   ).setup_data(
-       adata,
-       obsm_key="spatial",
-       min_cells_frac=0.05,
-   )
+       adata, backend="nufft", kernel_method="matern", bandwidth=2.0,
+   ).setup_data(adata, obsm_key="spatial")
 
-   q_results = detector.compute_qstat(n_jobs=4)
-   svgs = q_results[q_results["P_adj"] < 0.05]
-   print(f"Found {len(svgs)} spatially variable genes")
+   q_results = detector.compute_qstat()
+   spatial_genes = q_results.loc[q_results["P_adj"] < 0.05, "Feature"]
 
-``q_results`` is indexed by feature name and sorted by Q. It contains the test
-statistic, a p-value, and a Benjamini-Hochberg adjusted p-value.
+Here ``adata.X`` contains expression, with spots in rows and genes in columns.
+Use ``layer`` on the test and explanation methods to select an expression layer.
+The table reports Q, its p-value (``P_value``), and the Benjamini-Hochberg
+adjusted p-value (``P_adj``). The last line selects genes with ``P_adj < 0.05``.
 
-After finding spatially variable genes, test a smaller set for spatial
-co-expression:
+Test spatial association between genes with the R-test
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+The R-test asks whether two genes share a spatial pattern. With the Matérn
+kernel, a positive R indicates that high expression of one gene tends to occur
+near high expression of the other. A negative R indicates the opposite pattern.
+Use gene names from your dataset for this example and the map below.
 
 .. code-block:: python
 
-   top_genes = q_results.nlargest(100, "Q").index.tolist()
-   r_results = detector.compute_rstat(
-       features_x=top_genes,
-       features_y=None,
-       n_jobs=4,
-   )
+   r_results = detector.compute_rstat(features_x=["CD8"], features_y=["FoxP3"])
 
-``features_y=None`` tests pairs within ``features_x``. Pass a second list to
-test every pair between two feature sets.
+Pass two lists to test pairs between gene sets. Pass only ``features_x`` to
+test pairs within one set. For example, the names of the 100 genes with
+the highest Q scores in this coordinate workflow are in
+``q_results.nlargest(100, "Q")["Feature"]``.
 
+.. _plot-maps-and-select-zoom-regions:
 
-Which backend should I use?
-~~~~~~~~~~~~~~~~~~~~~~~~~~~
+Map the spots that contribute to a Q or R score
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
-.. list-table::
-   :header-rows: 1
-   :widths: 30 30 40
-
-   * - Data
-     - Starting point
-     - Use when
-   * - Two-dimensional coordinates, smooth patterns
-     - ``backend="nufft"`` with Matérn
-     - Default starting point for spatial Q-tests.
-   * - Coordinates or a graph
-     - ``backend="matrix"`` with CAR
-     - You want graph neighbourhoods or have a matrix in ``adata.obsp``.
-   * - Regular rasterized bins
-     - :class:`~sonic.DetectorGrid` through :func:`~sonic.Detector`
-     - The input is :class:`spatialdata.SpatialData`, such as Visium HD.
-
-For a precomputed adjacency or connectivity matrix, replace ``obsm_key`` with
-``obsp_key``:
+Q and R summarize a whole sample. A contribution map shows how each spot
+contributes to the score. The signed contributions sum to Q for one gene or
+to R for a pair.
 
 .. code-block:: python
 
-   detector = Detector(
-       adata,
-       kernel_method="car",
-       backend="matrix",
-       rho=0.9,
-   ).setup_data(adata, obsp_key="connectivities")
+   q_map = detector.explain_qstat("FoxP3")
+   r_map = detector.explain_rstat("CD8", "FoxP3")
+   regions = r_map.select_regions(size=100.0, n_regions=2)
+   figure = r_map.plot(regions=regions)
 
-See :doc:`/guides/kernels` for other kernels and tuning parameters.
+The plot shows expression, the kernel-filtered response, and signed
+contributions. Region selection ranks windows by the absolute value of their
+signed contribution sum. The test p-value applies to the whole sample.
+Choose the window width (``size``) in the sample's coordinate units.
+Use ``r_map.plot()`` for the overview alone. See
+:class:`~sonic.explanation.SpatialExplanation` for map fields and plotting
+options.
 
+.. _pattern-comparison:
 
-SpatialData with regular bins
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+Compare spatial patterns across samples
+---------------------------------------
 
-For a regular grid, pass a :class:`spatialdata.SpatialData` object and the keys
-needed to rasterize its table. The row and column fields must define a
-contiguous rectangular grid.
+Use one sample per biological replicate. Supply the same genes in the same
+order and use common spatial units. The default radial bins summarize variation
+by spatial scale, averaging over directions.
+
+Compare a gene's power, power distribution, or mean expression
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+DF compares mean log power at each scale. DF-norm first divides each bin's
+power by the gene's total across bins. A uniform fold change in expression
+preserves these shares. Use the expression test to compare the gene's mean
+expression between groups.
+
+.. code-block:: python
+
+   import anndata as ad
+   from sonic import Comparator
+
+   paths = [
+       "control_1.h5ad", "control_2.h5ad", "control_3.h5ad",
+       "case_1.h5ad", "case_2.h5ad", "case_3.h5ad",
+   ]
+   samples = [ad.read_h5ad(path) for path in paths]
+   groups = [0, 0, 0, 1, 1, 1]
+   comparison = Comparator(samples).compute_spectra()
+
+   df = comparison.test_diff_freq(groups)
+   df_norm = comparison.test_diff_freq(groups, normalize_shape=True)
+   expression = comparison.test_diff_expr(groups)
+
+In the DF tables, ``P_adj`` gives the adjusted p-value for each gene.
+``Estimate_per_bin`` gives the signed difference per bin on the natural-log
+scale. With the labels above, the difference is control minus case.
+
+Compare spatial coupling between gene pairs
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Fit cross-spectra for the pairs of interest. DF-coherence tests whether
+coupling strength changes between groups. DF-coherency tests whether signed
+alignment changes.
+
+.. code-block:: python
+
+   comparison.compute_cross_spectra([("CD8", "FoxP3")])
+   strength = comparison.test_cross_diff_freq(groups)
+   signed = comparison.test_cross_diff_freq(groups, representation="coherency")
+
+See :doc:`multisample` to identify the frequency bin with the strongest
+evidence, map its spatial contributions, or adjust a comparison for covariates.
+
+Other inputs and advanced options
+---------------------------------
+
+Use a neighborhood graph for detection
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+If an AnnData object contains a connectivity matrix in ``obsp``, use the
+matrix backend to define neighbors from that graph.
+
+.. code-block:: python
+
+   graph_detector = Detector(adata, backend="matrix", kernel_method="car")
+   graph_detector.setup_data(adata, obsp_key="connectivities")
+   graph_results = graph_detector.compute_qstat()
+
+Use a regular grid in SpatialData
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+For a rectangular grid, specify the bin shapes, expression table, and columns
+that identify grid rows and columns. Use keys from your SpatialData object.
+The grid kernel uses periodic boundaries. For hexagonal spots, use the
+coordinate workflow.
 
 .. code-block:: python
 
    import spatialdata as sd
-   from sonic import Detector
 
    sdata = sd.read_zarr("visium_hd.zarr")
-   detector = Detector(
-       sdata,
-       kernel_method="car",
-       rho=0.9,
-       neighbor_degree=1,
-   ).setup_data(
-       sdata,
-       bins="square_008um",
-       table_name="square_008um",
-       col_key="array_col",
-       row_key="array_row",
-       min_count=10,
+   grid_detector = Detector(sdata, kernel_method="car").setup_data(
+       sdata, bins="square_008um", table_name="table",
+       col_key="array_col", row_key="array_row",
    )
+   grid_results = grid_detector.compute_qstat()
 
-   q_results = detector.compute_qstat()
+To compare several grids, supply the same keys to ``Comparator`` and set
+``spacing`` to the physical height and width of a grid cell. See
+:doc:`multisample` for an example.
 
-The grid backend uses periodic boundaries. Standard Visium spot layouts are
-hexagonal; use the coordinate workflow for those samples. FFT acceleration is
-limited to rectangular grids.
+Test expression arrays directly
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
-
-Observed expression and numeric metadata must be finite; NaN and infinity are
-rejected before testing. Missing categorical metadata is also rejected.
-Categorical ``obs`` features are expanded into indicator columns for both Q
-and R tests on the matrix and NUFFT backends. Structural holes in a grid
-remain supported and are excluded from the observed domain.
-
-Test one feature directly
-~~~~~~~~~~~~~~~~~~~~~~~~~
-
-Use the lower-level functions when you already have arrays and want to run one
-test.
+If you already have expression vectors and coordinates in the same spot
+order, pass them to the Q-test or R-test with a kernel.
 
 .. code-block:: python
 
    from sonic import NUFFTKernel, spatial_q_test, spatial_r_test
 
-   kernel = NUFFTKernel(
-       coords,
-       method="matern",
-       bandwidth=2.0,
-       nu=1.5,
-   )
-   Q, q_pvalue = spatial_q_test(gene_x, kernel)
-   R, r_pvalue = spatial_r_test(gene_x, gene_y, kernel)
+   kernel = NUFFTKernel(adata.obsm["spatial"], method="matern", bandwidth=2.0)
+   values = adata[:, ["CD8", "FoxP3"]].to_df()
+   x = values["CD8"].to_numpy()
+   y = values["FoxP3"].to_numpy()
+   q, q_pvalue = spatial_q_test(x, kernel)
+   r, r_pvalue = spatial_r_test(x, y, kernel)
 
-
-Pattern comparison
-------------------
-
-Pattern comparison asks whether a gene's spatial layout changes across samples
-or conditions. SONIC compares spatial spectra, so samples can have different
-positions and orientations.
-
-The shortest workflow takes a list of :class:`anndata.AnnData` samples with
-shared ``var_names`` and coordinates in ``obsm["spatial"]``:
-
-.. code-block:: python
-
-   import anndata as ad
-   import numpy as np
-   from sonic import Comparator
-
-   paths = [
-       "control_1.h5ad",
-       "control_2.h5ad",
-       "control_3.h5ad",
-       "case_1.h5ad",
-       "case_2.h5ad",
-       "case_3.h5ad",
-   ]
-   samples = [ad.read_h5ad(path) for path in paths]
-   groups = np.array([0, 0, 0, 1, 1, 1])
-
-   comparison = Comparator(samples).compute_spectra(n_jobs=4)
-
-   # Optional: remove the sample-wide spectral background before testing.
-   # comparison.normalize_background()
-
-   pattern_results = comparison.test_diff_freq(
-       groups,
-       statistic="log_l2",
-       normalize_shape=True,
-   )
-   expression_results = comparison.test_diff_expr(groups)
-
-``pattern_results`` ranks genes by changes in spatial layout.
-``normalize_shape=True`` removes overall spectrum amplitude before testing, so
-the comparison focuses on how power moves across spatial scales.
-``expression_results`` tests each gene's sample-level mean expression.
-Background normalization is optional. Use it when sample-wide spectral
-differences are nuisance variation; it can also remove shared biological signal.
-
-A gene can therefore show:
-
-- a pattern change without a mean-expression change;
-- a mean-expression change without a pattern change;
-- both changes.
-
-For regular grids, pass a list of :class:`spatialdata.SpatialData` samples and
-the rasterization keys:
-
-.. code-block:: python
-
-   comparison = Comparator(
-       spatial_samples,
-       bins="square_008um",
-       table_name="square_008um",
-       col_key="array_col",
-       row_key="array_row",
-   ).compute_spectra()
-
-   pattern_results = comparison.test_diff_freq(groups)
-
-See :doc:`/guides/multisample` for covariate maps, physical coordinate units,
-permutation tests, and multi-factor designs.
-
-
-Next steps
-----------
-
-- :doc:`/guides/kernels` for choosing a kernel.
-- :doc:`/guides/multisample` for cross-sample analysis.
-- :doc:`/guides/scaling` for memory and runtime controls.
-- :doc:`/guides/theory` for the statistical derivations.
-- :doc:`/autoapi/sonic/index` for the full API.
+See :doc:`kernels` for kernel choices, :doc:`scaling` for memory and runtime
+options, and :doc:`theory` for calibration assumptions.

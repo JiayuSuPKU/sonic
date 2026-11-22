@@ -58,7 +58,7 @@ detector = Detector(
 q_results = detector.compute_qstat(return_pval=True)
 svgs = q_results[q_results["P_adj"] < 0.05]
 
-top_genes = q_results.nlargest(100, "Q").index.tolist()
+top_genes = q_results.nlargest(100, "Q")["Feature"].tolist()
 r_results = detector.compute_rstat(
     features_x=top_genes,
     features_y=None,
@@ -106,11 +106,10 @@ pattern_results = comparison.test_diff_freq(
 expression_results = comparison.test_diff_expr(groups)
 ```
 
-`pattern_results` tests the spatial layout of each gene.
-`expression_results` tests its sample-level mean expression. Run both when
-you want to distinguish a pattern change from an expression-level change.
-Background normalization is optional: use it when sample-wide spectral
-differences are nuisance variation. It can also remove shared biological signal.
+With `normalize_shape=True`, the pattern test compares each gene's share of
+power at each spatial scale. The expression test compares its mean expression
+between groups. Use background normalization when sample-wide differences in
+power are nuisance variation. It can also remove shared biological signal.
 
 ## Choose an interface
 
@@ -145,6 +144,13 @@ git clone https://github.com/JiayuSuPKU/sonic.git
 cd sonic
 pip install -e ".[dev,docs]"
 pytest -q
+```
+
+We use Ruff for linting and formatting, with a 100-character line limit.
+
+```bash
+ruff check src tests compat/quadsv/src
+ruff format --check src tests compat/quadsv/src
 ```
 
 See the [installation guide](https://sonic-spatial.readthedocs.io/en/latest/guides/installation.html)

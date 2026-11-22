@@ -26,9 +26,9 @@ def power_spectrum_2d(
 
     The result is *translation-invariant*: shifting the input image leaves the power
     spectrum unchanged. This makes the spectrum a natural alignment-free representation
-    of a spatial pattern. Use :func:`sonic.comparators.features.radial_bin_spectrum`
-    to further reduce the 2D spectrum to a 1D radial-binned vector that is also
-    rotation-invariant.
+    of a spatial pattern. :class:`sonic.ComparatorGrid` reduces sample power
+    spectra to rotation-invariant radial profiles or aligned polar features
+    through its ``compute_spectra()`` method.
 
     Parameters
     ----------
@@ -65,6 +65,25 @@ def power_spectrum_2d(
     >>> P.shape
     (32, 17)
     """
+    coefficients = _fourier_coefficients_2d(x, fft_solver, workers, center=center)
+    power = np.abs(coefficients)
+    del coefficients
+    np.square(power, out=power)
+    return power
+
+
+def _fourier_coefficients_2d(
+    x: np.ndarray,
+    fft_solver: str = "fft2",
+    workers: int | None = None,
+    *,
+    center: bool = False,
+) -> np.ndarray:
+    """Complex FFT in native order, with the public power helper's centering.
+
+    Returned coefficients have shape ``(ny, n_kx[, M])`` and are unnormalized. Retaining
+    phase so auto- and cross-spectra can share the same numerical transform.
+    """
     if fft_solver not in ("fft2", "rfft2"):
         raise ValueError(f"fft_solver must be 'fft2' or 'rfft2', got '{fft_solver}'")
 
@@ -73,25 +92,26 @@ def power_spectrum_2d(
         x = x[..., np.newaxis]
 
     transform = scipy.fft.fft2 if fft_solver == "fft2" else scipy.fft.rfft2
-    x_hat = transform(x, axes=(0, 1), workers=workers)
-    power = np.abs(x_hat)
-    del x_hat
+    coefficients = transform(x, axes=(0, 1), workers=workers)
     if center:
-        dc = power[0, 0].copy()
-        power[0, 0] = 0.0
+        dc = np.abs(coefficients[0, 0]).copy()
+        coefficients[0, 0] = 0.0
         # Avoid a full centered input copy unless the DC magnitude threatens
         # the accuracy of the nonconstant modes (especially for float32).
-        if np.any(dc * np.finfo(power.dtype).eps ** 0.25 > power.max(axis=(0, 1))):
-            del power
-            x_hat = transform(x - x.mean(axis=(0, 1), keepdims=True), axes=(0, 1), workers=workers)
-            power = np.abs(x_hat)
-            del x_hat
-            power[0, 0] = 0.0
-    np.square(power, out=power)
+        if np.any(
+            dc * np.finfo(coefficients.real.dtype).eps ** 0.25
+            > np.abs(coefficients).max(axis=(0, 1))
+        ):
+            del coefficients
+            # Pin a constant feature's mean to its input value before the FFT.
+            constant = x.min(axis=(0, 1)) == x.max(axis=(0, 1))
+            mean = np.where(constant, x[0, 0], x.mean(axis=(0, 1)))
+            coefficients = transform(x - mean, axes=(0, 1), workers=workers)
+            coefficients[0, 0] = 0.0
 
     if squeeze:
-        power = power[..., 0]
-    return power
+        coefficients = coefficients[..., 0]
+    return coefficients
 
 
 class FFTKernel(Kernel):

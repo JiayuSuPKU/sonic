@@ -455,6 +455,71 @@ class DetectorGrid(Detector):
             budget_bytes=budget_bytes if budget_bytes is not None else _DEFAULT_CHUNK_BUDGET,
         )
 
+    def _explain_statistic(self, features, statistic, source, layer, memory_budget_bytes):
+        from sonic.explanation import _check_explanation_budget, _explanation_from_responses
+        from sonic.kernels.fft import _standardize_grid
+
+        if source != "var" or layer is not None:
+            raise ValueError(
+                "Grid explanations use the setup-time raster: source='var', layer=None."
+            )
+        _check_explanation_budget(self.kernel_, len(features), memory_budget_bytes)
+        keys = list(dict.fromkeys(features))
+        selected = self._filter_features(keys, self._table_name)
+        if any(name not in selected for name in keys):
+            raise ValueError("Every requested feature must exist and pass min_count.")
+        data = np.array(
+            self.sdata[self._img_key].sel(c=list(features)).values, dtype=float, copy=True
+        )
+        observed = ~np.isnan(data[0])
+        if np.isinf(data).any() or np.any(np.isnan(data) != ~observed):
+            raise ValueError(
+                "Explanation features must be finite on identical observed-cell support."
+            )
+        if observed.sum() < 2:
+            raise ValueError("Explanation maps require at least two observed cells.")
+        values = data[:, observed].T.copy()
+        data = _mean_fill_missing(data, axis=(1, 2))
+        data[np.ptp(data, axis=(1, 2)) == 0] = 0.0
+        grid = np.moveaxis(data, 0, -1)
+        if statistic == "Q":
+            # Compute the preprocessed data and the reference Q statistic
+            prepared = _standardize_grid(grid)
+            reference = np.atleast_1d(spatial_q_test(grid, self.kernel_, return_pval=False))
+        else:
+            # Match compute_rstat's handling of small (nonconstant) grid features.
+            stds = np.std(grid, axis=(0, 1), keepdims=True, ddof=1)
+            stds[stds < 1e-12] = 1.0
+            prepared = (grid - grid.mean(axis=(0, 1), keepdims=True)) / stds
+            # Compute the reference R statistic
+            reference = np.atleast_1d(self.kernel_.xtKy(prepared[..., 0], prepared[..., 1]))
+
+        # Compute the kernel-filtered feature values and SpatialExplanation metadata
+        response = self.kernel_.Kx(prepared)
+        indices = np.flatnonzero(observed.ravel())
+        coords = np.column_stack(np.unravel_index(indices, observed.shape))
+        spacing = (self.kernel_._dy, self.kernel_._dx)
+        coords = coords * np.asarray(spacing)
+        return _explanation_from_responses(
+            values,
+            prepared[observed],
+            response[observed][None],
+            reference,
+            feature_names=features,
+            observation_indices=indices,
+            coordinates=coords,
+            metadata={
+                "statistic": statistic,
+                "backend": "fft",
+                "kernel_method": self.kernel_method_,
+                "coordinate_source": "kernel lattice (y, x), origin (0, 0)",
+                "observation_index_basis": "C-order flattened setup raster",
+                "grid_shape": observed.shape,
+                "spacing": spacing,
+                "normalization": "observed-mean fill; full-grid sample standard deviation (ddof=1)",
+            },
+        )
+
     def compute_qstat(
         self,
         features: list[str] | None = None,

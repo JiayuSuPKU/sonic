@@ -31,6 +31,7 @@ for higher traces; its reduced eigendecomposition requires an explicit opt-in.
 
 from __future__ import annotations
 
+from bisect import bisect_right
 from collections.abc import Sequence
 from copy import copy
 
@@ -44,6 +45,7 @@ from tqdm import tqdm
 from sonic.kernels import Kernel
 from sonic.utils import (
     _DEFAULT_CHUNK_BUDGET,
+    _kernel_workspace_bytes,
     _parse_memory_budget,
     _require_finite,
     auto_chunk_size,
@@ -114,41 +116,63 @@ def apply_bh_correction(p_values: np.ndarray | pd.Series | Sequence[float]) -> n
 
 
 def cauchy_combine(
-    pvals: np.ndarray, axis: int = -1, *, where: np.ndarray | None = None
+    pvals: np.ndarray,
+    axis: int = -1,
+    *,
+    where: np.ndarray | None = None,
+    weights: np.ndarray | None = None,
 ) -> np.ndarray:
-    """
-    Cauchy combination test.
-
-    For p-values :math:`p_1, \\dots, p_K`, forms
-    :math:`T = \\frac{1}{K}\\sum_k \\cot(\\pi p_k)` and returns
-    the analytic upper-tail probability under the standard Cauchy null,
-    :math:`p = \\arctan2(1, T) / \\pi`. Robust to arbitrary dependence
-    between the input p-values — that is the whole point of Cauchy
-    combination — so it is safe to apply over correlated frequency bins
-    without decorrelating them first.
+    """Combine p-values from several tests with the weighted Cauchy test.
 
     Parameters
     ----------
     pvals : np.ndarray
-        Input p-values in ``[0, 1]``. Values at the exact endpoints are
-        clipped away from them to keep :math:`\\tan` finite.
+        Input p-values between zero and one.
     axis : int, default -1
-        Axis along which to combine.
+        Axis containing the tests to combine.
     where : np.ndarray of bool, optional
-        Broadcastable mask selecting informative tests. Slices with no
-        selected tests return 1. Unselected tests receive no weight.
+        Boolean mask that can be broadcast to the input shape. True selects a test.
+    weights : np.ndarray, optional
+        One finite, nonnegative weight per test along ``axis``, with a positive
+        sum. A zero weight excludes a test. Choose weights independently of the
+        observed test statistics. The default gives selected tests equal weight.
 
     Returns
     -------
     np.ndarray
-        Combined p-value(s); one less axis than ``pvals``.
+        One combined p-value per input slice, with the test axis removed.
+        A slice with no selected positive weight returns one.
+
+    Notes
+    -----
+    The reference distribution is exact for independent uniform null p-values
+    with fixed weights and selection. For dependent tests, the Cauchy tail
+    is an approximation.
     """
     pvals = np.asarray(pvals, dtype=float)
     clipped = np.clip(pvals, np.finfo(float).tiny, np.nextafter(1.0, 0.0))
     # cot(pi * p) is equivalent to tan(pi * (0.5 - p)) but avoids precision
     # loss for the ultra-small p-values produced by analytic Welch tests.
     cot = 1.0 / np.tan(np.pi * clipped)
-    if where is None:
+    if weights is not None:
+        weights = np.asarray(weights, dtype=float)
+        if weights.ndim != 1 or len(weights) != pvals.shape[axis]:
+            raise ValueError("weights must be one-dimensional and match the combination axis.")
+        if not np.isfinite(weights).all() or np.any(weights < 0):
+            raise ValueError("weights must be finite and nonnegative.")
+        total = weights.sum()
+        if not np.isfinite(total) or total <= 0:
+            raise ValueError("weights must have a positive finite sum.")
+        shape = [1] * pvals.ndim
+        shape[axis] = len(weights)
+        selected = np.broadcast_to((weights / total).reshape(shape), pvals.shape)
+        if where is not None:
+            selected = np.where(where, selected, 0.0)
+        total = selected.sum(axis=axis, keepdims=True)
+        selected = np.divide(selected, total, out=np.zeros_like(selected), where=total > 0)
+        terms = np.multiply(cot, selected, out=np.zeros_like(cot), where=selected > 0)
+        T = np.where(np.squeeze(total, axis=axis) > 0, terms.sum(axis=axis), -np.inf)
+    elif where is None:
         T = np.mean(cot, axis=axis)
     else:
         where = np.broadcast_to(where, pvals.shape)
@@ -481,7 +505,15 @@ def _estimate_kernel_traces(  # noqa: C901
         except (ValueError, NotImplementedError):
             c1 = c2 = var_R = None
 
-    block_size = min(n_probes, max(1, _TRACE_PROBE_BUDGET_BYTES // (8 * n * 8)))
+    # Trace vectors live at observations; NUFFT applications also use a Fourier grid.
+    block_size = max(
+        1,
+        bisect_right(
+            range(1, n_probes + 1),
+            _TRACE_PROBE_BUDGET_BYTES,
+            key=lambda count: max(64 * n * count, _kernel_workspace_bytes(kernel, count)),
+        ),
+    )
     cached = getattr(kernel, "_trace_rvs_cache", None) if precision and rng_seed == 0 else None
     if cached is not None and cached["n_vectors"] != n_probes:
         cached = None

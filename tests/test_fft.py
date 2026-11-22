@@ -10,11 +10,45 @@ import pytest
 import scipy.fft
 
 from sonic.kernels import MatrixKernel
-from sonic.kernels.fft import FFTKernel
+from sonic.kernels.fft import FFTKernel, _fourier_coefficients_2d, power_spectrum_2d
 from sonic.statistics import _q_pvalues, compute_null_params, spatial_q_test, spatial_r_test
 from sonic.statistics import spatial_q_test as spatial_q_test_standard
 from sonic.statistics import spatial_r_test as spatial_r_test_standard
 from sonic.utils import compute_torus_distance_matrix
+
+
+@pytest.mark.parametrize("solver", ["fft2", "rfft2"])
+@pytest.mark.parametrize("shape", [(7, 9), (8, 10)])
+@pytest.mark.parametrize("n_features", [None, 1, 3])
+@pytest.mark.parametrize(
+    "dtype,offset,center",
+    [(np.float64, 0.0, False), (np.float64, 1e12, True), (np.float32, 1e5, True)],
+)
+def test_fourier_coefficients_preserve_phase_and_power(
+    solver, shape, n_features, dtype, offset, center
+):
+    values = (np.random.default_rng(91).normal(size=(*shape, 6)) + offset).astype(dtype)[..., ::2]
+    values[..., 1] = offset
+    values = values[..., 0] if n_features is None else values[..., :n_features]
+    original = values.copy()
+    values.flags.writeable = False
+    transform = scipy.fft.fft2 if solver == "fft2" else scipy.fft.rfft2
+    expected = transform(
+        values - values.mean(axis=(0, 1), keepdims=True) if center else values, axes=(0, 1)
+    )
+    if center:
+        expected[0, 0] = 0
+    coefficients = _fourier_coefficients_2d(values, solver, workers=1, center=center)
+    assert coefficients.shape == expected.shape
+    assert coefficients.dtype == expected.dtype
+    np.testing.assert_allclose(coefficients, expected, rtol=1e-6, atol=1e-10)
+    np.testing.assert_allclose(
+        power_spectrum_2d(values, solver, workers=1, center=center),
+        np.abs(expected) ** 2,
+        rtol=1e-6,
+        atol=1e-10,
+    )
+    np.testing.assert_array_equal(values, original)
 
 
 class TestFFTKernelBasics(unittest.TestCase):
@@ -336,9 +370,9 @@ class TestFFTVsMatrixKernelComparison(unittest.TestCase):
         # Should be extremely close
         assert len(fft_evals) == len(spatial_evals)
         rel_error = np.abs(fft_evals - spatial_evals) / (np.abs(spatial_evals) + 1e-10)
-        assert (
-            np.mean(rel_error) < 1e-5
-        ), f"Gaussian kernel eigenvalues rel error: {np.mean(rel_error)}"
+        assert np.mean(rel_error) < 1e-5, (
+            f"Gaussian kernel eigenvalues rel error: {np.mean(rel_error)}"
+        )
 
     def test_matern_kernel_eigenvalues_close(self):
         """Compare Matern kernel eigenvalues."""
@@ -352,9 +386,9 @@ class TestFFTVsMatrixKernelComparison(unittest.TestCase):
         # Should be extremely close
         assert len(fft_evals) == len(spatial_evals)
         rel_error = np.abs(fft_evals - spatial_evals) / (np.abs(spatial_evals) + 1e-10)
-        assert (
-            np.mean(rel_error) < 1e-5
-        ), f"Matern kernel eigenvalues rel error: {np.mean(rel_error)}"
+        assert np.mean(rel_error) < 1e-5, (
+            f"Matern kernel eigenvalues rel error: {np.mean(rel_error)}"
+        )
 
     def test_moran_eigenvalues_close(self):
         """Compare Moran kernel eigenvalues."""
@@ -368,9 +402,9 @@ class TestFFTVsMatrixKernelComparison(unittest.TestCase):
         # Should be extremely close
         assert len(fft_evals) == len(spatial_evals)
         rel_error = np.abs(fft_evals - spatial_evals) / (np.abs(spatial_evals) + 1e-10)
-        assert (
-            np.mean(rel_error) < 1e-5
-        ), f"Moran kernel eigenvalues rel error: {np.mean(rel_error)}"
+        assert np.mean(rel_error) < 1e-5, (
+            f"Moran kernel eigenvalues rel error: {np.mean(rel_error)}"
+        )
 
     def test_car_kernel_eigenvalues_close(self):
         """Compare CAR kernel eigenvalues.

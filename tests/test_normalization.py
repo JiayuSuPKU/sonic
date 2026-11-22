@@ -2,9 +2,12 @@
 
 from __future__ import annotations
 
+from fractions import Fraction
+
 import numpy as np
 import pytest
 
+from sonic.comparators._inference import _exact_shape_shares
 from sonic.comparators.normalization import (
     normalize_background,
     normalize_covariates,
@@ -55,6 +58,20 @@ def test_shape_normalization_preserves_tiny_and_huge_shapes_and_zero_spectra():
     np.testing.assert_array_equal(normalized[0], 0.0)
     np.testing.assert_array_equal(spectra, original)
     np.testing.assert_array_equal(normalize_shape(spectra.T, axis=0).T, normalized)
+
+
+def test_shape_shares_match_exact_ratios_across_bin_orders():
+    tiny = np.nextafter(0.0, 1.0)
+    huge = np.finfo(float).max
+    rows = np.array([[6, 5, 5], [1.5, 1.5 + 3 * 2.0**-52, 0], [huge, huge, tiny], [tiny, 1, 0]])
+    exact = [[Fraction(v) for v in row] for row in rows]
+    expected = np.array([[float(v / sum(row)) for v in row] for row in exact])
+    for order in ([0, 1, 2], [2, 0, 1]):
+        reordered = rows[:, order]
+        shares = normalize_shape(reordered)
+        np.testing.assert_array_equal(shares, normalize_shape(rows)[:, order])
+        np.testing.assert_array_max_ulp(shares, expected[:, order], maxulp=1)
+        np.testing.assert_array_equal(_exact_shape_shares(reordered), expected[:, order])
 
 
 @pytest.mark.parametrize(
@@ -115,9 +132,9 @@ class TestNormalizationPrimitives:
         for fn in (normalize_background, normalize_covariates, normalize_shape):
             sig = inspect.signature(fn)
             assert "eps" in sig.parameters, f"{fn.__name__} missing eps kwarg"
-            assert (
-                sig.parameters["eps"].default == 1e-12
-            ), f"{fn.__name__} eps default differs from 1e-12"
+            assert sig.parameters["eps"].default == 1e-12, (
+                f"{fn.__name__} eps default differs from 1e-12"
+            )
 
     def test_covariates_output_strictly_positive(self):
         rng = np.random.default_rng(0)

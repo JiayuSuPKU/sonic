@@ -1,67 +1,55 @@
-"""
-Shared mixin and input-validation helpers for the comparator layer.
+"""Shared methods for the regular-grid and irregular-coordinate comparators.
 
-This module hosts the private :class:`_ComparatorBase` mixin that
-:class:`~sonic.ComparatorIrregular` and :class:`~sonic.ComparatorGrid`
-inherit from. The mixin owns:
-
-- the ``compute_spectra`` driver that turns per-sample 2-D images
-  into the ``(n_samples, n_genes, n_feature_bins)`` ``spectra_`` tensor;
-- the chainable preprocessing methods ``normalize_background()`` and
-  ``normalize_covariates(covariates)`` — thin wrappers around the
-  same-named standalone functions in
-  :mod:`sonic.comparators.normalization` that mutate ``spectra_`` in
-  place;
-- the test methods ``test_diff_freq(design, ...)`` and
-  ``test_diff_expr(design, ...)`` — design-at-call-time so a single
-  fitted comparator can serve any number of unrelated contrasts on
-  the same spectra;
-- the diagnostic ``effective_rank()``.
-
-The shape-only / sum-1 feature representation is reached via the
-``normalize_shape: bool = False`` keyword on :meth:`test_diff_freq`
-(forwarded to its dispatch target), not via a chainable method — this
-keeps the per-test choice non-destructive.
-
-Concrete classes live in sibling modules:
-:mod:`sonic.comparators.irregular` and
-:mod:`sonic.comparators.grid`.
-"""
+Fit spectra once, then test the contrasts of interest. See
+:doc:`/guides/multisample` for examples and calibration assumptions."""
 
 from __future__ import annotations
 
 import copy
 import logging
 import warnings
-from abc import abstractmethod
 from collections.abc import Sequence
+from dataclasses import replace
+from functools import partial
 from typing import TYPE_CHECKING, Any
 
 import numpy as np
 from joblib import Parallel, delayed
 from tqdm.auto import tqdm
 
-from sonic.utils import _DEFAULT_CHUNK_BUDGET, _FFT_CHUNK_CAP, _parse_memory_budget
+from sonic.comparators.binning import (
+    _adapt_radial_edges,
+    _bin_radial_spectrum,
+    _polar_reducer_workspace_bytes,
+    _radial_bin_cell_counts,
+    _stream_polar_features,
+    _stream_radial_features,
+)
+from sonic.utils import _DEFAULT_CHUNK_BUDGET, _FFT_CHUNK_CAP, _gene_indices, _parse_memory_budget
 
 # Suppress known deprecation warnings from SpatialData dependencies BEFORE importing them.
 warnings.filterwarnings("ignore", category=FutureWarning, message=".*legacy Dask DataFrame.*")
 warnings.filterwarnings("ignore", category=UserWarning, message=".*pkg_resources is deprecated.*")
 
+from sonic.comparators._inference import (
+    _estimate_glm_masked_null_covariance,
+    _estimate_glm_null_covariance,
+    _estimate_two_group_masked_null_covariance,
+    _estimate_two_group_null_covariance,
+    _resolve_covariance,
+)
 from sonic.comparators.features import (
-    adapt_frequency_edges,
+    _ALIGNMENT_N_RADIUS,
+    _ALIGNMENT_N_THETA,
+    _landmark_angles,
+    _landmark_cross_sum,
+    _stream_landmark_polar,
     compute_sample_spectrum,
-    radial_bin_counts,
-    radial_bin_spectrum,
-    stream_polar_features,
 )
 from sonic.comparators.features import (
     gene_pattern_diversity as _gene_pattern_diversity,
 )
 from sonic.comparators.multisample import (
-    _estimate_glm_masked_null_covariance,
-    _estimate_glm_null_covariance,
-    _estimate_two_group_masked_null_covariance,
-    _estimate_two_group_null_covariance,
     compare_glm,
     compare_glm_masked,
     compare_glm_scalar,
@@ -80,7 +68,9 @@ from sonic.comparators.normalization import (
 )
 
 if TYPE_CHECKING:
-    from sonic.comparators.multisample import _AnalyticNullState
+    from sonic.comparators._inference import _PluginNullState
+    from sonic.comparators.cross_spectrum import CrossSpectra
+    from sonic.explanation import SpatialExplanation
 
 __all__: list[str] = []
 
@@ -97,8 +87,9 @@ def _run_per_sample(
     desc: str,
     n_jobs: int,
     progress: bool,
+    shared_output: bool = False,
 ) -> list[Any]:
-    """Invoke ``worker(i, pbar)`` for each sample, preserving sample order."""
+    """Preserve sample order and require shared memory for workers that fill caller-owned arrays."""
     out: list[Any] = [None] * n_samples_total
 
     run_sequential = progress or n_jobs == 1
@@ -112,7 +103,8 @@ def _run_per_sample(
         if pbar is not None:
             pbar.close()
     else:
-        results = Parallel(n_jobs=n_jobs, prefer="threads")(
+        constraints = {"require": "sharedmem"} if shared_output else {}
+        results = Parallel(n_jobs=n_jobs, prefer="threads", **constraints)(
             delayed(worker)(i, None) for i in range(n_samples_total)
         )
         for i, r in enumerate(results):
@@ -131,84 +123,36 @@ def _unpack_sample_triples(
     return [np.asarray(x) for x in feats], dc, presence
 
 
-def _unpack_sample_quads(
-    results: list[tuple[np.ndarray, np.ndarray, np.ndarray, Any]],
-) -> tuple[list[np.ndarray], np.ndarray, np.ndarray, list[Any]]:
-    """Convert ``[(features, dc, presence, extra), ...]`` to stacked outputs."""
-    feats, dc_list, pres_list, extra = zip(*results, strict=True)
-    dc = np.stack([np.asarray(x) for x in dc_list], axis=0)
-    presence = np.stack([np.asarray(x) for x in pres_list], axis=0)
-    return [np.asarray(x) for x in feats], dc, presence, list(extra)
-
-
 class _ComparatorBase:
-    """Shared state + shared methods for NUFFT / FFT pattern comparators.
+    """Common interface for gene and gene-pair comparisons across samples.
 
-    Subclasses populate the small public surface and the underscored
-    internal state listed below in ``__init__``, then implement
-    :meth:`_compute_spectra` to fill the post-``compute_spectra``
-    attributes. The comparator carries **no design / contrast state**:
-    cross-sample comparisons are specified per-call on
-    :meth:`test_diff_freq` and :meth:`test_diff_expr`, so a single
-    fitted comparator can serve any number of unrelated contrasts on
-    the same ``spectra_``.
-
-    Public attributes (user-facing, inspection-worthy)
-    --------------------------------------------------
+    Attributes
+    ----------
     samples : list
-        The exact ``samples`` sequence passed at construction (AnnData
-        list for the irregular path, SpatialData list for the grid
-        path). Reference-shared with the user's collection.
-    gene_names : list[str]
-        Per-gene labels (length ``n_genes``).
+        Input samples in design row order.
+    gene_names : list of str
+        Gene names in input column order.
     feature_mode : {'radial', '2d'}
-        Spectral feature representation chosen at construction.
-    freq_edges : np.ndarray | None
-        Shared radial-frequency bin edges used by both feature modes.
-        Auto-derived during :meth:`compute_spectra` if not supplied at
-        construction.
-
-    Public attributes set by :meth:`compute_spectra`
-    -------------------------------------------------
-    spectra_ : np.ndarray | None
-        Per-(sample, gene) spectral feature matrix, shape
-        ``(n_samples, n_genes, n_feature_bins)``. The trailing axis is
-        radial bins in ``feature_mode='radial'`` and flattened
-        ``radius × theta`` bins in ``feature_mode='2d'``. This is the
-        input to :meth:`test_diff_freq` and the in-place
-        :meth:`normalize_background` / :meth:`normalize_covariates`
-        preprocessing transforms.
-    dc_ : np.ndarray | None
-        DC component of the spectrum per (sample, gene), shape
-        ``(n_samples, n_genes)``. Equals the sample-grid mean of each
-        gene's uncentered expression. Input to :meth:`test_diff_expr`.
-    presence_ : np.ndarray | None
-        Boolean mask of shape ``(n_samples, n_genes)`` — ``True`` where
-        a gene's per-sample spot-presence fraction cleared
-        ``_presence_threshold``. Drives the masked variant of
-        :meth:`test_diff_freq` when any entry is ``False``.
-    rotation_angles_ : np.ndarray | None
-        Per-sample rotation angle (degrees) applied during
-        rotation-alignment. Populated only when ``feature_mode='2d'``.
-    freq_edges_requested_ : np.ndarray | None
-        The original auto-resolved or requested 1-D edge grid before adaptive
-        merging and support filtering. This is for reference purposes only.
-    frequency_bin_intervals_ : np.ndarray | None
-        The final radial frequency intervals of shape ``(n_retained_radius_bins, 2)``.
-        It is stored as intervals because after dropping empty bins the
-        edges may not be contiguous.
-    frequency_bin_counts_ : np.ndarray | None
-        Number of FFT-cell counts for each sample and originally requested radial
-        frequency bin, shape ``(n_samples, len(freq_edges_requested_) - 1)``.
-        These counts diagnose requested-bin support and distinguish empty
-        Fourier-grid intervals from true zero-power measurements in
-        :attr:`spectra_`.
-
-    Private state (set by subclasses; not part of the user API)
-    -----------------------------------------------------------
-    ``_n_radial_bins``, ``_n_theta_bins``, ``_fft_solver``, ``_workers``,
-    ``_presence_threshold``, ``_spacings``,
-    ``_spectrum_fft_solver``, ``_grid_shapes``, ``_raw_2d_spectra``.
+        Radial bins describe spatial scale. Directional bins also describe angle.
+    freq_edges : np.ndarray or None
+        Shared radial frequency edges in cycles per spatial unit.
+    spectra_ : np.ndarray or None
+        Power spectra with axes (sample, gene, bin). In directional mode, bin
+        indices run by radius and then by angle.
+    dc_ : np.ndarray or None
+        Mean expression for each sample and gene.
+    presence_ : np.ndarray or None
+        Boolean mask identifying genes that meet the sample's presence threshold.
+    rotation_angles_ : np.ndarray or None
+        Sample alignment angles in degrees for directional spectra.
+    freq_edges_requested_ : np.ndarray or None
+        Requested radial frequency edges before bin selection.
+    frequency_bin_intervals_ : np.ndarray or None
+        Lower and upper frequency bounds for each retained radial interval.
+    frequency_bin_counts_ : np.ndarray or None
+        Number of Fourier cells per sample and requested radial bin.
+    cross_spectra_ : CrossSpectra or None
+        Most recent result from ``compute_cross_spectra()``.
     """
 
     # --- public attribute stubs populated by subclass __init__ --------
@@ -231,15 +175,15 @@ class _ComparatorBase:
 
     # --- populated by :meth:`compute_spectra` ---------------------------
     spectra_: np.ndarray | None = None
+    cross_spectra_: CrossSpectra | None = None
     dc_: np.ndarray | None = None
     presence_: np.ndarray | None = None
     rotation_angles_: np.ndarray | None = None
+    _alignment_landmark_genes: tuple[str, ...] | None = None
     frequency_bin_counts_: np.ndarray | None = None
     freq_edges_requested_: np.ndarray | None = None
     frequency_bin_intervals_: np.ndarray | None = None
     _supported_frequency_bin_mask: np.ndarray | None = None
-
-    _raw_2d_spectra: list[np.ndarray] | None = None
 
     # Angular resolution of the ``feature_mode='2d'`` polar feature grid:
     # the 2-D feature axis is ``n_radius_bins × _n_theta_bins`` over the
@@ -247,50 +191,143 @@ class _ComparatorBase:
     _n_theta_bins: int = 36
 
     # ------------------------------------------------------------------
-    @abstractmethod
-    def _compute_spectra(
-        self,
-        n_jobs: int,
-        progress: bool,
-        landmark_genes: Sequence[str] | None = None,
-    ) -> tuple[list[np.ndarray], np.ndarray, np.ndarray]:
-        """Stream per-sample **feature** spectra + DC + presence mask.
+    def _prepare_frequency_grid(self) -> None:
+        """Resolve common geometry and bin support without computing gene spectra."""
+        if self._spectrum_backend == "fft":
+            self._grid_shapes = [tuple(self._rasterize_one(s).shape[-2:]) for s in self.samples]
+            self._spacings = self._spacing_override or [(1.0, 1.0)] * len(self.samples)
+        self._resolve_freq_edges()
+        self._record_frequency_bin_metadata(
+            self._fft_cell_counts_for_edges(self.freq_edges),
+            self._fft_cell_counts_for_edges(self.freq_edges_requested_),
+        )
 
-        Implemented by each backend. The dense full ``(n_genes, ny, n_kx)`` 2D
-        spectra should **never** materialised in either mode and peak memory stays
-        at ``O(chunk · ny · nx)``. Returns ``(feats, dc, presence)``:
+    def _ensure_alignment(self, n_jobs, progress, landmark_genes=None, *, chunk_size=None):
+        """Reuse sample angles or estimate them from compact polar landmarks only.
 
-        - ``feature_mode='radial'`` — rasterise/NUFFT → per-gene-chunk FFT →
-          radial-bin, discarding each dense chunk; ``feats`` are
-          **radial-binned** ``(n_genes, n_feature_bins)`` arrays. No alignment
-          needed here, and the ``landmark_genes`` argument is ignored.
-        - ``feature_mode='2d'`` — a **two-pass** streamed rotation alignment:
-          (A) learn per-sample rotation angles against a reference using
-          landmark genes (default: use the per-sample *geometric-mean* spectrum as
-          a single landmark, like
-          :func:`sonic.comparators.normalization.normalize_background`; optionally, align
-          the spectra of an explicit ``landmark_genes`` set).
-          (B) for every gene-chunk, first rotate by the estimated angle, then
-          resample onto a polar ``(radius, theta)`` grid whose **radius axis is
-          the shared physical-frequency grid** (:attr:`freq_edges`, the same
-          edges the radial path uses) and whose ``theta`` axis (length
-          :attr:`_n_theta_bins`) carries direction, and flatten — discarding each
-          dense chunk. ``feats`` are
-          ``(n_genes, n_radius_bins · _n_theta_bins)`` and are cross-sample
-          aligned (heterogeneous lattices map the same physical frequency to
-          the same radius bin, like radial mode). The recovered angles are
-          stored on ``self.rotation_angles_``.
-
-        ``dc`` is ``(n_samples, n_genes)`` and ``presence`` is
-        ``(n_samples, n_genes)`` bool. Each backend calls
-        :meth:`_resolve_freq_edges` once its per-sample spacing metadata is known
-        and before any streamed reducer consumes :attr:`freq_edges`. When an
-        explicit ``landmark_genes`` set would require caching the full landmark
-        spectra beyond :attr:`_landmark_cache_warn_bytes`, the backend warns and
-        falls back to a single streamed geometric mean **of the landmark genes**
-        (see :meth:`_landmark_cache_fits`) instead of raising.
+        This helper populates :attr:`rotation_angles_` and :attr:`_alignment_landmark_genes`
+        to be used by :meth:`_compute_spectra` when ``feature_mode='2d'``.
         """
-        raise NotImplementedError
+        if self.feature_mode != "2d":  # only applies to 2D polar bins
+            return
+        names = None if landmark_genes is None else tuple(landmark_genes)
+        indices = None
+        if names is not None:
+            if not names:
+                raise ValueError("landmark_genes must contain at least one gene")
+            available = set(self.gene_names)
+            missing = [g for g in names if g not in available]
+            if missing:
+                raise KeyError(f"landmark_genes not in gene_names: {missing}")
+            indices = _gene_indices(self.gene_names, names)
+        if self.rotation_angles_ is not None and (
+            names is None or names == self._alignment_landmark_genes
+        ):
+            return
+        if len(self.samples) == 1:
+            angles = np.zeros(1)
+        else:
+            padding = int(self._spectrum_backend == "nufft")
+            grids = [(ny + 2 * padding, nx + 2 * padding) for ny, nx in self._grid_shapes]
+            spec = self._resolve_chunk_spec(chunk_size)
+            n_genes = len(self.gene_names) if names is None else len(names)
+            n_jobs, chunk, spare = self._resolve_spectrum_schedule(
+                spec,
+                grids,
+                n_genes,
+                n_jobs=n_jobs,
+                alignment="geomean" if names is None else "per_gene",
+            )
+            f_max = min(0.5 / max(spacing) for spacing in self._spacings)
+            edges = np.linspace(0.0, f_max, _ALIGNMENT_N_RADIUS + 1)
+
+            def fourier(i, selected):
+                read, _, _, count, shape = self._sample_spectrum_chunker(
+                    i, gene_indices=selected, chunk_size=chunk, cache_budget=spare[i]
+                )
+                polar = _stream_landmark_polar(
+                    read,
+                    count,
+                    shape,
+                    chunk_size=chunk,
+                    fft_solver=self._spectrum_fft_solver,
+                    freq_edges=edges,
+                    spacing=self._spacings[i],
+                    geomean=selected is None,
+                    frequency_padding=padding,
+                )
+                return np.fft.rfft(polar, axis=1)
+
+            # The reference block is shared. Only angular cross-products survive each batch.
+            cross = np.zeros((len(self.samples), _ALIGNMENT_N_THETA // 2 + 1), dtype=complex)
+
+            def correlate(i, _pbar, *, reference, selected):
+                cross[i + 1] += _landmark_cross_sum(reference, fourier(i + 1, selected))
+
+            starts = (0,) if indices is None else range(0, n_genes, chunk)
+            for start in tqdm(starts, desc="Alignment landmarks", disable=not progress):
+                selected = None if indices is None else indices[start : start + chunk]
+                _run_per_sample(
+                    partial(correlate, reference=fourier(0, selected), selected=selected),
+                    len(self.samples) - 1,
+                    n_chunks_per_sample=1,
+                    desc="Alignment landmarks",
+                    n_jobs=n_jobs,
+                    progress=False,
+                    shared_output=True,
+                )
+            angles = _landmark_angles(cross, _ALIGNMENT_N_THETA)
+        self.rotation_angles_ = angles
+        self._alignment_landmark_genes = names
+
+    def _compute_spectra(self, n_jobs, progress, landmark_genes=None, *, chunk_size=None):
+        """Stream raw feature powers and DC/presence through either backend."""
+        self._prepare_frequency_grid()
+        padding = int(self.feature_mode == "2d" and self._spectrum_backend == "nufft")
+        grids = [(ny + 2 * padding, nx + 2 * padding) for ny, nx in self._grid_shapes]
+        spec = self._resolve_chunk_spec(chunk_size)
+        self._ensure_alignment(n_jobs, progress, landmark_genes, chunk_size=spec)
+        n_jobs, chunk, spare = self._resolve_spectrum_schedule(
+            spec, grids, len(self.gene_names), n_jobs=n_jobs, polar=self.feature_mode == "2d"
+        )
+        setattr(self, f"_{self._spectrum_backend}_chunk_size", chunk)
+
+        # Compute binned and flattened single-feature auto-spectra per sample.
+        def _one(i, pbar):
+            read, dc, presence, count, shape = self._sample_spectrum_chunker(
+                i, chunk_size=chunk, cache_budget=spare[i]
+            )
+            options = {
+                "chunk_size": chunk,
+                "fft_solver": self._spectrum_fft_solver,
+                "spacing": self._spacings[i],
+                "edges": self.freq_edges,
+                "pbar": pbar,
+            }
+            if self.feature_mode == "radial":
+                features = _stream_radial_features(read, count, shape, **options)
+            else:
+                features = _stream_polar_features(
+                    read,
+                    count,
+                    shape,
+                    angle_deg=float(self.rotation_angles_[i]),
+                    n_theta=self._n_theta_bins,
+                    frequency_padding=padding,
+                    **options,
+                )
+            return features, dc, presence
+
+        return _unpack_sample_triples(
+            _run_per_sample(
+                _one,
+                len(self.samples),
+                n_chunks_per_sample=int(np.ceil(len(self.gene_names) / chunk)),
+                desc="Spectra",
+                n_jobs=n_jobs,
+                progress=progress,
+            )
+        )
 
     # Backend cache sweet-spot cap for ``chunk_size='auto'`` — the empirically
     # tuned caps from :func:`sonic.utils.auto_chunk_size` (FFT → 32,
@@ -301,12 +338,25 @@ class _ComparatorBase:
 
     @staticmethod
     def _normalize_chunk_spec(spec: int | str) -> int | str:
-        """Validate a chunk-size spec at construction; return ``'auto'`` or a ``>=1`` int."""
-        if isinstance(spec, str):
-            if spec != "auto":
-                raise ValueError(f"chunk_size must be a positive int or 'auto', got {spec!r}.")
-            return "auto"
-        return max(1, int(spec))
+        """Accept only 'auto' or a positive integer, at construction and per call."""
+        if isinstance(spec, str) and spec == "auto":
+            return spec
+        if (
+            isinstance(spec, (int, np.integer))
+            and not isinstance(spec, (bool, np.bool_))
+            and spec >= 1
+        ):
+            return int(spec)
+        raise ValueError("chunk_size must be auto or a positive integer")
+
+    def _resolve_chunk_spec(self, chunk_size):
+        """Validate a call override without changing the constructor setting."""
+        spec = (
+            getattr(self, f"_{self._spectrum_backend}_chunk_size_spec")
+            if chunk_size is None
+            else chunk_size
+        )
+        return self._normalize_chunk_spec(spec)
 
     @staticmethod
     def _normalize_n_theta_bins(n_theta_bins: int) -> int:
@@ -347,80 +397,85 @@ class _ComparatorBase:
 
     # ------------------------------------------------------------------
     def _resolve_spectrum_schedule(
-        self, spec: int | str, grid_shapes: list[tuple[int, int]], *, n_jobs: int = 1
-    ) -> tuple[int, int]:
-        """Resolve sample jobs, transform threads and chunks from the same budget.
+        self,
+        spec: int | str,
+        grid_shapes: list[tuple[int, int]],
+        n_genes: int,
+        *,
+        n_jobs: int = 1,
+        polar: bool = False,
+        alignment: str | None = None,
+    ) -> tuple[int, int, list[int]]:
+        """Size concurrent transforms and return the spare bytes for sparse column caches."""
+        from bisect import bisect_right
 
-        Estimate 64 bytes per grid cell plus, for NUFFT, 64 per observation.
-        Automatic jobs can shrink to fit one feature per sample job; explicit
-        positive jobs retain their limit. Explicit chunks bypass memory sizing.
-        """
-        if isinstance(spec, str) and spec != "auto":
-            raise ValueError(f"chunk_size must be a positive int or 'auto', got {spec!r}.")
-        from sonic.utils import resolve_chunk_size, resolve_parallelism
+        from sonic.utils import _nufft_workspace_bytes, resolve_parallelism
 
-        max_lat = max((ny * nx for (ny, nx) in grid_shapes), default=1)
-        per_feat = 64 * max(max_lat, 1)
-        if self._spectrum_backend == "nufft":
-            per_feat += 64 * max(len(coords) for coords in self._coords)
+        reducers = [
+            _polar_reducer_workspace_bytes(
+                self._grid_shapes[i],
+                edges=self.freq_edges,
+                spacing=self._spacings[i],
+                n_theta=self._n_theta_bins,
+            )
+            if polar
+            else (0, 0)
+            for i in range(len(grid_shapes))
+        ]
+
+        def reference_bytes(count):
+            if alignment is None:
+                return 0
+            landmarks = count if alignment == "per_gene" else 1
+            return 16 * landmarks * _ALIGNMENT_N_RADIUS * (_ALIGNMENT_N_THETA // 2 + 1)
+
+        def workspace(i, count, workers):
+            shape = grid_shapes[i]
+            if self._spectrum_backend == "nufft":
+                transform = _nufft_workspace_bytes(
+                    shape, len(self._coords[i]), self._nufft_eps, count, workers
+                )
+            else:
+                transform = 64 * shape[0] * shape[1] * count
+            if alignment is not None:
+                landmarks = count if alignment == "per_gene" else 1
+                polar_bytes = 8 * _ALIGNMENT_N_THETA * _ALIGNMENT_N_RADIUS
+                # Interpolation retains Cartesian powers, coordinates and one polar block.
+                interpolate = 24 * shape[0] * shape[1] * landmarks + polar_bytes * (landmarks + 2)
+                return max(transform, interpolate, polar_bytes * landmarks + reference_bytes(count))
+            stored, peak = reducers[i]
+            return max(peak, stored + transform)
+
+        minimum = max(workspace(i, 1, 1) for i in range(len(grid_shapes)))
         n_jobs, self._workers = resolve_parallelism(
             n_jobs,
             self._workers_spec,
             backend=self._spectrum_backend,
-            n_tasks=len(self.samples),
-            per_feat_bytes=per_feat if spec == "auto" else None,
-            budget_bytes=self._auto_chunk_budget_bytes,
+            n_tasks=len(self.samples) - int(alignment is not None),
+            per_feat_bytes=minimum if spec == "auto" else None,
+            budget_bytes=max(1, self._auto_chunk_budget_bytes - reference_bytes(1)),
         )
-        chunk = (
-            resolve_chunk_size(
-                self._auto_chunk_cap,
-                per_feat,
-                n_jobs=n_jobs,
-                budget_bytes=self._auto_chunk_budget_bytes,
+
+        def total_bytes(count):
+            return reference_bytes(count) + n_jobs * max(
+                workspace(i, count, self._workers) for i in range(len(grid_shapes))
             )
-            if spec == "auto"
-            else max(1, int(spec))
-        )
-        return n_jobs, chunk
 
-    # Rotation-landmark cache budget (bytes). An explicit ``landmark_genes``
-    # set in 2d mode needs its full ``(n_landmarks, ny, n_kx)`` spectra cached
-    # per sample to estimate angles; if the largest such cache would exceed this
-    # we raise rather than risk an OOM. The streamed *geomean* landmark (the
-    # default) is a single ``(1, ny, n_kx)`` spectrum and never trips this.
-    _landmark_cache_warn_bytes: int = 8 * 1024**3  # 8 GiB
-
-    # ------------------------------------------------------------------
-    def _landmark_cache_fits(self, n_landmarks: int, *, frequency_padding: int = 0) -> bool:
-        """Whether caching ``n_landmarks`` full-2D spectra per sample fits budget.
-
-        The explicit-``landmark_genes`` path (2d mode) holds each sample's
-        ``(n_landmarks, ny, n_kx)`` landmark spectra in memory to estimate the
-        rotation. When the worst-case cache would exceed
-        :attr:`_landmark_cache_warn_bytes` this returns ``False`` so the caller
-        can fall back to a single streamed geometric-mean landmark (built over
-        just the landmark genes) instead of risking an OOM. Returns ``True``
-        (cache the per-gene landmark spectra) otherwise.
-        """
-        if not self._grid_shapes:
-            return True
-        worst = 0
-        for ny, nx in self._grid_shapes:
-            ny, nx = ny + 2 * frequency_padding, nx + 2 * frequency_padding
-            n_kx = nx if self._spectrum_fft_solver == "fft2" else nx // 2 + 1
-            worst = max(worst, n_landmarks * ny * n_kx * 8)
-        if worst > self._landmark_cache_warn_bytes:
-            warnings.warn(
-                f"Rotation alignment with {n_landmarks} explicit landmark genes would cache "
-                f"up to {worst / 1024**3:.1f} GiB of 2D spectra per sample "
-                f"(limit {self._landmark_cache_warn_bytes / 1024**3:.1f} GiB). Falling back "
-                "to a single streamed geometric-mean of the landmark genes to avoid OOM. "
-                "Pass fewer landmark_genes or raise _landmark_cache_warn_bytes to keep the "
-                "per-gene landmark alignment.",
-                stacklevel=2,
+        chunk = spec
+        if spec == "auto":
+            if total_bytes(1) > self._auto_chunk_budget_bytes:
+                raise ValueError(
+                    f"Budget cannot fit one feature per worker ({total_bytes(1)} bytes across {n_jobs} workers)."
+                )
+            chunk = bisect_right(
+                range(1, self._auto_chunk_cap + 1), self._auto_chunk_budget_bytes, key=total_bytes
             )
-            return False
-        return True
+        count = min(chunk, n_genes)
+        per_job = (self._auto_chunk_budget_bytes - reference_bytes(count)) // n_jobs
+        spare = [
+            max(0, per_job - workspace(i, count, self._workers)) for i in range(len(grid_shapes))
+        ]
+        return n_jobs, chunk, spare
 
     # ------------------------------------------------------------------
     def _resolve_freq_edges(self) -> None:
@@ -466,7 +521,7 @@ class _ComparatorBase:
             return None
         return np.vstack(
             [
-                radial_bin_counts(
+                _radial_bin_cell_counts(
                     shape,
                     n_bins=self._n_radial_bins,
                     fft_solver=self._spectrum_fft_solver,
@@ -486,7 +541,7 @@ class _ComparatorBase:
 
         edges = np.asarray(self.freq_edges, dtype=float)
         requested = edges.size - 1
-        self.freq_edges = adapt_frequency_edges(
+        self.freq_edges = _adapt_radial_edges(
             self._grid_shapes,
             self._spacings,
             edges,
@@ -506,27 +561,21 @@ class _ComparatorBase:
     def _select_supported_frequency_bins(
         self, features: np.ndarray, supported_bins: np.ndarray
     ) -> np.ndarray:
-        """Subset radial or 2D polar feature arrays to retained radial bins."""
-        if supported_bins.all():
-            return features
+        """Validate the feature axis and retain supported radial bands."""
         supported_bins = np.asarray(supported_bins, dtype=bool)
         n_radius = supported_bins.size
-        if self.feature_mode == "radial":
-            if features.shape[-1] != n_radius:
-                raise ValueError(
-                    f"radial feature axis has length {features.shape[-1]}, "
-                    f"expected {n_radius} bins before support filtering"
-                )
-            return features[..., supported_bins]
-
-        # In 2D mode, drop whole angular blocks for unsupported radial bins.
-        n_theta = self._n_theta_bins
+        n_theta = 1 if self.feature_mode == "radial" else self._n_theta_bins
         expected = n_radius * n_theta
         if features.shape[-1] != expected:
             raise ValueError(
-                f"2D feature axis has length {features.shape[-1]}, "
-                f"expected {expected} = {n_radius} radial bins x {n_theta} angles"
+                f"{self.feature_mode} feature axis has length {features.shape[-1]}, "
+                f"expected {expected} bins before support filtering"
             )
+        if supported_bins.all():
+            return features
+        if self.feature_mode == "radial":
+            return features[..., supported_bins]
+
         reshaped = features.reshape(*features.shape[:-1], n_radius, n_theta)
         kept = reshaped[..., supported_bins, :]
         return kept.reshape(*features.shape[:-1], int(supported_bins.sum()) * n_theta)
@@ -545,6 +594,9 @@ class _ComparatorBase:
 
         # Identify frequency bins in the current grid that are supported by all samples.
         supported_bins = (feature_grid_counts > 0).all(axis=0)
+        if self.feature_mode == "2d":
+            nyquist = min(0.5 / max(spacing) for spacing in self._spacings)
+            supported_bins &= np.asarray(self.freq_edges[1:]) <= nyquist * (1 + 2e-9)
         if not np.any(supported_bins):
             raise RuntimeError("No radial frequency bins are supported by every sample.")
 
@@ -565,7 +617,7 @@ class _ComparatorBase:
         dropped = int((~supported_bins).sum())
         if dropped:
             logger.info(
-                "Dropped %d radial bins with missing sample support " "(retained=%d).",
+                "Dropped %d radial bins with missing sample support (retained=%d).",
                 dropped,
                 int(supported_bins.sum()),
             )
@@ -580,84 +632,69 @@ class _ComparatorBase:
         progress: bool = True,
         *,
         memory_budget_bytes: int | str = _DEFAULT_CHUNK_BUDGET,
+        chunk_size: int | str | None = None,
     ) -> _ComparatorBase:
-        """
-        Compute per-sample power spectra and (if ``feature_mode='2d'``) rotation-align.
+        """Compute a power spectrum for each gene in each sample.
 
         Parameters
         ----------
         n_jobs : int, default -1
-            Parallelism over samples for the per-sample spectrum pass. When
-            ``progress=True`` the outer loop is sequential (so the tqdm bar is
-            accurate). Transform threads use spare CPUs, capped at four by
-            default. With automatic chunks, negative job counts are also capped
-            by the workspace needed for one feature per concurrent sample.
+            Number of samples to process in parallel. Use ``-1`` for automatic
+            allocation. Set ``progress=False`` to enable parallel sample processing.
         landmark_genes : sequence of str, optional
-            Only used in ``feature_mode='2d'``. Names of genes (matched against
-            :attr:`gene_names`) whose spectra define the rotation-alignment
-            landmarks. Recovered rotations are still applied to every gene in
-            :attr:`gene_names`. If None (default), a single streamed geometric
-            mean over every gene is used as the landmark.
+            Genes that define sample alignment in directional mode. The default
+            reuses an existing alignment or estimates one from all genes.
         progress : bool, default True
-            Show tqdm progress bars over the three phases (spectrum compute,
-            optional rotation alignment, radial binning).
-        memory_budget_bytes : int or str, default 2147483648 (2 GiB)
-            Bytes or a size string, e.g. ``"512 MB"`` or ``"2 GiB"``. Units are
-            case-insensitive: GB uses powers of 1000, GiB powers of 1024.
-            Positive estimated batch-workspace budget shared across actual
-            sample jobs when ``fft_chunk_size`` / ``nufft_chunk_size`` is
-            ``'auto'``. More jobs divide this fixed budget; increase it explicitly
-            to allow larger batches. Excludes stored inputs and retained outputs;
-            not a total-process memory limit. Explicit chunk sizes bypass sizing.
+            Show a progress bar and process one sample at a time.
+        memory_budget_bytes : int or str, default '2 GiB'
+            Estimated workspace for automatic transform blocks and directional binning
+            across sample jobs. Supply bytes or a size such as ``'512 MiB'``.
+        chunk_size : int, 'auto', or None, optional
+            Genes per transform block. By default, use the constructor setting.
+            An explicit size overrides the automatic memory budget.
 
         Returns
         -------
         self
+            Stores binned powers in ``spectra_``, sample mean expression in ``dc_``,
+            and gene presence in ``presence_``. Radial bins describe spatial scale.
+            Directional bins also describe angle.
+
+        Notes
+        -----
+        Recomputing gene spectra clears any previously computed cross-spectra.
         """
-        self._auto_chunk_budget_bytes = _parse_memory_budget(memory_budget_bytes)
+        chunk_size = self._resolve_chunk_spec(chunk_size)
+        # Fit on a shallow copy: old arrays are never mutated by extraction.
+        pending = copy.copy(self)
+        pending._auto_chunk_budget_bytes = _parse_memory_budget(memory_budget_bytes)
         logger.info(
             "Computing per-sample spectra (n_samples=%d, mean-centered)...",
-            len(self.samples),
+            len(pending.samples),
         )
-        # ``_compute_spectra`` streams and returns the **final per-sample
-        # features** for both modes — radial-binned ``(n_genes, n_feature_bins)``
-        # (radial), or rotation-aligned physical-frequency polar features
-        # ``(n_genes, n_radius_bins · _n_theta_bins)`` (2d). The dense full 2D
-        # spectra are never held; rotation angles (2d) are recorded on
-        # ``self.rotation_angles_`` by the backend.
-        self._raw_2d_spectra = None
-        per_sample, self.dc_, self.presence_ = self._compute_spectra(
-            # Backends resolve jobs/chunks once their grid shapes are known.
+        pending.cross_spectra_ = None
+        per_sample, pending.dc_, pending.presence_ = pending._compute_spectra(
             n_jobs=1 if progress else n_jobs,
             progress=progress,
             landmark_genes=landmark_genes,
+            chunk_size=chunk_size,
         )
 
-        # The feature grid may be adaptively merged; diagnostics also preserve
-        # support on the originally requested grid.
-        feature_grid_counts = self._fft_cell_counts_for_edges(self.freq_edges)
-        requested_grid_counts = self._fft_cell_counts_for_edges(self.freq_edges_requested_)
-        supported_bins = self._record_frequency_bin_metadata(
-            feature_grid_counts,
-            requested_grid_counts,
-        )
+        supported_bins = pending._supported_frequency_bin_mask
 
-        # self._compute_spectra returns the raw features with potential NA values.
-        # Keep only features in the supported frequency bins.
+        # Drop unsupported radial bands consistently across all samples.
         feats = list(per_sample)
         if supported_bins is not None:
-            feats = [self._select_supported_frequency_bins(f, supported_bins) for f in feats]
-        n_feature_bins = min(f.shape[-1] for f in feats)
-        feats = [f[..., :n_feature_bins] for f in feats]
-        self.spectra_ = np.stack(feats, axis=0)
-        if hasattr(self, "_nufft_eps") and len(self.samples) > 1:
+            feats = [pending._select_supported_frequency_bins(f, supported_bins) for f in feats]
+        pending.spectra_ = np.stack(feats, axis=0)
+        if hasattr(self, "_nufft_eps") and len(pending.samples) > 1:
             # Diagnostic only: eps is a transform target, not a statistical
             # variance floor. Keep small real effects and p-values unchanged.
-            spread = np.ptp(self.spectra_, axis=0).max(axis=-1)
-            scale = self.spectra_.max(axis=(0, 2))
-            unresolved = (spread > 0) & (spread <= 2 * self._nufft_eps * scale)
-            if self.presence_ is not None:
-                unresolved &= self.presence_.all(axis=0)
+            spread = np.ptp(pending.spectra_, axis=0).max(axis=-1)
+            scale = pending.spectra_.max(axis=(0, 2))
+            unresolved = (spread > 0) & (spread <= 2 * pending._nufft_eps * scale)
+            if pending.presence_ is not None:
+                unresolved &= pending.presence_.all(axis=0)
             if unresolved.any():
                 warnings.warn(
                     f"{unresolved.sum()} feature(s) have between-sample spectral differences "
@@ -667,17 +704,137 @@ class _ComparatorBase:
                     UserWarning,
                     stacklevel=2,
                 )
+        self.__dict__.update(pending.__dict__)
         return self
 
     # ------------------------------------------------------------------
-    def subset(self, indices: Sequence[int] | np.ndarray) -> _ComparatorBase:
-        """Return a lightweight comparator view over a subset of samples.
+    def compute_cross_spectra(
+        self,
+        pairs: Sequence[tuple[str, str]],
+        n_jobs: int = -1,
+        landmark_genes: Sequence[str] | None = None,
+        progress: bool = True,
+        *,
+        memory_budget_bytes: int | str = _DEFAULT_CHUNK_BUDGET,
+        chunk_size: int | str | None = None,
+    ) -> _ComparatorBase:
+        """Compute cross-spectra for selected gene pairs on a common frequency grid.
 
-        The returned comparator is a shallow copy of ``self``: sample containers
-        and gene-level configuration are shared, while per-sample fitted arrays
-        and per-sample metadata are indexed to ``indices``. This is intended for
-        running multiple contrasts against one fitted comparator without
-        recomputing spectra.
+        Parameters
+        ----------
+        pairs : sequence of (str, str)
+            Ordered gene pairs. Each name must identify one gene. Supply each
+            pair once, in one order. Self-pairs are available for description.
+        n_jobs : int, default -1
+            Number of samples to process in parallel. Use ``-1`` for automatic
+            allocation. Set ``progress=False`` to enable parallel sample processing.
+        landmark_genes : sequence of str, optional
+            Genes that define sample alignment in directional mode. The default
+            reuses an existing alignment or estimates one from all genes.
+        progress : bool, default True
+            Show a progress bar and process one sample at a time.
+        memory_budget_bytes : int or str, default '2 GiB'
+            Estimated workspace for transform blocks and polar reducers across sample
+            jobs when chunking automatically. Supply bytes or a size such as ``'512 MiB'``.
+        chunk_size : int, 'auto', or None, optional
+            Genes per transform block. By default, use the constructor setting.
+            An explicit size overrides the automatic memory budget.
+
+        Returns
+        -------
+        self
+            Stores the requested pairs in ``cross_spectra_``, replacing the previous
+            set. Cross-spectra have axes (sample, pair, bin). The matching power
+            spectra have axes (sample, gene, bin).
+
+        Notes
+        -----
+        Pair spectra use the original expression values, even after single-gene
+        normalization. Both kinds of spectra use the same directional alignment.
+        To change landmarks after fitting gene spectra, call ``compute_spectra()`` first.
+        """
+        from sonic.comparators.cross_spectrum import _compute_cross_spectra
+
+        pending = copy.copy(self)
+        pending.cross_spectra_ = _compute_cross_spectra(
+            pending,
+            pairs,
+            n_jobs=n_jobs,
+            progress=progress,
+            memory_budget_bytes=memory_budget_bytes,
+            chunk_size=chunk_size,
+            landmark_genes=landmark_genes,
+        )
+        self.__dict__.update(pending.__dict__)
+        return self
+
+    # ------------------------------------------------------------------
+    def explain_spectrum(
+        self,
+        features: str | Sequence[str],
+        *,
+        sample_index: int = 0,
+        bands: Sequence[int],
+        representation: str | None = None,
+        memory_budget_bytes: int | str = _DEFAULT_CHUNK_BUDGET,
+    ) -> SpatialExplanation:
+        """Map each location's contribution to selected frequency bins in one sample.
+
+        Parameters
+        ----------
+        features : str or sequence of str
+            One gene for a power map, or an ordered pair for a cross-spectrum map.
+        sample_index : int, default 0
+            Zero-based sample index in this comparator.
+        bands : sequence of int
+            Distinct zero-based indices of retained bins, in the desired output
+            order. Directional bins use radius first, then angle.
+        representation : str, optional
+            For one gene, use ``'power'`` (default) or ``'power_norm'`` for its
+            share of total power. For a pair, use ``'cross'`` (default, real
+            cross-spectrum), ``'coherency'`` (signed real part), or ``'coherence'``
+            (squared magnitude).
+        memory_budget_bytes : int or str, default '2 GiB'
+            Memory budget for reconstruction, including the returned maps.
+
+        Returns
+        -------
+        sonic.explanation.SpatialExplanation
+            One map per selected bin. Local contributions sum to the bin value
+            on the selected representation's original scale. Individual
+            contributions can be negative, including for coherence.
+
+        Notes
+        -----
+        Compute gene spectra or cross-spectra first. Maps use the source expression
+        values. Irregular samples retain their source coordinates. Grid maps use
+        local coordinates with origin zero and the specified grid spacing.
+        """
+        from sonic.comparators.explanation import _explain_spectrum
+
+        return _explain_spectrum(
+            self,
+            features,
+            sample_index=sample_index,
+            bands=bands,
+            representation=representation,
+            memory_budget_bytes=memory_budget_bytes,
+        )
+
+    # ------------------------------------------------------------------
+    def subset(self, indices: Sequence[int] | np.ndarray) -> _ComparatorBase:
+        """Select samples from this comparator for another comparison.
+
+        Parameters
+        ----------
+        indices : sequence of int or np.ndarray
+            Sample indices in the desired order, or a Boolean mask in sample order.
+
+        Returns
+        -------
+        ComparatorIrregular or ComparatorGrid
+            A comparator with the selected samples and their available fitted
+            results. It shares the source sample objects with this comparator.
         """
         idx = np.asarray(indices)
         if idx.dtype == bool:
@@ -696,6 +853,18 @@ class _ComparatorBase:
         sub.dc_ = None if self.dc_ is None else self.dc_[idx]
         sub.presence_ = None if self.presence_ is None else self.presence_[idx]
         sub.rotation_angles_ = None if self.rotation_angles_ is None else self.rotation_angles_[idx]
+        if self.cross_spectra_ is not None:
+            result = self.cross_spectra_
+            sub.cross_spectra_ = replace(
+                result,
+                cross_spectra=result.cross_spectra[idx],
+                auto_spectra=result.auto_spectra[idx],
+                coherency_valid=result.coherency_valid[idx],
+                presence=result.presence[idx],
+                mode_pair_counts=result.mode_pair_counts[idx],
+                rotation_angles_deg=result.rotation_angles_deg[idx],
+                chunk_schedules=[result.chunk_schedules[i] for i in idx],
+            )
         sub.frequency_bin_counts_ = (
             None if self.frequency_bin_counts_ is None else self.frequency_bin_counts_[idx]
         )
@@ -705,7 +874,6 @@ class _ComparatorBase:
         for name in (
             "_spacings",
             "_grid_shapes",
-            "_raw_2d_spectra",
             "_coords",
             "_unit_scales",
             "_spacing_override",
@@ -719,10 +887,13 @@ class _ComparatorBase:
     # Post-fit transforms
     # ------------------------------------------------------------------
     def normalize_background(self) -> _ComparatorBase:
-        """Normalize each sample using its observed genes' geometric mean.
+        """Adjust power in each frequency bin for the sample-wide background.
 
-        Genes excluded by ``presence_`` neither contribute to the background
-        nor get transformed. Samples with no observed genes are left unchanged.
+        Returns
+        -------
+        self
+            Updates ``spectra_`` using the geometric mean power of the observed
+            genes in each bin. Only observed genes enter the adjustment.
         """
         if self.spectra_ is None:
             raise RuntimeError("Call .compute_spectra() before .normalize_background().")
@@ -734,45 +905,22 @@ class _ComparatorBase:
         return self
 
     def normalize_covariates(self, covariates: Sequence[Any]) -> _ComparatorBase:  # noqa: C901
-        """Regress out per-sample covariate spectra from :attr:`spectra_`.
-
-        Two input modes, detected from the first element's type:
-
-        - **Sequence of str** — column-key list shared across samples.
-          Each string key is considered as one covariate applied to every
-          sample. Implementation depends on the subclass:
-
-            * :class:`~sonic.ComparatorIrregular` looks each key up in
-              ``adata.obs.columns`` first, then ``adata.var_names``
-              (preferring obs on collision); the resolved per-spot
-              vector is NUFFTed directly onto the sample's k-grid.
-            * :class:`~sonic.ComparatorGrid` rasterizes via
-              :func:`spatialdata.rasterize_bins` with the keys forwarded
-              as ``value_key`` (any combination of ``.obs`` columns and
-              ``var_names``).
-
-        - **Sequence of np.ndarray** — per-sample pre-rasterized images,
-          one ``(n_covariates, ny_i, nx_i)`` array per sample. Universal
-          path; works on either subclass. Use when you want full control
-          over rasterization, or when the covariates aren't already
-          attached to the sample containers. These rasters must have
-          frequency support compatible with the comparator's retained bins.
-
-        Both modes produce the same downstream behaviour: per-sample
-        covariate features are reduced to ``(n_covariates, n_feature_bins)``
-        (same trailing axis as :attr:`spectra_`) and passed through
-        :func:`~sonic.comparators.normalization.normalize_covariates` to
-        log-space-residualise each gene's spectrum against them.
+        """Adjust gene power for the spectra of known spatial covariates in each sample.
 
         Parameters
         ----------
         covariates : sequence of str or sequence of np.ndarray
-            See modes above. Strings are interpreted by the subclass;
-            ndarrays are used verbatim (one per sample).
+            Names of spatial covariates shared by the samples. On irregular
+            coordinates, SONIC checks ``obs`` first and then ``var_names``. On a
+            grid, use keys from the expression table. Alternatively, supply one
+            array of shape ``(n_covariates, ny, nx)`` per sample on a grid that
+            supports its frequency bins.
 
         Returns
         -------
-        self : _ComparatorBase
+        self
+            Replaces ``spectra_`` with the exponentiated residuals from regressing
+            each gene's log power on the log powers of the spatial covariates.
         """
         if self.spectra_ is None:
             raise RuntimeError("Call .compute_spectra() before .normalize_covariates().")
@@ -819,7 +967,6 @@ class _ComparatorBase:
                     cov_feat,
                     self._supported_frequency_bin_mask,
                 )
-            cov_feat = cov_feat[..., : self.spectra_.shape[-1]]
             self._validate_covariate_features(cov_feat, sample_index=i, mode=covariate_mode)
             cov_features_per_sample[i] = cov_feat
         # Keep the original spectra intact if a later sample has a saturated design.
@@ -871,9 +1018,9 @@ class _ComparatorBase:
         # across samples when ``feature_mode='radial'``) is what aligns the
         # bins, not grid_shape.
         cov_shape = cov.shape[-2:]
-        spacing = self._spacings[sample_index] if self._spacings is not None else None
+        spacing = self._spacings[sample_index] if self._spacings is not None else (1.0, 1.0)
         if self.feature_mode == "radial":
-            return radial_bin_spectrum(
+            return _bin_radial_spectrum(
                 cov_2d,
                 grid_shape=cov_shape,
                 n_bins=self._n_radial_bins,
@@ -889,13 +1036,13 @@ class _ComparatorBase:
         def _cov_chunk(start: int, stop: int) -> np.ndarray:
             return cov_2d[start:stop]
 
-        return stream_polar_features(
+        return _stream_polar_features(
             _cov_chunk,
             cov_2d.shape[0],
             cov_shape,
-            angle,
+            angle_deg=angle,
             chunk_size=max(1, cov_2d.shape[0]),
-            freq_edges=self.freq_edges,
+            edges=self.freq_edges,
             spacing=spacing,
             n_theta=self._n_theta_bins,
             fft_solver=self._spectrum_fft_solver,
@@ -926,7 +1073,7 @@ class _ComparatorBase:
         *,
         contrast: str | dict[str, float] | np.ndarray | None = None,
         statistic: str = "log_l2",
-        null: str = "analytic",
+        null: str | None = None,
         n_perm: int = 1000,
         random_state: int | None = None,
         freq_weights: np.ndarray | None = None,
@@ -934,87 +1081,94 @@ class _ComparatorBase:
         normalize_shape: bool = False,
         min_samples_per_group: int = 2,
         min_resid_df: int = 1,
+        covariance: str | None = None,
+        integration_tol: float = 1e-6,
     ) -> Any:
-        """Differential-frequency (DF) test on :attr:`spectra_`.
-
-        Tests whether each gene's radial-frequency power profile differs
-        between conditions / along a contrast. The companion DE test is
-        :meth:`test_diff_expr`.
-
-        Dispatches between four execution paths, picked from the
-        ``design`` argument's shape and the ``contrast=`` keyword:
-
-        - **Binary, analytic null** (1-D ``design``, ``null="analytic"`` (default),
-          ``contrast=None``): Liu mixture-χ² test on the binary indicator
-          via :func:`~sonic.comparators.multisample.compare_two_groups`
-          (or its masked variant when any ``presence_`` entry is
-          ``False``).
-        - **Binary, permutation null** (1-D ``design``,
-          ``null="permutation"``, ``contrast=None``): two-group
-          label-permutation test on the same dispatch target.
-        - **GLM analytic** (multi-column / continuous ``design`` **or**
-          explicit ``contrast=``): generalized Liu mixture-χ² test via
-          :func:`~sonic.comparators.multisample.compare_glm` (or
-          :func:`~sonic.comparators.multisample.compare_glm_masked`
-          when any ``presence_`` entry is ``False``).
-
-        Supplying ``contrast=`` alongside a 1-D ``design`` switches to
-        the GLM path on the single-column DataFrame that wraps the
-        binary groups (so the same contrast-resolution rules apply).
+        """Compare gene power across spatial frequencies in the fitted samples.
 
         Parameters
         ----------
-        design : 1-D array, 2-D ndarray, or pandas.DataFrame
-            Sample-level contrast specification. Length / first
-            dimension must equal ``len(samples)``. See
-            :func:`_validate_design` for the accepted forms; can differ
-            across calls on the same fitted comparator (fit once, test
-            many).
+        design : array-like, pandas.DataFrame, or 2-D np.ndarray
+            One row per sample, in fitted sample order. Use one-dimensional labels
+            for two groups. Use a design matrix and ``contrast`` for a linear model.
+            SONIC adds an intercept to a data frame. Include any intercept in a
+            numeric matrix yourself.
         contrast : str, dict, or np.ndarray, optional
-            Required when ``design`` is multi-column / continuous;
-            redundant for 1-D binary ``design`` (the binary indicator
-            *is* the contrast).
-        statistic : str, default 'log_l2'
-            Per-gene statistic. See
-            :func:`~sonic.comparators.multisample.compare_two_groups`
-            for the catalog.
-        null : {'analytic', 'permutation'}, default 'analytic'
-            Null-distribution method. ``'analytic'`` is the analytic
-            Liu-approximation null — the default on every dispatch
-            path. ``'permutation'`` is available on the binary path
-            only (raises on the GLM path).
-        n_perm, random_state, max_exact_permutations
-            Forwarded to the permutation path; ignored on the analytic
-            path.
+            Required for a linear model. Name one coefficient, map coefficient names
+            to weights, or supply a vector in encoded design-matrix column order.
+            The contrast must be estimable from the design.
+        statistic : {'log_l2', 'log_t_cauchy'}, default 'log_l2'
+            L2 measures the size of the contrast across bins. ``'log_t_cauchy'``
+            combines bin p-values and identifies the bin with the smallest
+            p-value among those used in the combination.
+        null : str, optional
+            For L2, use ``'rotation'`` (default) or ``'plugin'`` for Gaussian
+            plug-in calibration. Use ``'permutation'`` for two exchangeable groups
+            with one-dimensional labels and no ``contrast``.
+            For ``'log_t_cauchy'``, the only calibration is ``'analytic'`` (default).
+        n_perm : int, default 1000
+            Number of random group assignments for a sampled permutation test.
+        random_state : int, optional
+            Random seed for sampled permutations.
         freq_weights : np.ndarray, optional
-            Per-bin reweighting (same semantics as on the standalone).
+            Positive, finite weights in fitted bin order.
+            The default gives each bin equal weight. Choose weights before testing.
+        max_exact_permutations : int, default 10000
+            Enumerate all group assignments when their number is at most this
+            limit. Set it to zero to sample assignments.
         normalize_shape : bool, default False
-            If True, divide each per-(sample, gene) spectrum by its sum
-            along the trailing (frequency) axis before the statistic is
-            computed (delegated to the dispatch target's
-            ``normalize_shape=`` keyword). Use to isolate **shape-only**
-            redistribution of power across radial frequencies,
-            independent of overall amplitude. Non-destructive —
-            :attr:`spectra_` is unchanged after the call.
+            Divide each gene's power in each bin by its total power in that
+            sample before taking the logarithm (DF-norm).
         min_samples_per_group : int, default 2
-            Minimum per-group sample count required to keep a gene under
-            the masked path (forwarded to
-            :func:`~sonic.comparators.multisample.compare_two_groups_masked`).
-            Ignored on the unmasked / GLM paths.
+            Minimum observed samples in each group for binary L2 tests and
+            masked binary t-Cauchy tests.
         min_resid_df : int, default 1
-            Minimum per-gene residual degrees of freedom required under
-            the masked GLM path. Ignored on the unmasked and binary paths.
+            Minimum residual degrees of freedom for features with missing samples.
+            Fully observed features require one residual degree of freedom.
+        covariance : str, optional
+            With plug-in calibration, ``None`` or ``'per_gene'`` estimates residual
+            covariance across bins for each gene. ``'pooled'`` shares this estimate
+            across eligible genes. Setting a covariance selects plug-in calibration
+            if you omit ``null``. For other calibrations, leave this as ``None``.
+        integration_tol : float, default 1e-6
+            Target absolute error for numerical integration of rotation p-values.
+
+        Returns
+        -------
+        pandas.DataFrame
+            One row per gene, sorted by decreasing ``Statistic``. ``Feature`` identifies
+            the gene. ``P_value`` tests its contrast. ``P_adj`` gives the
+            Benjamini-Hochberg adjustment across tested genes.
+
+            ``Estimate_per_bin`` gives the first sorted group's mean minus the second
+            group's mean, or the specified linear contrast.
+            Estimates use natural-log power or natural-log power share in fitted bin order.
+            L2 reports the weighted root mean square of these estimates.
+
+            For t-Cauchy, ``Statistic`` is the largest absolute t statistic.
+            ``T_per_bin`` and ``P_value_per_bin`` give signed t statistics and
+            unadjusted two-sided p-values. ``Best_bin`` is the zero-based index
+            of the smallest p-value among bins used in the combination.
+
+            For rotation, ``P_value_method`` identifies the calculation.
+            ``P_value_error`` gives its numerical error estimate or budget, when available.
+            Masked comparisons add ``n_obs_A`` and ``n_obs_B`` for binary groups,
+            or ``n_obs`` and ``df_resid`` for a linear model.
+
+        Raises
+        ------
+        RuntimeError
+            If spectra are unavailable or the rotation p-value cannot be evaluated.
+        ValueError
+            If the input or test options are invalid.
+        NotImplementedError
+            If a linear model requests label permutation.
 
         Notes
         -----
-        Use the ``normalize_shape`` keyword for a one-shot shape-only
-        test that leaves :attr:`spectra_` untouched for further
-        analysis. For a permanent preprocessing transform that affects
-        every downstream operation on the same comparator, use the
-        chainable :meth:`normalize_background` and
-        :meth:`normalize_covariates` methods (no chainable equivalent
-        for sum-1 normalisation — call this kwarg or the standalone
-        :func:`~sonic.comparators.normalization.normalize_shape`).
+        Binary labels select binwise Welch t tests. A linear model uses ordinary
+        least squares t tests. See :doc:`/guides/multisample` for calibration
+        assumptions and interpretation.
         """
         if self.spectra_ is None:
             raise RuntimeError("Call .compute_spectra() before .test_diff_freq().")
@@ -1025,21 +1179,30 @@ class _ComparatorBase:
         groups, design_obj = _validate_design(design, len(self.samples))
         use_masked = self.presence_ is not None and not self.presence_.all()
 
+        options = {
+            "gene_names": self.gene_names,
+            "statistic": statistic,
+            "freq_weights": freq_weights,
+            "normalize_shape": normalize_shape,
+            "null": null,
+            "covariance": covariance,
+            "integration_tol": integration_tol,
+        }
+
         use_glm = (contrast is not None) or (groups is None)
         if use_glm:
-            if statistic != "log_l2":
+            if statistic not in ("log_l2", "log_t_cauchy"):
                 raise ValueError(
-                    "Only statistic='log_l2' is supported when "
+                    "Only statistic='log_l2' or 'log_t_cauchy' is supported when "
                     "contrast= is provided or `design` is a multi-column / "
                     f"continuous design, got statistic={statistic!r}."
                 )
-            if null != "analytic":
+            if statistic == "log_l2" and null == "permutation":
                 raise NotImplementedError(
-                    "Only null='analytic' is supported when "
+                    "Only null='plugin' or 'rotation' is supported for L2 when "
                     "contrast= is provided or `design` is a multi-column / "
-                    "continuous design. Pass null='analytic' or pass a 1-D "
-                    "binary `design` (and omit `contrast=`) to take the "
-                    "permutation path."
+                    "continuous design. For label permutations, pass a 1-D "
+                    "binary `design` without `contrast=`."
                 )
             if contrast is None:
                 raise ValueError(
@@ -1052,48 +1215,193 @@ class _ComparatorBase:
                     design_obj,
                     contrast,
                     self.presence_,
-                    gene_names=self.gene_names,
-                    freq_weights=freq_weights,
-                    normalize_shape=normalize_shape,
                     min_resid_df=int(min_resid_df),
+                    **options,
                 )
             return compare_glm(
                 self.spectra_,
                 design_obj,
                 contrast,
-                gene_names=self.gene_names,
-                freq_weights=freq_weights,
-                normalize_shape=normalize_shape,
+                **options,
             )
 
         # Binary path (1-D design, contrast is None).
+        options["random_state"] = random_state
         if use_masked:
             return compare_two_groups_masked(
                 self.spectra_,
                 groups,
                 self.presence_,
-                gene_names=self.gene_names,
-                statistic=statistic,
-                null=null,
                 n_perm=n_perm,
-                random_state=random_state,
                 min_samples_per_group=int(min_samples_per_group),
-                freq_weights=freq_weights,
                 max_exact_permutations=max_exact_permutations,
-                normalize_shape=normalize_shape,
+                **options,
             )
         return compare_two_groups(
             self.spectra_,
             groups,
-            gene_names=self.gene_names,
+            min_samples_per_group=int(min_samples_per_group),
+            n_perm=n_perm,
+            max_exact_permutations=max_exact_permutations,
+            **options,
+        )
+
+    def test_cross_diff_freq(
+        self,
+        design: Any,
+        *,
+        contrast: str | dict[str, float] | np.ndarray | None = None,
+        representation: str = "coherence",
+        statistic: str = "l2",
+        null: str | None = None,
+        n_perm: int = 1000,
+        random_state: int | None = None,
+        freq_weights: np.ndarray | None = None,
+        max_exact_permutations: int = 10000,
+        min_samples_per_group: int = 2,
+        min_resid_df: int = 1,
+        covariance: str | None = None,
+        integration_tol: float = 1e-6,
+    ):
+        """Compare the spatial coupling of each gene pair across samples.
+
+        Parameters
+        ----------
+        design : array-like, pandas.DataFrame, or 2-D np.ndarray
+            One row per sample, in fitted sample order. Use one-dimensional labels
+            for two groups. Use a design matrix and ``contrast`` for a linear model.
+            SONIC adds an intercept to a data frame. Include any intercept in a
+            numeric matrix yourself.
+        contrast : str, dict, or np.ndarray, optional
+            Required for a linear model. Name one coefficient, map coefficient names
+            to weights, or supply a vector in encoded design-matrix column order.
+            The contrast must be estimable from the design.
+        representation : {'coherence', 'coherency'}, default 'coherence'
+            ``'coherence'`` tests the natural logarithm of squared-magnitude coherency.
+            ``'coherency'`` tests the signed real part of coherency.
+        statistic : {'l2', 't_cauchy'}, default 'l2'
+            L2 measures the size of the contrast across bins. ``'t_cauchy'``
+            combines bin p-values and identifies the bin with the smallest
+            p-value among those used in the combination.
+        null : str, optional
+            For L2, use ``'rotation'`` (default) or ``'plugin'`` for Gaussian
+            plug-in calibration. Use ``'permutation'`` for two exchangeable groups
+            with one-dimensional labels and no ``contrast``.
+            For ``'t_cauchy'``, the only calibration is ``'analytic'`` (default).
+        n_perm : int, default 1000
+            Number of random group assignments for a sampled permutation test.
+        random_state : int, optional
+            Random seed for sampled permutations.
+        freq_weights : np.ndarray, optional
+            Positive, finite weights in original bin order (radius, then angle).
+            The default gives each bin equal weight. Choose weights before testing.
+        max_exact_permutations : int, default 10000
+            Enumerate all group assignments when their number is at most this
+            limit. Set it to zero to sample assignments.
+        min_samples_per_group : int, default 2
+            Minimum observed samples in each group for binary L2 tests and
+            masked binary t-Cauchy tests.
+        min_resid_df : int, default 1
+            Minimum residual degrees of freedom for features with missing samples.
+            Fully observed features require one residual degree of freedom.
+        covariance : str, optional
+            With plug-in calibration, ``None`` or ``'per_pair'`` estimates residual
+            covariance across bins for each pair. ``'pooled'`` shares this estimate
+            across eligible pairs. Setting a covariance selects plug-in calibration
+            if you omit ``null``. For other calibrations, leave this as ``None``.
+        integration_tol : float, default 1e-6
+            Target absolute error for numerical integration of rotation p-values.
+
+        Returns
+        -------
+        pandas.DataFrame
+            One row per pair, sorted by decreasing ``Statistic``. ``Feature_1`` and
+            ``Feature_2`` identify the pair. ``P_value`` tests its contrast. ``P_adj`` gives
+            the Benjamini-Hochberg adjustment across tested pairs.
+
+            ``Estimate_per_bin`` gives the first sorted group's mean minus the second
+            group's mean, or the specified linear contrast.
+            Estimates use natural-log coherence or real coherency in original bin order.
+            L2 reports the weighted root mean square of these estimates.
+
+            For t-Cauchy, ``Statistic`` is the largest absolute t statistic.
+            ``T_per_bin`` and ``P_value_per_bin`` give signed t statistics and
+            unadjusted two-sided p-values. ``Best_bin`` is the zero-based index
+            of the smallest p-value among bins used in the combination.
+
+            For rotation, ``P_value_method`` identifies the calculation.
+            ``P_value_error`` gives its numerical error estimate or budget, when available.
+            ``N_samples`` and ``N_bins`` give the retained counts. ``Status`` indicates
+            whether the pair was tested. ``DF_resid`` gives design residual degrees
+            of freedom. Binary comparisons also report ``n_obs_A`` and ``n_obs_B``.
+            ``N_pairs_pooled`` counts the pairs used to estimate covariance.
+            ``Effective_rank`` measures how many directions account for variation
+            in the plug-in covariance or conditional rotation distribution.
+            Use ``attrs["original_freq_weights"]`` to repeat the bin weighting.
+
+        Raises
+        ------
+        RuntimeError
+            If cross-spectra are unavailable or the rotation p-value cannot be evaluated.
+        ValueError
+            If the input or test options are invalid.
+        NotImplementedError
+            If a linear model requests label permutation.
+
+        Notes
+        -----
+        Each pair uses samples where both genes are present and bins with valid
+        coherency in all those samples. Self-pairs are descriptive only.
+
+        Binary labels select binwise Welch t tests. A linear model uses ordinary
+        least squares t tests. See :doc:`/guides/multisample` for calibration
+        assumptions and interpretation.
+        """
+        from sonic.comparators.cross_spectrum import _compare_cross_spectra
+
+        if self.cross_spectra_ is None:
+            raise RuntimeError("Call .compute_cross_spectra() before .test_cross_diff_freq().")
+        groups, design_obj = _validate_design(design, len(self.samples))
+        return _compare_cross_spectra(
+            self.cross_spectra_,
+            design_obj,
+            groups=groups,
+            contrast=contrast,
+            representation=representation,
             statistic=statistic,
             null=null,
             n_perm=n_perm,
             random_state=random_state,
             freq_weights=freq_weights,
             max_exact_permutations=max_exact_permutations,
-            normalize_shape=normalize_shape,
+            min_samples_per_group=min_samples_per_group,
+            min_resid_df=min_resid_df,
+            covariance=covariance,
+            integration_tol=integration_tol,
         )
+
+    def _covariance_columns(self, features, covariance, memory_budget_bytes):
+        """Check the two returned covariance arrays before copying or fitting any profiles."""
+        _, n_genes, n_bins = self.spectra_.shape
+        columns = slice(None)
+        if features is not None:
+            names = (features,) if isinstance(features, str) else tuple(features)
+            if not names or len(set(names)) != len(names):
+                raise ValueError("Select at least one feature and supply each name only once.")
+            columns = _gene_indices(self.gene_names, names)
+            n_genes = len(columns)
+        per_gene = covariance == "per_gene"
+        required = 2 * np.dtype(np.float64).itemsize * n_bins**2 * (n_genes if per_gene else 1)
+        budget = _parse_memory_budget(memory_budget_bytes)
+        if required > budget:
+            hint = (
+                "Select fewer features or use covariance='pooled'" if per_gene else "Use fewer bins"
+            )
+            raise MemoryError(
+                f"The covariance matrices require {required} bytes (budget {budget} bytes). "
+                f"{hint}, or increase memory_budget_bytes."
+            )
+        return columns
 
     def estimate_null_covariance(
         self,
@@ -1104,44 +1412,71 @@ class _ComparatorBase:
         normalize_shape: bool = False,
         min_samples_per_group: int = 2,
         min_resid_df: int = 1,
-    ) -> _AnalyticNullState:
-        """Estimate the analytic ``log_l2`` null covariance for inspection.
-
-        This method follows the same binary-vs-GLM and masked-vs-unmasked
-        dispatch rules as :meth:`test_diff_freq`, but returns the covariance
-        diagnostics used by the analytic Liu mixture null instead of running a
-        test. It is intentionally call-scoped: different designs, contrasts,
-        masks, frequency weights, or ``normalize_shape`` choices imply different
-        covariance estimates.
+        covariance: str | None = None,
+        features: str | Sequence[str] | None = None,
+        memory_budget_bytes: int | str = _DEFAULT_CHUNK_BUDGET,
+    ) -> _PluginNullState:
+        """Estimate residual covariance across bins for Gaussian plug-in calibration.
 
         Parameters
         ----------
-        design : 1-D array, 2-D ndarray, or pandas.DataFrame
-            Same design argument accepted by :meth:`test_diff_freq`.
-        contrast : str, dict, or ndarray, optional
-            Required for GLM designs, or to force a 1-D binary design through
-            the GLM path.
+        design : array-like, pandas.DataFrame, or 2-D np.ndarray
+            One row per sample, in fitted sample order. Use one-dimensional labels
+            for two groups. Use a design matrix and ``contrast`` for a linear model.
+            SONIC adds an intercept to a data frame. Include any intercept in a
+            numeric matrix yourself.
+        contrast : str, dict, or np.ndarray, optional
+            Required for a linear model. Name one coefficient, map coefficient names
+            to weights, or supply a vector in encoded design-matrix column order.
+            The contrast must be estimable from the design.
         freq_weights : np.ndarray, optional
-            Per-bin weights used to form ``weighted_cov = W^1/2 Sigma W^1/2``.
+            Positive, finite weights in fitted bin order. The default gives each
+            bin equal weight.
         normalize_shape : bool, default False
-            Apply non-destructive shape normalization before estimating
-            covariance, matching :meth:`test_diff_freq(normalize_shape=True)`.
+            Divide each gene's power in each bin by its total power in that
+            sample before taking the logarithm (DF-norm).
         min_samples_per_group : int, default 2
-            Minimum observed samples per arm for masked binary designs.
+            Minimum number of observed samples in each group for a binary fit.
         min_resid_df : int, default 1
-            Minimum per-gene residual df for masked GLM designs.
+            Minimum residual degrees of freedom for features with missing samples.
+            Fully observed features require one residual degree of freedom.
+        covariance : str, optional
+            Use ``'per_gene'`` (default) for separate gene covariance estimates.
+            Use ``'pooled'`` for a shared estimate across eligible genes.
+        features : str or sequence of str, optional
+            Inspect these genes in the requested order. Pooled covariance uses
+            only the selected genes. By default, use every gene in input order.
+        memory_budget_bytes : int or str, default '2 GiB'
+            Maximum combined size of the returned float64 ``sigma_log`` and
+            ``weighted_cov`` matrices. Other outputs and fitting workspace are additional.
 
         Returns
         -------
         dict
-            Analytic-null state with common keys ``mode``, ``masked``,
-            ``observed``, ``sigma_log``, ``freq_weights``, ``weighted_cov``,
-            ``eigenvalues``, ``effective_rank``, ``contrast_scale``,
-            ``df_resid``, and ``eligible``.
+            ``sigma_log`` gives the covariance across bins. Its shape is
+            ``(n_genes, n_bins, n_bins)`` for separate estimates and
+            ``(n_bins, n_bins)`` for a pooled estimate. ``weighted_cov`` includes the bin
+            weights. ``effective_rank`` measures how many directions account for its
+            variance. ``eigenvalues`` also includes the contrast variance factor.
+            ``observed`` gives the L2 statistic and ``eligible`` identifies tested genes.
 
-            Two-group-only metadata: ``n_obs_A`` and ``n_obs_B``.
-            GLM-only metadata: ``design_columns``, ``contrast_vector``,
-            fitted ``beta`` coefficients, and ``n_obs``.
+            ``beta`` contains fitted coefficients in the original predictor units,
+            with shape ``(n_terms, n_genes, n_bins)``. For binary labels the two rows
+            give the first sorted group's mean and the second mean minus the first.
+            For a linear model, ``design_columns`` identifies the coefficient rows.
+
+        Raises
+        ------
+        MemoryError
+            If the covariance matrices would exceed the budget.
+        RuntimeError
+            Compute spectra before calling this method.
+        ValueError
+            If the input or test options are invalid.
+
+        Notes
+        -----
+        See :doc:`/guides/multisample` for the covariance options.
         """
         if self.spectra_ is None:
             raise RuntimeError("Call .compute_spectra() before .estimate_null_covariance().")
@@ -1151,7 +1486,17 @@ class _ComparatorBase:
             raise ValueError(f"min_resid_df must be >= 1, got {min_resid_df}.")
 
         groups, design_obj = _validate_design(design, len(self.samples))
-        use_masked = self.presence_ is not None and not self.presence_.all()
+        covariance = _resolve_covariance(covariance)
+        columns = self._covariance_columns(features, covariance, memory_budget_bytes)
+        spectra = self.spectra_[:, columns]
+        presence = self.presence_[:, columns] if self.presence_ is not None else None
+        use_masked = presence is not None and not presence.all()
+        options = {
+            "freq_weights": freq_weights,
+            "normalize_shape": normalize_shape,
+            "covariance": covariance,
+        }
+
         use_glm = (contrast is not None) or (groups is None)
         if use_glm:
             if contrast is None:
@@ -1160,38 +1505,30 @@ class _ComparatorBase:
                     "`design` is a multi-column / continuous design."
                 )
             if use_masked:
-                return _estimate_glm_masked_null_covariance(
-                    self.spectra_,
+                state = _estimate_glm_masked_null_covariance(
+                    spectra,
                     design_obj,
                     contrast,
-                    self.presence_,
-                    freq_weights=freq_weights,
-                    normalize_shape=normalize_shape,
+                    presence,
                     min_resid_df=int(min_resid_df),
+                    **options,
                 )
-            return _estimate_glm_null_covariance(
-                self.spectra_,
-                design_obj,
-                contrast,
-                freq_weights=freq_weights,
-                normalize_shape=normalize_shape,
-            )
-
-        if use_masked:
-            return _estimate_two_group_masked_null_covariance(
-                self.spectra_,
+            else:
+                state = _estimate_glm_null_covariance(spectra, design_obj, contrast, **options)
+        elif use_masked:
+            state = _estimate_two_group_masked_null_covariance(
+                spectra,
                 groups,
-                self.presence_,
-                freq_weights=freq_weights,
-                normalize_shape=normalize_shape,
+                presence,
                 min_samples_per_group=int(min_samples_per_group),
+                **options,
             )
-        return _estimate_two_group_null_covariance(
-            self.spectra_,
-            groups,
-            freq_weights=freq_weights,
-            normalize_shape=normalize_shape,
-        )
+        else:
+            state = _estimate_two_group_null_covariance(
+                spectra, groups, min_samples_per_group=int(min_samples_per_group), **options
+            )
+        del state["estimate_per_bin"]
+        return state
 
     def test_diff_expr(
         self,
@@ -1201,34 +1538,46 @@ class _ComparatorBase:
         log_expression: bool = False,
         eps: float = 1e-12,
     ) -> Any:
-        """Differential-expression (DE) test on the DC component.
-
-        Per-gene two-sided test on the per-sample DC scalars (the grid
-        mean of each sample's per-gene expression), routed through
-        :func:`~sonic.comparators.multisample.compare_two_groups_scalar`
-        for 1-D binary designs, or through
-        :func:`~sonic.comparators.multisample.compare_glm_scalar` when
-        ``contrast=`` is supplied or ``design`` is a DataFrame / 2-D matrix.
-        The binary path uses Welch t statistics with Welch-Satterthwaite
-        t-distribution p-values; the GLM path uses OLS contrast t statistics
-        with Student t-distribution p-values. The companion DF test is
-        :meth:`test_diff_freq`.
+        """Compare the sample mean expression of each gene.
 
         Parameters
         ----------
-        design : 1-D array, pandas.Series, pandas.DataFrame, or 2-D ndarray
-            Binary group labels for the two-group path, or a GLM design matrix
-            when ``contrast=`` is supplied.
-        contrast : str, dict, or ndarray, optional
-            Linear contrast for a multi-column / continuous design. Required
-            unless ``design`` is a 1-D binary vector and the two-group path is
-            desired.
+        design : array-like, pandas.DataFrame, or 2-D np.ndarray
+            One row per sample, in fitted sample order. Use one-dimensional labels
+            for two groups. Use a design matrix and ``contrast`` for a linear model.
+            SONIC adds an intercept to a data frame. Include any intercept in a
+            numeric matrix yourself.
+        contrast : str, dict, or np.ndarray, optional
+            Required for a linear model. Name one coefficient, map coefficient names
+            to weights, or supply a vector in encoded design-matrix column order.
+            The contrast must be estimable from the design.
         log_expression : bool, default False
-            If True, run the scalar test on ``log(dc + eps)`` rather than raw
-            DC means. Applies to both the binary two-group path and the GLM
-            path.
+            Take the natural logarithm of each sample's mean expression plus ``eps``.
+            By default, the test uses mean expression on the input scale.
         eps : float, default 1e-12
-            Additive offset used only when ``log_expression=True``.
+            Positive offset for ``log_expression=True``.
+
+        Returns
+        -------
+        pandas.DataFrame
+            One row per gene, sorted by decreasing ``Statistic``. ``Feature`` identifies
+            the gene. ``P_value`` tests its contrast. ``P_adj`` gives the
+            Benjamini-Hochberg adjustment across tested genes.
+            ``Statistic`` is the absolute t statistic. ``Mean_diff`` gives the first
+            sorted group's mean minus the second group's mean. A linear model
+            returns its signed contrast in ``Estimate``.
+
+        Raises
+        ------
+        RuntimeError
+            Compute spectra before calling this method.
+        ValueError
+            If the input or test options are invalid.
+
+        Notes
+        -----
+        Binary labels select Welch's t test. A design matrix or an explicit
+        contrast selects an ordinary least squares t test.
         """
         if self.dc_ is None:
             raise RuntimeError("Call .compute_spectra() before .test_diff_expr().")
@@ -1257,24 +1606,26 @@ class _ComparatorBase:
         )
 
     def effective_rank(self, *, weights: np.ndarray | None = None) -> np.ndarray:
-        """Per-sample effective rank ``K_eff`` of the gene-spectrum covariance.
-
-        Quantifies how concentrated the spatial-frequency content is along
-        the eigen-directions of each sample's cross-gene-spectrum covariance matrix.
-        ``K_eff = (Σλ)² / Σλ²`` — bounded by 1 (rank-1, all power on a
-        single direction) and ``n_feature_bins`` (uniformly spread).
+        """Measure how the variance across genes is distributed across frequency bins.
 
         Parameters
         ----------
         weights : np.ndarray, optional
-            Per-bin weights (same semantics as ``freq_weights``). When
-            given, returns the effective rank of
-            ``W^{1/2} Σ W^{1/2}`` — useful for analysing how a
-            frequency-weighted L2 statistic redistributes its power.
+            Nonnegative weights in fitted bin order. By default, use the
+            unweighted covariance across bins.
 
         Returns
         -------
-        np.ndarray of shape ``(n_samples,)``.
+        np.ndarray
+            One effective rank per sample. For nonzero covariance, the rank is one
+            when a single direction accounts for all the variance. It equals the
+            number of bins when all covariance eigenvalues are equal.
+
+        Notes
+        -----
+        The covariance is calculated from log power across genes in this sample.
+        The effective rank is the squared sum of its eigenvalues divided by the
+        sum of their squares.
         """
         if self.spectra_ is None:
             raise RuntimeError("Call .compute_spectra() before .effective_rank().")
@@ -1365,7 +1716,7 @@ def _validate_design(  # noqa: C901 — dispatch over three input shapes is esse
     if isinstance(design, np.ndarray):
         if design.ndim != 2 or design.shape[0] != n_samples:
             raise ValueError(
-                f"design ndarray must be (n_samples, p) = ({n_samples}, p), " f"got {design.shape}."
+                f"design ndarray must be (n_samples, p) = ({n_samples}, p), got {design.shape}."
             )
         return None, design
     raise TypeError(

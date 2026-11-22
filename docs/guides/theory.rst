@@ -132,7 +132,7 @@ The unstandardized statistic instead has the Gaussian mixture null
 :math:`\sum_i\lambda_i\chi^2_1`. SONIC keeps these models separate:
 ``compute_null_params(..., dirichlet_correction=True)`` uses finite-sample
 ratio moments, while ``liu_sf(...)`` retains the mixture model
-used by analytic comparison. Setting ``dirichlet_correction=False`` opts
+used for Gaussian plug-in calibration of L2 comparisons. Setting ``dirichlet_correction=False`` opts
 into the unstandardized moment approximation for detection.
 
 .. list-table::

@@ -124,3 +124,27 @@ def test_backend_abcs_are_not_top_level_public():
         )
     # ...but the canonical path is still importable.
     from sonic.kernels import Kernel, MatrixKernelBase  # noqa: F401
+
+
+def test_comparison_docstrings_follow_the_public_signatures():
+    """Keep all comparison parameters documented, in their actual call order."""
+    import inspect
+    import re
+
+    from sonic.comparators import multisample
+    from sonic.comparators.base import _ComparatorBase
+
+    functions = [getattr(multisample, name) for name in multisample.__all__]
+    functions += [
+        _ComparatorBase.test_diff_freq,
+        _ComparatorBase.test_cross_diff_freq,
+        _ComparatorBase.test_diff_expr,
+        _ComparatorBase.estimate_null_covariance,
+    ]
+    for fn in functions:
+        doc = inspect.getdoc(fn)
+        parameters = doc.split("Parameters\n----------\n", 1)[1].split("\nReturns\n-------", 1)[0]
+        documented = re.findall(r"^(\w+) : ", parameters, flags=re.MULTILINE)
+        expected = [name for name in inspect.signature(fn).parameters if name != "self"]
+        assert documented == expected, fn.__name__
+        assert "Returns\n-------\n" in doc, fn.__name__

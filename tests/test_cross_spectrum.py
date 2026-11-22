@@ -1,5 +1,7 @@
 """Synthetic local checks for cross-spectrum extraction."""
 
+from unittest.mock import patch
+
 import anndata as ad
 import numpy as np
 import pandas as pd
@@ -7,7 +9,7 @@ import pytest
 from scipy.sparse import csr_matrix
 
 from sonic import ComparatorGrid, ComparatorIrregular
-from sonic.comparators.binning import _polar_bin_reducer
+from sonic.comparators.binning import _polar_bin_reducer, _polar_reducer_workspace_bytes
 from sonic.comparators.cross_spectrum import _compute_cross_spectra
 from tests.test_comparators import _grid_sample_to_adata, _install_grid_rasters
 from tests.test_features import _polar_area_reference
@@ -190,6 +192,20 @@ class TestFourierConsistency:
 
 
 class TestPolarBinning:
+    @pytest.mark.parametrize("edges", [[0, 0.1, 0.24, 0.25, 0.4], [0.3, 0.4]])
+    def test_stored_bytes_cover_rotated_sparse_rows(self, edges):
+        shape = (19, 129)
+        geometry = {"spacing": (0.8, 2.0), "n_theta": 12, "edges": edges}
+        stored, _ = _polar_reducer_workspace_bytes(shape, **geometry)
+        for angle in (0, 37, 90):
+            reducer, counts = _polar_bin_reducer(
+                shape, angle_deg=angle, frequency_padding=1, **geometry
+            )
+            size = sum(a.nbytes for a in (reducer.data, reducer.indices, reducer.indptr, counts))
+            assert size <= stored
+            if reducer.nnz == 0:
+                assert stored == size
+
     def test_angular_phase_seam_and_half_turn(self, make_comparator):
         rng = np.random.default_rng(23)
         values = rng.normal(size=(3, 33, 33))
@@ -497,6 +513,60 @@ class TestInputs:
 
 
 class TestChunking:
+    def test_auto_chunk_budgets_polar_construction_before_transform(self):
+        rng = np.random.default_rng(18)
+        shape = (16, 512)
+        comparator = _irregular_points(
+            rng.normal(size=(96, 3)),
+            rng.random((96, 2)) * shape,
+            shape=shape,
+            mode="2d",
+            n_theta_bins=8,
+            freq_edges=np.array([0.0, 0.5]),
+        )
+
+        pairs = [("a", "b")]
+
+        with patch("sonic.comparators.cross_spectrum._polar_bin_reducer") as build:
+            with pytest.raises(MemoryError):
+                comparator.compute_cross_spectra(
+                    pairs, chunk_size="auto", memory_budget_bytes="3 MiB", progress=False
+                )
+            build.assert_not_called()
+
+        comparator.compute_cross_spectra(pairs, chunk_size=1, progress=False)
+        reference = comparator.cross_spectra_
+        budget = reference.chunk_schedules[0]["estimated_workspace_bytes"]
+        comparator.compute_cross_spectra(
+            pairs, chunk_size="auto", memory_budget_bytes=budget, progress=False
+        )
+        result = comparator.cross_spectra_
+        assert result.chunk_schedules[0]["chunk_size"] == 2
+        assert result.chunk_schedules[0]["estimated_workspace_bytes"] == budget
+        np.testing.assert_allclose(result.cross_spectra, reference.cross_spectra)
+        explanation = comparator.explain_spectrum("a", bands=[0], memory_budget_bytes=budget)
+        np.testing.assert_allclose(explanation.scores, result.auto_spectra[0, 0, :1])
+
+    def test_auto_chunk_fits_elongated_polar_grid(self):
+        rng = np.random.default_rng(55)
+        shape = (128, 4096)
+        comparator = _irregular_points(
+            rng.normal(size=(2048, 3)),
+            rng.random((2048, 2)) * shape,
+            shape=shape,
+            mode="2d",
+            n_theta_bins=16,
+            freq_edges=np.linspace(0, 0.5, 33),
+        )
+        comparator.compute_cross_spectra(
+            [("a", "b")], chunk_size="auto", memory_budget_bytes="256 MiB", progress=False
+        )
+        result = comparator.cross_spectra_
+        assert result.chunk_schedules[0]["chunk_size"] == 2
+        assert result.chunk_schedules[0]["estimated_workspace_bytes"] <= 256 * 2**20
+        assert result.cross_spectra.shape == (1, 1, 512)
+        assert np.isfinite(result.cross_spectra).all()
+
     @pytest.mark.parametrize("mode", ["radial", "2d"])
     @pytest.mark.parametrize("backend", ["fft", "nufft"])
     def test_chunk_sizes_and_budget_give_identical_features(self, make_comparator, mode, backend):
@@ -523,6 +593,38 @@ class TestChunking:
         np.testing.assert_allclose(override.auto_spectra, reference.auto_spectra, atol=1e-10)
         assert override.chunk_schedules[0]["chunk_size"] == 3
         assert override.chunk_schedules[0]["estimated_workspace_bytes"] > 1
+
+    def test_polar_workspace_counts_toward_each_parallel_job(self, make_comparator, monkeypatch):
+        import sonic.comparators.cross_spectrum as cross_module
+
+        values = np.random.default_rng(65).normal(size=(3, 16, 64))
+        comparator = make_comparator(
+            [values, values], mode="2d", freq_edges=np.array([0.0, 0.5]), n_theta_bins=8
+        )
+        comparator.rotation_angles_ = np.zeros(2)
+        monkeypatch.setattr("sonic.utils.os.cpu_count", lambda: 4)
+        pairs = [("a", "b")]
+        comparator.compute_cross_spectra(pairs, chunk_size=1, n_jobs=1, progress=False)
+        schedule = comparator.cross_spectra_.chunk_schedules[0]
+        budget = schedule["estimated_workspace_bytes"]
+        transform_bytes = 128 * (2 * schedule["n_freqs"] + schedule["n_locations"])
+        assert budget > transform_bytes
+        with patch.object(
+            cross_module, "_run_per_sample", wraps=cross_module._run_per_sample
+        ) as run:
+            comparator.compute_cross_spectra(
+                pairs, chunk_size="auto", memory_budget_bytes=budget, n_jobs=-1, progress=False
+            )
+            assert run.call_args.kwargs["n_jobs"] == 1
+            assert all(
+                s["estimated_workspace_bytes"] == budget
+                for s in comparator.cross_spectra_.chunk_schedules
+            )
+            with pytest.raises(MemoryError):
+                comparator.compute_cross_spectra(
+                    pairs, chunk_size="auto", memory_budget_bytes=budget, n_jobs=2, progress=False
+                )
+            run.assert_called_once()
 
     def test_auto_chunk_requires_sufficient_budget(self, make_comparator):
         comparator = make_comparator(

@@ -521,6 +521,50 @@ class TestRepresentations:
 
 
 class TestSamplePresence:
+    @pytest.mark.parametrize(
+        "options",
+        [
+            {"null": "rotation"},
+            {"covariance": "per_pair"},
+            {"covariance": "pooled"},
+            {"statistic": "t_cauchy"},
+        ],
+    )
+    def test_masked_pairs_do_not_change_complete_glm_fit(self, options):
+        values = np.random.default_rng(58).uniform(0.1, 0.8, (6, 3, 4))
+        design = pd.DataFrame({"condition": [0, 0, 0, 1, 1, 1]})
+        kwargs = {"contrast": "condition", "min_resid_df": 5, **options}
+        reference = _comparison(values[:, :1]).test_cross_diff_freq(design, **kwargs).iloc[0]
+        comparator = _comparison(values)
+        cross = comparator.cross_spectra_
+        cross.pairs = (*cross.pairs[:2], ("g4", "g4"))
+        cross.pair_indices[2] = [4, 4]
+        cross.presence[-1, [2, 4]] = False
+        _mask_missing_pairs(cross)
+        actual = _ordered(comparator.test_cross_diff_freq(design, **kwargs))
+        assert actual.Status.tolist() == ["ok", "ineligible_design", "self_pair"]
+        complete = actual.iloc[0]
+        assert complete.DF_resid == 4
+        assert np.isfinite(complete.P_value)
+        np.testing.assert_allclose(complete.P_value, reference.P_value)
+        np.testing.assert_allclose(complete.Statistic, reference.Statistic)
+
+    def test_complete_pairs_share_sampled_labels_in_mixed_panel(self):
+        values = np.random.default_rng(15).uniform(0.1, 0.8, (10, 3, 4))
+        groups = np.repeat([0, 1], 5)
+        options = {
+            "null": "permutation",
+            "random_state": 19,
+            "n_perm": 29,
+            "max_exact_permutations": 0,
+        }
+        expected = _ordered(_comparison(values[:, 1:]).test_cross_diff_freq(groups, **options))
+        comparator = _comparison(values)
+        comparator.cross_spectra_.presence[0, 0] = False
+        _mask_missing_pairs(comparator.cross_spectra_)
+        actual = _ordered(comparator.test_cross_diff_freq(groups, **options))
+        np.testing.assert_array_equal(actual.P_value.iloc[1:], expected.P_value)
+
     @pytest.mark.parametrize("representation", ["coherence", "coherency"])
     @pytest.mark.parametrize("glm", [False, True])
     def test_pair_presence_matches_masked_df_and_independent_pooled_ols(self, representation, glm):
@@ -624,6 +668,8 @@ class TestSamplePresence:
         assert actual.N_bins.iloc[1] == 3
         assert actual.N_samples.iloc[1] == 10
         assert np.isfinite(actual.P_value.iloc[1])
+        cross.presence[-1, 2] = False
+        _mask_missing_pairs(cross)
         kwargs["min_resid_df" if glm else "min_samples_per_group"] = 20
         empty = comparator.test_cross_diff_freq(design, **kwargs)
         assert empty.P_value.isna().all()

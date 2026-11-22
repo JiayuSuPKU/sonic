@@ -686,8 +686,8 @@ class _ComparatorBase:
         progress : bool, default True
             Show a progress bar and process one sample at a time.
         memory_budget_bytes : int or str, default '2 GiB'
-            Estimated memory available for automatic transform blocks across sample
-            jobs. Supply bytes or a size such as ``'512 MiB'``.
+            Estimated workspace for transform blocks and polar reducers across sample
+            jobs when chunking automatically. Supply bytes or a size such as ``'512 MiB'``.
         chunk_size : int, 'auto', or None, optional
             Genes per transform block. By default, use the constructor setting.
             An explicit size overrides the automatic memory budget.

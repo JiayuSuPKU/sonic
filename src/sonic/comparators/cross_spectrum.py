@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from itertools import chain
 
 import numpy as np
 import pandas as pd
@@ -34,6 +35,7 @@ from sonic.comparators.base import _run_per_sample
 from sonic.comparators.binning import (
     _mode_pair_counts,
     _polar_bin_reducer,
+    _polar_reducer_workspace_bytes,
     _radial_bin_reducer,
 )
 from sonic.comparators.features import _center_observations, _shared_observation_mask
@@ -83,7 +85,8 @@ class CrossSpectra:
     feature_mode : {'radial', '2d'}
         Frequency representation used for the spectra.
     chunk_schedules : list of dict
-        Per-sample processing sizes and estimated memory use.
+        Per-sample chunk sizes and estimated peak workspace across reducer construction
+        and block transforms, in bytes.
 
     Notes
     -----
@@ -223,21 +226,33 @@ def _compute_cross_spectra(  # noqa: C901 — validation and two backend schedul
     frequency_padding = int(
         comparator.feature_mode == "2d" and comparator._spectrum_backend == "nufft"
     )
-    sample_sizes = [
-        (
-            int(np.prod(np.asarray(shape) + 2 * frequency_padding)),
+    sample_workspaces = []
+    for i, shape in enumerate(comparator._grid_shapes):
+        n_freqs = int(np.prod(np.asarray(shape) + 2 * frequency_padding))
+        n_locations = (
             len(comparator._coords[i])
             if comparator._spectrum_backend == "nufft"
-            else int(np.prod(shape)),
+            else int(np.prod(shape))
         )
-        for i, shape in enumerate(comparator._grid_shapes)
-    ]
+        stored = build_peak = 0
+        if comparator.feature_mode == "2d":
+            stored, build_peak = _polar_reducer_workspace_bytes(
+                shape,
+                edges=edges,
+                spacing=comparator._spacings[i],
+                n_theta=comparator._n_theta_bins,
+            )
+        fixed_bytes = 128 * n_freqs + stored
+        sample_workspaces.append((n_freqs, build_peak, fixed_bytes, 128 * (n_freqs + n_locations)))
     min_workspace_bytes = max(
-        128 * n_freqs + 128 * (n_freqs + n_locations) for n_freqs, n_locations in sample_sizes
+        max(build_peak, fixed + per_feature)
+        for _, build_peak, fixed, per_feature in sample_workspaces
     )
     # Keep automatic job counts inside the same aggregate budget as chunks.
     if chunk_size == "auto" and budget_bytes < min_workspace_bytes:
-        raise MemoryError("Budget cannot fit two one-feature transform blocks plus scratch")
+        raise MemoryError(
+            f"Cross-spectrum workspace requires at least {min_workspace_bytes} bytes per job"
+        )
     n_jobs, workers = resolve_parallelism(
         1 if progress else n_jobs,
         comparator._workers_spec,
@@ -247,6 +262,11 @@ def _compute_cross_spectra(  # noqa: C901 — validation and two backend schedul
         budget_bytes=budget_bytes,
     )
     sample_budget_bytes = budget_bytes // n_jobs
+    if chunk_size == "auto" and sample_budget_bytes < min_workspace_bytes:
+        raise MemoryError(
+            f"Cross-spectrum workspace requires at least {min_workspace_bytes} bytes per job "
+            f"across {n_jobs} jobs"
+        )
 
     # Existing auto features must retain the alignment under which they were computed.
     if comparator.feature_mode == "2d":
@@ -290,20 +310,15 @@ def _compute_cross_spectra(  # noqa: C901 — validation and two backend schedul
             else None
         )
         read_features, n_locations = _make_feature_reader(comparator, sample_index, raster)
-        n_freqs = int(np.prod(np.asarray(shape) + 2 * frequency_padding))
-        # Include two coefficient blocks, transform scratch and one pair-product grid.
-        fixed_bytes = 128 * n_freqs
-        bytes_per_feature = 128 * (n_freqs + n_locations)
+        n_freqs, build_peak, fixed_bytes, bytes_per_feature = sample_workspaces[sample_index]
         if chunk_size == "auto":
-            capacity = min(len(genes), (sample_budget_bytes - fixed_bytes) // bytes_per_feature)
-            if capacity < 1:
-                raise MemoryError("Budget cannot fit two one-feature transform blocks plus scratch")
-            chunk = int(min(32, capacity))
+            capacity = (sample_budget_bytes - fixed_bytes) // bytes_per_feature
+            chunk = min(32, len(genes), capacity)
         else:
             chunk = min(int(chunk_size), len(genes))
         chunk_schedules[sample_index] = {
             "chunk_size": chunk,
-            "estimated_workspace_bytes": fixed_bytes + bytes_per_feature * chunk,
+            "estimated_workspace_bytes": max(build_peak, fixed_bytes + bytes_per_feature * chunk),
             "n_locations": n_locations,
             "n_freqs": n_freqs,
         }
@@ -525,6 +540,14 @@ def _cross_pvalues_from_covariance(observed, scales, covariance, weights, roundo
     return pvals, effective_rank, np.where(np.isnan(pvals), "degenerate_null", "ok")
 
 
+def _cross_fit_groups(support, candidates, complete):
+    """Batch pairs with common bins and the same masked or unmasked fit policy."""
+    for is_complete in (True, False):
+        pairs = candidates[complete[candidates] == is_complete]
+        for keep, indices in _iter_mask_groups(support[pairs].T):
+            yield np.flatnonzero(keep), pairs[indices], not is_complete
+
+
 def _run_cross_plugin(  # noqa: C901 — shared fits across covariance modes and design paths
     result,
     pair_presence,
@@ -534,7 +557,7 @@ def _run_cross_plugin(  # noqa: C901 — shared fits across covariance modes and
     *,
     representation,
     covariance_mode,
-    use_masked,
+    complete,
     groups,
     prepared_design,
     min_samples_per_group,
@@ -563,9 +586,8 @@ def _run_cross_plugin(  # noqa: C901 — shared fits across covariance modes and
         untransformed signed real part for ``coherency``.
     covariance_mode : {'pooled', 'per_pair'}
         Pool across eligible pairs or use each pair's residual covariance.
-    use_masked : bool
-        Whether any pair in the complete panel has an absent sample.
-        This is a global dispatch decision.
+    complete : ndarray of bool, shape (n_pairs,)
+        Whether each pair is present in every sample.
     groups : ndarray, shape (n_samples,), or None
         Validated binary sample labels in the original sample order.
         Used when ``prepared_design`` is None; ignored for GLM contrasts.
@@ -612,9 +634,7 @@ def _run_cross_plugin(  # noqa: C901 — shared fits across covariance modes and
     use_glm = prepared_design is not None
     if use_glm:
         matrix, _, vector, fit = prepared_design
-        df_resid = (
-            np.zeros(n_pairs, dtype=int) if use_masked else np.full(n_pairs, n_samples - fit.rank)
-        )
+        df_resid = np.where(complete, n_samples - fit.rank, 0)
     else:
         df_resid = np.maximum(n_observed - 2, 0)
     observed = np.full(n_pairs, np.nan)
@@ -629,9 +649,7 @@ def _run_cross_plugin(  # noqa: C901 — shared fits across covariance modes and
         covariance = np.zeros((len(pooled_bins), len(pooled_bins)))
         covariance_df = np.zeros_like(covariance)
     # Batch fits by bin support; pooled mode combines shared covariance entries afterward.
-    for keep, indices in _iter_mask_groups(support[candidates].T):
-        pairs = candidates[indices]
-        bins = np.flatnonzero(keep)
+    for bins, pairs, use_masked in _cross_fit_groups(support, candidates, complete):
         group_presence = pair_presence[:, pairs]
         profiles = _prepare_cross_profiles(result, pairs, bins, representation, group_presence)
         group_weights = weights[bins]
@@ -736,7 +754,7 @@ def _run_cross_permutations(
     group_codes,
     *,
     representation,
-    use_masked,
+    complete,
     n_perm,
     max_exact_permutations,
     rng,
@@ -782,7 +800,9 @@ def _run_cross_permutations(
     permutation_counts = np.zeros(n_pairs, dtype=int)
     exact_permutations = np.zeros(n_pairs, dtype=bool)
     # Match DF: masked features draw in original order; unmasked features share labels.
-    batches = (np.array([pair]) for pair in candidates) if use_masked else (candidates,)
+    unmasked_pairs = candidates[complete[candidates]]
+    masked_pairs = candidates[~complete[candidates]]
+    batches = chain((unmasked_pairs,), (np.array([pair]) for pair in masked_pairs))
     for pairs in batches:
         if not pairs.size:
             continue
@@ -832,7 +852,7 @@ def _run_cross_rotations(
     freq_weights,
     *,
     representation,
-    use_masked,
+    complete,
     groups,
     prepared_design,
     min_resid_df,
@@ -893,10 +913,9 @@ def _run_cross_rotations(
     effective_rank = np.full(n_pairs, np.nan)
     df_resid = np.zeros(n_pairs, int)
     status = np.full(n_pairs, "no_common_bins", dtype=object)
-    for keep, indices in _iter_mask_groups(support[candidates].T):
-        bins = np.flatnonzero(keep)
-        for block in _iter_feature_blocks(n_samples, len(indices), len(bins)):
-            pairs = candidates[indices[block]]
+    for bins, group, use_masked in _cross_fit_groups(support, candidates, complete):
+        for block in _iter_feature_blocks(n_samples, len(group), len(bins)):
+            pairs = group[block]
             group_presence = pair_presence[:, pairs]
             profiles = _prepare_cross_profiles(result, pairs, bins, representation, group_presence)
             rotation = _run_l2_conditional(
@@ -944,7 +963,7 @@ def _run_cross_t_cauchy(
     weights,
     *,
     representation,
-    use_masked,
+    complete,
     groups,
     prepared_design,
     min_samples_per_group,
@@ -999,10 +1018,9 @@ def _run_cross_t_cauchy(
     binwise = {name: np.full((n_pairs, n_bins), np.nan) for name in _BINWISE_COLUMNS}
     best_bin = np.full(n_pairs, np.nan)
     unit_fits = {}
-    for keep, indices in _iter_mask_groups(support[candidates].T):
-        bins = np.flatnonzero(keep)
-        for block in _iter_feature_blocks(n_samples, len(indices), len(bins)):
-            pairs = candidates[indices[block]]
+    for bins, group, use_masked in _cross_fit_groups(support, candidates, complete):
+        for block in _iter_feature_blocks(n_samples, len(group), len(bins)):
+            pairs = group[block]
             presence = pair_presence[:, pairs]
             profiles = _prepare_cross_profiles(result, pairs, bins, representation, presence)
             observed[pairs], pvals[pairs], extra = _run_t_cauchy_test(
@@ -1311,8 +1329,13 @@ def _compare_cross_spectra(  # noqa: C901 — validation and dispatch over binar
         raise ValueError("presence must match the sample and selected-gene axes of auto_spectra.")
     left, right = result.pair_indices.T
     pair_presence = presence[:, left] & presence[:, right]
-    use_masked = not pair_presence.all()
     n_observed = pair_presence.sum(axis=0)
+    complete = n_observed == n_samples
+    # Missing expression excludes samples; unsupported frequencies still exclude bins.
+    support = (result.coherency_valid | ~pair_presence[..., None]).all(axis=0)
+    support &= pair_presence.any(axis=0)[:, None]
+    self_pairs = np.array([a == b for a, b in result.pairs], dtype=bool)
+    testable = ~self_pairs & support.any(axis=1)
     # Validate the full design, then let masked DF check each retained-sample fit.
     use_glm = contrast is not None or groups is None
     design_metadata = {}
@@ -1326,7 +1349,7 @@ def _compare_cross_spectra(  # noqa: C901 — validation and dispatch over binar
             )
         if contrast is None:
             raise ValueError("test_cross_diff_freq() requires contrast= for a design matrix.")
-        if use_masked:
+        if not complete.all() and not complete[testable].any():
             matrix, columns = _build_design_matrix(design, n_samples)
             vector = _resolve_contrast(contrast, columns)
             prepared_design = matrix, columns, vector, _decompose_glm_design(matrix, vector)
@@ -1354,11 +1377,6 @@ def _compare_cross_spectra(  # noqa: C901 — validation and dispatch over binar
         if not isinstance(max_exact_permutations, (int, np.integer)) or max_exact_permutations < 0:
             raise ValueError("max_exact_permutations must be a nonnegative integer.")
 
-    # Missing expression excludes samples; unsupported frequencies still exclude bins.
-    support = (result.coherency_valid | ~pair_presence[..., None]).all(axis=0)
-    support &= pair_presence.any(axis=0)[:, None]
-    self_pairs = np.array([a == b for a, b in result.pairs], dtype=bool)
-    testable = ~self_pairs & support.any(axis=1)
     binary_l2 = statistic == "l2" and not use_glm
     if binary_l2:
         insufficient = (n_a < min_samples_per_group) | (n_b < min_samples_per_group)
@@ -1372,7 +1390,7 @@ def _compare_cross_spectra(  # noqa: C901 — validation and dispatch over binar
             candidates,
             weights,
             representation=representation,
-            use_masked=use_masked,
+            complete=complete,
             groups=groups,
             prepared_design=prepared_design,
             min_samples_per_group=min_samples_per_group,
@@ -1387,7 +1405,7 @@ def _compare_cross_spectra(  # noqa: C901 — validation and dispatch over binar
             weights,
             group_codes,
             representation=representation,
-            use_masked=use_masked,
+            complete=complete,
             n_perm=n_perm,
             max_exact_permutations=max_exact_permutations,
             rng=rng,
@@ -1400,7 +1418,7 @@ def _compare_cross_spectra(  # noqa: C901 — validation and dispatch over binar
             candidates,
             freq_weights,
             representation=representation,
-            use_masked=use_masked,
+            complete=complete,
             groups=groups,
             prepared_design=prepared_design,
             min_resid_df=min_resid_df,
@@ -1415,7 +1433,7 @@ def _compare_cross_spectra(  # noqa: C901 — validation and dispatch over binar
             weights,
             representation=representation,
             covariance_mode=covariance_mode,
-            use_masked=use_masked,
+            complete=complete,
             groups=groups,
             prepared_design=prepared_design,
             min_samples_per_group=min_samples_per_group,
@@ -1441,7 +1459,7 @@ def _compare_cross_spectra(  # noqa: C901 — validation and dispatch over binar
         statistic=statistic,
         null=null,
         covariance_mode=covariance_mode,
-        use_masked=use_masked,
+        use_masked=not complete.all(),
         design_metadata=design_metadata,
         count_columns=count_columns,
     )

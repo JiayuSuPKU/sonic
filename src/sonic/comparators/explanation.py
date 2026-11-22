@@ -10,7 +10,7 @@ from scipy.sparse import issparse
 from sonic.comparators.binning import (
     _mode_pair_counts,
     _polar_bin_reducer,
-    _polar_quadrature_counts,
+    _polar_reducer_workspace_bytes,
     _radial_bin_reducer,
 )
 from sonic.comparators.features import _center_observations, _shared_observation_mask
@@ -30,15 +30,13 @@ def _check_spectrum_budget(comparator, sample_index, n_features, n_maps, budget)
     estimate = 8 * n_locations * (2 * n_maps * n_features + 3 * n_maps + 5 * n_features + 8)
     estimate += 128 * n_modes * (n_features + 1)
     if polar:
-        nr, nt, supported = _polar_quadrature_counts(
+        stored, build_peak = _polar_reducer_workspace_bytes(
             shape,
             edges=comparator.freq_edges,
             spacing=comparator._spacings[sample_index],
             n_theta=comparator._n_theta_bins,
         )
-        points = nr[supported] * nt[supported]
-        # Include duplicate sparse entries and the largest quadrature work array.
-        estimate += 128 * int(points.sum()) * comparator._n_theta_bins + 256 * int(points.max())
+        estimate = max(build_peak, estimate + stored)
     else:
         estimate += 64 * n_modes
     if estimate > budget:

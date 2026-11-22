@@ -533,6 +533,37 @@ def _polar_quadrature_counts(grid_shape, *, edges, spacing, n_theta, oversamplin
     return radial, angular, supported
 
 
+def _polar_reducer_workspace_bytes(grid_shape, *, edges, spacing, n_theta) -> tuple[int, int]:
+    """Estimate bytes retained in CSR/counts and peak bytes while building them."""
+    nr, nt, supported = _polar_quadrature_counts(
+        grid_shape, edges=edges, spacing=spacing, n_theta=n_theta
+    )
+    points = nr[supported].astype(float) * nt[supported]
+    edges = np.asarray(edges, dtype=float)
+    lo, hi = edges[:-1][supported], edges[1:][supported]
+    sy, sx = np.asarray(grid_shape, dtype=float) * spacing
+    # In grid cells, each band's sectors cover half an elliptical annulus.
+    area = 0.5 * np.pi * (hi - lo) * (hi + lo) * sy * sx
+    # Bound total travel along both axes for the two arcs and each sector's radial sides.
+    boundary = 2 * ((sy + sx) * (hi + lo) + n_theta * np.hypot(sy, sx) * (hi - lo))
+    # Each bilinear neighbor's unit cell lies within 1.5 cells of its sector.
+    # Sweeping a 3x3 square along its boundary covers all area added outside it.
+    entries = int(
+        np.ceil(np.minimum(4 * points * n_theta, area + 3 * boundary + 9 * n_theta).sum())
+    )
+    rows = len(nr) * n_theta
+    # Allow 64-bit sparse indices on grids or operators too large for int32.
+    ny, nx = map(int, grid_shape)
+    index_bytes = 8 if max(entries, rows, (ny + 2) * (nx + 2)) > 2**31 - 1 else 4
+    stored = (8 + index_bytes) * entries + index_bytes * (rows + 1) + 8 * rows
+    # The builder holds two array headers per supported row, row pointers and CSR metadata.
+    row_overhead = 320 * len(points) * n_theta + 8 * rows + 8192
+    # Only one sector needs interpolation and sort buffers. The final sector is still
+    # live when the compact rows are copied into the assembled CSR matrix.
+    build_peak = 2 * stored + row_overhead + 256 * int(points.max(initial=0))
+    return stored, build_peak
+
+
 def _mode_pair_counts(reducer, grid_shape, *, periodic=True):
     """Count contributing source-frequency groups per row, excluding DC.
 

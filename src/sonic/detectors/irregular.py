@@ -738,7 +738,7 @@ class DetectorIrregular(Detector):
             # check if keys are in var
             if keys is not None:
                 valid = [g for g in keys if g in self.adata.var_names]
-                adata_tmp = self.adata[:, valid]
+                adata_tmp = self.adata[:, _gene_indices(self.adata.var_names, valid)]
             else:
                 adata_tmp = self.adata
 

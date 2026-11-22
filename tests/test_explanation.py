@@ -170,6 +170,21 @@ class TestSpatialExplanation:
 
 
 class TestIrregularExplanation:
+    @pytest.mark.parametrize("sparse,layer", [(False, None), (True, "alternative")])
+    def test_matrix_explains_unique_gene_on_duplicate_axis(self, sparse, layer):
+        data = _adata(sparse=sparse)
+        data.var_names = ["dup", "unique", "dup"]
+        if layer is not None:
+            data.layers[layer] = data.X[:, [2, 0, 1]].copy()
+        detector = _detector(data)
+        scores = detector.compute_qstat(
+            layer=layer, n_jobs=1, return_pval=False, show_progress=False
+        )
+        explanation = detector.explain_qstat("unique", layer=layer)
+        np.testing.assert_allclose(explanation.scores, [scores.loc["unique", "Q"]])
+        with pytest.raises(ValueError, match="Ambiguous.*dup"):
+            detector.explain_qstat("dup", layer=layer)
+
     @pytest.mark.parametrize("backend", ["matrix", "nufft"])
     @pytest.mark.parametrize("method", ["gaussian", "moran"])
     @pytest.mark.parametrize("sparse", [False, True])

@@ -833,20 +833,25 @@ def _estimate_rotations_from_polar(
     landmarks: Sequence[np.ndarray], *, reference_index: int = 0, progress: bool = False
 ) -> np.ndarray:
     """Correlate compact (landmark, angle, radius) stacks along the angle axis."""
-    ref_hat = np.fft.fft(landmarks[reference_index], axis=1)
-    n_theta = ref_hat.shape[1]
-    angles = np.zeros(len(landmarks))
-    indices = range(len(landmarks))
-    if progress:
-        indices = tqdm(indices, desc="Rotation estimation")
-    for i in indices:
-        if i == reference_index:
-            continue
-        cur_hat = np.fft.fft(landmarks[i], axis=1)
-        corr = np.real(np.fft.ifft(ref_hat * np.conj(cur_hat), axis=1))
-        total = corr.sum(axis=(0, 2))
-        angles[i] = int(np.argmax(total)) * 180.0 / n_theta
-    return angles
+    n_genes, n_theta, n_radius = landmarks[reference_index].shape
+    n_freq = n_theta // 2 + 1
+    cross = np.zeros((len(landmarks), n_freq), dtype=complex)
+    # Bound the two complex FFT blocks independently of the retained landmark panels.
+    chunk = max(1, (8 << 20) // (2 * 16 * n_freq * n_radius))
+    starts = range(0, n_genes, chunk)
+    for start in tqdm(starts, desc="Rotation estimation", disable=not progress):
+        genes = slice(start, start + chunk)
+        reference = np.fft.rfft(landmarks[reference_index][genes], axis=1)
+        for i, stack in enumerate(landmarks):
+            if i == reference_index:
+                continue
+            current = np.fft.rfft(stack[genes], axis=1)
+            np.conjugate(current, out=current)
+            current *= reference
+            cross[i] += current.sum(axis=(0, 2))
+            del current
+    correlations = np.fft.irfft(cross, n=n_theta, axis=1)
+    return correlations.argmax(axis=1) * (180.0 / n_theta)
 
 
 def apply_rotations_to_spectra(

@@ -7,7 +7,9 @@ import logging
 import os
 import re
 import warnings
+from bisect import bisect_right
 from fractions import Fraction
+from math import ceil, log10, prod
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -83,6 +85,7 @@ def _require_finite(values, name: str = "Data") -> None:
 _DEFAULT_CHUNK_BUDGET = 2 * (1 << 30)
 _FFT_CHUNK_CAP = 32
 _NUFFT_CHUNK_CAP = 32
+_NUFFT_HIGH_PRECISION_EPS = 1e-9
 
 
 def _parse_memory_budget(memory_budget_bytes: int | str) -> int:
@@ -166,6 +169,8 @@ def auto_chunk_size(
     NUFFT cell plus 64 per observation; and 32 bytes per matrix observation
     (48 for precision solves). They allow for simultaneous real/complex
     buffers and sparse-to-dense conversions, including paired R-test work.
+    NUFFT tolerances at or below 1e-9 also account for the oversampled native
+    grid for each simultaneous transform, up to the transform thread count.
     The budget covers transient batches across ``n_jobs``, excluding retained
     input/output arrays, kernel storage and cached factorizations. Native
     library workspace is implementation-dependent; these are estimates.
@@ -176,8 +181,18 @@ def auto_chunk_size(
     Explicit user chunk sizes bypass this policy. The caps are conservative
     defaults from ``benchmarks/benchmark_scheduling.py``, not runtime autotuning.
     """
-    cap, per_feat = _chunk_parameters(kernel)
-    return resolve_chunk_size(cap, per_feat, n_jobs=n_jobs, budget_bytes=budget_bytes)
+    from sonic.kernels.nufft import NUFFTKernel
+
+    cap, per_feature = _chunk_parameters(kernel)
+    if isinstance(kernel, NUFFTKernel) and kernel._eps <= _NUFFT_HIGH_PRECISION_EPS:
+        return _fit_chunk_size(
+            cap,
+            _kernel_workspace_bytes(kernel),
+            n_jobs,
+            budget_bytes,
+            lambda count: _kernel_workspace_bytes(kernel, count),
+        )
+    return resolve_chunk_size(cap, per_feature, n_jobs=n_jobs, budget_bytes=budget_bytes)
 
 
 def _chunk_parameters(kernel: Kernel) -> tuple[int, int]:
@@ -192,6 +207,38 @@ def _chunk_parameters(kernel: Kernel) -> tuple[int, int]:
         return _NUFFT_CHUNK_CAP, 64 * (int(np.prod(kernel.grid_shape)) + n)
     precision = bool(getattr(kernel, "stores_precision", False))
     return (4, 48 * n) if precision else (32, 32 * n)
+
+
+def _nufft_native_grid_bytes(shape, eps, count, nthreads):
+    """High-precision FINUFFT grid workspace, including batch output coefficients."""
+    if not eps <= _NUFFT_HIGH_PRECISION_EPS:
+        return 0
+    from scipy.fftpack import next_fast_len
+
+    # Tight tolerances use 2x oversampling on each FFT axis. FINUFFT rounds
+    # each length up to an even 2/3/5-smooth size that fits the spreading kernel.
+    width = ceil(1 - log10(max(eps, 1e-15)))
+    fine_cells = prod(2 * next_fast_len(max(int(length), width)) for length in shape)
+    # Allow two complex fine grids for spreading and FFT work per active transform.
+    # Output coefficients span the full batch even when transforms run serially.
+    return 32 * fine_cells * min(count, nthreads) + 16 * prod(map(int, shape)) * count
+
+
+def _nufft_workspace_bytes(shape, n_spots, eps, count, nthreads):
+    ordinary = 64 * (prod(map(int, shape)) + n_spots) * count
+    native = _nufft_native_grid_bytes(shape, eps, count, nthreads)
+    return max(ordinary, native + 32 * n_spots * count)
+
+
+def _kernel_workspace_bytes(kernel, count=1):
+    """Estimate one kernel batch using its active transform threads."""
+    from sonic.kernels.nufft import NUFFTKernel
+
+    if isinstance(kernel, NUFFTKernel):
+        return _nufft_workspace_bytes(
+            kernel.grid_shape, kernel.n, kernel._eps, count, kernel.nthreads
+        )
+    return count * _chunk_parameters(kernel)[1]
 
 
 def resolve_chunk_size(
@@ -210,20 +257,27 @@ def resolve_chunk_size(
     KB/MB/GB/TB use powers of 1000; KiB/MiB/GiB/TiB use powers of 1024.
     Raises ``ValueError`` when one feature per job exceeds ``budget_bytes``.
     """
-    cap, per_feat, requested_jobs = int(chunk_cap), int(per_feat_bytes), int(n_jobs)
+    return _fit_chunk_size(int(chunk_cap), int(per_feat_bytes), n_jobs, budget_bytes)
+
+
+def _fit_chunk_size(cap, per_feat, n_jobs, budget_bytes, workspace=None):
+    """Fit the largest batch whose estimated peak fits one job's share."""
+    requested_jobs = int(n_jobs)
     if cap < 1 or per_feat < 1 or requested_jobs == 0:
         raise ValueError("chunk_cap and per_feat_bytes must be positive; n_jobs cannot be zero.")
     jobs = (
         max(1, (os.cpu_count() or 1) + 1 + requested_jobs) if requested_jobs < 0 else requested_jobs
     )
-    mem_cap = _parse_memory_budget(budget_bytes) // jobs // per_feat
-    if mem_cap < 1:
+    share = _parse_memory_budget(budget_bytes) // jobs
+    if share < per_feat:
         raise ValueError(
             f"budget_bytes={budget_bytes} cannot fit one feature per worker "
             f"({per_feat} bytes each across {jobs} workers). "
             "Increase budget_bytes or reduce n_jobs."
         )
-    return min(mem_cap, cap)
+    if workspace is None:
+        return min(cap, share // per_feat)
+    return bisect_right(range(1, cap + 1), share, key=workspace)
 
 
 # ---------------------------------------------------------------------------

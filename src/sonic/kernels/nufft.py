@@ -888,7 +888,7 @@ class NUFFTKernel(Kernel):
             raise ValueError(f"x first dim {x.shape[0]} does not match n={self.n}.")
         ny, nx = self.grid_shape
         x_in = x[:, None] if x.ndim == 1 else x
-        c = np.ascontiguousarray(x_in.T.astype(np.complex128))  # (M, N)
+        c = np.asarray(x_in.T, dtype=np.complex128, order="C")  # (M, N)
         return finufft.nufft2d1(
             self._y_scaled,
             self._x_scaled,
@@ -1039,13 +1039,12 @@ class NUFFTKernel(Kernel):
         z_hat = self._nufft_type1(z)  # (M, ny, nx) complex, DC centred
         if self.centering:
             z_hat[:, ny // 2, nx // 2] = 0.0
-        out_k = np.ascontiguousarray(
-            (lam_centred[None, :, :] * z_hat / (ny * nx)).astype(np.complex128)
-        )
+        z_hat *= lam_centred
+        z_hat /= ny * nx
         Kz = finufft.nufft2d2(
             self._y_scaled,
             self._x_scaled,
-            out_k,
+            z_hat,
             eps=self._eps,
             isign=+1,
             nthreads=self.nthreads,

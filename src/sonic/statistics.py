@@ -31,6 +31,7 @@ for higher traces; its reduced eigendecomposition requires an explicit opt-in.
 
 from __future__ import annotations
 
+from bisect import bisect_right
 from collections.abc import Sequence
 from copy import copy
 
@@ -44,6 +45,7 @@ from tqdm import tqdm
 from sonic.kernels import Kernel
 from sonic.utils import (
     _DEFAULT_CHUNK_BUDGET,
+    _kernel_workspace_bytes,
     _parse_memory_budget,
     _require_finite,
     auto_chunk_size,
@@ -503,7 +505,15 @@ def _estimate_kernel_traces(  # noqa: C901
         except (ValueError, NotImplementedError):
             c1 = c2 = var_R = None
 
-    block_size = min(n_probes, max(1, _TRACE_PROBE_BUDGET_BYTES // (8 * n * 8)))
+    # Trace vectors live at observations; NUFFT applications also use a Fourier grid.
+    block_size = max(
+        1,
+        bisect_right(
+            range(1, n_probes + 1),
+            _TRACE_PROBE_BUDGET_BYTES,
+            key=lambda count: max(64 * n * count, _kernel_workspace_bytes(kernel, count)),
+        ),
+    )
     cached = getattr(kernel, "_trace_rvs_cache", None) if precision and rng_seed == 0 else None
     if cached is not None and cached["n_vectors"] != n_probes:
         cached = None

@@ -230,6 +230,20 @@ class TestRadialBinning:
         np.testing.assert_allclose(_radial_bin_cell_counts(shape, **kwargs), counts)
         np.testing.assert_allclose(_bin_radial_spectrum(power, shape, **kwargs), sums / counts)
 
+    @pytest.mark.parametrize("shape", [(7, 10), (10, 7), (1, 8)])
+    @pytest.mark.parametrize("exclude_dc", [False, True])
+    def test_cell_counts_at_exact_mode_frequencies(self, shape, exclude_dc):
+        dy, dx = 0.5, 1.25
+        fy, fx = np.fft.fftfreq(shape[0], dy), np.fft.fftfreq(shape[1], dx)
+        radii = np.sqrt(fy[:, None] ** 2 + fx**2)
+        edges = np.unique(radii)
+        expected = np.histogram(radii[radii > 0] if exclude_dc else radii, bins=edges)[0]
+        for solver in ("fft2", "rfft2"):
+            actual = _radial_bin_cell_counts(
+                shape, spacing=(dy, dx), fft_solver=solver, edges=edges, exclude_dc=exclude_dc
+            )
+            np.testing.assert_array_equal(actual, expected)
+
     @pytest.mark.parametrize("shape", [(8, 8), (7, 9)])
     @pytest.mark.parametrize("solver", ["fft2", "rfft2"])
     def test_radial_reduction_preserves_missing_bins_and_ignores_excluded_nans(self, shape, solver):
@@ -412,6 +426,22 @@ class TestPolarBinning:
 
 class TestRotationAlignment:
     """Rotation recovery and application on synthetic spatial patterns."""
+
+    def test_landmark_correlations_use_bounded_blocks(self, monkeypatch):
+        from sonic.comparators.features import _estimate_rotations_from_polar
+
+        rng = np.random.default_rng(34)
+        reference = rng.normal(size=(100, 91, 64))
+        stacks = [np.roll(reference, 12, axis=1), reference, np.roll(reference, -5, axis=1)]
+        fft = np.fft.rfft
+
+        def check(block, *args, **kwargs):
+            assert block.shape[0] < len(reference)
+            return fft(block, *args, **kwargs)
+
+        monkeypatch.setattr(np.fft, "rfft", check)
+        angles = _estimate_rotations_from_polar(stacks, reference_index=1)
+        np.testing.assert_allclose(angles, np.array([79, 0, 5]) * 180 / 91)
 
     @staticmethod
     def _stripes(ny: int, nx: int, period: float = 8.0) -> np.ndarray:

@@ -17,7 +17,12 @@ from sonic.comparators.features import _center_observations, _shared_observation
 from sonic.explanation import _explanation_from_responses
 from sonic.kernels.fft import _fourier_coefficients_2d
 from sonic.kernels.nufft import _fourier_coefficients_2d_nufft
-from sonic.utils import _gene_indices, _parse_memory_budget, _take_feature_columns
+from sonic.utils import (
+    _gene_indices,
+    _nufft_native_grid_bytes,
+    _parse_memory_budget,
+    _take_feature_columns,
+)
 
 
 def _check_spectrum_budget(comparator, sample_index, n_features, n_maps, budget):
@@ -25,10 +30,22 @@ def _check_spectrum_budget(comparator, sample_index, n_features, n_maps, budget)
     shape = comparator._grid_shapes[sample_index]
     polar = comparator.feature_mode == "2d"
     irregular = comparator._spectrum_backend == "nufft"
-    n_modes = int(np.prod(np.asarray(shape) + 2 * int(polar and irregular)))
+    mode_shape = tuple(n + 2 * int(polar and irregular) for n in shape)
+    n_modes = int(np.prod(mode_shape))
     n_locations = len(comparator._coords[sample_index]) if irregular else int(np.prod(shape))
-    estimate = 8 * n_locations * (2 * n_maps * n_features + 3 * n_maps + 5 * n_features + 8)
-    estimate += 128 * n_modes * (n_features + 1)
+    if irregular:
+        # NUFFT also needs native plans and a separate irregular observation lattice.
+        estimate = 8 * n_locations * (2 * n_maps * n_features + 3 * n_maps + 5 * n_features + 8)
+        native = _nufft_native_grid_bytes(
+            mode_shape, comparator._nufft_eps, n_features, comparator._workers
+        )
+        estimate += max(128 * n_modes * (n_features + 1), native)
+    else:
+        # FFT coefficients, weighted inverse, selected responses, observed data and geometry.
+        transforms = n_modes * (48 + 80 * n_features + 8 * n_maps * n_features)
+        # At return the filtered maps coexist with their copies and contribution maps.
+        maps = 8 * n_locations * (2 * n_maps * n_features + 2 * n_maps + 3 * n_features + 6)
+        estimate = max(transforms, maps)
     if polar:
         stored, build_peak = _polar_reducer_workspace_bytes(
             shape,
@@ -37,7 +54,7 @@ def _check_spectrum_budget(comparator, sample_index, n_features, n_maps, budget)
             n_theta=comparator._n_theta_bins,
         )
         estimate = max(build_peak, estimate + stored)
-    else:
+    elif irregular:
         estimate += 64 * n_modes
     if estimate > budget:
         raise MemoryError(
@@ -127,7 +144,8 @@ def _explain_spectrum(  # noqa: C901 — validation, backend adjoints and five r
         block = comparator._batch_raster(raster, columns).reshape(len(names), -1).T
         mask = _shared_observation_mask(block)
         indices = np.flatnonzero(mask)
-        values = block[mask].copy()
+        values = block[mask]
+        del block
         coordinates = np.column_stack(np.unravel_index(indices, shape)) * np.asarray(spacing)
         coordinate_system = "local_raster_yx"
         unit_scale = 1.0
@@ -158,8 +176,10 @@ def _explain_spectrum(  # noqa: C901 — validation, backend adjoints and five r
         coefficients = _fourier_coefficients_2d(
             filled.reshape(*shape, len(names)), "fft2", comparator._workers, center=True
         )
+        del filled
     coefficients[0, 0] = 0
-    coefficients = np.moveaxis(coefficients, -1, 0).reshape(len(names), -1) / n
+    coefficients = np.moveaxis(coefficients, -1, 0).reshape(len(names), -1)
+    coefficients /= n
     auto = (reducer @ (abs(coefficients) ** 2).T).T
     auto[:, counts == 0] = np.nan
     cross = None
@@ -199,8 +219,9 @@ def _explain_spectrum(  # noqa: C901 — validation, backend adjoints and five r
                 / n
             )
         else:
-            response = ifft2(weighted, axes=(-2, -1), workers=comparator._workers)
-            response = response.reshape(len(names), -1).T[mask] * (np.prod(shape) / n)
+            response = ifft2(weighted, axes=(-2, -1), workers=comparator._workers, overwrite_x=True)
+            response = response.reshape(len(names), -1).T[mask]
+            response *= np.prod(shape) / n
         response -= response.mean(axis=0)
         if representation in ("power", "power_norm"):
             denominator = 1.0 if representation == "power" else total_power
@@ -224,6 +245,8 @@ def _explain_spectrum(  # noqa: C901 — validation, backend adjoints and five r
                 abs(coherency) ** 2 if representation == "coherence" else coherency.real
             )
 
+        del weighted, response, weights
+    del coefficients, reducer
     return _explanation_from_responses(
         values,
         prepared,

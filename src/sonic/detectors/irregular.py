@@ -24,8 +24,8 @@ from sonic.statistics import (
 )
 from sonic.utils import (
     _DEFAULT_CHUNK_BUDGET,
-    _chunk_parameters,
     _gene_indices,
+    _kernel_workspace_bytes,
     _parse_memory_budget,
     _require_finite,
     _take_feature_columns,
@@ -963,7 +963,7 @@ class DetectorIrregular(Detector):
             workers if self.backend_ == "nufft" else 1,
             backend="nufft" if self.backend_ == "nufft" else "matrix",
             n_tasks=n_batches,
-            per_feat_bytes=_chunk_parameters(self.kernel_)[1] if auto_chunk else None,
+            per_feat_bytes=_kernel_workspace_bytes(self.kernel_) if auto_chunk else None,
             budget_bytes=memory_budget_bytes,
         )
         if self.backend_ == "nufft":
@@ -1167,7 +1167,7 @@ class DetectorIrregular(Detector):
             workers if self.backend_ == "nufft" else 1,
             backend="nufft" if self.backend_ == "nufft" else "matrix",
             n_tasks=1 if self.backend_ == "nufft" else n_batches,
-            per_feat_bytes=_chunk_parameters(self.kernel_)[1] if auto_chunk else None,
+            per_feat_bytes=_kernel_workspace_bytes(self.kernel_) if auto_chunk else None,
             budget_bytes=memory_budget_bytes,
         )
         if self.backend_ == "nufft":

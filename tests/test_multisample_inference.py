@@ -359,6 +359,15 @@ class TestPermutationCalibration:
         # Materialize the reference null, retaining the public API's RNG sequence.
         perm_rng = np.random.default_rng(19)
         expected = []
+
+        def sample_assignments(labels):
+            assignments = []
+            for _ in range(43):
+                perm_rng.shuffle(labels)
+                assignments.append(labels.copy())
+            return assignments
+
+        shared = None if exact else sample_assignments(groups.copy())
         for gene in range(4):
             keep = presence[:, gene]
             labels = groups[keep].copy()
@@ -371,13 +380,8 @@ class TestPermutationCalibration:
                     assignment = np.ones(len(labels), dtype=int)
                     assignment[list(indices)] = 0
                     assignments.append(assignment)
-            elif not masked and gene > 0:
-                pass  # Unmasked genes use the same relabellings.
             else:
-                assignments = []
-                for _ in range(43):
-                    perm_rng.shuffle(labels)
-                    assignments.append(labels.copy())
+                assignments = shared if keep.all() else sample_assignments(labels)
             observed = statistic(spectra[keep, gene], groups[keep])
             null = np.array(
                 [statistic(spectra[keep, gene], assignment) for assignment in assignments]

@@ -1099,6 +1099,67 @@ class TestComparatorNullCovariance:
         np.testing.assert_allclose(selected["sigma_log"], reference["sigma_log"])
         np.testing.assert_allclose(selected["eigenvalues"], reference["eigenvalues"])
 
+    @pytest.mark.parametrize(
+        "options",
+        [
+            {"null": "rotation"},
+            {"covariance": "per_gene"},
+            {"covariance": "pooled"},
+            {"statistic": "log_t_cauchy"},
+        ],
+    )
+    def test_complete_gene_in_mixed_glm_keeps_its_fit(self, options):
+        spectra = np.random.default_rng(743).lognormal(size=(6, 2, 4))
+        presence = np.ones((6, 2), bool)
+        presence[0, 1] = False
+        spectra[~presence] = np.nan
+        design = pd.DataFrame({"group": [0, 0, 0, 1, 1, 1]})
+        mixed = _comparator_from_spectra(spectra, presence)
+        single = _comparator_from_spectra(spectra[:, :1])
+        kwargs = {"contrast": "group", "min_resid_df": 5, **options}
+        actual = mixed.test_diff_freq(design, **kwargs).set_index("Feature")
+        expected = single.test_diff_freq(design, **kwargs).iloc[0]
+        assert np.isfinite(expected.P_value)
+        np.testing.assert_allclose(
+            actual.loc["g0", ["Statistic", "P_value"]].to_numpy(float),
+            [expected.Statistic, expected.P_value],
+        )
+        assert np.isnan(actual.loc["g1", "P_value"])
+        if "covariance" in options:
+            state = mixed.estimate_null_covariance(design, **kwargs)
+            alone = single.estimate_null_covariance(design, **kwargs)
+            np.testing.assert_array_equal(state["eligible"], [True, False])
+            np.testing.assert_array_equal(state["df_resid"], [4, 3])
+            np.testing.assert_allclose(
+                state["sigma_log"] if options["covariance"] == "pooled" else state["sigma_log"][:1],
+                alone["sigma_log"],
+            )
+
+    @pytest.mark.parametrize("statistic", ["log_l2", "log_t_cauchy"])
+    def test_complete_genes_in_mixed_binary_panel(self, statistic):
+        spectra = np.random.default_rng(744).lognormal(size=(10, 3, 4))
+        presence = np.ones((10, 3), bool)
+        presence[0, 0] = False
+        groups = np.repeat([0, 1], 5)
+        options = (
+            {"null": "permutation", "random_state": 57, "max_exact_permutations": 0, "n_perm": 37}
+            if statistic == "log_l2"
+            else {"min_samples_per_group": 6}
+        )
+
+        def test(values, mask=None):
+            return (
+                _comparator_from_spectra(values, mask)
+                .test_diff_freq(groups, statistic=statistic, **options)
+                .sort_values("Feature")
+            )
+
+        expected = test(spectra[:, 1:])
+        actual = test(spectra, presence)
+        np.testing.assert_allclose(actual.P_value.iloc[1:], expected.P_value)
+        if statistic == "log_t_cauchy":
+            assert np.isnan(actual.P_value.iloc[0])
+
     def test_covariance_feature_names(self):
         cmp = _comparator_from_spectra(np.random.default_rng(741).lognormal(size=(8, 3, 5)))
         cmp.gene_names = ["a", "a", "b"]
@@ -1786,6 +1847,32 @@ def test_covariate_normalization_failure_preserves_all_samples(monkeypatch):
     assert cmp.spectra_.dtype == np.float32
 
 
+def test_tight_nufft_tolerance_checks_native_workspace_before_transform(monkeypatch):
+    monkeypatch.setattr("os.cpu_count", lambda: 2)
+    rng = np.random.default_rng(27)
+    shape = (512, 1024)
+    sample = ad.AnnData(rng.normal(size=(4096, 1)))
+    sample.obsm["spatial"] = rng.uniform((0, 0), shape, size=(4096, 2))
+    options = {"grid_shape": shape, "spacing": (1.0, 1.0), "workers": 1, "n_radial_bins": 4}
+    ordinary = ComparatorIrregular([sample], **options)
+    precise = ComparatorIrregular([sample, sample], eps=1e-12, **options)
+    old_budget = 64 * (np.prod(shape) + sample.n_obs)
+    ordinary.compute_spectra(memory_budget_bytes=int(old_budget), progress=False)
+    with monkeypatch.context() as m:
+
+        def unexpected(*args, **kwargs):
+            pytest.fail("started NUFFT before checking the budget")
+
+        m.setattr("sonic.kernels.nufft.power_spectrum_2d_nufft", unexpected)
+        with pytest.raises(ValueError, match="cannot fit one feature"):
+            precise.compute_spectra(memory_budget_bytes=int(old_budget), progress=False)
+        with pytest.raises(ValueError, match="cannot fit one feature"):
+            precise.compute_spectra(memory_budget_bytes="73 MiB", n_jobs=2, progress=False)
+    precise.compute_spectra(memory_budget_bytes="73 MiB", n_jobs=-1, progress=False)
+    for spectrum in precise.spectra_:
+        np.testing.assert_allclose(spectrum, ordinary.spectra_[0], rtol=2e-5)
+
+
 @pytest.mark.parametrize("backend", ["fft", "nufft"])
 def test_2d_schedule_uses_transform_workspace(backend, monkeypatch):
     import os
@@ -1814,22 +1901,27 @@ def test_2d_schedule_uses_transform_workspace(backend, monkeypatch):
         per_feature = 64 * np.prod(shape)
     else:
         comparator = ComparatorIrregular(
-            _grid_samples_to_adata(values, names), grid_shape=shape, eps=1e-12, **options
+            _grid_samples_to_adata(values, names), grid_shape=shape, **options
         )
         per_feature = 64 * (np.prod(np.asarray(shape) + 2) + np.prod(shape))
-    budget = int(4 * per_feature)
+    from sonic.comparators.binning import _polar_reducer_workspace_bytes
+
+    stored, peak = _polar_reducer_workspace_bytes(shape, edges=edges, spacing=(1, 1), n_theta=4)
+    minimum = max(peak, stored + per_feature)
+    per_job = max(peak, stored + 2 * per_feature)
+    budget = int(2 * per_job)
     comparator.compute_spectra(n_jobs=2, progress=False, memory_budget_bytes=budget)
     parallel = comparator.spectra_.copy()
-    assert getattr(comparator, f"_{backend}_chunk_size") == 2
+    assert getattr(comparator, f"_{backend}_chunk_size") == (per_job - stored) // per_feature
     comparator.compute_spectra(n_jobs=1, progress=False, memory_budget_bytes=budget)
     np.testing.assert_allclose(comparator.spectra_, parallel, atol=1e-10)
     assert getattr(comparator, f"_{backend}_chunk_size") > 2
-    comparator.compute_spectra(n_jobs=-1, progress=False, memory_budget_bytes=int(per_feature))
+    comparator.compute_spectra(n_jobs=-1, progress=False, memory_budget_bytes=int(minimum))
     np.testing.assert_allclose(comparator.spectra_, parallel, atol=1e-10)
-    assert getattr(comparator, f"_{backend}_chunk_size") == 1
+    assert getattr(comparator, f"_{backend}_chunk_size") == (minimum - stored) // per_feature
     with pytest.raises(ValueError, match="cannot fit one feature"):
         comparator.compute_spectra(
-            n_jobs=2, progress=False, memory_budget_bytes=int(2 * per_feature - 1)
+            n_jobs=2, progress=False, memory_budget_bytes=int(2 * minimum - 1)
         )
 
 

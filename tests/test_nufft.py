@@ -9,6 +9,37 @@ from sonic.kernels.fft import power_spectrum_2d
 from sonic.kernels.nufft import _fourier_coefficients_2d_nufft, power_spectrum_2d_nufft
 
 
+def test_trace_probe_batches_include_fourier_grid(monkeypatch):
+    from sonic import statistics
+    from sonic.kernels import NUFFTKernel
+
+    rng = np.random.default_rng(41)
+    shape = (32, 64)
+    kernel = NUFFTKernel(rng.uniform(0, 32, (64, 2)), shape, (1, 1), bandwidth=2.0, eps=1e-12)
+    reference = statistics._estimate_kernel_traces(
+        kernel, n_probes=7, centered=True, use_analytic_traces=False
+    )
+    # Two high-precision transforms share the native grid on this one-thread kernel.
+    monkeypatch.setattr(statistics, "_TRACE_PROBE_BUDGET_BYTES", 340 * 1024)
+    apply = kernel.Kx
+    widths = []
+
+    def observe(values):
+        widths.append(values.shape[1])
+        return apply(values)
+
+    monkeypatch.setattr(kernel, "Kx", observe)
+    actual = statistics._estimate_kernel_traces(
+        kernel, n_probes=7, centered=True, use_analytic_traces=False
+    )
+    assert max(widths) == 2
+    for order in (2, 3, 4):
+        np.testing.assert_allclose(
+            actual["powers"][order] * actual["scale"] ** order,
+            reference["powers"][order] * reference["scale"] ** order,
+        )
+
+
 @pytest.mark.parametrize("bandwidth", [100.0, 1e5])
 def test_broad_centered_kernel_traces_keep_small_ac_signal(bandwidth):
     from sonic.kernels import NUFFTKernel

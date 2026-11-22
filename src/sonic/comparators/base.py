@@ -19,6 +19,7 @@ from tqdm.auto import tqdm
 from sonic.comparators.binning import (
     _adapt_radial_edges,
     _bin_radial_spectrum,
+    _polar_reducer_workspace_bytes,
     _radial_bin_cell_counts,
     _stream_polar_features,
     _stream_radial_features,
@@ -227,8 +228,10 @@ class _ComparatorBase:
             padding = int(self._spectrum_backend == "nufft")
             grids = [(ny + 2 * padding, nx + 2 * padding) for ny, nx in self._grid_shapes]
             spec = self._resolve_chunk_spec(chunk_size)
-            n_jobs, chunk = self._resolve_spectrum_schedule(spec, grids, n_jobs=n_jobs)
             n_genes = len(self.gene_names) if names is None else len(names)
+            n_jobs, chunk, spare = self._resolve_spectrum_schedule(
+                spec, grids, n_genes, n_jobs=n_jobs
+            )
             use_geomean = names is None or not self._landmark_cache_fits(n_genes)
             f_max = min(0.5 / max(spacing) for spacing in self._spacings)
             edges = np.linspace(0.0, f_max, _ALIGNMENT_N_RADIUS + 1)
@@ -236,7 +239,7 @@ class _ComparatorBase:
             # Compute interpolated polar spectra for selected landmarks per sample.
             def _one(i, pbar):
                 read, _dc, _presence, count, shape = self._sample_spectrum_chunker(
-                    i, gene_indices=indices
+                    i, gene_indices=indices, chunk_size=chunk, cache_budget=spare[i]
                 )
 
                 return _stream_landmark_polar(
@@ -270,13 +273,17 @@ class _ComparatorBase:
         padding = int(self.feature_mode == "2d" and self._spectrum_backend == "nufft")
         grids = [(ny + 2 * padding, nx + 2 * padding) for ny, nx in self._grid_shapes]
         spec = self._resolve_chunk_spec(chunk_size)
-        n_jobs, chunk = self._resolve_spectrum_schedule(spec, grids, n_jobs=n_jobs)
+        n_jobs, chunk, spare = self._resolve_spectrum_schedule(
+            spec, grids, len(self.gene_names), n_jobs=n_jobs, polar=self.feature_mode == "2d"
+        )
         setattr(self, f"_{self._spectrum_backend}_chunk_size", chunk)
         self._ensure_alignment(n_jobs, progress, landmark_genes, chunk_size=chunk)
 
         # Compute binned and flattened single-feature auto-spectra per sample.
         def _one(i, pbar):
-            read, dc, presence, count, shape = self._sample_spectrum_chunker(i)
+            read, dc, presence, count, shape = self._sample_spectrum_chunker(
+                i, chunk_size=chunk, cache_budget=spare[i]
+            )
             options = {
                 "chunk_size": chunk,
                 "fft_solver": self._spectrum_fft_solver,
@@ -377,39 +384,70 @@ class _ComparatorBase:
 
     # ------------------------------------------------------------------
     def _resolve_spectrum_schedule(
-        self, spec: int | str, grid_shapes: list[tuple[int, int]], *, n_jobs: int = 1
-    ) -> tuple[int, int]:
-        """Resolve sample jobs, transform threads and chunks from the same budget.
+        self,
+        spec: int | str,
+        grid_shapes: list[tuple[int, int]],
+        n_genes: int,
+        *,
+        n_jobs: int = 1,
+        polar: bool = False,
+    ) -> tuple[int, int, list[int]]:
+        """Size concurrent transforms and return the spare bytes for sparse column caches."""
+        from bisect import bisect_right
 
-        Estimate 64 bytes per grid cell plus, for NUFFT, 64 per observation.
-        Automatic jobs can shrink to fit one feature per sample job; explicit
-        positive jobs retain their limit. Explicit chunks bypass memory sizing.
-        """
-        from sonic.utils import resolve_chunk_size, resolve_parallelism
+        from sonic.utils import _nufft_workspace_bytes, resolve_parallelism
 
-        max_lat = max((ny * nx for (ny, nx) in grid_shapes), default=1)
-        per_feat = 64 * max(max_lat, 1)
-        if self._spectrum_backend == "nufft":
-            per_feat += 64 * max(len(coords) for coords in self._coords)
+        reducers = [
+            _polar_reducer_workspace_bytes(
+                self._grid_shapes[i],
+                edges=self.freq_edges,
+                spacing=self._spacings[i],
+                n_theta=self._n_theta_bins,
+            )
+            if polar
+            else (0, 0)
+            for i in range(len(grid_shapes))
+        ]
+
+        def workspace(i, count, workers):
+            shape = grid_shapes[i]
+            if self._spectrum_backend == "nufft":
+                transform = _nufft_workspace_bytes(
+                    shape, len(self._coords[i]), self._nufft_eps, count, workers
+                )
+            else:
+                transform = 64 * shape[0] * shape[1] * count
+            stored, peak = reducers[i]
+            return max(peak, stored + transform)
+
+        minimum = max(workspace(i, 1, 1) for i in range(len(grid_shapes)))
         n_jobs, self._workers = resolve_parallelism(
             n_jobs,
             self._workers_spec,
             backend=self._spectrum_backend,
             n_tasks=len(self.samples),
-            per_feat_bytes=per_feat if spec == "auto" else None,
+            per_feat_bytes=minimum if spec == "auto" else None,
             budget_bytes=self._auto_chunk_budget_bytes,
         )
-        chunk = (
-            resolve_chunk_size(
-                self._auto_chunk_cap,
-                per_feat,
-                n_jobs=n_jobs,
-                budget_bytes=self._auto_chunk_budget_bytes,
+        per_job = self._auto_chunk_budget_bytes // n_jobs
+        chunk = spec
+        if spec == "auto":
+            if per_job < minimum:
+                raise ValueError(
+                    f"Budget cannot fit one feature per worker ({minimum} bytes each across {n_jobs} workers)."
+                )
+            chunk = bisect_right(
+                range(1, self._auto_chunk_cap + 1),
+                per_job,
+                key=lambda count: max(
+                    workspace(i, count, self._workers) for i in range(len(grid_shapes))
+                ),
             )
-            if spec == "auto"
-            else spec
-        )
-        return n_jobs, chunk
+        spare = [
+            max(0, per_job - workspace(i, min(chunk, n_genes), self._workers))
+            for i in range(len(grid_shapes))
+        ]
+        return n_jobs, chunk, spare
 
     # Compact polar stacks are retained only for the alignment pass.
     _landmark_cache_warn_bytes: int = 8 * 1024**3
@@ -599,8 +637,8 @@ class _ComparatorBase:
         progress : bool, default True
             Show a progress bar and process one sample at a time.
         memory_budget_bytes : int or str, default '2 GiB'
-            Estimated memory available for automatic transform blocks across sample
-            jobs. Supply bytes or a size such as ``'512 MiB'``.
+            Estimated workspace for automatic transform blocks and directional binning
+            across sample jobs. Supply bytes or a size such as ``'512 MiB'``.
         chunk_size : int, 'auto', or None, optional
             Genes per transform block. By default, use the constructor setting.
             An explicit size overrides the automatic memory budget.
@@ -1075,7 +1113,8 @@ class _ComparatorBase:
             Minimum observed samples in each group for binary L2 tests and
             masked binary t-Cauchy tests.
         min_resid_df : int, default 1
-            Minimum residual degrees of freedom for a masked linear model.
+            Minimum residual degrees of freedom for features with missing samples.
+            Fully observed features require one residual degree of freedom.
         covariance : str, optional
             With plug-in calibration, ``None`` or ``'per_gene'`` estimates residual
             covariance across bins for each gene. ``'pooled'`` shares this estimate
@@ -1253,7 +1292,8 @@ class _ComparatorBase:
             Minimum observed samples in each group for binary L2 tests and
             masked binary t-Cauchy tests.
         min_resid_df : int, default 1
-            Minimum residual degrees of freedom for a masked linear model.
+            Minimum residual degrees of freedom for features with missing samples.
+            Fully observed features require one residual degree of freedom.
         covariance : str, optional
             With plug-in calibration, ``None`` or ``'per_pair'`` estimates residual
             covariance across bins for each pair. ``'pooled'`` shares this estimate
@@ -1388,7 +1428,8 @@ class _ComparatorBase:
         min_samples_per_group : int, default 2
             Minimum number of observed samples in each group for a binary fit.
         min_resid_df : int, default 1
-            Minimum residual degrees of freedom for a masked linear model.
+            Minimum residual degrees of freedom for features with missing samples.
+            Fully observed features require one residual degree of freedom.
         covariance : str, optional
             Use ``'per_gene'`` (default) for separate gene covariance estimates.
             Use ``'pooled'`` for a shared estimate across eligible genes.

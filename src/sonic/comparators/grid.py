@@ -224,7 +224,7 @@ class ComparatorGrid(_ComparatorBase):
             batch = img.sel(c=[self.gene_names[j] for j in columns])
         return np.asarray(batch.values, dtype=np.float64)
 
-    def _sample_spectrum_chunker(self, i: int, *, gene_indices=None):
+    def _sample_spectrum_chunker(self, i: int, *, chunk_size, cache_budget, gene_indices=None):
         """Stream selected genes' powers and collect their DC/presence in the same pass."""
         img = self._rasterize_one(self.samples[i])
         columns = np.arange(len(self.gene_names)) if gene_indices is None else gene_indices

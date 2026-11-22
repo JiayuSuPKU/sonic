@@ -724,7 +724,7 @@ def _estimate_glm_masked_null_covariance(  # noqa: C901
         fit = _lm._decompose_glm_design(design_matrix[sample_mask], contrast_vector)
         df_gene = count - fit.rank
         df_resid[genes] = df_gene
-        if df_gene < int(min_resid_df):
+        if df_gene < (1 if count == n_samples else int(min_resid_df)):
             continue
         if not fit.estimable:
             continue
@@ -969,11 +969,17 @@ def _run_two_group_permutations(
     max_exact_permutations,
     random_state,
 ):
-    """Run binary permutations, retaining feature order for masked RNG draws."""
-    profiles = np.asarray(profiles, dtype=np.float64)
-    freq_weights = _resolve_freq_weights(freq_weights, profiles.shape[-1])
+    """Share labels across complete genes, then draw for incomplete genes in input order."""
+    profiles = np.asarray(profiles)
+    n_samples, n_genes, n_bins = profiles.shape
+    freq_weights = _resolve_freq_weights(freq_weights, n_bins)
     rng = np.random.default_rng(random_state)
-    if presence is None:
+    complete = np.ones(n_genes, dtype=bool) if presence is None else presence.all(axis=0)
+    observed = np.full(n_genes, np.nan)
+    pvals = np.full(n_genes, np.nan)
+    estimates = np.full((n_genes, n_bins), np.nan)
+    complete_genes = np.flatnonzero(complete)
+    if complete_genes.size:
         labels, exact = _make_label_permutations(
             groups, n_perm, rng, max_exact_permutations=max_exact_permutations
         )
@@ -984,19 +990,19 @@ def _run_two_group_permutations(
                 len(groups),
                 int((groups == 0).sum()),
             )
-        return _run_l2_permutations(
-            profiles,
-            groups,
-            labels,
-            freq_weights=freq_weights,
-            is_exact=exact,
-            normalize_shape=normalize_shape,
-        )
+        for block in _iter_feature_blocks(n_samples, len(complete_genes), n_bins):
+            cols = complete_genes[block] if presence is not None else block
+            observed[cols], pvals[cols], estimates[cols] = _run_l2_permutations(
+                profiles[:, cols],
+                groups,
+                labels,
+                freq_weights=freq_weights,
+                is_exact=exact,
+                normalize_shape=normalize_shape,
+            )
+        del labels
 
-    observed = np.full(profiles.shape[1], np.nan)
-    pvals = np.full(profiles.shape[1], np.nan)
-    estimates = np.full(profiles.shape[1:], np.nan)
-    for gene in range(profiles.shape[1]):
+    for gene in np.flatnonzero(~complete):
         mask = presence[:, gene]
         sub_groups = groups[mask]
         if min(np.sum(sub_groups == 0), np.sum(sub_groups == 1)) < min_samples_per_group:
@@ -1013,6 +1019,7 @@ def _run_two_group_permutations(
             normalize_shape=normalize_shape,
         )
         observed[gene], pvals[gene], estimates[gene] = statistic[0], tail[0], effect[0]
+        del labels
     return observed, pvals, estimates
 
 
@@ -1653,7 +1660,7 @@ def _run_l2_conditional(  # noqa: C901
         x, rank = fit.matrix, fit.rank
         df = count - rank
         df_resid[genes] = df
-        if df < int(min_resid_df) or not fit.estimable:
+        if df < (1 if count == n_samples else int(min_resid_df)) or not fit.estimable:
             continue
         # a = c^T X^+ gives sample weights for the fitted contrast: theta = a @ Y.
         a = fit.sample_weights

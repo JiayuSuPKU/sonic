@@ -194,28 +194,58 @@ class ComparatorIrregular(_ComparatorBase):
         self._grid_shapes = grids
         self._spacings = spacings
 
-    def _sample_spectrum_chunker(self, i: int, *, gene_indices=None):
+    def _feature_reader(self, i, columns, chunk_size, cache_budget):
+        """Read writable float blocks and optionally index repeated CSR reads by column."""
+        sample = self.samples[i]
+        matrix = sample.X if self._layer is None else sample.layers[self._layer]
+        cache_bytes = 0
+        if getattr(matrix, "format", None) == "csr" and len(columns) > chunk_size:
+            rows, cols = matrix.shape
+            index_bytes = matrix.indices.itemsize
+            entry_bytes = index_bytes + matrix.dtype.itemsize
+            if len(columns) >= cols:
+                needed = matrix.nnz * entry_bytes + (cols + 1) * index_bytes
+                if needed <= cache_budget:
+                    matrix = matrix.tocsc()
+                    cache_bytes = needed
+            elif matrix.has_canonical_format:
+                # Allow the selected CSR and CSC to coexist during conversion.
+                entries = (
+                    min(matrix.nnz, rows * len(columns))
+                    if np.all(np.diff(columns) > 0)
+                    else rows * len(columns)
+                )
+                needed = 2 * entries * entry_bytes + (rows + cols + len(columns) + 3) * index_bytes
+                if needed <= cache_budget:
+                    matrix = matrix[:, columns].tocsc()
+                    columns = np.arange(len(columns))
+                    cache_bytes = matrix.data.nbytes + matrix.indices.nbytes + matrix.indptr.nbytes
+
+        def read(block):
+            values = _take_feature_columns(matrix, columns[block])
+            if sp.issparse(values):
+                return values.toarray().astype(float, copy=False)
+            return np.array(values, dtype=float, copy=True)
+
+        return read, cache_bytes
+
+    def _sample_spectrum_chunker(self, i: int, *, chunk_size, cache_budget, gene_indices=None):
         """Stream selected genes' powers, collecting DC/presence only for each batch."""
         from sonic.kernels.nufft import power_spectrum_2d_nufft
 
-        adata = self.samples[i]
-        X_src = adata.X if self._layer is None else adata.layers[self._layer]
-        X_src = X_src.tocsc() if sp.issparse(X_src) else X_src
         columns = (
             np.arange(len(self.gene_names)) if gene_indices is None else np.asarray(gene_indices)
         )
+        read, _ = self._feature_reader(i, columns, chunk_size, cache_budget)
         n_genes = len(columns)
-        n_spots = X_src.shape[0]
+        n_spots = len(self._coords[i])
         grid_i = self._grid_shapes[i]
         dc = np.empty(n_genes, dtype=float)
         presence = np.empty(n_genes, dtype=bool)
         padding = int(self.feature_mode == "2d")
 
         def _spec_chunk(start: int, stop: int) -> np.ndarray:
-            values = _take_feature_columns(X_src, columns[start:stop])
-            block = np.array(
-                values.toarray() if sp.issparse(values) else values, dtype=float, copy=True
-            )
+            block = read(slice(start, stop))
             dc[start:stop] = block.mean(axis=0)
             presence[start:stop] = (
                 np.count_nonzero(block, axis=0) / max(n_spots, 1)

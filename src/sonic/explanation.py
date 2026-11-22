@@ -7,7 +7,7 @@ from typing import Any
 
 import numpy as np
 
-from sonic.utils import _chunk_parameters, _parse_memory_budget
+from sonic.utils import _chunk_parameters, _kernel_workspace_bytes, _parse_memory_budget
 
 
 @dataclass
@@ -162,7 +162,12 @@ class SpatialExplanation:
         pitch = size / tiles
         shape_float = np.floor(extent / pitch)
         cells = float(np.prod(shape_float))
-        if not np.isfinite(cells) or 128 * cells + 64 * len(coords) > budget:
+        # Coordinate indexing, weighted binning and integral images peak at different times.
+        n = len(coords)
+        workspace = 8 * (shape_float.sum() + 2) + max(
+            40 * n, 18 * n + 9 * cells, 9 * n + 20 * cells
+        )
+        if not np.isfinite(workspace) or workspace > budget:
             raise MemoryError(
                 "Region tiling exceeds the memory budget; increase size or memory_budget_bytes."
             )
@@ -172,12 +177,16 @@ class SpatialExplanation:
             [np.searchsorted(edges[d], coords[:, d], side="right") - 1 for d in (0, 1)]
         )
         inside = ((ij >= 0) & (ij < shape)).all(axis=1)
-        flat = ij[inside, 0] * shape[1] + ij[inside, 1]
+        flat = (ij[:, 0] * shape[1] + ij[:, 1])[inside]
+        del ij
         count = np.bincount(flat, minlength=int(cells)).reshape(shape)
+        coverage = _window_sum(count > 0, tiles, 5) / tiles**2
+        observations = _window_sum(count, tiles, 5)
+        del count
         total = np.bincount(flat, weights=contribution[inside], minlength=int(cells)).reshape(shape)
-        coverage = _window_sum(count > 0, tiles)[::5, ::5] / tiles**2
-        observations = _window_sum(count, tiles)[::5, ::5]
-        sums = _window_sum(total, tiles)[::5, ::5]
+        del flat, inside
+        sums = _window_sum(total, tiles, 5)
+        del total
         rank = (
             abs(sums) if direction == "absolute" else sums * (1 if direction == "positive" else -1)
         )
@@ -466,14 +475,18 @@ def _region_mask(coords, lower, upper):
     return ((coords >= lower) & (coords < upper)).all(axis=1)
 
 
-def _window_sum(array, width):
-    integral = np.pad(array, ((1, 0), (1, 0))).cumsum(0).cumsum(1)
-    return (
-        integral[width:, width:]
-        - integral[:-width, width:]
-        - integral[width:, :-width]
-        + integral[:-width, :-width]
-    )
+def _window_sum(array, width, step):
+    """Sum only candidate windows, using one padded integral image."""
+    ny, nx = array.shape
+    integral = np.zeros((ny + 1, nx + 1), dtype=np.result_type(array.dtype, np.int64))
+    core = integral[1:, 1:]
+    core[:] = array
+    np.cumsum(core, axis=0, out=core)
+    np.cumsum(core, axis=1, out=core)
+    sums = integral[width::step, width::step] - integral[:-width:step, width::step]
+    sums -= integral[width::step, :-width:step]
+    sums += integral[:-width:step, :-width:step]
+    return sums
 
 
 def _check_explanation_budget(kernel, n_features, memory_budget_bytes):
@@ -484,7 +497,8 @@ def _check_explanation_budget(kernel, n_features, memory_budget_bytes):
     """
     budget = _parse_memory_budget(memory_budget_bytes)
     per_feature = _chunk_parameters(kernel)[1]
-    estimate = 2 * n_features * per_feature + 8 * kernel.n * (3 * n_features + 5)
+    transform = max(2 * n_features * per_feature, _kernel_workspace_bytes(kernel, n_features))
+    estimate = transform + 8 * kernel.n * (3 * n_features + 5)
     if estimate > budget:
         raise MemoryError(
             f"Estimated explanation workspace {estimate} bytes exceeds budget {budget} bytes."

@@ -985,6 +985,14 @@ class TestExplanationRegions:
         with pytest.raises(ValueError):
             self._map().select_regions(**kwargs)
 
+    def test_sparse_region_tiling_fits_candidate_window_budget(self):
+        result = self._map()
+        options = {"size": 4, "min_coverage": 0.02, "min_observations": 1}
+        expected = result.select_regions(**options)
+        assert len(expected) == 2
+        actual = result.select_regions(**options, memory_budget_bytes="3 MiB")
+        pd.testing.assert_frame_equal(actual, expected)
+
     def test_missing_coordinates_zero_edge_and_memory_limit(self):
         result = self._map()
         with patch("numpy.bincount", side_effect=AssertionError("allocated before guard")):

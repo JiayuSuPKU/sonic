@@ -328,7 +328,9 @@ def _run_t_cauchy_test(  # noqa: C901 — binary/GLM eligibility and masked fits
             continue
         if binary:
             codes = groups[sample_mask]
-            if masked and min(np.sum(codes == 0), np.sum(codes == 1)) < int(min_samples_per_group):
+            if count < n_samples and min(np.sum(codes == 0), np.sum(codes == 1)) < int(
+                min_samples_per_group
+            ):
                 continue
             n_terms = 0
             if normalize_shape:
@@ -346,7 +348,7 @@ def _run_t_cauchy_test(  # noqa: C901 — binary/GLM eligibility and masked fits
                 extra["df_resid"][genes] = df_resid
             scale = float(np.sum(fit.sample_weights**2))
             if (
-                df_resid < int(min_resid_df)
+                df_resid < (1 if count == n_samples else int(min_resid_df))
                 or not fit.estimable
                 or not np.isfinite(scale)
                 or scale <= 0
@@ -564,8 +566,8 @@ def compare_two_groups_masked(
     random_state : int, optional
         Random seed for sampled permutations.
     min_samples_per_group : int, default 2
-        Minimum observed samples in each group for each gene. For L2,
-        each group must also meet this minimum before masking.
+        Minimum observed samples per group for genes with missing samples.
+        For L2, each group must also meet this minimum before masking.
     freq_weights : np.ndarray, optional
         Positive, finite weights in fitted bin order.
         The default gives each bin equal weight. Choose weights before testing.
@@ -786,7 +788,8 @@ def compare_glm_masked(
         Divide each gene's power in each bin by its total power in that
         sample before taking the logarithm (DF-norm).
     min_resid_df : int, default 1
-        Minimum residual degrees of freedom for each gene's linear model.
+        Minimum residual degrees of freedom for genes with missing samples.
+        Fully observed genes require one residual degree of freedom.
     statistic : {'log_l2', 'log_t_cauchy'}, default 'log_l2'
         L2 measures the size of the contrast across bins. ``'log_t_cauchy'``
         combines bin p-values and identifies the bin with the smallest

@@ -291,14 +291,36 @@ def _radial_bin_cell_counts(
         Zero means no grid support, so the corresponding radial mean is NaN.
         Counts do not depend on expression and are not independent observations.
     """
-    return _radial_bin_index_and_counts(
-        grid_shape,
-        n_bins=n_bins,
-        fft_solver=fft_solver,
-        exclude_dc=exclude_dc,
-        spacing=spacing,
-        edges=edges,
-    )[2]
+    if fft_solver not in ("fft2", "rfft2"):
+        raise ValueError(f"fft_solver must be 'fft2' or 'rfft2', got {fft_solver!r}")
+    ny, nx = grid_shape
+    dy, dx = _validate_spacing(spacing)
+    if ny > nx:
+        ny, nx, dy, dx = nx, ny, dx, dy
+    fy = np.fft.rfftfreq(ny, dy)
+    fx2 = np.fft.rfftfreq(nx, dx) ** 2
+    if edges is None:
+        maximum = np.sqrt(fy[-1] ** 2 + fx2[-1])
+        edges = np.linspace(0.0, maximum * (1.0 + 1e-9), n_bins + 1)
+    else:
+        edges = np.asarray(edges, dtype=float)
+        if edges.ndim != 1 or edges.size < 2 or not np.all(np.diff(edges) > 0):
+            raise ValueError("edges must be a 1D monotonically increasing array of length >= 2.")
+
+    # Frequency radii increase along a quadrant row. Count both signs, with DC
+    # and even-axis Nyquist frequencies counted once, for either FFT layout.
+    counts = np.zeros(len(edges) - 1)
+    for row, y in enumerate(fy):
+        radius = np.sqrt(y**2 + fx2)
+        stops = np.searchsorted(radius, edges)
+        stops[-1] = np.searchsorted(radius, edges[-1], side="right")
+        below = 2 * stops - (stops > 0) - ((nx % 2 == 0) & (stops == len(radius)))
+        multiplicity = 1 if row == 0 or (ny % 2 == 0 and row == ny // 2) else 2
+        counts += multiplicity * np.diff(below)
+    if exclude_dc and edges[0] <= 0 <= edges[-1]:
+        dc_bin = min(np.searchsorted(edges, 0, side="right") - 1, len(counts) - 1)
+        counts[dc_bin] -= 1
+    return counts
 
 
 def _adapt_radial_edges(

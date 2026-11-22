@@ -2,12 +2,12 @@
 
 from __future__ import annotations
 
+from bisect import bisect_right
 from dataclasses import dataclass
 from itertools import chain
 
 import numpy as np
 import pandas as pd
-from scipy.sparse import issparse
 
 from sonic.comparators._inference import (
     _L2_NULL_OPTIONS,
@@ -47,7 +47,12 @@ from sonic.comparators.multisample import (
 from sonic.kernels.fft import _fourier_coefficients_2d
 from sonic.kernels.nufft import _fourier_coefficients_2d_nufft
 from sonic.statistics import apply_bh_correction
-from sonic.utils import _gene_indices, _parse_memory_budget, resolve_parallelism
+from sonic.utils import (
+    _gene_indices,
+    _nufft_workspace_bytes,
+    _parse_memory_budget,
+    resolve_parallelism,
+)
 
 
 @dataclass
@@ -133,32 +138,27 @@ class CrossSpectra:
         return np.abs(self.coherency) ** 2
 
 
-def _make_feature_reader(comparator, sample_index, raster):
+def _make_feature_reader(comparator, sample_index, raster, columns, chunk, cache_budget):
     """Return a feature reader and location count; densify only requested columns."""
     if comparator._spectrum_backend == "nufft":
-        sample = comparator.samples[sample_index]
-        matrix = sample.X if comparator._layer is None else sample.layers[comparator._layer]
-        if issparse(matrix):
-            matrix = matrix.tocsc()
-        n_locations = matrix.shape[0]
-
-        def read_features(columns):
-            block = matrix[:, columns]
-            return np.asarray(block.toarray() if issparse(block) else block, dtype=float).copy()
-
+        read_features, cache_bytes = comparator._feature_reader(
+            sample_index, columns, chunk, cache_budget
+        )
         coords = comparator._coords[sample_index]
+        n_locations = len(coords)
         if not np.isfinite(coords).all():
             raise ValueError("Coordinates must be finite")
     else:
+        cache_bytes = 0
         n_locations = int(np.prod(raster.shape[-2:]))
 
-        def read_features(columns):
-            values = comparator._batch_raster(raster, columns)
-            return values.reshape(len(columns), -1).T.copy()
+        def read_features(block):
+            values = comparator._batch_raster(raster, columns[block])
+            return values.reshape(len(block), -1).T.copy()
 
     if n_locations < 2:
         raise ValueError("Each sample must have at least two observations")
-    return read_features, n_locations
+    return read_features, n_locations, cache_bytes
 
 
 def _compute_cross_spectra(  # noqa: C901 — validation and two backend schedules
@@ -226,28 +226,35 @@ def _compute_cross_spectra(  # noqa: C901 — validation and two backend schedul
     frequency_padding = int(
         comparator.feature_mode == "2d" and comparator._spectrum_backend == "nufft"
     )
-    sample_workspaces = []
-    for i, shape in enumerate(comparator._grid_shapes):
-        n_freqs = int(np.prod(np.asarray(shape) + 2 * frequency_padding))
-        n_locations = (
-            len(comparator._coords[i])
-            if comparator._spectrum_backend == "nufft"
-            else int(np.prod(shape))
+    mode_shapes = [
+        tuple(size + 2 * frequency_padding for size in shape) for shape in comparator._grid_shapes
+    ]
+    reducers = [
+        _polar_reducer_workspace_bytes(
+            shape, edges=edges, spacing=comparator._spacings[i], n_theta=comparator._n_theta_bins
         )
-        stored = build_peak = 0
-        if comparator.feature_mode == "2d":
-            stored, build_peak = _polar_reducer_workspace_bytes(
-                shape,
-                edges=edges,
-                spacing=comparator._spacings[i],
-                n_theta=comparator._n_theta_bins,
+        if comparator.feature_mode == "2d"
+        else (0, 0)
+        for i, shape in enumerate(comparator._grid_shapes)
+    ]
+
+    def sample_workspace(i, count, threads):
+        shape = mode_shapes[i]
+        n_freqs = shape[0] * shape[1]
+        if comparator._spectrum_backend == "fft":
+            working = 64 * n_freqs * (1 + count)
+        else:
+            n_locations = len(comparator._coords[i])
+            working = 128 * (n_freqs + (n_freqs + n_locations) * count)
+            native = _nufft_workspace_bytes(
+                shape, n_locations, comparator._nufft_eps, count, threads
             )
-        fixed_bytes = 128 * n_freqs + stored
-        sample_workspaces.append((n_freqs, build_peak, fixed_bytes, 128 * (n_freqs + n_locations)))
-    min_workspace_bytes = max(
-        max(build_peak, fixed + per_feature)
-        for _, build_peak, fixed, per_feature in sample_workspaces
-    )
+            # The second transform can run while the first coefficient block is retained.
+            working = max(working, native + 16 * n_freqs * count)
+        stored, build_peak = reducers[i]
+        return max(build_peak, stored + working)
+
+    min_workspace_bytes = max(sample_workspace(i, 1, 1) for i in range(n_samples))
     # Keep automatic job counts inside the same aggregate budget as chunks.
     if chunk_size == "auto" and budget_bytes < min_workspace_bytes:
         raise MemoryError(
@@ -309,16 +316,22 @@ def _compute_cross_spectra(  # noqa: C901 — validation and two backend schedul
             if comparator._spectrum_backend == "fft"
             else None
         )
-        read_features, n_locations = _make_feature_reader(comparator, sample_index, raster)
-        n_freqs, build_peak, fixed_bytes, bytes_per_feature = sample_workspaces[sample_index]
+        n_freqs = int(np.prod(mode_shapes[sample_index]))
         if chunk_size == "auto":
-            capacity = (sample_budget_bytes - fixed_bytes) // bytes_per_feature
-            chunk = min(32, len(genes), capacity)
+            chunk = bisect_right(
+                range(1, min(32, len(genes)) + 1),
+                sample_budget_bytes,
+                key=lambda count: sample_workspace(sample_index, count, workers),
+            )
         else:
             chunk = min(int(chunk_size), len(genes))
+        workspace = sample_workspace(sample_index, chunk, workers)
+        read_features, n_locations, cache_bytes = _make_feature_reader(
+            comparator, sample_index, raster, gene_columns, chunk, sample_budget_bytes - workspace
+        )
         chunk_schedules[sample_index] = {
             "chunk_size": chunk,
-            "estimated_workspace_bytes": max(build_peak, fixed_bytes + bytes_per_feature * chunk),
+            "estimated_workspace_bytes": workspace + cache_bytes,
             "n_locations": n_locations,
             "n_freqs": n_freqs,
         }
@@ -339,7 +352,7 @@ def _compute_cross_spectra(  # noqa: C901 — validation and two backend schedul
         shared_mask = [None]
 
         def transform_block(columns):
-            block = read_features(gene_columns[columns])
+            block = read_features(columns)
             values = block
             if comparator._spectrum_backend == "fft":
                 mask = _shared_observation_mask(block)

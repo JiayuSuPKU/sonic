@@ -513,6 +513,72 @@ class TestInputs:
 
 
 class TestChunking:
+    @pytest.mark.parametrize("chunk", ["auto", 1])
+    def test_small_sparse_panel_does_not_copy_unselected_genes(self, monkeypatch, chunk):
+        rng = np.random.default_rng(99)
+        rows, cols = 512, 2048
+        matrix = csr_matrix(
+            (
+                rng.random(60000, dtype=np.float32),
+                (rng.integers(rows, size=60000), rng.integers(cols, size=60000)),
+            ),
+            shape=(rows, cols),
+        )
+        coords = rng.uniform(0, 8, (rows, 2))
+
+        def fit(matrix):
+            sample = ad.AnnData(matrix)
+            sample.obsm["spatial"] = coords
+            comparator = ComparatorIrregular(
+                [sample], grid_shape=(8, 8), spacing=(1, 1), n_radial_bins=3, workers=1
+            )
+            comparator.compute_cross_spectra(
+                [("2017", "4")], chunk_size=chunk, memory_budget_bytes="160 KiB", progress=False
+            )
+            return comparator.cross_spectra_
+
+        expected = fit(matrix.tocsc())
+        convert = csr_matrix.tocsc
+
+        def selected_only(block, *args, **kwargs):
+            assert block.shape[1] <= 2
+            return convert(block, *args, **kwargs)
+
+        monkeypatch.setattr(csr_matrix, "tocsc", selected_only)
+        result = fit(matrix)
+        np.testing.assert_allclose(result.cross_spectra, expected.cross_spectra)
+        np.testing.assert_allclose(result.auto_spectra, expected.auto_spectra)
+        assert result.chunk_schedules[0]["estimated_workspace_bytes"] <= 160 * 1024
+
+    def test_grid_cross_and_explanation_fit_single_lattice_budget(self, make_comparator):
+        data = np.random.default_rng(92).normal(size=(3, 128, 128))
+        data[:, :10] = np.nan
+        comparator = make_comparator(data)
+        pairs = [("a", "b"), ("a", "c")]
+        comparator.compute_cross_spectra(pairs, progress=False)
+        expected = comparator.cross_spectra_.cross_spectra.copy()
+        comparator.compute_cross_spectra(pairs, memory_budget_bytes="3 MiB", progress=False)
+        np.testing.assert_allclose(comparator.cross_spectra_.cross_spectra, expected)
+        explanation = comparator.explain_spectrum(
+            ("a", "b"), bands=[0, 1], memory_budget_bytes="4 MiB"
+        )
+        np.testing.assert_allclose(explanation.scores, expected[0, 0, :2].real)
+
+    def test_thin_high_precision_nufft_budgets_spreading_width(self):
+        shape = (2, 2048)
+        rng = np.random.default_rng(81)
+        cmp = _irregular_points(
+            rng.normal(size=(128, 3)), rng.uniform((0, 0), shape, (128, 2)), shape=shape
+        )
+        pairs = [("a", "b")]
+        with pytest.raises(MemoryError, match="workspace"):
+            cmp.compute_cross_spectra(pairs, memory_budget_bytes="2 MiB", progress=False)
+        cmp.compute_cross_spectra(pairs, memory_budget_bytes="6 MiB", progress=False)
+        with pytest.raises(MemoryError, match="workspace"):
+            cmp.explain_spectrum("a", bands=[0], memory_budget_bytes="2 MiB")
+        result = cmp.explain_spectrum("a", bands=[0], memory_budget_bytes="6 MiB")
+        np.testing.assert_allclose(result.scores, cmp.cross_spectra_.auto_spectra[0, 0, :1])
+
     def test_auto_chunk_budgets_polar_construction_before_transform(self):
         rng = np.random.default_rng(18)
         shape = (16, 512)
@@ -532,6 +598,11 @@ class TestChunking:
                 comparator.compute_cross_spectra(
                     pairs, chunk_size="auto", memory_budget_bytes="3 MiB", progress=False
                 )
+            build.assert_not_called()
+
+        with patch("sonic.comparators.binning._polar_bin_reducer") as build:
+            with pytest.raises(ValueError, match="cannot fit one feature"):
+                comparator.compute_spectra(memory_budget_bytes="3 MiB", progress=False)
             build.assert_not_called()
 
         comparator.compute_cross_spectra(pairs, chunk_size=1, progress=False)
@@ -574,9 +645,8 @@ class TestChunking:
         comparator = make_comparator(values, backend=backend, mode=mode)
         pairs = [("c", "b"), ("a", "c"), ("b", "a"), ("b", "b")]
         reference = _cross_at_angle(comparator, pairs, angle_deg=23, chunk_size=3)
-        budget = reference.chunk_schedules[0]["estimated_workspace_bytes"] - 128 * (
-            reference.chunk_schedules[0]["n_locations"] + reference.chunk_schedules[0]["n_freqs"]
-        )
+        two = _cross_at_angle(comparator, pairs, angle_deg=23, chunk_size=2)
+        budget = two.chunk_schedules[0]["estimated_workspace_bytes"]
         for chunk in (1, 2, "auto"):
             result = _cross_at_angle(
                 comparator, pairs, angle_deg=23, chunk_size=chunk, memory_budget_bytes=budget
@@ -585,7 +655,11 @@ class TestChunking:
             np.testing.assert_allclose(result.auto_spectra, reference.auto_spectra, atol=1e-10)
             np.testing.assert_array_equal(result.coherency_valid, reference.coherency_valid)
             assert result.chunk_schedules[0]["estimated_workspace_bytes"] <= budget
-            assert result.chunk_schedules[0]["chunk_size"] <= 2
+            if (
+                chunk == "auto"
+                and reference.chunk_schedules[0]["estimated_workspace_bytes"] > budget
+            ):
+                assert result.chunk_schedules[0]["chunk_size"] == 2
         override = _cross_at_angle(
             comparator, pairs, angle_deg=23, chunk_size=3, memory_budget_bytes=1
         )
@@ -607,7 +681,7 @@ class TestChunking:
         comparator.compute_cross_spectra(pairs, chunk_size=1, n_jobs=1, progress=False)
         schedule = comparator.cross_spectra_.chunk_schedules[0]
         budget = schedule["estimated_workspace_bytes"]
-        transform_bytes = 128 * (2 * schedule["n_freqs"] + schedule["n_locations"])
+        transform_bytes = 128 * schedule["n_freqs"]
         assert budget > transform_bytes
         with patch.object(
             cross_module, "_run_per_sample", wraps=cross_module._run_per_sample

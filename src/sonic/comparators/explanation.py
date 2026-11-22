@@ -17,7 +17,7 @@ from sonic.comparators.features import _center_observations, _shared_observation
 from sonic.explanation import _explanation_from_responses
 from sonic.kernels.fft import _fourier_coefficients_2d
 from sonic.kernels.nufft import _fourier_coefficients_2d_nufft
-from sonic.utils import _parse_memory_budget, _take_feature_columns
+from sonic.utils import _gene_indices, _parse_memory_budget, _take_feature_columns
 
 
 def _check_spectrum_budget(comparator, sample_index, n_features, n_maps, budget):
@@ -57,8 +57,7 @@ def _explain_spectrum(  # noqa: C901 — validation, backend adjoints and five r
     names = (features,) if isinstance(features, str) else tuple(features)
     if len(names) not in (1, 2) or any(not isinstance(g, str) for g in names):
         raise ValueError("Provide one feature name or a pair of feature names.")
-    if any(g not in comparator.gene_names for g in names):
-        raise ValueError("All explanation features must exist in the comparator.")
+    columns = _gene_indices(comparator.gene_names, names)
     choices = ("power", "power_norm") if len(names) == 1 else ("cross", "coherency", "coherence")
     if representation is None:
         representation = choices[0]
@@ -111,7 +110,6 @@ def _explain_spectrum(  # noqa: C901 — validation, backend adjoints and five r
     if np.any(counts[bands] == 0):
         raise ValueError("Requested bins have no supported non-DC Fourier modes.")
 
-    columns = [list(comparator.gene_names).index(g) for g in names]
     if irregular:
         sample = comparator.samples[sample_index]
         matrix = sample.X if comparator._layer is None else sample.layers[comparator._layer]
@@ -128,7 +126,7 @@ def _explain_spectrum(  # noqa: C901 — validation, backend adjoints and five r
         raster = comparator._rasterize_one(comparator.samples[sample_index])
         if tuple(raster.shape[-2:]) != tuple(shape):
             raise ValueError("Raster geometry changed; recompute spectra before explaining bins.")
-        block = comparator._batch_raster(raster, names).reshape(len(names), -1).T
+        block = comparator._batch_raster(raster, columns).reshape(len(names), -1).T
         mask = _shared_observation_mask(block)
         indices = np.flatnonzero(mask)
         values = block[mask].copy()

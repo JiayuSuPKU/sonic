@@ -25,6 +25,7 @@ from sonic.statistics import (
 from sonic.utils import (
     _DEFAULT_CHUNK_BUDGET,
     _chunk_parameters,
+    _gene_indices,
     _parse_memory_budget,
     _require_finite,
     _take_feature_columns,
@@ -1300,7 +1301,7 @@ class DetectorIrregular(Detector):
         never materializes a full dense ``X``."""
         if source == "var":
             X = self.adata.X if layer is None else self.adata.layers[layer]
-            names = list(self.adata.var_names)
+            names = self.adata.var_names
             if features is not None:
                 selected = [g for g in features if g in names]
                 missing = set(features) - set(selected)
@@ -1308,7 +1309,7 @@ class DetectorIrregular(Detector):
                     logger.warning(
                         "Requested features not in adata.var_names: %s", sorted(missing)[:5]
                     )
-                idx = [names.index(g) for g in selected]
+                idx = _gene_indices(names, selected)
                 X = _take_feature_columns(X, idx)
                 names = selected
             X_csc = X.tocsc() if sp.issparse(X) else sp.csc_matrix(X)

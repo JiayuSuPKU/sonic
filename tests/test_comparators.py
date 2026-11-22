@@ -15,6 +15,7 @@ warnings.filterwarnings("ignore", category=DeprecationWarning)
 import pandas as pd
 import shapely.geometry as sg
 import spatialdata as sd
+import xarray as xr
 from geopandas import GeoDataFrame
 from spatialdata.models import ShapesModel, TableModel
 
@@ -29,26 +30,6 @@ from sonic.comparators.multisample import (
 from sonic.statistics import liu_sf
 
 # Standalone comparison helpers are the oracles for wrapper-level dispatch tests.
-
-
-class _ArraySelection:
-    """Small object that mimics xarray's ``.sel(...).values`` result."""
-
-    def __init__(self, values: np.ndarray) -> None:
-        self.values = values
-
-
-class _ArrayRaster:
-    """Minimal xarray-like raster used to test ComparatorGrid directly."""
-
-    def __init__(self, values: np.ndarray, gene_names: list[str]) -> None:
-        self._values = np.asarray(values, dtype=np.float64)
-        self.shape = self._values.shape
-        self._name_to_idx = {g: i for i, g in enumerate(gene_names)}
-
-    def sel(self, *, c):
-        names = [c] if isinstance(c, str) else list(c)
-        return _ArraySelection(self._values[[self._name_to_idx[g] for g in names]])
 
 
 def _make_table_only_sdata(gene_names: list[str]) -> sd.SpatialData:
@@ -66,7 +47,9 @@ def _install_grid_rasters(monkeypatch, rasters: list[np.ndarray], gene_names: li
     by_sample_id = {id(sample): raster for sample, raster in zip(samples, rasters, strict=True)}
 
     def fake_rasterize_one(self, sdata):
-        return _ArrayRaster(by_sample_id[id(sdata)], self.gene_names)
+        return xr.DataArray(
+            by_sample_id[id(sdata)], dims=("c", "y", "x"), coords={"c": self.gene_names}
+        )
 
     monkeypatch.setattr(ComparatorGrid, "_rasterize_one", fake_rasterize_one)
     return samples
@@ -337,6 +320,26 @@ class TestComparatorGrid:
         df = cmp.test_diff_freq(groups, statistic="log_t_cauchy")
         assert df.shape[0] == 3
         assert df["P_value"].between(0, 1).all()
+
+    def test_gene_covariates_on_a_grid_with_duplicate_names(self):
+        sample = _make_bin_sdata(8, 8)
+        table = sample.tables["table"]
+        table.var_names = ["dup", "unique", "dup"]
+        table.obs["gene_copy"] = table.X[:, 1]
+        cmp = ComparatorGrid(
+            [sample],
+            bins="bins",
+            table_name="table",
+            col_key="col_idx",
+            row_key="row_idx",
+            n_radial_bins=3,
+        ).compute_spectra(progress=False)
+        expected = cmp._covariate_features_from_keys(["gene_copy"])
+        np.testing.assert_allclose(cmp._covariate_features_from_keys(["unique"]), expected)
+        with pytest.raises(ValueError, match="Ambiguous feature names.*dup"):
+            cmp.normalize_covariates(["dup"])
+        with pytest.raises(ValueError, match="missing has not been found"):
+            cmp.normalize_covariates(["missing"])
 
 
 class TestComparatorGridFeatures:
@@ -760,6 +763,19 @@ class TestComparatorIrregularFeatures:
                 spacing=[(1.0, 1.0), (1.0, 1.0), (1.0, 1.0)],
             )
 
+    @pytest.mark.parametrize("n_samples", [1, 2])
+    def test_2d_selects_only_unambiguous_landmarks(self, n_samples):
+        rng = np.random.default_rng(4)
+        rasters = [rng.standard_normal((3, 8, 8)) for _ in range(n_samples)]
+        samples = _grid_samples_to_adata(rasters, ["dup", "unique", "dup"])
+        cmp = ComparatorIrregular(
+            samples, feature_mode="2d", n_radial_bins=3, grid_shape=(8, 8), spacing=(1, 1)
+        )
+        cmp.compute_spectra(landmark_genes=["unique"], n_jobs=1, progress=False)
+        assert np.all(np.isfinite(cmp.rotation_angles_))
+        with pytest.raises(ValueError, match="Ambiguous feature names.*dup"):
+            cmp.compute_spectra(landmark_genes=["dup"], n_jobs=1, progress=False)
+
     def test_2d_rejects_unknown_landmark_gene(self):
         rng = np.random.default_rng(4)
         gene_names = ["g0", "g1"]
@@ -1022,6 +1038,78 @@ class TestComparatorNullCovariance:
         assert 1.0 <= diag["effective_rank"] <= 4.0
         self._assert_diag_reproduces_pvalues(cmp, df, diag)
 
+    def test_default_covariance_budget_rejects_large_panel_before_allocation(self, monkeypatch):
+        from sonic.comparators import _inference
+
+        spectra = np.broadcast_to(1.0, (6, 5000, 1080))
+        cmp = _comparator_from_spectra(spectra)
+        monkeypatch.setattr(
+            _inference,
+            "_init_per_gene_covariance",
+            lambda *args: pytest.fail("Attempted to allocate the oversized covariance"),
+        )
+        with pytest.raises(MemoryError, match="93312000000 bytes"):
+            cmp.estimate_null_covariance([0, 0, 0, 1, 1, 1])
+
+    @pytest.mark.parametrize("covariance", ["per_gene", "pooled"])
+    @pytest.mark.parametrize("masked", [False, True])
+    @pytest.mark.parametrize("glm", [False, True])
+    def test_covariance_budget_counts_selected_genes(self, covariance, masked, glm):
+        spectra = np.random.default_rng(740).lognormal(size=(8, 4, 5))
+        presence = np.ones((8, 4), dtype=bool)
+        if masked:
+            presence[0, 2] = False
+        groups = np.repeat([0, 1], 4)
+        design = np.column_stack([np.ones(8), groups]) if glm else groups
+        options = {"covariance": covariance, "contrast": "x1" if glm else None}
+        cmp = _comparator_from_spectra(spectra, presence)
+        cols = [2, 0]
+        expected = _comparator_from_spectra(spectra[:, cols], presence[:, cols])
+        reference = expected.estimate_null_covariance(design, **options)
+        nbytes = reference["sigma_log"].nbytes + reference["weighted_cov"].nbytes
+
+        with pytest.raises(MemoryError, match="memory_budget_bytes"):
+            cmp.estimate_null_covariance(
+                design, features=["g2", "g0"], memory_budget_bytes=nbytes - 1, **options
+            )
+        selected = cmp.estimate_null_covariance(
+            design, features=["g2", "g0"], memory_budget_bytes=f"{nbytes} B", **options
+        )
+        for key in ("sigma_log", "weighted_cov", "beta", "eligible"):
+            np.testing.assert_allclose(selected[key], reference[key])
+
+    @pytest.mark.parametrize("glm", [False, True], ids=["two_group", "glm"])
+    def test_covariance_ignores_missing_data_in_unselected_gene(self, glm):
+        spectra = np.random.default_rng(742).lognormal(size=(6, 2, 4))
+        presence = np.ones((6, 2), dtype=bool)
+        presence[0, 0] = False
+        groups = np.repeat([0, 1], 3)
+        design = np.column_stack([np.ones(6), groups]) if glm else groups
+        # The masked GLM would reject this six-sample fit with four residual df.
+        options = {"contrast": "x1", "min_resid_df": 5} if glm else {}
+        cmp = _comparator_from_spectra(spectra, presence)
+        selected = cmp.estimate_null_covariance(
+            design, features="g1", covariance="pooled", **options
+        )
+        reference = _comparator_from_spectra(spectra[:, 1:]).estimate_null_covariance(
+            design, covariance="pooled", **options
+        )
+
+        assert not selected["masked"]
+        np.testing.assert_allclose(selected["sigma_log"], reference["sigma_log"])
+        np.testing.assert_allclose(selected["eigenvalues"], reference["eigenvalues"])
+
+    def test_covariance_feature_names(self):
+        cmp = _comparator_from_spectra(np.random.default_rng(741).lognormal(size=(8, 3, 5)))
+        cmp.gene_names = ["a", "a", "b"]
+        groups = np.repeat([0, 1], 4)
+        selected = cmp.estimate_null_covariance(groups, features="b")
+        full = cmp.estimate_null_covariance(groups)
+        np.testing.assert_allclose(selected["sigma_log"], full["sigma_log"][2:])
+        for names in ([], ["b", "b"], ["a"], ["missing"]):
+            with pytest.raises(ValueError):
+                cmp.estimate_null_covariance(groups, features=names)
+
     def test_covariance_requires_computed_spectra(self):
         gene_names = ["a", "b"]
         adatas = _grid_samples_to_adata([np.zeros((2, 4, 4)), np.zeros((2, 4, 4))], gene_names)
@@ -1065,6 +1153,21 @@ class TestComparatorIrregularNormalizeCovariates:
         cmp = ComparatorIrregular(samples).compute_spectra(progress=False)
         with pytest.raises(KeyError, match="in neither obs.columns nor"):
             cmp.normalize_covariates(["does_not_exist"])
+
+    def test_gene_covariates_reject_only_ambiguous_names(self):
+        samples = self._build_samples(n_samples=2)
+        for sample in samples:
+            sample.var_names = ["dup", "unique", "dup", "other"]
+            sample.obs["dup"] = sample.obs["cov_a"]
+            sample.obs["gene_copy"] = sample.X[:, 1]
+        cmp = ComparatorIrregular(samples).compute_spectra(progress=False)
+        actual = cmp._covariate_features_from_keys(["dup", "unique"])
+        expected = cmp._covariate_features_from_keys(["cov_a", "gene_copy"])
+        np.testing.assert_allclose(actual, expected)
+        for sample in samples:
+            del sample.obs["dup"]
+        with pytest.raises(ValueError, match="Ambiguous feature names.*dup"):
+            cmp.normalize_covariates(["dup"])
 
     def test_obs_key_takes_precedence_over_var_name(self):
         samples = self._build_samples()

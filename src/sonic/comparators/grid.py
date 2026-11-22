@@ -21,6 +21,7 @@ from sonic.comparators.base import (
     _validate_common,
 )
 from sonic.comparators.features import compute_sample_spectrum
+from sonic.utils import _gene_indices
 
 __all__ = ["ComparatorGrid"]
 
@@ -196,18 +197,7 @@ class ComparatorGrid(_ComparatorBase):
 
     # ------------------------------------------------------------------
     def _rasterize_one(self, sdata: Any):
-        """Lazy-rasterize one sample using ``spatialdata.rasterize_bins``.
-
-        ``spatialdata.rasterize_bins`` returns a dask-backed ``xarray.DataArray``
-        with a named gene coordinate ``c`` and one-gene-per-block chunking. We
-        deliberately do **not** materialise the full ``(n_genes, ny, nx)`` spectra.
-        Instead the lazy ``DataArray`` is returned so :meth:`_compute_spectra`
-        can pull one **gene-name batch** at a time via
-        ``img.sel(c=batch).values`` (label-based, so it also handles any
-        ``gene_names`` reordering — same idiom as ``DetectorGrid``'s
-        ``_qstat_worker_fft``). Returns the lazy ``(n_genes, ny, nx)``
-        ``DataArray``.
-        """
+        """Return the lazy raster so spectrum batches can load individual channels."""
         from sonic._rasterize import rasterize_table
 
         img = rasterize_table(
@@ -225,28 +215,25 @@ class ComparatorGrid(_ComparatorBase):
             )
         return img
 
-    def _batch_raster(self, img: Any, names: Sequence[str]) -> np.ndarray:
-        """Materialise the ``(len(names), ny, nx)`` raster block for ``names``.
-
-        Label-based selection off the lazy ``DataArray`` (``img.sel(c=names)``),
-        so only this gene batch is pulled into memory and the result follows
-        :attr:`gene_names` order regardless of the raster's own gene order —
-        the same idiom as ``DetectorGrid._qstat_worker_fft``.
-        """
-        return np.asarray(img.sel(c=list(names)).values, dtype=np.float64)
+    def _batch_raster(self, img: Any, columns) -> np.ndarray:
+        """Read resolved columns, preserving label alignment on reordered rasters."""
+        axis = img.get_index("c")
+        if not axis.is_unique and axis.tolist() == self.gene_names:
+            batch = img.isel(c=columns)
+        else:
+            batch = img.sel(c=[self.gene_names[j] for j in columns])
+        return np.asarray(batch.values, dtype=np.float64)
 
     def _sample_spectrum_chunker(self, i: int, *, gene_indices=None):
         """Stream selected genes' powers and collect their DC/presence in the same pass."""
         img = self._rasterize_one(self.samples[i])
-        names = (
-            self.gene_names if gene_indices is None else [self.gene_names[j] for j in gene_indices]
-        )
-        n_genes = len(names)
+        columns = np.arange(len(self.gene_names)) if gene_indices is None else gene_indices
+        n_genes = len(columns)
         dc = np.empty(n_genes, dtype=float)
         presence = np.empty(n_genes, dtype=bool)
 
         def _spec_chunk(start: int, stop: int) -> np.ndarray:
-            block = self._batch_raster(img, names[start:stop])
+            block = self._batch_raster(img, columns[start:stop])
             presence[start:stop] = _observed_nonzero_fraction(block) >= self._presence_threshold
             spectrum, dc[start:stop] = _grid_spectrum(
                 block,
@@ -260,30 +247,27 @@ class ComparatorGrid(_ComparatorBase):
 
     # ------------------------------------------------------------------
     def _covariate_features_from_keys(self, keys: Sequence[str]) -> list[np.ndarray]:
-        """Forward ``keys`` to :func:`spatialdata.rasterize_bins` as
-        ``value_key`` and turn each per-sample raster into covariate features.
-
-        ``keys`` may name any combination of ``.obs`` columns and
-        ``var_names`` in the comparator's ``table_name`` table —
-        ``rasterize_bins`` accepts both. Each sample's resulting
-        ``(n_keys, ny, nx)`` raster is then funneled through the same
-        spectrum + radial-binning pipeline as the gene panel via
-        :meth:`_covariate_features_from_array`.
-        """
+        """Rasterize the selected gene or observation covariates for each sample."""
         from sonic._rasterize import rasterize_table
 
         keys = list(keys)
         out: list[np.ndarray] = []
         for i, sdata in enumerate(self.samples):
+            table = sdata.tables[self._table_name]
+            columns = None
+            if all(k in table.var_names and k not in table.obs for k in keys):
+                columns = _gene_indices(table.var_names, keys)
             img = rasterize_table(
                 sdata,
                 bins=self._bins,
                 table_name=self._table_name,
                 col_key=self._col_key,
                 row_key=self._row_key,
-                value_key=keys,
+                value_key=keys if columns is None else None,
                 return_region_as_labels=False,
             )
+            if columns is not None:
+                img = img.isel(c=columns)
             arr = np.asarray(img.data if hasattr(img, "data") else img, dtype=np.float64)
             if arr.ndim == 2:
                 # Single key → rasterize_bins drops the leading axis. Re-insert.

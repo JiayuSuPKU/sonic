@@ -19,7 +19,7 @@ from sonic.comparators.binning import (
     _stream_polar_features,
 )
 from sonic.comparators.features import _center_observations
-from sonic.utils import _NUFFT_CHUNK_CAP, _take_feature_columns
+from sonic.utils import _NUFFT_CHUNK_CAP, _gene_indices, _take_feature_columns
 
 __all__ = ["ComparatorIrregular"]
 
@@ -268,8 +268,8 @@ class ComparatorIrregular(_ComparatorBase):
             ``adata.var_names`` in any sample, or if a key resolves to
             different sources across samples.
         ValueError
-            If an obs column cannot be cast to float (e.g., string
-            categoricals — encode them first).
+            If a requested gene name is ambiguous or an obs column cannot
+            be cast to float (e.g., string categoricals).
         """
         from sonic.kernels.nufft import power_spectrum_2d_nufft
 
@@ -315,7 +315,7 @@ class ComparatorIrregular(_ComparatorBase):
                             f"sample 0 (sample 0 → var_names, sample {i} → not in "
                             "var_names)."
                         )
-                    idx = adata.var_names.get_loc(k)
+                    idx = _gene_indices(adata.var_names, [k])
                     X_src = adata.X if self._layer is None else adata.layers[self._layer]
                     col = X_src[:, idx]
                     if sp.issparse(col):

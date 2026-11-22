@@ -37,6 +37,21 @@ __all__ = [
 logger = logging.getLogger(__name__)
 
 
+def _gene_indices(gene_names, names) -> np.ndarray:
+    """Return columns in request order. Only requested names must be unambiguous."""
+    genes = gene_names if isinstance(gene_names, pd.Index) else pd.Index(gene_names)
+    if not genes.is_unique:
+        ambiguous = genes[genes.duplicated() & genes.isin(names)].unique().tolist()
+        if ambiguous:
+            raise ValueError(
+                f"Ambiguous feature names {ambiguous}. Use unique feature identifiers."
+            )
+    indices = genes.get_indexer_for(names)
+    if (indices < 0).any():
+        raise ValueError("All requested features must exist in the comparator.")
+    return indices
+
+
 def _take_feature_columns(matrix, columns):
     """Read selected columns in request order, including repeats on HDF5-backed data."""
     if isinstance(matrix, np.ndarray) or sp.issparse(matrix) or np.all(np.diff(columns) > 0):

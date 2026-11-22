@@ -45,7 +45,7 @@ from sonic.comparators.multisample import (
 from sonic.kernels.fft import _fourier_coefficients_2d
 from sonic.kernels.nufft import _fourier_coefficients_2d_nufft
 from sonic.statistics import apply_bh_correction
-from sonic.utils import _parse_memory_budget, resolve_parallelism
+from sonic.utils import _gene_indices, _parse_memory_budget, resolve_parallelism
 
 
 @dataclass
@@ -150,7 +150,7 @@ def _make_feature_reader(comparator, sample_index, raster):
         n_locations = int(np.prod(raster.shape[-2:]))
 
         def read_features(columns):
-            values = comparator._batch_raster(raster, [comparator.gene_names[j] for j in columns])
+            values = comparator._batch_raster(raster, columns)
             return values.reshape(len(columns), -1).T.copy()
 
     if n_locations < 2:
@@ -189,25 +189,16 @@ def _compute_cross_spectra(  # noqa: C901 — validation and two backend schedul
     chunk_size = comparator._resolve_chunk_spec(chunk_size)
 
     # Check the requested pairs and map them to the comparator's gene names.
-    all_genes = pd.Index(comparator.gene_names)
     pairs = tuple(pairs)
     if not pairs or any(isinstance(p, str) or len(p) != 2 for p in pairs):
         raise ValueError("Provide at least one pair of feature names")
     pairs = tuple(tuple(p) for p in pairs)
-    pair_genes = {g for p in pairs for g in p}
-    if not pair_genes.issubset(all_genes):
-        raise ValueError("All pair features must exist in the comparator")
     if len({frozenset(p) for p in pairs}) != len(pairs):
         raise ValueError("Duplicate or reversed duplicate pairs are not allowed")
-    gene_columns = np.flatnonzero(all_genes.isin(pair_genes))
-    selected = all_genes[gene_columns]
-    if not selected.is_unique:
-        ambiguous = selected[selected.duplicated()].unique().tolist()
-        raise ValueError(
-            f"Ambiguous pair feature names {ambiguous}. Use unique feature identifiers."
-        )
-    genes = tuple(selected)
-    pair_indices = selected.get_indexer(np.ravel(pairs)).reshape(-1, 2)
+    columns = _gene_indices(comparator.gene_names, np.asarray(pairs, dtype=object).ravel())
+    gene_columns, pair_indices = np.unique(columns, return_inverse=True)
+    genes = tuple(comparator.gene_names[i] for i in gene_columns)
+    pair_indices = pair_indices.reshape(-1, 2)
     n_samples = len(comparator.samples)
 
     # Prepare on the public caller's shallow copy, so failed fits leave its state intact.

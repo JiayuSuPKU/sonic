@@ -291,8 +291,8 @@ covariance selects plug-in calibration if you omit ``null``.
    per_gene = comparison.test_diff_freq(groups, null="plugin")
    pooled = comparison.test_cross_diff_freq(groups, covariance="pooled")
 
-Use ``estimate_null_covariance`` to inspect the gene covariance estimates and
-fitted coefficients.
+To inspect covariance matrices and fitted coefficients for selected genes, use
+``comparison.estimate_null_covariance(groups, features=["CD8", "CD20"])``.
 
 Permutation of binary group labels
 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^

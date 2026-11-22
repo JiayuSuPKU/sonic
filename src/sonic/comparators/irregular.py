@@ -199,7 +199,7 @@ class ComparatorIrregular(_ComparatorBase):
         sample = self.samples[i]
         matrix = sample.X if self._layer is None else sample.layers[self._layer]
         cache_bytes = 0
-        if getattr(matrix, "format", None) == "csr" and len(columns) > chunk_size:
+        if sp.issparse(matrix) and matrix.format == "csr" and len(columns) > chunk_size:
             rows, cols = matrix.shape
             index_bytes = matrix.indices.itemsize
             entry_bytes = index_bytes + matrix.dtype.itemsize
@@ -320,8 +320,21 @@ class ComparatorIrregular(_ComparatorBase):
                 )
             sources[k] = "obs" if in_obs else "var"
 
+        gene_keys = [k for k in sources if sources[k] == "var"]
         out: list[np.ndarray] = []
         for i, adata in enumerate(self.samples):
+            if gene_keys:
+                for k in gene_keys:
+                    if k not in adata.var_names:
+                        raise KeyError(
+                            f"sample {i} resolves covariate {k!r} differently from "
+                            f"sample 0 (sample 0 → var_names, sample {i} → not in var_names)."
+                        )
+                matrix = adata.X if self._layer is None else adata.layers[self._layer]
+                values = _take_feature_columns(matrix, _gene_indices(adata.var_names, gene_keys))
+                if sp.issparse(values):
+                    values = values.toarray()
+                genes = dict(zip(gene_keys, values.T, strict=True))
             cols: list[np.ndarray] = []
             for k in keys:
                 src = sources[k]
@@ -338,20 +351,9 @@ class ComparatorIrregular(_ComparatorBase):
                             f"sample {i} obs[{k!r}] cannot be cast to float "
                             f"({type(exc).__name__}); encode categoricals before passing."
                         ) from exc
-                else:  # var_names path
-                    if k not in adata.var_names:
-                        raise KeyError(
-                            f"sample {i} resolves covariate {k!r} differently from "
-                            f"sample 0 (sample 0 → var_names, sample {i} → not in "
-                            "var_names)."
-                        )
-                    idx = _gene_indices(adata.var_names, [k])
-                    X_src = adata.X if self._layer is None else adata.layers[self._layer]
-                    col = X_src[:, idx]
-                    if sp.issparse(col):
-                        col = col.toarray()
-                    cols.append(np.asarray(col, dtype=np.float64).ravel())
-            block = np.column_stack(cols)  # (n_obs, n_cov)
+                else:
+                    cols.append(genes[k])
+            block = np.asarray(np.column_stack(cols), dtype=np.float64)  # (n_obs, n_cov)
             # Mean-centre each column, matching the gene panel's per-column DC removal.
             block = block - block.mean(axis=0, keepdims=True)
 

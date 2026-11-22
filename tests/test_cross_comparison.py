@@ -116,6 +116,38 @@ def _permutation_reference(profiles, groups, weights, *, exact, n_perm=0, seed=N
     return observed, pvals, len(labels)
 
 
+@pytest.mark.parametrize(
+    "options",
+    [
+        {"covariance": "pooled"},
+        {"covariance": "per_pair"},
+        {"null": "permutation", "max_exact_permutations": 100},
+        {"null": "permutation", "max_exact_permutations": 0},
+    ],
+)
+def test_pair_profile_blocks_preserve_inference(monkeypatch, options):
+    from sonic.comparators import cross_spectrum
+
+    comparator = _comparison(np.random.default_rng(83).uniform(0.1, 0.9, (8, 12, 5)))
+    cross = comparator.cross_spectra_
+    cross.presence[0, 4:8] = False
+    cross.coherency_valid[:, 5:7, 1] = False
+    _mask_missing_pairs(cross)
+    groups = np.repeat([0, 1], 4)
+    options = {**options, "n_perm": 19, "random_state": 48}
+    expected = comparator.test_cross_diff_freq(groups, **options)
+    prepare = cross_spectrum._prepare_cross_profiles
+
+    def bounded(result, pairs, *args):
+        assert len(pairs) <= 2
+        return prepare(result, pairs, *args)
+
+    monkeypatch.setattr(l2, "_COMPARISON_WORKSPACE_BYTES", 2 * 64 * len(groups) * 5)
+    monkeypatch.setattr(cross_spectrum, "_prepare_cross_profiles", bounded)
+    actual = comparator.test_cross_diff_freq(groups, **options)
+    pd.testing.assert_frame_equal(actual, expected)
+
+
 @pytest.mark.parametrize("representation", ["coherence", "coherency"])
 class TestPluginNull:
     @pytest.mark.parametrize("glm", [False, True])

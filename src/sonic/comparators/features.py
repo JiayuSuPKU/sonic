@@ -666,20 +666,17 @@ def _build_landmark_polar_stack(
         n_theta=n_theta,
         frequency_padding=frequency_padding,
     )
-    out = np.empty((shifted.shape[0], n_theta, n_radius), dtype=float)
+    out = np.empty((shifted.shape[0], n_radius, n_theta), dtype=float)
     for j in range(shifted.shape[0]):
-        polar = (
-            scipy.ndimage.map_coordinates(
-                shifted[j],
-                coords,
-                order=1,
-                mode="nearest" if frequency_padding else "grid-wrap",
-            )
-            .reshape(n_radius, n_theta)
-            .T
+        scipy.ndimage.map_coordinates(
+            shifted[j],
+            coords,
+            output=out[j].ravel(),
+            order=1,
+            mode="nearest" if frequency_padding else "grid-wrap",
         )
-        out[j] = polar - polar.mean(axis=0, keepdims=True)
-    return out
+        out[j] -= out[j].mean(axis=1, keepdims=True)
+    return out.transpose(0, 2, 1)
 
 
 def _stream_landmark_polar(
@@ -693,43 +690,18 @@ def _stream_landmark_polar(
     spacing: tuple[float, float],
     geomean: bool,
     frequency_padding: int = 0,
-    pbar: Any = None,
 ) -> np.ndarray:
-    """Reduce power chunks to compact alignment landmarks, discarding each dense chunk.
-
-    Return (landmark, angle, radius), with one landmark for the Cartesian
-    geometric mean or one per selected gene. Progress advances once per chunk.
-    """
-
-    def polar(power):
-        return _build_landmark_polar_stack(
-            power,
-            grid_shape,
-            fft_solver,
-            _ALIGNMENT_N_THETA,
-            freq_edges,
-            spacing,
-            frequency_padding,
-        )
-
+    """Interpolate one selected block or the streamed Cartesian geometric mean."""
     if geomean:
         # Geometric averaging must precede interpolation; these operations do not commute.
-        return polar(
-            stream_geomean_landmark(
-                spectrum_chunk_fn,
-                n_genes,
-                grid_shape,
-                chunk_size=chunk_size,
-                pbar=pbar,
-            )
+        power = stream_geomean_landmark(
+            spectrum_chunk_fn, n_genes, grid_shape, chunk_size=chunk_size
         )
-    out = np.empty((n_genes, _ALIGNMENT_N_THETA, len(freq_edges) - 1))
-    for start in range(0, n_genes, chunk_size):
-        stop = min(start + chunk_size, n_genes)
-        out[start:stop] = polar(spectrum_chunk_fn(start, stop))
-        if pbar is not None:
-            pbar.update(1)
-    return out
+    else:
+        power = spectrum_chunk_fn(0, n_genes)
+    return _build_landmark_polar_stack(
+        power, grid_shape, fft_solver, _ALIGNMENT_N_THETA, freq_edges, spacing, frequency_padding
+    )
 
 
 def estimate_rotations_from_landmarks(
@@ -829,6 +801,17 @@ def estimate_rotations_from_landmarks(
     return _estimate_rotations_from_polar(polar, reference_index=reference_index, progress=progress)
 
 
+def _landmark_cross_sum(reference, current):
+    np.conjugate(current, out=current)
+    current *= reference
+    return current.sum(axis=(0, 2))
+
+
+def _landmark_angles(cross, n_theta):
+    correlations = np.fft.irfft(cross, n=n_theta, axis=1)
+    return correlations.argmax(axis=1) * (180.0 / n_theta)
+
+
 def _estimate_rotations_from_polar(
     landmarks: Sequence[np.ndarray], *, reference_index: int = 0, progress: bool = False
 ) -> np.ndarray:
@@ -846,12 +829,9 @@ def _estimate_rotations_from_polar(
             if i == reference_index:
                 continue
             current = np.fft.rfft(stack[genes], axis=1)
-            np.conjugate(current, out=current)
-            current *= reference
-            cross[i] += current.sum(axis=(0, 2))
+            cross[i] += _landmark_cross_sum(reference, current)
             del current
-    correlations = np.fft.irfft(cross, n=n_theta, axis=1)
-    return correlations.argmax(axis=1) * (180.0 / n_theta)
+    return _landmark_angles(cross, n_theta)
 
 
 def apply_rotations_to_spectra(

@@ -449,7 +449,8 @@ class TestComparatorGridFeatures:
         calls = []
 
         class FakeParallel:
-            def __init__(self, *, n_jobs, prefer):
+            def __init__(self, *, n_jobs, prefer, require=None):
+                self.require = require
                 self.n_jobs = n_jobs
                 self.prefer = prefer
                 calls.append(self)
@@ -492,6 +493,7 @@ class TestComparatorGridFeatures:
             fft_chunk_size=1,
         ).compute_spectra(n_jobs=2, landmark_genes=["g0"], progress=False)
         assert [c.n_jobs for c in calls] == [2, 2]
+        assert [c.require for c in calls] == ["sharedmem", None]
         assert all(c.prefer == "threads" for c in calls)
         assert cmp.spectra_.shape == (3, 2, 3 * 4)
 
@@ -709,7 +711,8 @@ class TestComparatorIrregularFeatures:
         calls = []
 
         class FakeParallel:
-            def __init__(self, *, n_jobs, prefer):
+            def __init__(self, *, n_jobs, prefer, require=None):
+                self.require = require
                 self.n_jobs = n_jobs
                 self.prefer = prefer
                 calls.append(self)
@@ -734,6 +737,7 @@ class TestComparatorIrregularFeatures:
         ).compute_spectra(n_jobs=2, landmark_genes=["g0"], progress=False)
 
         assert [c.n_jobs for c in calls] == [2, 2]
+        assert [c.require for c in calls] == ["sharedmem", None]
         assert all(c.prefer == "threads" for c in calls)
         assert cmp.spectra_.shape == (3, 2, 3 * 4)
 
@@ -1910,6 +1914,10 @@ def test_2d_schedule_uses_transform_workspace(backend, monkeypatch):
     minimum = max(peak, stored + per_feature)
     per_job = max(peak, stored + 2 * per_feature)
     budget = int(2 * per_job)
+    # This transform-only budget fits the second pass once the alignment is available.
+    with pytest.raises(ValueError, match="cannot fit one feature"):
+        comparator.compute_spectra(n_jobs=2, progress=False, memory_budget_bytes=budget)
+    comparator.compute_spectra(n_jobs=1, progress=False)
     comparator.compute_spectra(n_jobs=2, progress=False, memory_budget_bytes=budget)
     parallel = comparator.spectra_.copy()
     assert getattr(comparator, f"_{backend}_chunk_size") == (per_job - stored) // per_feature

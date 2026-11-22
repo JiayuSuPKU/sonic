@@ -550,6 +550,49 @@ class TestChunking:
         np.testing.assert_allclose(result.auto_spectra, expected.auto_spectra)
         assert result.chunk_schedules[0]["estimated_workspace_bytes"] <= 160 * 1024
 
+    def test_backed_csr_reads_row_blocks_for_spectra_and_covariates(self, tmp_path, monkeypatch):
+        from sonic.utils import _take_feature_columns
+
+        rng = np.random.default_rng(53)
+        sample = ad.AnnData(csr_matrix(rng.normal(size=(400, 384))))
+        sample.obsm["spatial"] = rng.uniform(0, 8, (sample.n_obs, 2))
+        path = tmp_path / "sample.h5ad"
+        sample.write_h5ad(path)
+
+        def fit(adata):
+            comp = ComparatorIrregular(
+                [adata], grid_shape=(16, 16), spacing=(1, 1), n_radial_bins=6, workers=1
+            )
+            comp.compute_spectra(chunk_size=16, progress=False)
+            comp.compute_cross_spectra([("32", "4")], chunk_size=1, progress=False)
+            auto = comp.spectra_.copy()
+            cross = comp.cross_spectra_.cross_spectra.copy()
+            comp.normalize_covariates(["32", "4"])
+            return auto, cross, comp.spectra_
+
+        reference = fit(sample)
+        disk = ad.read_h5ad(path, backed="r")
+        try:
+            dataset = type(disk.X)
+            getitem = dataset.__getitem__
+
+            def check_rows(matrix, key):
+                rows, cols = key
+                assert cols == slice(None)
+                assert 0 < rows.stop - rows.start < matrix.shape[0]
+                return getitem(matrix, key)
+
+            monkeypatch.setattr(dataset, "__getitem__", check_rows)
+            monkeypatch.setattr(dataset, "to_memory", lambda *_: pytest.fail("read all of X"))
+            selected = [32, 4, 32]
+            np.testing.assert_array_equal(
+                _take_feature_columns(disk.X, selected).toarray(), sample.X[:, selected].toarray()
+            )
+            for actual, expected in zip(fit(disk), reference, strict=True):
+                np.testing.assert_allclose(actual, expected, atol=1e-12)
+        finally:
+            disk.file.close()
+
     def test_grid_cross_and_explanation_fit_single_lattice_budget(self, make_comparator):
         data = np.random.default_rng(92).normal(size=(3, 128, 128))
         data[:, :10] = np.nan
@@ -871,7 +914,7 @@ class TestComparatorIntegration:
         first = np.random.default_rng(81).normal(size=(3, 33, 33))
         values = [first, 1.2 * np.rot90(first, axes=(-2, -1))]
         comparator = make_comparator(values, backend=backend, mode="2d", n_theta_bins=12)
-        estimate = base_module._estimate_rotations_from_polar
+        estimate = base_module._landmark_angles
         fits = []
 
         def tracked_estimate(*args, **kwargs):
@@ -879,7 +922,7 @@ class TestComparatorIntegration:
             fits.append(angles.copy())
             return angles
 
-        monkeypatch.setattr(base_module, "_estimate_rotations_from_polar", tracked_estimate)
+        monkeypatch.setattr(base_module, "_landmark_angles", tracked_estimate)
         comparator.compute_cross_spectra([("b", "c")], landmark_genes=["a"], progress=False)
         assert len(fits) == 1
         assert comparator.rotation_angles_[0] == 0
@@ -1051,17 +1094,19 @@ class TestAlignment:
             )
             for p, shape in zip(expected, shapes, strict=True)
         ]
-        estimate = base_module._estimate_rotations_from_polar
+        stream = base_module._stream_landmark_polar
+        expected_stacks = iter(expected_polar)
 
-        def check_polar(polar, **kwargs):
-            for actual, reference in zip(polar, expected_polar, strict=True):
-                np.testing.assert_allclose(actual, reference, rtol=1e-11, atol=1e-14)
-            return estimate(polar, **kwargs)
+        def check_polar(*args, **kwargs):
+            actual = stream(*args, **kwargs)
+            np.testing.assert_allclose(actual, next(expected_stacks), rtol=1e-11, atol=1e-14)
+            return actual
 
-        monkeypatch.setattr(base_module, "_estimate_rotations_from_polar", check_polar)
+        monkeypatch.setattr(base_module, "_stream_landmark_polar", check_polar)
         comparator.compute_cross_spectra(
-            [("a", "c")], landmark_genes=landmarks, chunk_size=2, progress=False
+            [("a", "c")], landmark_genes=landmarks, chunk_size=2, n_jobs=1, progress=False
         )
+        assert next(expected_stacks, None) is None
         np.testing.assert_array_equal(comparator.rotation_angles_, expected_angles)
         assert comparator.spectra_ is None
 
@@ -1113,15 +1158,33 @@ class TestAlignment:
         assert comparator.spectra_ is None
 
     @pytest.mark.parametrize("backend", ["fft", "nufft"])
-    def test_cache_fallback_keeps_batched_selected_geomean(self, make_comparator, backend):
-        values = np.random.default_rng(117).normal(size=(3, 17, 19))
-        comparator = make_comparator([values, values * 2], backend=backend, mode="2d")
-        comparator._landmark_cache_warn_bytes = 1
-        with pytest.warns(UserWarning, match="geometric-mean"):
-            comparator.compute_cross_spectra(
-                [("a", "b")], landmark_genes=["a", "c"], chunk_size=2, progress=False
-            )
-        np.testing.assert_allclose(comparator.rotation_angles_, 0)
+    @pytest.mark.parametrize("method", ["compute_cross_spectra", "compute_spectra"])
+    def test_landmark_budget_preserves_per_gene_alignment(
+        self, make_comparator, backend, method, monkeypatch
+    ):
+        import sonic.comparators.base as base_module
+
+        rng = np.random.default_rng(117)
+        values = [rng.normal(size=(3, 17, 19)) for _ in range(3)]
+        names = ["c", "a", "b"] * 8
+        args = ([("a", "b")],) if method == "compute_cross_spectra" else ()
+        options = {"landmark_genes": names, "n_jobs": 1, "progress": False}
+        reference = make_comparator(values, backend=backend, mode="2d")
+        getattr(reference, method)(*args, chunk_size=len(names), **options)
+        stream = base_module._stream_landmark_polar
+        counts = []
+
+        def track(read, count, *args, **kwargs):
+            assert not kwargs["geomean"]
+            counts.append(count)
+            return stream(read, count, *args, **kwargs)
+
+        monkeypatch.setattr(base_module, "_stream_landmark_polar", track)
+        actual = make_comparator(values, backend=backend, mode="2d")
+        getattr(actual, method)(*args, memory_budget_bytes="1 MiB", **options)
+        assert max(counts) < len(names)
+        assert sum(counts) == len(values) * len(names)
+        np.testing.assert_array_equal(actual.rotation_angles_, reference.rotation_angles_)
 
 
 class TestFitState:
@@ -1169,7 +1232,7 @@ class TestFitState:
         def fail(*args, **kwargs):
             raise RuntimeError("synthetic alignment failure")
 
-        monkeypatch.setattr(base_module, "_estimate_rotations_from_polar", fail)
+        monkeypatch.setattr(base_module, "_landmark_angles", fail)
         with pytest.raises(RuntimeError, match="synthetic alignment failure"):
             comparator.compute_cross_spectra([("a", "c")], landmark_genes=["c"], progress=False)
         assert all(comparator.__dict__[key] is value for key, value in before.items())

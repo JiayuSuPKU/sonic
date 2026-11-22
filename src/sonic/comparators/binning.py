@@ -496,11 +496,12 @@ def _polar_bin_center_coords(
     # Sample the original spectrum at the inverse rotation. Applying the
     # angle here preserves physical directions on anisotropic FFT grids.
     thetas = np.linspace(0.0, np.pi, n_theta, endpoint=False) - np.deg2rad(angle_deg)
-    rr, tt = np.meshgrid(radii, thetas, indexing="ij")  # (n_radius, n_theta)
-    cy, cx = ny // 2 + frequency_padding, nx // 2 + frequency_padding
-    yy = cy + rr * np.sin(tt) * ny * dy
-    xx = cx + rr * np.cos(tt) * nx * dx
-    return np.stack([yy.ravel(), xx.ravel()], axis=0), len(radii)
+    coords = np.empty((2, len(radii), n_theta))
+    coords[0] = radii[:, None] * (np.sin(thetas) * ny * dy)
+    coords[1] = radii[:, None] * (np.cos(thetas) * nx * dx)
+    coords[0] += ny // 2 + frequency_padding
+    coords[1] += nx // 2 + frequency_padding
+    return coords.reshape(2, -1), len(radii)
 
 
 def _polar_quadrature_counts(grid_shape, *, edges, spacing, n_theta, oversampling=2):

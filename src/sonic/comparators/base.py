@@ -10,6 +10,7 @@ import logging
 import warnings
 from collections.abc import Sequence
 from dataclasses import replace
+from functools import partial
 from typing import TYPE_CHECKING, Any
 
 import numpy as np
@@ -40,7 +41,8 @@ from sonic.comparators._inference import (
 from sonic.comparators.features import (
     _ALIGNMENT_N_RADIUS,
     _ALIGNMENT_N_THETA,
-    _estimate_rotations_from_polar,
+    _landmark_angles,
+    _landmark_cross_sum,
     _stream_landmark_polar,
     compute_sample_spectrum,
 )
@@ -230,19 +232,20 @@ class _ComparatorBase:
             spec = self._resolve_chunk_spec(chunk_size)
             n_genes = len(self.gene_names) if names is None else len(names)
             n_jobs, chunk, spare = self._resolve_spectrum_schedule(
-                spec, grids, n_genes, n_jobs=n_jobs
+                spec,
+                grids,
+                n_genes,
+                n_jobs=n_jobs,
+                alignment="geomean" if names is None else "per_gene",
             )
-            use_geomean = names is None or not self._landmark_cache_fits(n_genes)
             f_max = min(0.5 / max(spacing) for spacing in self._spacings)
             edges = np.linspace(0.0, f_max, _ALIGNMENT_N_RADIUS + 1)
 
-            # Compute interpolated polar spectra for selected landmarks per sample.
-            def _one(i, pbar):
-                read, _dc, _presence, count, shape = self._sample_spectrum_chunker(
-                    i, gene_indices=indices, chunk_size=chunk, cache_budget=spare[i]
+            def fourier(i, selected):
+                read, _, _, count, shape = self._sample_spectrum_chunker(
+                    i, gene_indices=selected, chunk_size=chunk, cache_budget=spare[i]
                 )
-
-                return _stream_landmark_polar(
+                polar = _stream_landmark_polar(
                     read,
                     count,
                     shape,
@@ -250,20 +253,30 @@ class _ComparatorBase:
                     fft_solver=self._spectrum_fft_solver,
                     freq_edges=edges,
                     spacing=self._spacings[i],
-                    geomean=use_geomean,
+                    geomean=selected is None,
                     frequency_padding=padding,
-                    pbar=pbar,
                 )
+                return np.fft.rfft(polar, axis=1)
 
-            landmarks = _run_per_sample(
-                _one,
-                len(self.samples),
-                n_chunks_per_sample=int(np.ceil(n_genes / chunk)),
-                desc="Alignment landmarks",
-                n_jobs=n_jobs,
-                progress=progress,
-            )
-            angles = _estimate_rotations_from_polar(landmarks, progress=progress)
+            # The reference block is shared. Only angular cross-products survive each batch.
+            cross = np.zeros((len(self.samples), _ALIGNMENT_N_THETA // 2 + 1), dtype=complex)
+
+            def correlate(i, _pbar, *, reference, selected):
+                cross[i + 1] += _landmark_cross_sum(reference, fourier(i + 1, selected))
+
+            starts = (0,) if indices is None else range(0, n_genes, chunk)
+            for start in tqdm(starts, desc="Alignment landmarks", disable=not progress):
+                selected = None if indices is None else indices[start : start + chunk]
+                _run_per_sample(
+                    partial(correlate, reference=fourier(0, selected), selected=selected),
+                    len(self.samples) - 1,
+                    n_chunks_per_sample=1,
+                    desc="Alignment landmarks",
+                    n_jobs=n_jobs,
+                    progress=False,
+                    shared_output=True,
+                )
+            angles = _landmark_angles(cross, _ALIGNMENT_N_THETA)
         self.rotation_angles_ = angles
         self._alignment_landmark_genes = names
 
@@ -273,11 +286,11 @@ class _ComparatorBase:
         padding = int(self.feature_mode == "2d" and self._spectrum_backend == "nufft")
         grids = [(ny + 2 * padding, nx + 2 * padding) for ny, nx in self._grid_shapes]
         spec = self._resolve_chunk_spec(chunk_size)
+        self._ensure_alignment(n_jobs, progress, landmark_genes, chunk_size=spec)
         n_jobs, chunk, spare = self._resolve_spectrum_schedule(
             spec, grids, len(self.gene_names), n_jobs=n_jobs, polar=self.feature_mode == "2d"
         )
         setattr(self, f"_{self._spectrum_backend}_chunk_size", chunk)
-        self._ensure_alignment(n_jobs, progress, landmark_genes, chunk_size=chunk)
 
         # Compute binned and flattened single-feature auto-spectra per sample.
         def _one(i, pbar):
@@ -391,6 +404,7 @@ class _ComparatorBase:
         *,
         n_jobs: int = 1,
         polar: bool = False,
+        alignment: str | None = None,
     ) -> tuple[int, int, list[int]]:
         """Size concurrent transforms and return the spare bytes for sparse column caches."""
         from bisect import bisect_right
@@ -409,6 +423,12 @@ class _ComparatorBase:
             for i in range(len(grid_shapes))
         ]
 
+        def reference_bytes(count):
+            if alignment is None:
+                return 0
+            landmarks = count if alignment == "per_gene" else 1
+            return 16 * landmarks * _ALIGNMENT_N_RADIUS * (_ALIGNMENT_N_THETA // 2 + 1)
+
         def workspace(i, count, workers):
             shape = grid_shapes[i]
             if self._spectrum_backend == "nufft":
@@ -417,6 +437,12 @@ class _ComparatorBase:
                 )
             else:
                 transform = 64 * shape[0] * shape[1] * count
+            if alignment is not None:
+                landmarks = count if alignment == "per_gene" else 1
+                polar_bytes = 8 * _ALIGNMENT_N_THETA * _ALIGNMENT_N_RADIUS
+                # Interpolation retains Cartesian powers, coordinates and one polar block.
+                interpolate = 24 * shape[0] * shape[1] * landmarks + polar_bytes * (landmarks + 2)
+                return max(transform, interpolate, polar_bytes * landmarks + reference_bytes(count))
             stored, peak = reducers[i]
             return max(peak, stored + transform)
 
@@ -425,47 +451,31 @@ class _ComparatorBase:
             n_jobs,
             self._workers_spec,
             backend=self._spectrum_backend,
-            n_tasks=len(self.samples),
+            n_tasks=len(self.samples) - int(alignment is not None),
             per_feat_bytes=minimum if spec == "auto" else None,
-            budget_bytes=self._auto_chunk_budget_bytes,
+            budget_bytes=max(1, self._auto_chunk_budget_bytes - reference_bytes(1)),
         )
-        per_job = self._auto_chunk_budget_bytes // n_jobs
+
+        def total_bytes(count):
+            return reference_bytes(count) + n_jobs * max(
+                workspace(i, count, self._workers) for i in range(len(grid_shapes))
+            )
+
         chunk = spec
         if spec == "auto":
-            if per_job < minimum:
+            if total_bytes(1) > self._auto_chunk_budget_bytes:
                 raise ValueError(
-                    f"Budget cannot fit one feature per worker ({minimum} bytes each across {n_jobs} workers)."
+                    f"Budget cannot fit one feature per worker ({total_bytes(1)} bytes across {n_jobs} workers)."
                 )
             chunk = bisect_right(
-                range(1, self._auto_chunk_cap + 1),
-                per_job,
-                key=lambda count: max(
-                    workspace(i, count, self._workers) for i in range(len(grid_shapes))
-                ),
+                range(1, self._auto_chunk_cap + 1), self._auto_chunk_budget_bytes, key=total_bytes
             )
+        count = min(chunk, n_genes)
+        per_job = (self._auto_chunk_budget_bytes - reference_bytes(count)) // n_jobs
         spare = [
-            max(0, per_job - workspace(i, min(chunk, n_genes), self._workers))
-            for i in range(len(grid_shapes))
+            max(0, per_job - workspace(i, count, self._workers)) for i in range(len(grid_shapes))
         ]
         return n_jobs, chunk, spare
-
-    # Compact polar stacks are retained only for the alignment pass.
-    _landmark_cache_warn_bytes: int = 8 * 1024**3
-
-    def _landmark_cache_fits(self, n_landmarks: int) -> bool:
-        """Bound the total compact landmark cache across samples, excluding transform chunks."""
-        cache_bytes = len(self.samples) * n_landmarks * _ALIGNMENT_N_THETA * _ALIGNMENT_N_RADIUS * 8
-        if cache_bytes > self._landmark_cache_warn_bytes:
-            warnings.warn(
-                f"Rotation alignment with {n_landmarks} explicit landmark genes would cache "
-                f"{cache_bytes / 1024**3:.1f} GiB of polar spectra "
-                f"(limit {self._landmark_cache_warn_bytes / 1024**3:.1f} GiB). Falling back "
-                "to a single streamed geometric-mean of the landmark genes to avoid OOM.",
-                UserWarning,
-                stacklevel=3,
-            )
-            return False
-        return True
 
     # ------------------------------------------------------------------
     def _resolve_freq_edges(self) -> None:

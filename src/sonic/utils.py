@@ -56,6 +56,21 @@ def _gene_indices(gene_names, names) -> np.ndarray:
 
 def _take_feature_columns(matrix, columns):
     """Read selected columns in request order, including repeats on HDF5-backed data."""
+    if not sp.issparse(matrix) and getattr(matrix, "format", None) == "csr":
+        # AnnData loads the entire backed CSR for fancy column indexing. Slice rows on disk.
+        n_rows = matrix.shape[0]
+        if not n_rows or not len(columns):
+            return sp.csr_matrix((n_rows, len(columns)), dtype=matrix.dtype)
+        indptr = matrix.group["indptr"][:]
+        tile_bytes = min(1 << 20, 8 * n_rows * len(columns))
+        entries = tile_bytes // (matrix.dtype.itemsize + indptr.itemsize)
+        blocks = []
+        start = 0
+        while start < n_rows:
+            stop = max(start + 1, indptr.searchsorted(int(indptr[start]) + entries, "right") - 1)
+            blocks.append(matrix[start:stop, :][:, columns])
+            start = stop
+        return sp.vstack(blocks, format="csr") if len(blocks) > 1 else blocks[0]
     if isinstance(matrix, np.ndarray) or sp.issparse(matrix) or np.all(np.diff(columns) > 0):
         return matrix[:, columns]
     unique, order = np.unique(columns, return_inverse=True)

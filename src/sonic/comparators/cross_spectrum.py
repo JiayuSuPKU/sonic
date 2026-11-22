@@ -260,8 +260,9 @@ def _compute_cross_spectra(  # noqa: C901 — validation and two backend schedul
         raise MemoryError(
             f"Cross-spectrum workspace requires at least {min_workspace_bytes} bytes per job"
         )
+    requested_jobs = 1 if progress else n_jobs
     n_jobs, workers = resolve_parallelism(
-        1 if progress else n_jobs,
+        requested_jobs,
         comparator._workers_spec,
         backend=comparator._spectrum_backend,
         n_tasks=n_samples,
@@ -287,7 +288,7 @@ def _compute_cross_spectra(  # noqa: C901 — validation and two backend schedul
             )
         comparator._auto_chunk_budget_bytes = budget_bytes
         comparator._ensure_alignment(
-            1 if progress else n_jobs, progress, landmark_genes, chunk_size=chunk_size
+            requested_jobs, progress, landmark_genes, chunk_size=chunk_size
         )
         rotation_angles_deg = np.asarray(comparator.rotation_angles_, dtype=float)
     else:
@@ -484,7 +485,7 @@ def _prepare_cross_profiles(result, pairs, bins, representation, presence):
     left, right = result.pair_indices[pairs].T
     denominator = np.sqrt(result.auto_spectra[np.ix_(rows, left, bins)])
     denominator *= np.sqrt(result.auto_spectra[np.ix_(rows, right, bins)])
-    values = result.cross_spectra[np.ix_(rows, pairs, bins)].astype(np.complex128)
+    values = result.cross_spectra[np.ix_(rows, pairs, bins)].astype(np.complex128, copy=False)
     if np.any(presence[..., None] & ~(np.isfinite(denominator) & (denominator > 0))):
         raise ValueError("Valid coherency bins must have finite positive auto-power.")
     # Missing pairs stay NaN and are excluded by the shared masked DF helpers.
@@ -553,12 +554,20 @@ def _cross_pvalues_from_covariance(observed, scales, covariance, weights, roundo
     return pvals, effective_rank, np.where(np.isnan(pvals), "degenerate_null", "ok")
 
 
-def _cross_fit_groups(support, candidates, complete):
+def _cross_profile_blocks(support, pairs, n_samples):
+    """Yield common-bin blocks before allocating sample-by-pair-by-bin profiles."""
+    for keep, indices in _iter_mask_groups(support[pairs].T):
+        bins = np.flatnonzero(keep)
+        for block in _iter_feature_blocks(n_samples, len(indices), len(bins)):
+            yield bins, pairs[indices[block]]
+
+
+def _cross_fit_groups(support, candidates, complete, n_samples):
     """Batch pairs with common bins and the same masked or unmasked fit policy."""
     for is_complete in (True, False):
         pairs = candidates[complete[candidates] == is_complete]
-        for keep, indices in _iter_mask_groups(support[pairs].T):
-            yield np.flatnonzero(keep), pairs[indices], not is_complete
+        for bins, selected in _cross_profile_blocks(support, pairs, n_samples):
+            yield bins, selected, not is_complete
 
 
 def _run_cross_plugin(  # noqa: C901 — shared fits across covariance modes and design paths
@@ -662,7 +671,7 @@ def _run_cross_plugin(  # noqa: C901 — shared fits across covariance modes and
         covariance = np.zeros((len(pooled_bins), len(pooled_bins)))
         covariance_df = np.zeros_like(covariance)
     # Batch fits by bin support; pooled mode combines shared covariance entries afterward.
-    for bins, pairs, use_masked in _cross_fit_groups(support, candidates, complete):
+    for bins, pairs, use_masked in _cross_fit_groups(support, candidates, complete, n_samples):
         group_presence = pair_presence[:, pairs]
         profiles = _prepare_cross_profiles(result, pairs, bins, representation, group_presence)
         group_weights = weights[bins]
@@ -826,9 +835,7 @@ def _run_cross_permutations(
             rng,
             max_exact_permutations=max_exact_permutations,
         )
-        for keep, local in _iter_mask_groups(support[pairs].T):
-            selected = pairs[local]
-            bins = np.flatnonzero(keep)
+        for bins, selected in _cross_profile_blocks(support, pairs, len(pair_presence)):
             profiles = _prepare_cross_profiles(
                 result, selected, bins, representation, pair_presence[:, selected]
             )
@@ -926,32 +933,30 @@ def _run_cross_rotations(
     effective_rank = np.full(n_pairs, np.nan)
     df_resid = np.zeros(n_pairs, int)
     status = np.full(n_pairs, "no_common_bins", dtype=object)
-    for bins, group, use_masked in _cross_fit_groups(support, candidates, complete):
-        for block in _iter_feature_blocks(n_samples, len(group), len(bins)):
-            pairs = group[block]
-            group_presence = pair_presence[:, pairs]
-            profiles = _prepare_cross_profiles(result, pairs, bins, representation, group_presence)
-            rotation = _run_l2_conditional(
-                profiles,
-                matrix,
-                vector,
-                group_presence if use_masked else None,
-                freq_weights=None if freq_weights is None else freq_weights[bins],
-                log_transform=representation == "coherence",
-                min_resid_df=min_resid_df if use_glm and use_masked else 1,
-                allow_empty=True,
-                integration_tol=integration_tol,
-            )
-            observed[pairs] = rotation["observed"]
-            effect = rotation["estimate_per_bin"]
-            estimates[np.ix_(pairs, bins)] = effect if use_glm else -effect
-            pvals[pairs] = rotation["pvals"]
-            pvalue_error[pairs] = rotation["pvalue_error"]
-            pvalue_method[pairs] = rotation["pvalue_method"]
-            effective_rank[pairs] = rotation["effective_rank"]
-            df_resid[pairs] = rotation["df_resid"]
-            status[pairs] = "ineligible_design" if use_glm else "insufficient_samples"
-            status[pairs[rotation["eligible"]]] = "ok"
+    for bins, pairs, use_masked in _cross_fit_groups(support, candidates, complete, n_samples):
+        group_presence = pair_presence[:, pairs]
+        profiles = _prepare_cross_profiles(result, pairs, bins, representation, group_presence)
+        rotation = _run_l2_conditional(
+            profiles,
+            matrix,
+            vector,
+            group_presence if use_masked else None,
+            freq_weights=None if freq_weights is None else freq_weights[bins],
+            log_transform=representation == "coherence",
+            min_resid_df=min_resid_df if use_glm and use_masked else 1,
+            allow_empty=True,
+            integration_tol=integration_tol,
+        )
+        observed[pairs] = rotation["observed"]
+        effect = rotation["estimate_per_bin"]
+        estimates[np.ix_(pairs, bins)] = effect if use_glm else -effect
+        pvals[pairs] = rotation["pvals"]
+        pvalue_error[pairs] = rotation["pvalue_error"]
+        pvalue_method[pairs] = rotation["pvalue_method"]
+        effective_rank[pairs] = rotation["effective_rank"]
+        df_resid[pairs] = rotation["df_resid"]
+        status[pairs] = "ineligible_design" if use_glm else "insufficient_samples"
+        status[pairs[rotation["eligible"]]] = "ok"
     metadata["n_saddlepoint"] = int(np.count_nonzero(pvalue_method == "saddlepoint"))
     return {
         "observed": observed,
@@ -1031,38 +1036,36 @@ def _run_cross_t_cauchy(
     binwise = {name: np.full((n_pairs, n_bins), np.nan) for name in _BINWISE_COLUMNS}
     best_bin = np.full(n_pairs, np.nan)
     unit_fits = {}
-    for bins, group, use_masked in _cross_fit_groups(support, candidates, complete):
-        for block in _iter_feature_blocks(n_samples, len(group), len(bins)):
-            pairs = group[block]
-            presence = pair_presence[:, pairs]
-            profiles = _prepare_cross_profiles(result, pairs, bins, representation, presence)
-            observed[pairs], pvals[pairs], extra = _run_t_cauchy_test(
-                profiles,
-                groups=None if use_glm else codes,
-                design=matrix if use_glm else None,
-                contrast=vector if use_glm else None,
-                prepared_design=prepared_design if not use_masked else None,
-                unit_fits=unit_fits,
-                presence=presence if use_masked else None,
-                log_transform=representation == "coherence",
-                freq_weights=weights[bins],
-                min_samples_per_group=min_samples_per_group,
-                min_resid_df=min_resid_df if use_masked else 1,
-            )
-            if use_glm:
-                df_resid[pairs] = extra["df_resid"] if use_masked else n_samples - fit.rank
-            else:
-                df_resid[pairs] = np.maximum(presence.sum(axis=0) - 2, 0)
-            status[pairs] = np.where(
-                np.isfinite(pvals[pairs]),
-                "ok",
-                "ineligible_design" if use_glm else "insufficient_samples",
-            )
-            for name in _BINWISE_COLUMNS:
-                binwise[name][np.ix_(pairs, bins)] = np.stack(extra[name])
-            local_best = extra["Best_bin"].to_numpy(dtype=float, na_value=np.nan)
-            eligible = np.isfinite(local_best)
-            best_bin[pairs[eligible]] = bins[local_best[eligible].astype(int)]
+    for bins, pairs, use_masked in _cross_fit_groups(support, candidates, complete, n_samples):
+        presence = pair_presence[:, pairs]
+        profiles = _prepare_cross_profiles(result, pairs, bins, representation, presence)
+        observed[pairs], pvals[pairs], extra = _run_t_cauchy_test(
+            profiles,
+            groups=None if use_glm else codes,
+            design=matrix if use_glm else None,
+            contrast=vector if use_glm else None,
+            prepared_design=prepared_design if not use_masked else None,
+            unit_fits=unit_fits,
+            presence=presence if use_masked else None,
+            log_transform=representation == "coherence",
+            freq_weights=weights[bins],
+            min_samples_per_group=min_samples_per_group,
+            min_resid_df=min_resid_df if use_masked else 1,
+        )
+        if use_glm:
+            df_resid[pairs] = extra["df_resid"] if use_masked else n_samples - fit.rank
+        else:
+            df_resid[pairs] = np.maximum(presence.sum(axis=0) - 2, 0)
+        status[pairs] = np.where(
+            np.isfinite(pvals[pairs]),
+            "ok",
+            "ineligible_design" if use_glm else "insufficient_samples",
+        )
+        for name in _BINWISE_COLUMNS:
+            binwise[name][np.ix_(pairs, bins)] = np.stack(extra[name])
+        local_best = extra["Best_bin"].to_numpy(dtype=float, na_value=np.nan)
+        eligible = np.isfinite(local_best)
+        best_bin[pairs[eligible]] = bins[local_best[eligible].astype(int)]
     return {
         "observed": observed,
         "pvals": pvals,
@@ -1345,7 +1348,7 @@ def _compare_cross_spectra(  # noqa: C901 — validation and dispatch over binar
     n_observed = pair_presence.sum(axis=0)
     complete = n_observed == n_samples
     # Missing expression excludes samples; unsupported frequencies still exclude bins.
-    support = (result.coherency_valid | ~pair_presence[..., None]).all(axis=0)
+    support = np.all(result.coherency_valid, axis=0, where=pair_presence[..., None])
     support &= pair_presence.any(axis=0)[:, None]
     self_pairs = np.array([a == b for a, b in result.pairs], dtype=bool)
     testable = ~self_pairs & support.any(axis=1)

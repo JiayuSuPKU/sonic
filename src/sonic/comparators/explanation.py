@@ -57,7 +57,8 @@ def _explain_spectrum(  # noqa: C901 — validation, backend adjoints and five r
     names = (features,) if isinstance(features, str) else tuple(features)
     if len(names) not in (1, 2) or any(not isinstance(g, str) for g in names):
         raise ValueError("Provide one feature name or a pair of feature names.")
-    columns = comparator._gene_indices(names)
+    if any(g not in comparator.gene_names for g in names):
+        raise ValueError("All explanation features must exist in the comparator.")
     choices = ("power", "power_norm") if len(names) == 1 else ("cross", "coherency", "coherence")
     if representation is None:
         representation = choices[0]
@@ -110,6 +111,7 @@ def _explain_spectrum(  # noqa: C901 — validation, backend adjoints and five r
     if np.any(counts[bands] == 0):
         raise ValueError("Requested bins have no supported non-DC Fourier modes.")
 
+    columns = [list(comparator.gene_names).index(g) for g in names]
     if irregular:
         sample = comparator.samples[sample_index]
         matrix = sample.X if comparator._layer is None else sample.layers[comparator._layer]

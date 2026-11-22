@@ -291,12 +291,8 @@ covariance selects plug-in calibration if you omit ``null``.
    per_gene = comparison.test_diff_freq(groups, null="plugin")
    pooled = comparison.test_cross_diff_freq(groups, covariance="pooled")
 
-Use ``comparison.estimate_null_covariance(groups, features=["CD8", "CD20"])``
-to inspect covariance matrices and fitted coefficients for those genes in that
-order. With ``covariance="pooled"``, the selected genes form the pool. The two
-returned covariance matrices together require 16 bytes times the squared bin
-count per gene, or once for a pooled estimate. The default limit for those
-matrices is 2 GiB. Set ``memory_budget_bytes`` to change it.
+Use ``estimate_null_covariance`` to inspect the gene covariance estimates and
+fitted coefficients.
 
 Permutation of binary group labels
 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^

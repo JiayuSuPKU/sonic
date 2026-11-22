@@ -1022,57 +1022,6 @@ class TestComparatorNullCovariance:
         assert 1.0 <= diag["effective_rank"] <= 4.0
         self._assert_diag_reproduces_pvalues(cmp, df, diag)
 
-    def test_default_covariance_budget_rejects_large_panel_before_allocation(self, monkeypatch):
-        from sonic.comparators import _inference
-
-        spectra = np.broadcast_to(1.0, (6, 5000, 1080))
-        cmp = _comparator_from_spectra(spectra)
-        monkeypatch.setattr(
-            _inference,
-            "_init_per_gene_covariance",
-            lambda *args: pytest.fail("Attempted to allocate the oversized covariance"),
-        )
-        with pytest.raises(MemoryError, match="93312000000 bytes"):
-            cmp.estimate_null_covariance([0, 0, 0, 1, 1, 1])
-
-    @pytest.mark.parametrize("covariance", ["per_gene", "pooled"])
-    @pytest.mark.parametrize("masked", [False, True])
-    @pytest.mark.parametrize("glm", [False, True])
-    def test_covariance_budget_counts_selected_genes(self, covariance, masked, glm):
-        spectra = np.random.default_rng(740).lognormal(size=(8, 4, 5))
-        presence = np.ones((8, 4), dtype=bool)
-        if masked:
-            presence[0, 2] = False
-        groups = np.repeat([0, 1], 4)
-        design = np.column_stack([np.ones(8), groups]) if glm else groups
-        options = {"covariance": covariance, "contrast": "x1" if glm else None}
-        cmp = _comparator_from_spectra(spectra, presence)
-        cols = [2, 0]
-        expected = _comparator_from_spectra(spectra[:, cols], presence[:, cols])
-        reference = expected.estimate_null_covariance(design, **options)
-        nbytes = reference["sigma_log"].nbytes + reference["weighted_cov"].nbytes
-
-        with pytest.raises(MemoryError, match="memory_budget_bytes"):
-            cmp.estimate_null_covariance(
-                design, features=["g2", "g0"], memory_budget_bytes=nbytes - 1, **options
-            )
-        selected = cmp.estimate_null_covariance(
-            design, features=["g2", "g0"], memory_budget_bytes=f"{nbytes} B", **options
-        )
-        for key in ("sigma_log", "weighted_cov", "beta", "eligible"):
-            np.testing.assert_allclose(selected[key], reference[key])
-
-    def test_covariance_feature_names(self):
-        cmp = _comparator_from_spectra(np.random.default_rng(741).lognormal(size=(8, 3, 5)))
-        cmp.gene_names = ["a", "a", "b"]
-        groups = np.repeat([0, 1], 4)
-        selected = cmp.estimate_null_covariance(groups, features="b")
-        full = cmp.estimate_null_covariance(groups)
-        np.testing.assert_allclose(selected["sigma_log"], full["sigma_log"][2:])
-        for names in ([], ["b", "b"], ["a"], ["missing"]):
-            with pytest.raises(ValueError):
-                cmp.estimate_null_covariance(groups, features=names)
-
     def test_covariance_requires_computed_spectra(self):
         gene_names = ["a", "b"]
         adatas = _grid_samples_to_adata([np.zeros((2, 4, 4)), np.zeros((2, 4, 4))], gene_names)

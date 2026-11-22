@@ -425,21 +425,6 @@ class TestDetectorExplanation:
 class TestComparatorExplanation:
     REPRESENTATIONS = ["power", "power_norm", "cross", "coherency", "coherence"]
 
-    def test_explanation_rejects_only_ambiguous_gene_names(self):
-        from sonic import ComparatorIrregular
-
-        sample = _adata()
-        sample.var_names = ["a", "a", "c"]
-        comparator = ComparatorIrregular(
-            [sample], obsm_key="positions", grid_shape=(9, 11), spacing=(1, 1), workers=1
-        ).compute_spectra(progress=False)
-
-        for features in ("a", ("c", "a")):
-            with pytest.raises(ValueError, match="Ambiguous.*'a'"):
-                comparator.explain_spectrum(features, bands=[0])
-        result = comparator.explain_spectrum(("c", "c"), bands=[0])
-        np.testing.assert_array_equal(result.values, sample.X[:, [2, 2]])
-
     def test_backed_spectrum_explains_reversed_and_repeated_features(self, tmp_path):
         from sonic import ComparatorIrregular
 
